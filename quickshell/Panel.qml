@@ -18,6 +18,7 @@ Item {
   property bool editingPlanTask: false
   property bool rejectingPlan: false
   property string localDraftError: ""
+  property var repositoryPathCandidates: []
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id
@@ -94,6 +95,7 @@ Item {
     focusArea = "content"
     editingDraft = true
     localDraftError = ""
+    repositoryPathCandidates = []
     engine.requestError = ""
     Qt.callLater(function() { repositoryField.forceActiveFocus() })
   }
@@ -102,6 +104,7 @@ Item {
     if (engine.requestPending) return
     editingDraft = false
     localDraftError = ""
+    repositoryPathCandidates = []
     repositoryField.focus = false
     goalField.focus = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -123,6 +126,28 @@ Item {
 
     localDraftError = ""
     engine.createDraft(repository, goal)
+  }
+
+  function completeRepositoryPath() {
+    if (!engine.connected || engine.requestPending) return
+    localDraftError = ""
+    repositoryPathCandidates = []
+    engine.completeRepositoryPath(repositoryField.text)
+  }
+
+  function repositoryCandidateText() {
+    var labels = []
+    var count = Math.min(repositoryPathCandidates.length, 6)
+    for (var i = 0; i < count; i++) {
+      var candidate = String(repositoryPathCandidates[i])
+      var withoutSlash = candidate.endsWith("/")
+        ? candidate.slice(0, candidate.length - 1)
+        : candidate
+      labels.push(withoutSlash.slice(withoutSlash.lastIndexOf("/") + 1) + "/")
+    }
+    if (repositoryPathCandidates.length > count)
+      labels.push("… " + (repositoryPathCandidates.length - count) + " more")
+    return "Matches:  " + labels.join("    ")
   }
 
   function draftError() {
@@ -207,7 +232,7 @@ Item {
   }
 
   function footerHelp() {
-    if (editingDraft) return "Tab  Next field    Enter  Continue or create    Esc  Cancel"
+    if (editingDraft) return "Tab  Complete repository path    Enter  Continue or create    Esc  Cancel"
     if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
     if (focusArea === "sections")
@@ -240,11 +265,19 @@ Item {
     id: engine
     onDraftCreated: {
       root.editingDraft = false
+      root.repositoryPathCandidates = []
       repositoryField.text = ""
       goalField.text = ""
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
+    onRepositoryPathCompleted: function(replacement, candidates) {
+      repositoryField.text = replacement
+      repositoryField.cursorPosition = repositoryField.text.length
+      root.repositoryPathCandidates = candidates || []
+      Qt.callLater(function() { repositoryField.forceActiveFocus() })
+    }
     onRequestCompleted: function(method) {
+      if (method === "complete_repository_path") return
       if (method === "update_plan_task") root.editingPlanTask = false
       if (method === "reject_plan") root.rejectingPlan = false
       root.selectedTaskIndex = Math.max(0, root.selectedTaskIndex)
@@ -562,17 +595,31 @@ Item {
                       id: repositoryField
                       width: parent.width
                       enabled: !engine.requestPending
+                        || engine.pendingMethod === "complete_repository_path"
                       placeholderText: "/absolute/path/to/repository"
                       foreground: root.foreground
                       accent: root.accent
+                      onTextEdited: root.repositoryPathCandidates = []
 
                       Keys.onPressed: function(event) {
                         if (event.key === Qt.Key_Escape) {
                           root.cancelDraftEntry(); event.accepted = true
-                        } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                        } else if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) {
+                          root.completeRepositoryPath(); event.accepted = true
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                           goalField.forceActiveFocus(); event.accepted = true
                         }
                       }
+                    }
+
+                    Text {
+                      visible: root.repositoryPathCandidates.length > 1
+                      width: parent.width
+                      text: root.repositoryCandidateText()
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
                     }
 
                     Text {

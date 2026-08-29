@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -193,6 +193,19 @@ async fn handle_request(
     }
 
     let response = match request.request {
+        ClientRequest::CompleteRepositoryPath { path } => {
+            match complete_repository_path(path).await {
+                Ok(completion) => ServerMessage::PathCompletion {
+                    version: PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    replacement: completion.replacement,
+                    candidates: completion.candidates,
+                },
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
         ClientRequest::CreateDraftRun { repository, goal } => {
             match create_draft_run(repository, goal, storage).await {
                 Ok(stored_snapshot) => {
@@ -298,6 +311,152 @@ impl RequestFailure {
             message: format!("{context}: {error}"),
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PathCompletion {
+    replacement: String,
+    candidates: Vec<String>,
+}
+
+async fn complete_repository_path(path: String) -> Result<PathCompletion, RequestFailure> {
+    if path.chars().count() > 4096 {
+        return Err(RequestFailure {
+            code: "invalid_path",
+            message: "repository path must not exceed 4,096 characters".to_owned(),
+        });
+    }
+
+    tokio::task::spawn_blocking(move || complete_repository_path_blocking(&path))
+        .await
+        .map_err(|error| RequestFailure {
+            code: "path_completion_failed",
+            message: format!("path completion task failed: {error}"),
+        })?
+}
+
+fn complete_repository_path_blocking(input: &str) -> Result<PathCompletion, RequestFailure> {
+    let expanded = expand_home_path(input)?;
+    let path = PathBuf::from(&expanded);
+    if !path.is_absolute() {
+        return Err(RequestFailure {
+            code: "invalid_path",
+            message: "use an absolute repository path or a path beginning with ~/".to_owned(),
+        });
+    }
+
+    let has_trailing_separator = expanded.ends_with(std::path::MAIN_SEPARATOR);
+    let (directory, prefix) = if has_trailing_separator {
+        (path, String::new())
+    } else {
+        let directory = path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        let prefix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        (directory, prefix)
+    };
+
+    let entries = fs::read_dir(&directory).map_err(|error| RequestFailure {
+        code: "path_completion_failed",
+        message: format!("cannot read {}: {error}", directory.display()),
+    })?;
+    let include_hidden = prefix.starts_with('.');
+    let mut matches = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if (!include_hidden && name.starts_with('.')) || !name.starts_with(&prefix) {
+            continue;
+        }
+        if entry.path().is_dir() {
+            matches.push(name);
+        }
+    }
+    matches.sort_unstable();
+
+    let candidates = matches
+        .iter()
+        .take(20)
+        .filter_map(|name| directory.join(name).to_str().map(directory_path_string))
+        .collect::<Vec<_>>();
+    let replacement = match matches.as_slice() {
+        [] => expanded,
+        [only] => directory_path_string(directory.join(only).to_string_lossy().as_ref()),
+        many => {
+            let common = common_prefix(many);
+            if common.len() > prefix.len() {
+                directory.join(common).to_string_lossy().into_owned()
+            } else {
+                expanded
+            }
+        }
+    };
+
+    Ok(PathCompletion {
+        replacement,
+        candidates,
+    })
+}
+
+fn expand_home_path(input: &str) -> Result<String, RequestFailure> {
+    if !input.is_empty() && input != "~" && !input.starts_with("~/") {
+        return Ok(input.to_owned());
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| RequestFailure {
+            code: "path_completion_failed",
+            message: "HOME is unavailable for repository path completion".to_owned(),
+        })?;
+    let needs_separator = input.is_empty() || input == "~" || input.ends_with('/');
+    let expanded = if input.is_empty() || input == "~" {
+        home
+    } else {
+        home.join(input.trim_start_matches("~/"))
+    };
+    let expanded = expanded.to_string_lossy();
+    Ok(if needs_separator {
+        directory_path_string(expanded.as_ref())
+    } else {
+        expanded.into_owned()
+    })
+}
+
+fn directory_path_string(path: &str) -> String {
+    if path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.to_owned()
+    } else {
+        format!("{path}{}", std::path::MAIN_SEPARATOR)
+    }
+}
+
+fn common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for value in &values[1..] {
+        let shared_bytes = prefix
+            .char_indices()
+            .zip(value.chars())
+            .take_while(|((_, left), right)| *left == *right)
+            .last()
+            .map_or(0, |((index, character), _)| index + character.len_utf8());
+        prefix.truncate(shared_bytes);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
 }
 
 async fn create_draft_run(
@@ -778,6 +937,56 @@ mod tests {
                 & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn completes_repository_directories_with_terminal_style_prefixes() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        fs::create_dir(temporary.path().join("Projects")).expect("Projects directory should exist");
+        fs::create_dir(temporary.path().join("Prototypes"))
+            .expect("Prototypes directory should exist");
+        fs::create_dir(temporary.path().join("Downloads"))
+            .expect("Downloads directory should exist");
+        fs::create_dir(temporary.path().join(".private")).expect("hidden directory should exist");
+        fs::write(temporary.path().join("Profile.txt"), "not a directory")
+            .expect("regular file should exist");
+
+        let base = temporary.path().display().to_string();
+        let ambiguous = complete_repository_path_blocking(&format!("{base}/Pr"))
+            .expect("ambiguous prefix should complete");
+        assert_eq!(ambiguous.replacement, format!("{base}/Pro"));
+        assert_eq!(
+            ambiguous.candidates,
+            vec![format!("{base}/Projects/"), format!("{base}/Prototypes/")]
+        );
+
+        let unique = complete_repository_path_blocking(&format!("{base}/Down"))
+            .expect("unique prefix should complete");
+        assert_eq!(unique.replacement, format!("{base}/Downloads/"));
+        assert_eq!(unique.candidates, vec![format!("{base}/Downloads/")]);
+
+        let visible = complete_repository_path_blocking(&format!("{base}/"))
+            .expect("directory should list visible children");
+        assert!(
+            !visible
+                .candidates
+                .iter()
+                .any(|path| path.contains(".private"))
+        );
+        assert!(
+            !visible
+                .candidates
+                .iter()
+                .any(|path| path.contains("Profile.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_relative_repository_path_completion() {
+        let error = complete_repository_path_blocking("Projects/Fo")
+            .expect_err("relative path completion should fail");
+
+        assert_eq!(error.code, "invalid_path");
     }
 
     #[tokio::test]

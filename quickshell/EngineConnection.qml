@@ -29,6 +29,7 @@ Item {
 
   signal snapshotChanged()
   signal draftCreated()
+  signal repositoryPathCompleted(string replacement, var candidates)
   signal requestCompleted(string method)
 
   function reconnect() {
@@ -45,6 +46,12 @@ Item {
     return sendRequest("create_draft_run", {
       repository: String(repository || ""),
       goal: String(goal || "")
+    })
+  }
+
+  function completeRepositoryPath(path) {
+    return sendRequest("complete_repository_path", {
+      path: String(path || "")
     })
   }
 
@@ -140,6 +147,22 @@ Item {
         requestError = String(message.message || "The engine rejected the request")
       } else {
         lastError = String(message.message || "The engine rejected a request")
+      }
+      return
+    }
+
+    if (message.type === "path_completion") {
+      if (message.request_id && message.request_id === pendingRequestId) {
+        var completedMethod = pendingMethod
+        requestPending = false
+        pendingRequestId = ""
+        pendingMethod = ""
+        requestError = ""
+        repositoryPathCompleted(
+          String(message.replacement || ""),
+          message.candidates || []
+        )
+        requestCompleted(completedMethod)
       }
       return
     }

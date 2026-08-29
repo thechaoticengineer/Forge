@@ -15,6 +15,9 @@ pub struct ClientMessage {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ClientRequest {
+    CompleteRepositoryPath {
+        path: String,
+    },
     CreateDraftRun {
         repository: String,
         goal: String,
@@ -60,6 +63,12 @@ pub enum MoveDirection {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    PathCompletion {
+        version: u16,
+        request_id: String,
+        replacement: String,
+        candidates: Vec<String>,
+    },
     Snapshot {
         version: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +154,36 @@ mod tests {
                 goal: "Add a test".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn parses_repository_path_completion_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-path","method":"complete_repository_path","path":"/home/dev/Pro"}"#,
+        )
+        .expect("path completion request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::CompleteRepositoryPath {
+                path: "/home/dev/Pro".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn serializes_repository_path_completion_response() {
+        let message = ServerMessage::PathCompletion {
+            version: PROTOCOL_VERSION,
+            request_id: "request-path".to_owned(),
+            replacement: "/home/dev/Projects/".to_owned(),
+            candidates: vec!["/home/dev/Projects/".to_owned()],
+        };
+        let json = serde_json::to_value(message).expect("completion should serialize");
+
+        assert_eq!(json["type"], "path_completion");
+        assert_eq!(json["replacement"], "/home/dev/Projects/");
+        assert_eq!(json["candidates"][0], "/home/dev/Projects/");
     }
 
     #[test]
