@@ -10,8 +10,10 @@ use std::{
     thread,
 };
 
-use orchestrator_core::state::{ActiveRunSummary, RunStatus};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use orchestrator_core::state::{
+    ActiveRunSummary, AgentKind, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary, RunStatus,
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -19,9 +21,15 @@ use tokio::sync::oneshot;
 const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
-const LATEST_SCHEMA_VERSION: i64 = 1;
-const MIGRATIONS: &[(i64, &str, &str)] =
-    &[(1, "initial", include_str!("../migrations/0001_initial.sql"))];
+const LATEST_SCHEMA_VERSION: i64 = 2;
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial", include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        "planning",
+        include_str!("../migrations/0002_planning.sql"),
+    ),
+];
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -56,8 +64,22 @@ pub enum StorageError {
     ClockBeforeEpoch,
     #[error("database returned an invalid run status: {0}")]
     InvalidRunStatus(String),
+    #[error("database returned an invalid plan status: {0}")]
+    InvalidPlanStatus(String),
+    #[error("database returned an invalid agent kind: {0}")]
+    InvalidAgentKind(String),
+    #[error("run does not exist: {0}")]
+    RunNotFound(String),
+    #[error("run is not ready for planning: {0}")]
+    RunNotPlannable(String),
+    #[error("planning attempt does not exist or is no longer running: {0}")]
+    AttemptNotRunning(String),
+    #[error("plan does not exist or is not the current proposal: {0}")]
+    PlanNotCurrent(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
+    #[error("database position is outside the supported range: {0}")]
+    InvalidPosition(i64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +176,44 @@ pub struct DraftRunInput {
     pub worktree_dirty: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAttemptInput {
+    pub run_id: String,
+    pub agent: AgentKind,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedPlanAttempt {
+    pub attempt_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAttemptSuccess {
+    pub attempt_id: String,
+    pub proposal: PlanProposal,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanAttemptFailure {
+    pub attempt_id: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: Option<i32>,
+    pub error_message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanRevisionInput {
+    pub run_id: String,
+    pub based_on_plan_id: String,
+    pub proposal: PlanProposal,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -165,6 +225,33 @@ enum Command {
         DraftRunInput,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
+    BeginPlanAttempt(
+        PlanAttemptInput,
+        oneshot::Sender<Result<StartedPlanAttempt, StorageError>>,
+    ),
+    CompletePlanAttempt(
+        PlanAttemptSuccess,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    FailPlanAttempt(
+        PlanAttemptFailure,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    RevisePlan(
+        PlanRevisionInput,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    ApprovePlan {
+        run_id: String,
+        plan_id: String,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
+    RejectPlan {
+        run_id: String,
+        plan_id: String,
+        reason: Option<String>,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
     Health(oneshot::Sender<Result<StorageHealth, StorageError>>),
     Shutdown,
@@ -296,6 +383,96 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    pub async fn begin_plan_attempt(
+        &self,
+        input: PlanAttemptInput,
+    ) -> Result<StartedPlanAttempt, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::BeginPlanAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    pub async fn complete_plan_attempt(
+        &self,
+        input: PlanAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CompletePlanAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    pub async fn fail_plan_attempt(
+        &self,
+        input: PlanAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::FailPlanAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    pub async fn revise_plan(
+        &self,
+        input: PlanRevisionInput,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::RevisePlan(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    pub async fn approve_plan(
+        &self,
+        run_id: String,
+        plan_id: String,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ApprovePlan {
+                run_id,
+                plan_id,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    pub async fn reject_plan(
+        &self,
+        run_id: String,
+        plan_id: String,
+        reason: Option<String>,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::RejectPlan {
+                run_id,
+                plan_id,
+                reason,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -312,6 +489,34 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
         match command {
             Command::CreateDraftRun(input, reply) => {
                 let _ = reply.send(database.create_draft_run(&input));
+            }
+            Command::BeginPlanAttempt(input, reply) => {
+                let _ = reply.send(database.begin_plan_attempt(&input));
+            }
+            Command::CompletePlanAttempt(input, reply) => {
+                let _ = reply.send(database.complete_plan_attempt(&input));
+            }
+            Command::FailPlanAttempt(input, reply) => {
+                let _ = reply.send(database.fail_plan_attempt(&input));
+            }
+            Command::RevisePlan(input, reply) => {
+                let _ = reply.send(database.revise_plan(&input));
+            }
+            Command::ApprovePlan {
+                run_id,
+                plan_id,
+                reply,
+            } => {
+                let _ = reply.send(database.decide_plan(&run_id, &plan_id, true, None));
+            }
+            Command::RejectPlan {
+                run_id,
+                plan_id,
+                reason,
+                reply,
+            } => {
+                let _ =
+                    reply.send(database.decide_plan(&run_id, &plan_id, false, reason.as_deref()));
             }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
@@ -338,6 +543,7 @@ impl Database {
         set_file_mode(paths.database(), 0o600)?;
         configure_connection(&connection)?;
         apply_migrations(&mut connection)?;
+        recover_interrupted_planning(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -361,11 +567,11 @@ impl Database {
             [],
             |row| row.get::<_, i64>(0),
         )?;
-        let active_run = self
+        let mut active_run = self
             .connection
             .query_row(
                 "SELECT r.id, r.goal, p.repository_path, r.base_revision, r.branch, \
-                        r.worktree_dirty, r.status \
+                        r.worktree_dirty, r.status, r.last_error \
                  FROM runs r \
                  JOIN projects p ON p.id = r.project_id \
                  WHERE r.status NOT IN ('completed', 'rejected', 'cancelled') \
@@ -375,6 +581,10 @@ impl Database {
                 row_to_run,
             )
             .optional()?;
+
+        if let Some(run) = &mut active_run {
+            run.plan = self.load_latest_plan(&run.id)?;
+        }
 
         Ok(StoredSnapshot {
             sequence: sequence_to_u64(sequence)?,
@@ -445,9 +655,474 @@ impl Database {
                 branch: input.branch.clone(),
                 worktree_dirty: input.worktree_dirty,
                 run_status: RunStatus::Draft,
+                plan: None,
+                last_error: None,
             }),
         })
     }
+
+    fn begin_plan_attempt(
+        &self,
+        input: &PlanAttemptInput,
+    ) -> Result<StartedPlanAttempt, StorageError> {
+        let started_at = unix_milliseconds()?;
+        let attempt_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE runs SET status = 'planning', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status IN ('draft', 'failed')",
+            (&input.run_id, started_at),
+        )?;
+        if changed == 0 {
+            return Err(if run_exists(&transaction, &input.run_id)? {
+                StorageError::RunNotPlannable(input.run_id.clone())
+            } else {
+                StorageError::RunNotFound(input.run_id.clone())
+            });
+        }
+
+        transaction.execute(
+            "INSERT INTO plan_attempts(\
+                id, run_id, agent, status, prompt, started_at\
+             ) VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            (
+                &attempt_id,
+                &input.run_id,
+                input.agent.as_str(),
+                &input.prompt,
+                started_at,
+            ),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "agent": input.agent,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'planning_started', ?2, ?3, ?4)",
+            (
+                &input.run_id,
+                input.agent.as_str(),
+                payload.to_string(),
+                started_at,
+            ),
+        )?;
+        transaction.commit()?;
+
+        Ok(StartedPlanAttempt {
+            attempt_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn complete_plan_attempt(
+        &self,
+        input: &PlanAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, agent) = running_attempt(&transaction, &input.attempt_id)?;
+
+        transaction.execute(
+            "UPDATE plans SET status = 'superseded' \
+             WHERE run_id = ?1 AND status = 'proposed'",
+            [&run_id],
+        )?;
+        let revision = next_plan_revision(&transaction, &run_id)?;
+        let plan_id = insert_plan(
+            &transaction,
+            &run_id,
+            None,
+            Some(&input.attempt_id),
+            agent,
+            revision,
+            &input.proposal,
+            completed_at,
+        )?;
+        let changed = transaction.execute(
+            "UPDATE plan_attempts SET \
+                status = 'completed', final_output = ?2, diagnostic_output = ?3, \
+                exit_code = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::AttemptNotRunning(input.attempt_id.clone()));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'waiting_for_user', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1",
+            (&run_id, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "plan_id": plan_id,
+            "revision": revision,
+            "agent": agent,
+            "task_count": input.proposal.tasks.len(),
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'plan_proposed', ?2, ?3, ?4)",
+            (&run_id, agent.as_str(), payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn fail_plan_attempt(
+        &self,
+        input: &PlanAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, agent) = running_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE plan_attempts SET \
+                status = 'failed', final_output = ?2, diagnostic_output = ?3, \
+                exit_code = ?4, error_message = ?5, completed_at = ?6 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                &input.error_message,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::AttemptNotRunning(input.attempt_id.clone()));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1",
+            (&run_id, &input.error_message, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "agent": agent,
+            "exit_code": input.exit_code,
+            "error": input.error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'planning_failed', ?2, ?3, ?4)",
+            (&run_id, agent.as_str(), payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn revise_plan(&self, input: &PlanRevisionInput) -> Result<StoredSnapshot, StorageError> {
+        let created_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let planner =
+            current_proposed_plan_agent(&transaction, &input.run_id, &input.based_on_plan_id)?;
+        transaction.execute(
+            "UPDATE plans SET status = 'superseded' WHERE id = ?1",
+            [&input.based_on_plan_id],
+        )?;
+        let revision = next_plan_revision(&transaction, &input.run_id)?;
+        let plan_id = insert_plan(
+            &transaction,
+            &input.run_id,
+            Some(&input.based_on_plan_id),
+            None,
+            planner,
+            revision,
+            &input.proposal,
+            created_at,
+        )?;
+        transaction.execute(
+            "UPDATE runs SET status = 'waiting_for_user', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1",
+            (&input.run_id, created_at),
+        )?;
+        let payload = json!({
+            "plan_id": plan_id,
+            "based_on_plan_id": input.based_on_plan_id,
+            "revision": revision,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'plan_revised', 'user', ?2, ?3)",
+            (&input.run_id, payload.to_string(), created_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn decide_plan(
+        &self,
+        run_id: &str,
+        plan_id: &str,
+        approved: bool,
+        reason: Option<&str>,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let decided_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let plan_status = if approved { "approved" } else { "rejected" };
+        let changed = transaction.execute(
+            "UPDATE plans SET status = ?3, decided_at = ?4 \
+             WHERE id = ?2 AND run_id = ?1 AND status = 'proposed' \
+               AND revision = (SELECT max(revision) FROM plans WHERE run_id = ?1)",
+            (run_id, plan_id, plan_status, decided_at),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::PlanNotCurrent(plan_id.to_owned()));
+        }
+        let run_status = if approved {
+            "waiting_for_user"
+        } else {
+            "draft"
+        };
+        transaction.execute(
+            "UPDATE runs SET status = ?2, last_error = NULL, updated_at = ?3 WHERE id = ?1",
+            (run_id, run_status, decided_at),
+        )?;
+        let kind = if approved {
+            "plan_approved"
+        } else {
+            "plan_rejected"
+        };
+        let payload = json!({
+            "plan_id": plan_id,
+            "reason": reason,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, ?2, 'user', ?3, ?4)",
+            (run_id, kind, payload.to_string(), decided_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn load_latest_plan(&self, run_id: &str) -> Result<Option<PlanSummary>, StorageError> {
+        let plan = self
+            .connection
+            .query_row(
+                "SELECT id, revision, planner_agent, status, summary \
+                 FROM plans WHERE run_id = ?1 ORDER BY revision DESC LIMIT 1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((plan_id, revision, planner, status, summary)) = plan else {
+            return Ok(None);
+        };
+
+        let mut statement = self.connection.prepare(
+            "SELECT id, position, title, description \
+             FROM plan_tasks WHERE plan_id = ?1 ORDER BY position",
+        )?;
+        let task_rows = statement.query_map([&plan_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut tasks = Vec::new();
+        for task in task_rows {
+            let (task_id, position, title, description) = task?;
+            let acceptance_criteria = self.load_acceptance_criteria(&task_id)?;
+            let depends_on = self.load_dependencies(&plan_id, &task_id)?;
+            tasks.push(PlanTaskSummary {
+                id: task_id,
+                position: position_to_u32(position)?,
+                title,
+                description,
+                acceptance_criteria,
+                depends_on,
+            });
+        }
+
+        Ok(Some(PlanSummary {
+            id: plan_id,
+            revision: position_to_u32(revision)?,
+            planner: parse_agent_kind(&planner)?,
+            status: parse_plan_status(&status)?,
+            summary,
+            tasks,
+        }))
+    }
+
+    fn load_acceptance_criteria(&self, task_id: &str) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT criterion FROM plan_acceptance_criteria \
+             WHERE task_id = ?1 ORDER BY position",
+        )?;
+        let rows = statement.query_map([task_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn load_dependencies(&self, plan_id: &str, task_id: &str) -> Result<Vec<u32>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT dependency.position \
+             FROM plan_task_dependencies link \
+             JOIN plan_tasks dependency ON dependency.id = link.depends_on_task_id \
+             WHERE link.plan_id = ?1 AND link.task_id = ?2 \
+             ORDER BY dependency.position",
+        )?;
+        let rows = statement.query_map((plan_id, task_id), |row| row.get::<_, i64>(0))?;
+        rows.map(|row| position_to_u32(row?)).collect()
+    }
+}
+
+fn run_exists(transaction: &Transaction<'_>, run_id: &str) -> Result<bool, StorageError> {
+    transaction
+        .query_row("SELECT 1 FROM runs WHERE id = ?1", [run_id], |_| Ok(true))
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+fn running_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+) -> Result<(String, AgentKind), StorageError> {
+    let attempt = transaction
+        .query_row(
+            "SELECT run_id, agent FROM plan_attempts \
+             WHERE id = ?1 AND status = 'running'",
+            [attempt_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((run_id, agent)) = attempt else {
+        return Err(StorageError::AttemptNotRunning(attempt_id.to_owned()));
+    };
+    Ok((run_id, parse_agent_kind(&agent)?))
+}
+
+fn current_proposed_plan_agent(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    plan_id: &str,
+) -> Result<AgentKind, StorageError> {
+    let agent = transaction
+        .query_row(
+            "SELECT planner_agent FROM plans \
+             WHERE id = ?2 AND run_id = ?1 AND status = 'proposed' \
+               AND revision = (SELECT max(revision) FROM plans WHERE run_id = ?1)",
+            (run_id, plan_id),
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    agent
+        .as_deref()
+        .map(parse_agent_kind)
+        .transpose()?
+        .ok_or_else(|| StorageError::PlanNotCurrent(plan_id.to_owned()))
+}
+
+fn next_plan_revision(transaction: &Transaction<'_>, run_id: &str) -> Result<u32, StorageError> {
+    let revision = transaction.query_row(
+        "SELECT coalesce(max(revision), 0) + 1 FROM plans WHERE run_id = ?1",
+        [run_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    position_to_u32(revision)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_plan(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    based_on_plan_id: Option<&str>,
+    source_attempt_id: Option<&str>,
+    planner: AgentKind,
+    revision: u32,
+    proposal: &PlanProposal,
+    created_at: i64,
+) -> Result<String, StorageError> {
+    let plan_id = uuid::Uuid::now_v7().to_string();
+    transaction.execute(
+        "INSERT INTO plans(\
+            id, run_id, revision, based_on_plan_id, source_attempt_id, \
+            planner_agent, status, summary, created_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'proposed', ?7, ?8)",
+        (
+            &plan_id,
+            run_id,
+            revision,
+            based_on_plan_id,
+            source_attempt_id,
+            planner.as_str(),
+            &proposal.summary,
+            created_at,
+        ),
+    )?;
+
+    let task_ids: Vec<String> = proposal
+        .tasks
+        .iter()
+        .map(|_| uuid::Uuid::now_v7().to_string())
+        .collect();
+    for (index, task) in proposal.tasks.iter().enumerate() {
+        let position =
+            u32::try_from(index + 1).map_err(|_| StorageError::InvalidPosition(i64::MAX))?;
+        transaction.execute(
+            "INSERT INTO plan_tasks(id, plan_id, position, title, description) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &task_ids[index],
+                &plan_id,
+                position,
+                &task.title,
+                &task.description,
+            ),
+        )?;
+        for (criterion_index, criterion) in task.acceptance_criteria.iter().enumerate() {
+            let criterion_position = u32::try_from(criterion_index + 1)
+                .map_err(|_| StorageError::InvalidPosition(i64::MAX))?;
+            transaction.execute(
+                "INSERT INTO plan_acceptance_criteria(\
+                    id, task_id, position, criterion\
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                (
+                    uuid::Uuid::now_v7().to_string(),
+                    &task_ids[index],
+                    criterion_position,
+                    criterion,
+                ),
+            )?;
+        }
+    }
+
+    for (index, task) in proposal.tasks.iter().enumerate() {
+        for dependency_position in &task.depends_on {
+            let dependency_index = usize::try_from(*dependency_position)
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .filter(|position| *position < task_ids.len())
+                .ok_or_else(|| StorageError::InvalidPosition(i64::from(*dependency_position)))?;
+            transaction.execute(
+                "INSERT INTO plan_task_dependencies(plan_id, task_id, depends_on_task_id) \
+                 VALUES (?1, ?2, ?3)",
+                (&plan_id, &task_ids[index], &task_ids[dependency_index]),
+            )?;
+        }
+    }
+
+    Ok(plan_id)
 }
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
@@ -463,7 +1138,27 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         branch: row.get(4)?,
         worktree_dirty: row.get(5)?,
         run_status,
+        plan: None,
+        last_error: row.get(7)?,
     })
+}
+
+fn parse_agent_kind(agent: &str) -> Result<AgentKind, StorageError> {
+    match agent {
+        "codex" => Ok(AgentKind::Codex),
+        "claude" => Ok(AgentKind::Claude),
+        _ => Err(StorageError::InvalidAgentKind(agent.to_owned())),
+    }
+}
+
+fn parse_plan_status(status: &str) -> Result<PlanStatus, StorageError> {
+    match status {
+        "proposed" => Ok(PlanStatus::Proposed),
+        "approved" => Ok(PlanStatus::Approved),
+        "rejected" => Ok(PlanStatus::Rejected),
+        "superseded" => Ok(PlanStatus::Superseded),
+        _ => Err(StorageError::InvalidPlanStatus(status.to_owned())),
+    }
 }
 
 fn parse_run_status(status: &str) -> Result<RunStatus, StorageError> {
@@ -483,6 +1178,10 @@ fn parse_run_status(status: &str) -> Result<RunStatus, StorageError> {
 
 fn sequence_to_u64(sequence: i64) -> Result<u64, StorageError> {
     u64::try_from(sequence).map_err(|_| StorageError::NegativeSequence(sequence))
+}
+
+fn position_to_u32(position: i64) -> Result<u32, StorageError> {
+    u32::try_from(position).map_err(|_| StorageError::InvalidPosition(position))
 }
 
 fn unix_milliseconds() -> Result<i64, StorageError> {
@@ -542,6 +1241,53 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
         transaction.pragma_update(None, "user_version", version)?;
         transaction.commit()?;
     }
+    Ok(())
+}
+
+fn recover_interrupted_planning(connection: &mut Connection) -> Result<(), StorageError> {
+    let interrupted = {
+        let mut statement = connection
+            .prepare("SELECT id, run_id, agent FROM plan_attempts WHERE status = 'running'")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+
+    let recovered_at = unix_milliseconds()?;
+    let error_message = "engine stopped before the planner completed";
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (attempt_id, run_id, agent) in interrupted {
+        transaction.execute(
+            "UPDATE plan_attempts SET \
+                status = 'failed', error_message = ?2, completed_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&attempt_id, error_message, recovered_at),
+        )?;
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'planning'",
+            (&run_id, error_message, recovered_at),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "agent": agent,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'planning_interrupted', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), recovered_at),
+        )?;
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -668,7 +1414,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 1);
+        assert_eq!(migration_count, 2);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -805,10 +1551,180 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn persists_plan_attempts_revisions_and_approval() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let draft = worker
+            .create_draft_run(draft_input("Plan the change", false))
+            .await
+            .expect("draft should persist");
+        let run_id = draft.active_run.expect("run should exist").id;
+
+        let started = worker
+            .begin_plan_attempt(PlanAttemptInput {
+                run_id: run_id.clone(),
+                agent: AgentKind::Codex,
+                prompt: "Inspect the repository and propose a plan".to_owned(),
+            })
+            .await
+            .expect("attempt should start");
+        assert_eq!(
+            started
+                .snapshot
+                .active_run
+                .as_ref()
+                .map(|run| &run.run_status),
+            Some(&RunStatus::Planning)
+        );
+
+        let proposed = worker
+            .complete_plan_attempt(PlanAttemptSuccess {
+                attempt_id: started.attempt_id,
+                proposal: sample_proposal(),
+                final_output: "{\"summary\":\"Safe plan\"}".to_owned(),
+                diagnostic_output: "planner progress".to_owned(),
+                exit_code: 0,
+            })
+            .await
+            .expect("proposal should persist");
+        let plan = proposed
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("plan should be visible");
+        assert_eq!(plan.revision, 1);
+        assert_eq!(plan.status, PlanStatus::Proposed);
+        assert_eq!(plan.planner, AgentKind::Codex);
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[1].depends_on, vec![1]);
+
+        let mut revised_proposal = sample_proposal();
+        revised_proposal.tasks[0].title = "Inspect current behavior".to_owned();
+        let revised = worker
+            .revise_plan(PlanRevisionInput {
+                run_id: run_id.clone(),
+                based_on_plan_id: plan.id.clone(),
+                proposal: revised_proposal,
+            })
+            .await
+            .expect("revision should persist");
+        let revised_plan = revised
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("revised plan should be visible");
+        assert_eq!(revised_plan.revision, 2);
+        assert_eq!(revised_plan.tasks[0].title, "Inspect current behavior");
+
+        let approved = worker
+            .approve_plan(run_id, revised_plan.id.clone())
+            .await
+            .expect("plan should be approved");
+        assert_eq!(
+            approved
+                .active_run
+                .and_then(|run| run.plan)
+                .map(|plan| plan.status),
+            Some(PlanStatus::Approved)
+        );
+
+        drop(worker);
+        let connection = Connection::open(paths.database()).expect("database should reopen");
+        let plan_count: i64 = connection
+            .query_row("SELECT count(*) FROM plans", [], |row| row.get(0))
+            .expect("plans should be countable");
+        let attempt_count: i64 = connection
+            .query_row("SELECT count(*) FROM plan_attempts", [], |row| row.get(0))
+            .expect("attempts should be countable");
+        assert_eq!(plan_count, 2);
+        assert_eq!(attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_plan_and_returns_the_run_to_draft() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let worker = StorageWorker::start(StatePaths::new(temporary.path().join("state")))
+            .expect("storage should start");
+        let draft = worker
+            .create_draft_run(draft_input("Plan the change", false))
+            .await
+            .expect("draft should persist");
+        let run_id = draft.active_run.expect("run should exist").id;
+        let started = worker
+            .begin_plan_attempt(PlanAttemptInput {
+                run_id: run_id.clone(),
+                agent: AgentKind::Claude,
+                prompt: "Propose a plan".to_owned(),
+            })
+            .await
+            .expect("attempt should start");
+        let proposed = worker
+            .complete_plan_attempt(PlanAttemptSuccess {
+                attempt_id: started.attempt_id,
+                proposal: sample_proposal(),
+                final_output: "result".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("proposal should persist");
+        let plan_id = proposed
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("plan should exist")
+            .id
+            .clone();
+
+        let rejected = worker
+            .reject_plan(run_id, plan_id, Some("Too broad".to_owned()))
+            .await
+            .expect("plan should be rejected");
+        let run = rejected.active_run.expect("run should remain active");
+        assert_eq!(run.run_status, RunStatus::Draft);
+        assert_eq!(run.plan.map(|plan| plan.status), Some(PlanStatus::Rejected));
+    }
+
+    #[tokio::test]
+    async fn recovers_an_interrupted_planning_attempt_as_failed() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let draft = worker
+            .create_draft_run(draft_input("Plan the change", false))
+            .await
+            .expect("draft should persist");
+        let run_id = draft.active_run.expect("run should exist").id;
+        worker
+            .begin_plan_attempt(PlanAttemptInput {
+                run_id,
+                agent: AgentKind::Codex,
+                prompt: "Propose a plan".to_owned(),
+            })
+            .await
+            .expect("attempt should start");
+        drop(worker);
+
+        let reopened = StorageWorker::start(paths).expect("storage should recover");
+        let run = reopened
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should remain active");
+        assert_eq!(run.run_status, RunStatus::Failed);
+        assert_eq!(
+            run.last_error.as_deref(),
+            Some("engine stopped before the planner completed")
+        );
     }
 
     #[test]
@@ -855,6 +1771,26 @@ mod tests {
             base_revision: "0123456789012345678901234567890123456789".to_owned(),
             branch: Some("main".to_owned()),
             worktree_dirty,
+        }
+    }
+
+    fn sample_proposal() -> PlanProposal {
+        PlanProposal {
+            summary: "Safe plan".to_owned(),
+            tasks: vec![
+                orchestrator_core::state::ProposedTask {
+                    title: "Inspect behavior".to_owned(),
+                    description: "Understand the current implementation.".to_owned(),
+                    acceptance_criteria: vec!["Relevant behavior is documented.".to_owned()],
+                    depends_on: vec![],
+                },
+                orchestrator_core::state::ProposedTask {
+                    title: "Implement change".to_owned(),
+                    description: "Make the smallest verified change.".to_owned(),
+                    acceptance_criteria: vec!["Relevant tests pass.".to_owned()],
+                    depends_on: vec![1],
+                },
+            ],
         }
     }
 }

@@ -35,6 +35,82 @@ pub struct ActiveRunSummary {
     pub branch: Option<String>,
     pub worktree_dirty: bool,
     pub run_status: RunStatus,
+    pub plan: Option<PlanSummary>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Codex,
+    Claude,
+}
+
+impl AgentKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Proposed,
+    Approved,
+    Rejected,
+    Superseded,
+}
+
+impl PlanStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanSummary {
+    pub id: String,
+    pub revision: u32,
+    pub planner: AgentKind,
+    pub status: PlanStatus,
+    pub summary: String,
+    pub tasks: Vec<PlanTaskSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanTaskSummary {
+    pub id: String,
+    pub position: u32,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub depends_on: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProposal {
+    pub summary: String,
+    pub tasks: Vec<ProposedTask>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedTask {
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+    pub depends_on: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
