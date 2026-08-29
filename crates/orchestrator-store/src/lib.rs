@@ -10,7 +10,9 @@ use std::{
     thread,
 };
 
-use rusqlite::{Connection, TransactionBehavior};
+use orchestrator_core::state::{ActiveRunSummary, RunStatus};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde_json::json;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -50,6 +52,12 @@ pub enum StorageError {
     WorkerStopped,
     #[error("storage worker panicked")]
     WorkerPanicked,
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeEpoch,
+    #[error("database returned an invalid run status: {0}")]
+    InvalidRunStatus(String),
+    #[error("database sequence is negative: {0}")]
+    NegativeSequence(i64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,7 +144,28 @@ pub struct StorageHealth {
     pub schema_version: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DraftRunInput {
+    pub repository_path: String,
+    pub git_common_dir: String,
+    pub goal: String,
+    pub base_revision: String,
+    pub branch: Option<String>,
+    pub worktree_dirty: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoredSnapshot {
+    pub sequence: u64,
+    pub active_run: Option<ActiveRunSummary>,
+}
+
 enum Command {
+    CreateDraftRun(
+        DraftRunInput,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
     Health(oneshot::Sender<Result<StorageHealth, StorageError>>),
     Shutdown,
 }
@@ -233,6 +262,40 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Loads the newest non-terminal run and latest audit sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker stops or persisted data is invalid.
+    pub async fn current_snapshot(&self) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CurrentSnapshot(reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Creates a durable draft run and its audit event transactionally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worker stops, the data violates the schema,
+    /// the clock is unavailable, or SQLite cannot commit the transaction.
+    pub async fn create_draft_run(
+        &self,
+        input: DraftRunInput,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CreateDraftRun(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -247,6 +310,12 @@ impl Drop for StorageWorker {
 fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
     while let Ok(command) = receiver.recv() {
         match command {
+            Command::CreateDraftRun(input, reply) => {
+                let _ = reply.send(database.create_draft_run(&input));
+            }
+            Command::CurrentSnapshot(reply) => {
+                let _ = reply.send(database.current_snapshot());
+            }
             Command::Health(reply) => {
                 let _ = reply.send(database.health());
             }
@@ -285,6 +354,142 @@ impl Database {
             schema_version,
         })
     }
+
+    fn current_snapshot(&self) -> Result<StoredSnapshot, StorageError> {
+        let sequence = self.connection.query_row(
+            "SELECT coalesce(max(sequence), 0) FROM run_events",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let active_run = self
+            .connection
+            .query_row(
+                "SELECT r.id, r.goal, p.repository_path, r.base_revision, r.branch, \
+                        r.worktree_dirty, r.status \
+                 FROM runs r \
+                 JOIN projects p ON p.id = r.project_id \
+                 WHERE r.status NOT IN ('completed', 'rejected', 'cancelled') \
+                 ORDER BY r.updated_at DESC, r.rowid DESC \
+                 LIMIT 1",
+                [],
+                row_to_run,
+            )
+            .optional()?;
+
+        Ok(StoredSnapshot {
+            sequence: sequence_to_u64(sequence)?,
+            active_run,
+        })
+    }
+
+    fn create_draft_run(&self, input: &DraftRunInput) -> Result<StoredSnapshot, StorageError> {
+        let created_at = unix_milliseconds()?;
+        let project_candidate = uuid::Uuid::now_v7().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+
+        let project_id: String = transaction.query_row(
+            "INSERT INTO projects(\
+                id, repository_path, git_common_dir, created_at, last_opened_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?4) \
+             ON CONFLICT(repository_path) DO UPDATE SET \
+                git_common_dir = excluded.git_common_dir, \
+                last_opened_at = excluded.last_opened_at \
+             RETURNING id",
+            (
+                &project_candidate,
+                &input.repository_path,
+                &input.git_common_dir,
+                created_at,
+            ),
+            |row| row.get(0),
+        )?;
+
+        transaction.execute(
+            "INSERT INTO runs(\
+                id, project_id, goal, base_revision, branch, worktree_dirty, \
+                status, created_at, updated_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', ?7, ?7)",
+            (
+                &run_id,
+                &project_id,
+                &input.goal,
+                &input.base_revision,
+                &input.branch,
+                input.worktree_dirty,
+                created_at,
+            ),
+        )?;
+
+        let payload = json!({
+            "repository": input.repository_path,
+            "base_revision": input.base_revision,
+            "branch": input.branch,
+            "worktree_dirty": input.worktree_dirty,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'draft_created', 'user', ?2, ?3)",
+            (&run_id, payload.to_string(), created_at),
+        )?;
+        let sequence = transaction.last_insert_rowid();
+        transaction.commit()?;
+
+        Ok(StoredSnapshot {
+            sequence: sequence_to_u64(sequence)?,
+            active_run: Some(ActiveRunSummary {
+                id: run_id,
+                goal: input.goal.clone(),
+                repository: input.repository_path.clone(),
+                base_revision: input.base_revision.clone(),
+                branch: input.branch.clone(),
+                worktree_dirty: input.worktree_dirty,
+                run_status: RunStatus::Draft,
+            }),
+        })
+    }
+}
+
+fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
+    let status: String = row.get(6)?;
+    let run_status = parse_run_status(&status).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ActiveRunSummary {
+        id: row.get(0)?,
+        goal: row.get(1)?,
+        repository: row.get(2)?,
+        base_revision: row.get(3)?,
+        branch: row.get(4)?,
+        worktree_dirty: row.get(5)?,
+        run_status,
+    })
+}
+
+fn parse_run_status(status: &str) -> Result<RunStatus, StorageError> {
+    match status {
+        "draft" => Ok(RunStatus::Draft),
+        "planning" => Ok(RunStatus::Planning),
+        "waiting_for_user" => Ok(RunStatus::WaitingForUser),
+        "running" => Ok(RunStatus::Running),
+        "blocked" => Ok(RunStatus::Blocked),
+        "failed" => Ok(RunStatus::Failed),
+        "completed" => Ok(RunStatus::Completed),
+        "rejected" => Ok(RunStatus::Rejected),
+        "cancelled" => Ok(RunStatus::Cancelled),
+        _ => Err(StorageError::InvalidRunStatus(status.to_owned())),
+    }
+}
+
+fn sequence_to_u64(sequence: i64) -> Result<u64, StorageError> {
+    u64::try_from(sequence).map_err(|_| StorageError::NegativeSequence(sequence))
+}
+
+fn unix_milliseconds() -> Result<i64, StorageError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| StorageError::ClockBeforeEpoch)?;
+    i64::try_from(duration.as_millis()).map_err(|_| StorageError::ClockBeforeEpoch)
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), StorageError> {
@@ -341,7 +546,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
-    match fs::symlink_metadata(path) {
+    let created = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() {
                 return Err(StorageError::FileSystem {
@@ -353,6 +558,18 @@ fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
                     ),
                 });
             }
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(StorageError::FileSystem {
+                    operation: "use non-private state directory",
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("directory mode {mode:04o} is not owner-only"),
+                    ),
+                });
+            }
+            false
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::DirBuilder::new()
@@ -364,6 +581,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
                     path: path.to_path_buf(),
                     source,
                 })?;
+            true
         }
         Err(source) => {
             return Err(StorageError::FileSystem {
@@ -372,9 +590,12 @@ fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
                 source,
             });
         }
-    }
+    };
 
-    set_file_mode(path, 0o700)
+    if created {
+        set_file_mode(path, 0o700)?;
+    }
+    Ok(())
 }
 
 fn set_file_mode(path: &Path, mode: u32) -> Result<(), StorageError> {
@@ -477,6 +698,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn persists_draft_runs_and_restores_the_latest() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+
+        assert_eq!(
+            worker
+                .current_snapshot()
+                .await
+                .expect("empty snapshot should load"),
+            StoredSnapshot::default()
+        );
+
+        let first = worker
+            .create_draft_run(draft_input("First goal", false))
+            .await
+            .expect("first draft should persist");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(
+            first.active_run.as_ref().map(|run| run.goal.as_str()),
+            Some("First goal")
+        );
+
+        let second = worker
+            .create_draft_run(draft_input("Second goal", true))
+            .await
+            .expect("second draft should persist");
+        assert_eq!(second.sequence, 2);
+        assert_eq!(
+            second.active_run.as_ref().map(|run| run.goal.as_str()),
+            Some("Second goal")
+        );
+        assert!(
+            second
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.worktree_dirty)
+        );
+        drop(worker);
+
+        let reopened = StorageWorker::start(paths.clone()).expect("storage should reopen");
+        assert_eq!(
+            reopened
+                .current_snapshot()
+                .await
+                .expect("snapshot should restore"),
+            second
+        );
+        drop(reopened);
+
+        let connection = Connection::open(paths.database()).expect("database should reopen");
+        let project_count: i64 = connection
+            .query_row("SELECT count(*) FROM projects", [], |row| row.get(0))
+            .expect("projects should be countable");
+        let run_count: i64 = connection
+            .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+            .expect("runs should be countable");
+        let event_count: i64 = connection
+            .query_row("SELECT count(*) FROM run_events", [], |row| row.get(0))
+            .expect("events should be countable");
+        assert_eq!(project_count, 1);
+        assert_eq!(run_count, 2);
+        assert_eq!(event_count, 2);
+    }
+
     #[test]
     fn configures_required_sqlite_pragmas() {
         let temporary = TempDir::new().expect("temporary directory should exist");
@@ -538,11 +825,36 @@ mod tests {
         assert!(matches!(error, StorageError::FileSystem { .. }));
     }
 
+    #[test]
+    fn refuses_a_permissive_existing_state_root() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let state_root = temporary.path().join("state");
+        fs::create_dir(&state_root).expect("state root should exist");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o755))
+            .expect("test permissions should be set");
+
+        let Err(error) = StorageWorker::start(StatePaths::new(state_root)) else {
+            panic!("permissive state root should be rejected");
+        };
+        assert!(matches!(error, StorageError::FileSystem { .. }));
+    }
+
     fn mode(path: &Path) -> u32 {
         fs::metadata(path)
             .expect("path metadata should exist")
             .permissions()
             .mode()
             & 0o777
+    }
+
+    fn draft_input(goal: &str, worktree_dirty: bool) -> DraftRunInput {
+        DraftRunInput {
+            repository_path: "/tmp/project".to_owned(),
+            git_common_dir: "/tmp/project/.git".to_owned(),
+            goal: goal.to_owned(),
+            base_revision: "0123456789012345678901234567890123456789".to_owned(),
+            branch: Some("main".to_owned()),
+            worktree_dirty,
+        }
     }
 }

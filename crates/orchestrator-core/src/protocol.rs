@@ -15,6 +15,7 @@ pub struct ClientMessage {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ClientRequest {
+    CreateDraftRun { repository: String, goal: String },
     GetSnapshot,
     Ping,
 }
@@ -91,5 +92,21 @@ mod tests {
         assert_eq!(message.version, PROTOCOL_VERSION);
         assert_eq!(message.request_id, "request-1");
         assert_eq!(message.request, ClientRequest::GetSnapshot);
+    }
+
+    #[test]
+    fn parses_create_draft_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-2","method":"create_draft_run","repository":"/tmp/project","goal":"Add a test"}"#,
+        )
+        .expect("request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::CreateDraftRun {
+                repository: "/tmp/project".to_owned(),
+                goal: "Add a test".to_owned(),
+            }
+        );
     }
 }

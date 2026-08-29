@@ -10,8 +10,13 @@ version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-git = { path = "../orchestrator-git" }
+orchestrator-store = { path = "../orchestrator-store" }
 serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

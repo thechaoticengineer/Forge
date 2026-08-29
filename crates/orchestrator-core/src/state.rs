@@ -31,6 +31,41 @@ pub struct ActiveRunSummary {
     pub id: String,
     pub goal: String,
     pub repository: String,
+    pub base_revision: String,
+    pub branch: Option<String>,
+    pub worktree_dirty: bool,
+    pub run_status: RunStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Draft,
+    Planning,
+    WaitingForUser,
+    Running,
+    Blocked,
+    Failed,
+    Completed,
+    Rejected,
+    Cancelled,
+}
+
+impl RunStatus {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Planning => "planning",
+            Self::WaitingForUser => "waiting_for_user",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

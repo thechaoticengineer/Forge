@@ -3,6 +3,7 @@ members = [
   "crates/orchestrator-cli",
   "crates/orchestrator-core",
   "crates/orchestrator-engine",
+  "crates/orchestrator-git",
   "crates/orchestrator-store",
 ]
 resolver = "3"
@@ -22,6 +23,7 @@ rusqlite = "0.40.2"
 tempfile = "3.27.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1.26.0", features = ["v7"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
