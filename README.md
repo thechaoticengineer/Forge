@@ -2,7 +2,9 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** Foundation development has started. The repository currently contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, constrained Codex and Claude Code planner adapters, a CLI, and reconnecting Omarchy bar-widget and panel entry points. A developer can create a durable draft, ask either installed CLI for a structured plan, edit or reorder its tasks, and approve or reject it from the CLI or panel. Isolated implementation, deterministic verification, independent review, and final change approval remain planned unless explicitly stated otherwise.
+> **Project status:** The foundation and planning slice are implemented. The repository contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, constrained Codex and Claude Code planner adapters, a CLI, and reconnecting Omarchy bar-widget and panel entry points. The panel supports directional keyboard focus with arrow keys or `h`/`j`/`k`/`l`, engine-backed repository path completion with `Tab`, durable draft creation, structured plan generation, task editing and reordering, and plan approval or rejection. Isolated implementation, deterministic verification, independent review, and final change approval remain planned.
+>
+> **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
 ## Vision
 
@@ -207,6 +209,8 @@ The main panel should be a first-class product interface, not a transcript viewe
 
 The default screen should summarize progress and prioritize actionable information. Detailed prompts, responses, stdout, stderr, and internal events remain one level deeper for users who need to investigate.
 
+The implemented panel currently makes the **Overview** and **Plan** sections functional. **Changes**, **Verification**, and **Review** are visible placeholders for later workflow stages; they must not be mistaken for completed capabilities.
+
 ### Keyboard-first operation
 
 The complete workflow must be usable without a mouse. Mouse interaction may be supported, but no important operation should require it.
@@ -223,6 +227,10 @@ Vim-style navigation should be used where it is natural and consistent with the 
 Plan approval, diff inspection, verification results, retries, agent instructions, and final approval should have discoverable shortcuts. The user should not need to memorize them: the panel should show context-sensitive actions, and every important command should be searchable in the palette.
 
 Destructive or consequential actions must not rely on single ambiguous keystrokes. Their confirmation should state the target, effect, and recovery implications.
+
+The implemented planning panel already provides two explicit focus areas: the section list and the selected section's content. `Right` or `l` enters the content, while `Left` or `h` returns to the section list. `Up`/`Down` and `j`/`k` move within the focused area, and `Enter` opens or activates the focused target. Text fields retain normal character input.
+
+In the repository field, `Tab` requests directory completion from the Rust engine. A unique directory or shared prefix is inserted, and multiple matches are shown beneath the field. `Enter` then advances to the goal. This filesystem operation crosses the same structured local IPC boundary as the rest of the workflow; QML does not enumerate directories inside `omarchy-shell`. A richer keyboard-driven repository chooser remains planned.
 
 ## Architecture Boundaries
 
@@ -393,6 +401,8 @@ The first milestone is a complete vertical slice that includes both the Rust eng
 12. Use the bar widget to see whether work is active or waiting for attention.
 
 CLI commands may expose the same workflow, but CLI completion alone does not satisfy this milestone. The Quickshell panel and bar widget are part of the first usable product slice.
+
+The current completion state and the ordered work needed to close this milestone are tracked in [ROADMAP.md](ROADMAP.md).
 
 ## Non-Goals
 

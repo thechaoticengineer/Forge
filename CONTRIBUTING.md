@@ -9,6 +9,7 @@ The project name is temporary. Use the descriptive working title from the README
 Read these files before making changes:
 
 - `README.md` for the product vision, architecture, initial scope, and milestone;
+- `ROADMAP.md` for implemented capabilities, the next delivery slice, and milestone progress;
 - `AGENTS.md` for repository instructions that also apply to coding agents;
 - `docs/adr/` for accepted architecture decisions and the ADR process;
 - the current installed Omarchy documentation when changing or documenting shell integration.
