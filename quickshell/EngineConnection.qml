@@ -23,11 +23,13 @@ Item {
   property string lastError: ""
   property bool requestPending: false
   property string pendingRequestId: ""
+  property string pendingMethod: ""
   property string requestError: ""
   property int requestSequence: 0
 
   signal snapshotChanged()
   signal draftCreated()
+  signal requestCompleted(string method)
 
   function reconnect() {
     if (socketPath === "") {
@@ -40,6 +42,60 @@ Item {
   }
 
   function createDraft(repository, goal) {
+    return sendRequest("create_draft_run", {
+      repository: String(repository || ""),
+      goal: String(goal || "")
+    })
+  }
+
+  function generatePlan(agent) {
+    if (!activeRun) return false
+    return sendRequest("generate_plan", {
+      run_id: activeRun.id,
+      agent: String(agent || "")
+    })
+  }
+
+  function updatePlanTask(taskId, title, description, acceptanceCriteria) {
+    if (!activeRun || !activeRun.plan) return false
+    return sendRequest("update_plan_task", {
+      run_id: activeRun.id,
+      plan_id: activeRun.plan.id,
+      task_id: taskId,
+      title: String(title || ""),
+      description: String(description || ""),
+      acceptance_criteria: acceptanceCriteria || []
+    })
+  }
+
+  function movePlanTask(taskId, direction) {
+    if (!activeRun || !activeRun.plan) return false
+    return sendRequest("move_plan_task", {
+      run_id: activeRun.id,
+      plan_id: activeRun.plan.id,
+      task_id: taskId,
+      direction: direction
+    })
+  }
+
+  function approvePlan() {
+    if (!activeRun || !activeRun.plan) return false
+    return sendRequest("approve_plan", {
+      run_id: activeRun.id,
+      plan_id: activeRun.plan.id
+    })
+  }
+
+  function rejectPlan(reason) {
+    if (!activeRun || !activeRun.plan) return false
+    return sendRequest("reject_plan", {
+      run_id: activeRun.id,
+      plan_id: activeRun.plan.id,
+      reason: String(reason || "")
+    })
+  }
+
+  function sendRequest(method, payload) {
     if (!socket.connected) {
       requestError = "The orchestration engine is not connected"
       return false
@@ -48,15 +104,16 @@ Item {
 
     requestSequence++
     pendingRequestId = "qml-" + Date.now() + "-" + requestSequence
+    pendingMethod = method
     requestPending = true
     requestError = ""
-    socket.write(JSON.stringify({
+    var message = {
       version: 1,
       request_id: pendingRequestId,
-      method: "create_draft_run",
-      repository: String(repository || ""),
-      goal: String(goal || "")
-    }) + "\n")
+      method: method
+    }
+    for (var key in payload) message[key] = payload[key]
+    socket.write(JSON.stringify(message) + "\n")
     socket.flush()
     return true
   }
@@ -79,6 +136,7 @@ Item {
       if (message.request_id && message.request_id === pendingRequestId) {
         requestPending = false
         pendingRequestId = ""
+        pendingMethod = ""
         requestError = String(message.message || "The engine rejected the request")
       } else {
         lastError = String(message.message || "The engine rejected a request")
@@ -109,10 +167,13 @@ Item {
     hasSnapshot = true
     lastError = ""
     if (message.request_id && message.request_id === pendingRequestId) {
+      var completedMethod = pendingMethod
       requestPending = false
       pendingRequestId = ""
+      pendingMethod = ""
       requestError = ""
-      draftCreated()
+      if (completedMethod === "create_draft_run") draftCreated()
+      requestCompleted(completedMethod)
     }
     snapshotChanged()
   }
@@ -137,6 +198,7 @@ Item {
         if (root.requestPending) {
           root.requestPending = false
           root.pendingRequestId = ""
+          root.pendingMethod = ""
           root.requestError = "Connection lost before the engine responded"
         }
         retryTimer.restart()

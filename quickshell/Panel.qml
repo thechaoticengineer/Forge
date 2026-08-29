@@ -12,7 +12,10 @@ Item {
   property var manifest: null
   property bool closingFromHost: false
   property int selectedSection: 0
+  property int selectedTaskIndex: 0
   property bool editingDraft: false
+  property bool editingPlanTask: false
+  property bool rejectingPlan: false
   property string localDraftError: ""
 
   readonly property string pluginId: manifest && manifest.id
@@ -44,10 +47,24 @@ Item {
     else window.visible = false
   }
 
-  function moveSelection(delta) {
-    if (editingDraft) return
+  function moveSection(delta) {
+    if (editingDraft || editingPlanTask || rejectingPlan) return
     var count = sectionModel.count
     selectedSection = ((selectedSection + delta) % count + count) % count
+    selectedTaskIndex = 0
+  }
+
+  function moveNavigation(dx, dy) {
+    if (editingDraft || editingPlanTask || rejectingPlan) return
+    var plan = currentPlan()
+    if (selectedSection === 1 && plan && plan.tasks && dy !== 0) {
+      selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex + dy))
+      planTaskList.positionViewAtIndex(selectedTaskIndex, ListView.Contain)
+    } else if (dx !== 0) {
+      moveSection(dx)
+    } else if (dy !== 0) {
+      moveSection(dy)
+    }
   }
 
   function beginDraftEntry() {
@@ -90,9 +107,91 @@ Item {
     return localDraftError || engine.requestError
   }
 
+  function currentPlan() {
+    return engine.activeRun && engine.activeRun.plan ? engine.activeRun.plan : null
+  }
+
+  function selectedTask() {
+    var plan = currentPlan()
+    if (!plan || !plan.tasks || plan.tasks.length === 0) return null
+    selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex))
+    return plan.tasks[selectedTaskIndex]
+  }
+
+  function generatePlan(agent) {
+    if (engine.requestPending || !engine.activeRun) return
+    engine.requestError = ""
+    engine.generatePlan(agent)
+  }
+
+  function beginPlanTaskEdit() {
+    var task = selectedTask()
+    var plan = currentPlan()
+    if (!task || !plan || plan.status !== "proposed" || engine.requestPending) return
+    editingPlanTask = true
+    taskTitleField.text = task.title || ""
+    taskDescriptionField.text = task.description || ""
+    taskCriteriaField.text = (task.acceptance_criteria || []).join(" || ")
+    engine.requestError = ""
+    Qt.callLater(function() { taskTitleField.forceActiveFocus() })
+  }
+
+  function savePlanTask() {
+    var task = selectedTask()
+    if (!task) return
+    var parts = taskCriteriaField.text.split("||")
+    var criteria = []
+    for (var i = 0; i < parts.length; i++) {
+      var criterion = parts[i].trim()
+      if (criterion !== "") criteria.push(criterion)
+    }
+    engine.updatePlanTask(
+      task.id,
+      taskTitleField.text.trim(),
+      taskDescriptionField.text.trim(),
+      criteria
+    )
+  }
+
+  function cancelPlanInput() {
+    if (engine.requestPending) return
+    editingPlanTask = false
+    rejectingPlan = false
+    taskTitleField.focus = false
+    taskDescriptionField.focus = false
+    taskCriteriaField.focus = false
+    rejectionReasonField.focus = false
+    engine.requestError = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function beginRejectPlan() {
+    var plan = currentPlan()
+    if (!plan || plan.status !== "proposed" || engine.requestPending) return
+    rejectingPlan = true
+    rejectionReasonField.text = ""
+    Qt.callLater(function() { rejectionReasonField.forceActiveFocus() })
+  }
+
+  function submitPlanRejection() {
+    engine.rejectPlan(rejectionReasonField.text.trim())
+  }
+
+  function moveCurrentTask(direction) {
+    var task = selectedTask()
+    var plan = currentPlan()
+    if (!task || !plan || plan.status !== "proposed" || engine.requestPending) return
+    engine.movePlanTask(task.id, direction)
+  }
+
   function footerHelp() {
     if (editingDraft) return "Tab  Next field    Enter  Continue or create    Esc  Cancel"
-    if (selectedSection === 0 && engine.activeRun) return "j/k  Navigate    n  New draft    r  Reconnect    Esc  Close"
+    if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
+    if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
+    if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
+      return "j/k  Task    e  Edit    J/K  Reorder    a  Approve    x  Reject"
+    if (selectedSection === 1) return "c  Plan with Codex    d  Plan with Claude    h/l  Sections"
+    if (selectedSection === 0 && engine.activeRun) return "h/l or arrows  Sections    n  New draft    r  Reconnect    Esc  Close"
     if (selectedSection === 0) return "j/k  Navigate    Enter  Create draft    r  Reconnect    Esc  Close"
     return "j/k or arrows  Navigate    r  Reconnect    Esc  Close"
   }
@@ -118,6 +217,19 @@ Item {
       goalField.text = ""
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
+    onRequestCompleted: function(method) {
+      if (method === "update_plan_task") root.editingPlanTask = false
+      if (method === "reject_plan") root.rejectingPlan = false
+      root.selectedTaskIndex = Math.max(0, root.selectedTaskIndex)
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+    onSnapshotChanged: {
+      var plan = root.currentPlan()
+      if (plan && plan.tasks)
+        root.selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, root.selectedTaskIndex))
+      else
+        root.selectedTaskIndex = 0
+    }
   }
 
   ListModel {
@@ -128,7 +240,7 @@ Item {
     }
     ListElement {
       title: "Plan"
-      description: "Explicit tasks, dependencies, and acceptance criteria will appear here."
+      description: "Generate, inspect, revise, reorder, approve, or reject the explicit task plan."
     }
     ListElement {
       title: "Changes"
@@ -166,17 +278,26 @@ Item {
         id: keyCatcher
         anchors.fill: parent
         blocked: repositoryField.activeFocus || goalField.activeFocus
+          || taskTitleField.activeFocus || taskDescriptionField.activeFocus
+          || taskCriteriaField.activeFocus || rejectionReasonField.activeFocus
         onMoveRequested: function(dx, dy) {
-          if (dy !== 0) root.moveSelection(dy)
-          else if (dx !== 0) root.moveSelection(dx)
+          root.moveNavigation(dx, dy)
         }
         onActivateRequested: {
           if (root.selectedSection === 0 && !root.editingDraft) root.beginDraftEntry()
+          else if (root.selectedSection === 1) root.beginPlanTaskEdit()
         }
         onCloseRequested: root.requestClose()
         onTextKey: function(text) {
           if (text === "r") engine.reconnect()
           else if (text === "n") root.beginDraftEntry()
+          else if (root.selectedSection === 1 && text === "c") root.generatePlan("codex")
+          else if (root.selectedSection === 1 && text === "d") root.generatePlan("claude")
+          else if (root.selectedSection === 1 && text === "e") root.beginPlanTaskEdit()
+          else if (root.selectedSection === 1 && text === "J") root.moveCurrentTask("down")
+          else if (root.selectedSection === 1 && text === "K") root.moveCurrentTask("up")
+          else if (root.selectedSection === 1 && text === "a" && root.currentPlan() && root.currentPlan().status === "proposed") engine.approvePlan()
+          else if (root.selectedSection === 1 && text === "x") root.beginRejectPlan()
         }
 
         Column {
@@ -318,6 +439,15 @@ Item {
 
                   Text {
                     text: {
+                      if (root.selectedSection === 1) {
+                        var plan = root.currentPlan()
+                        if (!engine.activeRun) return "Create a draft first"
+                        if (engine.activeRun.run_status === "planning") return "Planner is inspecting the repository"
+                        if (engine.activeRun.run_status === "failed") return "Planning failed"
+                        if (!plan || plan.status === "rejected") return "Choose a planning agent"
+                        if (plan.status === "approved") return "Plan approved"
+                        return "Plan revision " + plan.revision
+                      }
                       if (root.selectedSection !== 0) return "Planned capability"
                       if (!engine.connected) return "Start the Rust engine to connect"
                       if (root.editingDraft) return "Create a durable draft run"
@@ -331,7 +461,7 @@ Item {
                   }
 
                   Text {
-                    visible: root.selectedSection !== 0
+                    visible: root.selectedSection > 1
                     width: parent.width
                     text: sectionModel.get(root.selectedSection).description
                     color: root.mutedForeground
@@ -499,7 +629,9 @@ Item {
 
                     Text {
                       width: parent.width
-                      text: "This draft survives engine and shell restarts. Planning and agent assignment are the next workflow stage and are not implemented yet."
+                      text: engine.activeRun && engine.activeRun.plan
+                        ? "The plan is durable. Open the Plan section to inspect its tasks and decision state."
+                        : "This draft survives engine and shell restarts. Open the Plan section to choose Codex or Claude as the read-only planner."
                       color: root.mutedForeground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -511,6 +643,376 @@ Item {
                       foreground: root.foreground
                       accent: root.accent
                       onClicked: root.beginDraftEntry()
+                    }
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 1
+                    width: parent.width
+                    spacing: Style.space(10)
+
+                    Text {
+                      visible: !engine.activeRun
+                      width: parent.width
+                      text: "Create a durable draft in Overview before asking an agent to inspect the repository."
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                      visible: !!engine.activeRun && engine.activeRun.run_status === "planning"
+                      width: parent.width
+                      text: "The selected agent is inspecting the repository with read-only permissions. The engine owns the process and will preserve either the proposal or the failure evidence."
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Column {
+                      visible: !!engine.activeRun
+                        && engine.activeRun.run_status !== "planning"
+                        && (!root.currentPlan() || root.currentPlan().status === "rejected"
+                            || engine.activeRun.run_status === "failed")
+                      width: parent.width
+                      spacing: Style.space(10)
+
+                      Text {
+                        width: parent.width
+                        text: engine.activeRun && engine.activeRun.last_error
+                          ? engine.activeRun.last_error
+                          : (root.currentPlan() && root.currentPlan().status === "rejected"
+                             ? "The previous proposal was rejected. Generate a new revision when ready."
+                             : "Choose which independent CLI should inspect the repository and prepare the first structured plan.")
+                        color: engine.activeRun && engine.activeRun.last_error ? root.urgent : root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+
+                      Row {
+                        spacing: Style.space(8)
+
+                        Button {
+                          text: engine.requestPending && engine.pendingMethod === "generate_plan" ? "Planning…" : "Plan with Codex"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.generatePlan("codex")
+                        }
+
+                        Button {
+                          text: "Plan with Claude"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.generatePlan("claude")
+                        }
+                      }
+                    }
+
+                    Column {
+                      visible: !!root.currentPlan()
+                        && root.currentPlan().status !== "rejected"
+                        && !root.editingPlanTask && !root.rejectingPlan
+                      width: parent.width
+                      spacing: Style.space(8)
+
+                      Text {
+                        width: parent.width
+                        text: root.currentPlan() ? root.currentPlan().summary : ""
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                        wrapMode: Text.WordWrap
+                      }
+
+                      Text {
+                        text: root.currentPlan()
+                          ? ("Revision " + root.currentPlan().revision + "  •  "
+                             + root.currentPlan().planner + "  •  " + root.currentPlan().status)
+                          : ""
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+
+                      ListView {
+                        id: planTaskList
+                        width: parent.width
+                        height: Style.space(215)
+                        clip: true
+                        spacing: Style.space(6)
+                        model: root.currentPlan() && root.currentPlan().tasks
+                          ? root.currentPlan().tasks
+                          : []
+                        currentIndex: root.selectedTaskIndex
+
+                        delegate: Rectangle {
+                          id: taskDelegate
+                          required property int index
+                          required property var modelData
+                          width: ListView.view.width
+                          height: taskContent.implicitHeight + Style.space(16)
+                          radius: Style.cornerRadius
+                          color: index === root.selectedTaskIndex
+                            ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14)
+                            : "transparent"
+                          border.width: index === root.selectedTaskIndex ? 1 : 0
+                          border.color: root.accent
+
+                          Column {
+                            id: taskContent
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(3)
+
+                            Text {
+                              width: parent.width
+                              text: taskDelegate.modelData.position + ". " + taskDelegate.modelData.title
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              width: parent.width
+                              text: taskDelegate.modelData.description
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              width: parent.width
+                              text: "✓ " + (taskDelegate.modelData.acceptance_criteria || []).join("\n✓ ")
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              visible: taskDelegate.modelData.depends_on
+                                && taskDelegate.modelData.depends_on.length > 0
+                              text: "Depends on: " + (taskDelegate.modelData.depends_on || []).join(", ")
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                            }
+                          }
+
+                          MouseArea {
+                            anchors.fill: parent
+                            onClicked: root.selectedTaskIndex = taskDelegate.index
+                            onDoubleClicked: {
+                              root.selectedTaskIndex = taskDelegate.index
+                              root.beginPlanTaskEdit()
+                            }
+                          }
+                        }
+                      }
+
+                      Row {
+                        visible: root.currentPlan() && root.currentPlan().status === "proposed"
+                        spacing: Style.space(6)
+
+                        Button {
+                          text: "Approve"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: engine.approvePlan()
+                        }
+                        Button {
+                          text: "Edit"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginPlanTaskEdit()
+                        }
+                        Button {
+                          text: "↑"
+                          enabled: !engine.requestPending && root.selectedTaskIndex > 0
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.moveCurrentTask("up")
+                        }
+                        Button {
+                          text: "↓"
+                          enabled: !engine.requestPending && root.currentPlan()
+                            && root.selectedTaskIndex < root.currentPlan().tasks.length - 1
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.moveCurrentTask("down")
+                        }
+                        Button {
+                          text: "Reject"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginRejectPlan()
+                        }
+                      }
+
+                      Text {
+                        visible: root.currentPlan() && root.currentPlan().status === "approved"
+                        width: parent.width
+                        text: "This plan is approved and durable. Isolated implementation is the next workflow stage and has not started."
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+                    }
+
+                    Column {
+                      visible: root.editingPlanTask
+                      width: parent.width
+                      spacing: Style.space(7)
+
+                      Text {
+                        text: "Edit selected task"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                      }
+
+                      TextField {
+                        id: taskTitleField
+                        width: parent.width
+                        enabled: !engine.requestPending
+                        placeholderText: "Task title"
+                        foreground: root.foreground
+                        accent: root.accent
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.cancelPlanInput(); event.accepted = true
+                          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            taskDescriptionField.forceActiveFocus(); event.accepted = true
+                          }
+                        }
+                      }
+
+                      TextField {
+                        id: taskDescriptionField
+                        width: parent.width
+                        enabled: !engine.requestPending
+                        placeholderText: "Task description"
+                        foreground: root.foreground
+                        accent: root.accent
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.cancelPlanInput(); event.accepted = true
+                          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            taskCriteriaField.forceActiveFocus(); event.accepted = true
+                          }
+                        }
+                      }
+
+                      TextField {
+                        id: taskCriteriaField
+                        width: parent.width
+                        enabled: !engine.requestPending
+                        placeholderText: "Criteria separated with ||"
+                        foreground: root.foreground
+                        accent: root.accent
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.cancelPlanInput(); event.accepted = true
+                          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            root.savePlanTask(); event.accepted = true
+                          }
+                        }
+                      }
+
+                      Row {
+                        spacing: Style.space(8)
+                        Button {
+                          text: engine.requestPending ? "Saving…" : "Save revision"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.savePlanTask()
+                        }
+                        Button {
+                          text: "Cancel"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.cancelPlanInput()
+                        }
+                      }
+                    }
+
+                    Column {
+                      visible: root.rejectingPlan
+                      width: parent.width
+                      spacing: Style.space(8)
+
+                      Text {
+                        width: parent.width
+                        text: "Rejecting preserves this proposal in history and returns the run to draft state. Add an optional reason."
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+                      TextField {
+                        id: rejectionReasonField
+                        width: parent.width
+                        enabled: !engine.requestPending
+                        placeholderText: "Reason for rejection (optional)"
+                        foreground: root.foreground
+                        accent: root.accent
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.cancelPlanInput(); event.accepted = true
+                          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            root.submitPlanRejection(); event.accepted = true
+                          }
+                        }
+                      }
+                      Row {
+                        spacing: Style.space(8)
+                        Button {
+                          text: engine.requestPending ? "Rejecting…" : "Confirm rejection"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.submitPlanRejection()
+                        }
+                        Button {
+                          text: "Cancel"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.cancelPlanInput()
+                        }
+                      }
+                    }
+
+                    Text {
+                      visible: engine.requestError !== ""
+                      width: parent.width
+                      text: engine.requestError
+                      color: root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
                     }
                   }
 
