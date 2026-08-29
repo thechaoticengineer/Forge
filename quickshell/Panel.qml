@@ -13,6 +13,7 @@ Item {
   property bool closingFromHost: false
   property int selectedSection: 0
   property int selectedTaskIndex: 0
+  property string focusArea: "sections"
   property bool editingDraft: false
   property bool editingPlanTask: false
   property bool rejectingPlan: false
@@ -31,6 +32,7 @@ Item {
 
   function open(payloadJson) {
     closingFromHost = false
+    focusArea = "sections"
     window.visible = true
     engine.reconnect()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -52,24 +54,44 @@ Item {
     var count = sectionModel.count
     selectedSection = ((selectedSection + delta) % count + count) % count
     selectedTaskIndex = 0
+    sectionList.positionViewAtIndex(selectedSection, ListView.Contain)
   }
 
   function moveNavigation(dx, dy) {
     if (editingDraft || editingPlanTask || rejectingPlan) return
+
+    if (dx !== 0) {
+      if (dx > 0 && focusArea === "sections") focusArea = "content"
+      else if (dx < 0 && focusArea === "content") focusArea = "sections"
+      return
+    }
+
+    if (dy === 0) return
+    if (focusArea === "sections") {
+      moveSection(dy)
+      return
+    }
+
     var plan = currentPlan()
-    if (selectedSection === 1 && plan && plan.tasks && dy !== 0) {
+    if (selectedSection === 1 && plan && plan.tasks && plan.tasks.length > 0) {
       selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex + dy))
       planTaskList.positionViewAtIndex(selectedTaskIndex, ListView.Contain)
-    } else if (dx !== 0) {
-      moveSection(dx)
-    } else if (dy !== 0) {
-      moveSection(dy)
     }
+  }
+
+  function activateNavigation() {
+    if (focusArea === "sections") {
+      focusArea = "content"
+      return
+    }
+    if (selectedSection === 0 && !editingDraft) beginDraftEntry()
+    else if (selectedSection === 1) beginPlanTaskEdit()
   }
 
   function beginDraftEntry() {
     if (!engine.connected || engine.requestPending) return
     selectedSection = 0
+    focusArea = "content"
     editingDraft = true
     localDraftError = ""
     engine.requestError = ""
@@ -188,12 +210,17 @@ Item {
     if (editingDraft) return "Tab  Next field    Enter  Continue or create    Esc  Cancel"
     if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
+    if (focusArea === "sections")
+      return "j/k or ↑/↓  Sections    l/→ or Enter  Open    r  Reconnect    Esc  Close"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
-      return "j/k  Task    e  Edit    J/K  Reorder    a  Approve    x  Reject"
-    if (selectedSection === 1) return "c  Plan with Codex    d  Plan with Claude    h/l  Sections"
-    if (selectedSection === 0 && engine.activeRun) return "h/l or arrows  Sections    n  New draft    r  Reconnect    Esc  Close"
-    if (selectedSection === 0) return "j/k  Navigate    Enter  Create draft    r  Reconnect    Esc  Close"
-    return "j/k or arrows  Navigate    r  Reconnect    Esc  Close"
+      return "h/←  Sections    j/k or ↑/↓  Tasks    Enter/e  Edit    J/K  Reorder    a  Approve    x  Reject"
+    if (selectedSection === 1)
+      return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
+    if (selectedSection === 0 && engine.activeRun)
+      return "h/←  Sections    Enter/n  New draft    r  Reconnect    Esc  Close"
+    if (selectedSection === 0)
+      return "h/←  Sections    Enter  Create draft    r  Reconnect    Esc  Close"
+    return "h/←  Sections    r  Reconnect    Esc  Close"
   }
 
   function statusLabel() {
@@ -283,10 +310,7 @@ Item {
         onMoveRequested: function(dx, dy) {
           root.moveNavigation(dx, dy)
         }
-        onActivateRequested: {
-          if (root.selectedSection === 0 && !root.editingDraft) root.beginDraftEntry()
-          else if (root.selectedSection === 1) root.beginPlanTaskEdit()
-        }
+        onActivateRequested: root.activateNavigation()
         onCloseRequested: root.requestClose()
         onTextKey: function(text) {
           if (text === "r") engine.reconnect()
@@ -378,9 +402,10 @@ Item {
                 height: Style.space(42)
                 radius: Style.cornerRadius
                 color: index === root.selectedSection
-                  ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
+                  ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b,
+                            root.focusArea === "sections" ? 0.18 : 0.08)
                   : "transparent"
-                border.width: index === root.selectedSection ? 1 : 0
+                border.width: index === root.selectedSection && root.focusArea === "sections" ? 1 : 0
                 border.color: root.accent
 
                 Text {
@@ -392,6 +417,20 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                   font.bold: sectionDelegate.index === root.selectedSection
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: {
+                    root.selectedSection = sectionDelegate.index
+                    root.selectedTaskIndex = 0
+                    root.focusArea = "sections"
+                  }
+                  onDoubleClicked: {
+                    root.selectedSection = sectionDelegate.index
+                    root.selectedTaskIndex = 0
+                    root.focusArea = "content"
+                  }
                 }
               }
             }
@@ -425,12 +464,15 @@ Item {
               }
 
               Rectangle {
+                id: contentSurface
                 width: parent.width
                 height: contentPane.parent.height - Style.space(92)
                 radius: Style.cornerRadius
                 color: root.surface
-                border.width: 1
-                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
+                border.width: root.focusArea === "content" ? 2 : 1
+                border.color: root.focusArea === "content"
+                  ? root.accent
+                  : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
 
                 Column {
                   anchors.fill: parent
@@ -813,7 +855,10 @@ Item {
 
                           MouseArea {
                             anchors.fill: parent
-                            onClicked: root.selectedTaskIndex = taskDelegate.index
+                            onClicked: {
+                              root.selectedTaskIndex = taskDelegate.index
+                              root.focusArea = "content"
+                            }
                             onDoubleClicked: {
                               root.selectedTaskIndex = taskDelegate.index
                               root.beginPlanTaskEdit()
