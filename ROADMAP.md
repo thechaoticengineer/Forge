@@ -8,7 +8,7 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 ## Current Position
 
-The foundation and planning workflow are implemented. A developer can open the Omarchy panel, select a local repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it. The next major slice is isolated implementation in a protected Git worktree.
+The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it. The next major slice is isolated implementation in a protected Git worktree.
 
 The **Changes**, **Verification**, and **Review** panel sections currently communicate product direction but do not yet run those stages.
 
@@ -35,10 +35,12 @@ The **Changes**, **Verification**, and **Review** panel sections currently commu
 - [x] Edit tasks, safely reorder them, and preserve plan revisions.
 - [x] Approve or reject the plan from either the CLI or Omarchy panel.
 - [x] Restore the active draft and plan after engine or frontend restart.
+- [x] Browse bounded local project roots and remote-only GitHub repositories from the panel.
+- [x] Explicitly clone a selected GitHub repository into a collision-safe local destination.
 
 Planned usability follow-ups:
 
-- [ ] Add a richer keyboard-driven repository directory chooser.
+- [x] Add a richer keyboard-driven repository chooser with shared search and manual-path fallback.
 - [ ] Add current and previous run selection.
 - [ ] Add the searchable command palette and contextual action discovery.
 - [ ] Extend cursor-level keyboard focus to every actionable control introduced by later phases.
@@ -102,7 +104,7 @@ The first milestone is complete only when the whole workflow works through the r
 
 - [x] Install or enable the validated Quickshell plugin.
 - [x] Summon the orchestrator panel from Omarchy.
-- [x] Open a local Git repository through the panel.
+- [x] Open a local Git repository or clone one from GitHub through the panel.
 - [x] Describe a small engineering goal.
 - [x] Inspect, revise, approve, or reject a generated plan.
 - [ ] Watch Codex CLI or Claude Code CLI implement the plan in an isolated worktree.

@@ -15,6 +15,10 @@ pub struct ClientMessage {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ClientRequest {
+    ListRepositories,
+    CloneRepository {
+        name_with_owner: String,
+    },
     CompleteRepositoryPath {
         path: String,
     },
@@ -63,6 +67,17 @@ pub enum MoveDirection {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    RepositoryCatalog {
+        version: u16,
+        request_id: String,
+        catalog: RepositoryCatalog,
+    },
+    RepositoryCloned {
+        version: u16,
+        request_id: String,
+        name_with_owner: String,
+        path: String,
+    },
     PathCompletion {
         version: u16,
         request_id: String,
@@ -86,6 +101,39 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryCatalog {
+    pub project_roots: Vec<String>,
+    pub local: Vec<LocalRepository>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_error: Option<String>,
+    pub github: Vec<GithubRepository>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalRepository {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_with_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub dirty: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GithubRepository {
+    pub name: String,
+    pub name_with_owner: String,
+    pub url: String,
+    pub archived: bool,
+    pub fork: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_at: Option<String>,
 }
 
 impl ServerMessage {
@@ -169,6 +217,80 @@ mod tests {
                 path: "/home/dev/Pro".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn parses_repository_catalog_and_clone_requests() {
+        let list: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-list","method":"list_repositories"}"#,
+        )
+        .expect("catalog request should parse");
+        assert_eq!(list.request, ClientRequest::ListRepositories);
+
+        let clone: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-clone","method":"clone_repository","name_with_owner":"owner/project"}"#,
+        )
+        .expect("clone request should parse");
+        assert_eq!(
+            clone.request,
+            ClientRequest::CloneRepository {
+                name_with_owner: "owner/project".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn serializes_repository_catalog_response() {
+        let message = ServerMessage::RepositoryCatalog {
+            version: PROTOCOL_VERSION,
+            request_id: "request-repositories".to_owned(),
+            catalog: RepositoryCatalog {
+                project_roots: vec!["/home/dev/Projects".to_owned()],
+                local: vec![LocalRepository {
+                    name: "Forge".to_owned(),
+                    path: "/home/dev/Projects/Forge".to_owned(),
+                    name_with_owner: Some("developer/Forge".to_owned()),
+                    branch: Some("main".to_owned()),
+                    dirty: false,
+                }],
+                local_error: None,
+                github: vec![GithubRepository {
+                    name: "remote-only".to_owned(),
+                    name_with_owner: "developer/remote-only".to_owned(),
+                    url: "https://github.com/developer/remote-only".to_owned(),
+                    archived: false,
+                    fork: false,
+                    pushed_at: None,
+                }],
+                github_error: None,
+            },
+        };
+        let json = serde_json::to_value(message).expect("catalog should serialize");
+
+        assert_eq!(json["type"], "repository_catalog");
+        assert_eq!(json["catalog"]["local"][0]["name"], "Forge");
+        assert!(json["catalog"].get("local_error").is_none());
+        assert_eq!(
+            json["catalog"]["github"][0]["name_with_owner"],
+            "developer/remote-only"
+        );
+        assert!(json["catalog"].get("github_error").is_none());
+    }
+
+    #[test]
+    fn serializes_repository_clone_response() {
+        let message = ServerMessage::RepositoryCloned {
+            version: PROTOCOL_VERSION,
+            request_id: "request-clone".to_owned(),
+            name_with_owner: "owner/project".to_owned(),
+            path: "/home/dev/Projects/project".to_owned(),
+        };
+
+        let json = serde_json::to_value(message).expect("clone response should serialize");
+
+        assert_eq!(json["type"], "repository_cloned");
+        assert_eq!(json["name_with_owner"], "owner/project");
+        assert_eq!(json["path"], "/home/dev/Projects/project");
     }
 
     #[test]

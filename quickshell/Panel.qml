@@ -19,6 +19,13 @@ Item {
   property bool rejectingPlan: false
   property string localDraftError: ""
   property var repositoryPathCandidates: []
+  property string draftStep: "repository"
+  property int repositorySourceIndex: 0
+  property int selectedRepositoryIndex: 0
+  property string selectedRepositoryPath: ""
+  property string selectedRepositoryLabel: ""
+  property int draftSessionGeneration: 0
+  property int cloneDraftSession: -1
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id
@@ -46,6 +53,14 @@ Item {
   }
 
   function requestClose() {
+    if (editingDraft) {
+      cancelDraftEntry()
+      return
+    }
+    if (editingPlanTask || rejectingPlan) {
+      cancelPlanInput()
+      return
+    }
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else window.visible = false
   }
@@ -59,6 +74,20 @@ Item {
   }
 
   function moveNavigation(dx, dy) {
+    if (editingDraft && draftStep === "repository") {
+      if (dx !== 0) {
+        repositorySourceIndex = Math.max(0, Math.min(1, repositorySourceIndex + dx))
+        selectedRepositoryIndex = 0
+      } else if (dy !== 0) {
+        var repositories = currentRepositoryList()
+        selectedRepositoryIndex = Math.max(
+          0,
+          Math.min(Math.max(0, repositories.length - 1), selectedRepositoryIndex + dy)
+        )
+        currentRepositoryView().positionViewAtIndex(selectedRepositoryIndex, ListView.Contain)
+      }
+      return
+    }
     if (editingDraft || editingPlanTask || rejectingPlan) return
 
     if (dx !== 0) {
@@ -81,6 +110,10 @@ Item {
   }
 
   function activateNavigation() {
+    if (editingDraft && draftStep === "repository") {
+      activateRepository()
+      return
+    }
     if (focusArea === "sections") {
       focusArea = "content"
       return
@@ -94,24 +127,40 @@ Item {
     selectedSection = 0
     focusArea = "content"
     editingDraft = true
+    draftSessionGeneration++
+    cloneDraftSession = -1
+    draftStep = "repository"
+    repositorySourceIndex = 0
+    selectedRepositoryIndex = 0
+    selectedRepositoryPath = ""
+    selectedRepositoryLabel = ""
     localDraftError = ""
     repositoryPathCandidates = []
     engine.requestError = ""
-    Qt.callLater(function() { repositoryField.forceActiveFocus() })
+    repositoryEngine.requestError = ""
+    repositoryEngine.listRepositories()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function cancelDraftEntry() {
     if (engine.requestPending) return
+    if (repositoryEngine.requestPending) repositoryEngine.abandonRequest()
     editingDraft = false
     localDraftError = ""
     repositoryPathCandidates = []
+    draftStep = "repository"
+    selectedRepositoryPath = ""
+    selectedRepositoryLabel = ""
+    cloneDraftSession = -1
     repositoryField.focus = false
+    repositorySearchField.focus = false
+    repositorySearchField.text = ""
     goalField.focus = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function submitDraft() {
-    var repository = repositoryField.text.trim()
+    var repository = selectedRepositoryPath || repositoryField.text.trim()
     var goal = goalField.text.trim()
     if (repository === "") {
       localDraftError = "Enter an absolute repository path"
@@ -126,6 +175,91 @@ Item {
 
     localDraftError = ""
     engine.createDraft(repository, goal)
+  }
+
+  function repositoryMatches(repository) {
+    var query = repositorySearchField.text.trim().toLowerCase()
+    if (query === "") return true
+    return String(repository.name || "").toLowerCase().indexOf(query) !== -1
+      || String(repository.name_with_owner || "").toLowerCase().indexOf(query) !== -1
+      || String(repository.path || "").toLowerCase().indexOf(query) !== -1
+  }
+
+  function filteredLocalRepositories() {
+    var result = []
+    var repositories = repositoryEngine.repositoryCatalog.local || []
+    for (var i = 0; i < repositories.length; i++)
+      if (repositoryMatches(repositories[i])) result.push(repositories[i])
+    return result
+  }
+
+  function filteredGithubRepositories() {
+    var result = []
+    var repositories = repositoryEngine.repositoryCatalog.github || []
+    for (var i = 0; i < repositories.length; i++)
+      if (repositoryMatches(repositories[i])) result.push(repositories[i])
+    return result
+  }
+
+  function currentRepositoryList() {
+    return repositorySourceIndex === 0
+      ? filteredLocalRepositories()
+      : filteredGithubRepositories()
+  }
+
+  function currentRepositoryView() {
+    return repositorySourceIndex === 0 ? localRepositoryList : githubRepositoryList
+  }
+
+  function activateRepository() {
+    var repositories = currentRepositoryList()
+    if (repositories.length === 0 || repositoryEngine.requestPending) return
+    selectedRepositoryIndex = Math.max(0, Math.min(repositories.length - 1, selectedRepositoryIndex))
+    var repository = repositories[selectedRepositoryIndex]
+    localDraftError = ""
+    repositoryEngine.requestError = ""
+    if (repositorySourceIndex === 0) {
+      selectedRepositoryPath = String(repository.path || "")
+      selectedRepositoryLabel = String(repository.name_with_owner || repository.name || "")
+      draftStep = "goal"
+      Qt.callLater(function() { goalField.forceActiveFocus() })
+    } else {
+      cloneDraftSession = draftSessionGeneration
+      if (!repositoryEngine.cloneRepository(repository.name_with_owner))
+        cloneDraftSession = -1
+    }
+  }
+
+  function beginManualRepositoryEntry() {
+    if (repositoryEngine.requestPending) return
+    draftStep = "path"
+    localDraftError = ""
+    repositoryEngine.requestError = ""
+    Qt.callLater(function() { repositoryField.forceActiveFocus() })
+  }
+
+  function acceptManualRepositoryPath() {
+    var path = repositoryField.text.trim()
+    if (path === "") {
+      localDraftError = "Enter an absolute repository path"
+      return
+    }
+    selectedRepositoryPath = path
+    selectedRepositoryLabel = path
+    draftStep = "goal"
+    Qt.callLater(function() { goalField.forceActiveFocus() })
+  }
+
+  function returnToRepositoryBrowser() {
+    if (engine.requestPending) return
+    draftStep = "repository"
+    localDraftError = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function beginRepositorySearch() {
+    if (draftStep !== "repository") return
+    Qt.callLater(function() { repositorySearchField.forceActiveFocus() })
   }
 
   function completeRepositoryPath() {
@@ -151,7 +285,7 @@ Item {
   }
 
   function draftError() {
-    return localDraftError || engine.requestError
+    return localDraftError || repositoryEngine.requestError || engine.requestError
   }
 
   function currentPlan() {
@@ -232,7 +366,11 @@ Item {
   }
 
   function footerHelp() {
-    if (editingDraft) return "Tab  Complete repository path    Enter  Continue or create    Esc  Cancel"
+    if (editingDraft && draftStep === "repository")
+      return "h/l or ←/→  Source    j/k or ↑/↓  Repository    Enter  Open or clone    /  Search    p  Path    Esc  Cancel"
+    if (editingDraft && draftStep === "path")
+      return "Tab  Complete path    Enter  Continue    Esc  Repository browser"
+    if (editingDraft) return "Enter  Create draft    Shift+Tab  Repositories    Esc  Cancel"
     if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
     if (focusArea === "sections")
@@ -265,8 +403,12 @@ Item {
     id: engine
     onDraftCreated: {
       root.editingDraft = false
+      root.draftStep = "repository"
       root.repositoryPathCandidates = []
+      root.selectedRepositoryPath = ""
+      root.selectedRepositoryLabel = ""
       repositoryField.text = ""
+      repositorySearchField.text = ""
       goalField.text = ""
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
@@ -289,6 +431,25 @@ Item {
         root.selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, root.selectedTaskIndex))
       else
         root.selectedTaskIndex = 0
+    }
+  }
+
+
+  EngineConnection {
+    id: repositoryEngine
+    onRepositoryCloned: function(nameWithOwner, path) {
+      if (!root.editingDraft || root.cloneDraftSession !== root.draftSessionGeneration) return
+      root.cloneDraftSession = -1
+      root.selectedRepositoryPath = path
+      root.selectedRepositoryLabel = nameWithOwner
+      root.draftStep = "goal"
+      Qt.callLater(function() { goalField.forceActiveFocus() })
+    }
+    onRepositoryCatalogChanged: {
+      root.selectedRepositoryIndex = 0
+      if (root.editingDraft && root.draftStep === "repository"
+          && !repositorySearchField.activeFocus)
+        Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
 
@@ -338,6 +499,7 @@ Item {
         id: keyCatcher
         anchors.fill: parent
         blocked: repositoryField.activeFocus || goalField.activeFocus
+          || repositorySearchField.activeFocus
           || taskTitleField.activeFocus || taskDescriptionField.activeFocus
           || taskCriteriaField.activeFocus || rejectionReasonField.activeFocus
         onMoveRequested: function(dx, dy) {
@@ -346,6 +508,12 @@ Item {
         onActivateRequested: root.activateNavigation()
         onCloseRequested: root.requestClose()
         onTextKey: function(text) {
+          if (root.editingDraft && root.draftStep === "repository") {
+            if (text === "/") root.beginRepositorySearch()
+            else if (text === "p") root.beginManualRepositoryEntry()
+            else if (text === "r") repositoryEngine.listRepositories()
+            return
+          }
           if (text === "r") engine.reconnect()
           else if (text === "n") root.beginDraftEntry()
           else if (root.selectedSection === 1 && text === "c") root.generatePlan("codex")
@@ -584,89 +752,367 @@ Item {
                     spacing: Style.space(8)
 
                     Text {
-                      text: "Repository"
+                      text: root.draftStep === "goal" ? "Engineering goal" : "Choose a repository"
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
                       font.bold: true
                     }
 
-                    TextField {
-                      id: repositoryField
+                    Column {
+                      visible: root.draftStep === "repository"
                       width: parent.width
-                      enabled: !engine.requestPending
-                        || engine.pendingMethod === "complete_repository_path"
-                      placeholderText: "/absolute/path/to/repository"
-                      foreground: root.foreground
-                      accent: root.accent
-                      onTextEdited: root.repositoryPathCandidates = []
+                      spacing: Style.space(7)
 
-                      Keys.onPressed: function(event) {
-                        if (event.key === Qt.Key_Escape) {
-                          root.cancelDraftEntry(); event.accepted = true
-                        } else if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) {
-                          root.completeRepositoryPath(); event.accepted = true
-                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                          goalField.forceActiveFocus(); event.accepted = true
+                      TextField {
+                        id: repositorySearchField
+                        width: parent.width
+                        enabled: true
+                        placeholderText: "Search local and GitHub repositories  (/ to focus)"
+                        foreground: root.foreground
+                        accent: root.accent
+                        onTextEdited: root.selectedRepositoryIndex = 0
+
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            repositorySearchField.focus = false
+                            keyCatcher.forceActiveFocus()
+                            event.accepted = true
+                          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            repositorySearchField.focus = false
+                            keyCatcher.forceActiveFocus()
+                            root.activateRepository()
+                            event.accepted = true
+                          }
                         }
+                      }
+
+                      Text {
+                        width: parent.width
+                        text: "Projects root: " + (repositoryEngine.repositoryCatalog.project_roots || []).join(", ")
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        elide: Text.ElideMiddle
+                      }
+
+                      Row {
+                        width: parent.width
+                        height: Style.space(245)
+                        spacing: Style.space(8)
+
+                        Rectangle {
+                          width: (parent.width - parent.spacing) / 2
+                          height: parent.height
+                          radius: Style.cornerRadius
+                          color: "transparent"
+                          border.width: root.repositorySourceIndex === 0 ? 2 : 1
+                          border.color: root.repositorySourceIndex === 0
+                            ? root.accent
+                            : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
+
+                          Column {
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(5)
+
+                            Text {
+                              text: "Local  " + root.filteredLocalRepositories().length
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                            }
+
+                            ListView {
+                              id: localRepositoryList
+                              width: parent.width
+                              height: parent.height - Style.space(28)
+                              clip: true
+                              spacing: Style.space(3)
+                              model: root.filteredLocalRepositories()
+                              currentIndex: root.repositorySourceIndex === 0
+                                ? root.selectedRepositoryIndex
+                                : -1
+
+                              delegate: Rectangle {
+                                id: localRepositoryDelegate
+                                required property int index
+                                required property var modelData
+                                width: ListView.view.width
+                                height: Style.space(48)
+                                radius: Style.cornerRadius
+                                color: root.repositorySourceIndex === 0
+                                  && index === root.selectedRepositoryIndex
+                                  ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14)
+                                  : "transparent"
+
+                                Column {
+                                  anchors.left: parent.left
+                                  anchors.right: parent.right
+                                  anchors.verticalCenter: parent.verticalCenter
+                                  anchors.leftMargin: Style.space(7)
+                                  anchors.rightMargin: Style.space(7)
+                                  spacing: Style.space(2)
+
+                                  Text {
+                                    width: parent.width
+                                    text: localRepositoryDelegate.modelData.name_with_owner
+                                      || localRepositoryDelegate.modelData.name
+                                    color: root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                  }
+                                  Text {
+                                    width: parent.width
+                                    text: (localRepositoryDelegate.modelData.branch || "detached HEAD")
+                                      + (localRepositoryDelegate.modelData.dirty ? "  •  dirty" : "  •  clean")
+                                    color: localRepositoryDelegate.modelData.dirty
+                                      ? root.urgent : root.mutedForeground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    elide: Text.ElideRight
+                                  }
+                                }
+
+                                MouseArea {
+                                  anchors.fill: parent
+                                  onClicked: {
+                                    root.repositorySourceIndex = 0
+                                    root.selectedRepositoryIndex = localRepositoryDelegate.index
+                                  }
+                                  onDoubleClicked: root.activateRepository()
+                                }
+                              }
+                            }
+                          }
+                        }
+
+                        Rectangle {
+                          width: (parent.width - parent.spacing) / 2
+                          height: parent.height
+                          radius: Style.cornerRadius
+                          color: "transparent"
+                          border.width: root.repositorySourceIndex === 1 ? 2 : 1
+                          border.color: root.repositorySourceIndex === 1
+                            ? root.accent
+                            : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
+
+                          Column {
+                            anchors.fill: parent
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(5)
+
+                            Text {
+                              text: "GitHub  " + root.filteredGithubRepositories().length
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                            }
+
+                            ListView {
+                              id: githubRepositoryList
+                              width: parent.width
+                              height: parent.height - Style.space(28)
+                              clip: true
+                              spacing: Style.space(3)
+                              model: root.filteredGithubRepositories()
+                              currentIndex: root.repositorySourceIndex === 1
+                                ? root.selectedRepositoryIndex
+                                : -1
+
+                              delegate: Rectangle {
+                                id: githubRepositoryDelegate
+                                required property int index
+                                required property var modelData
+                                width: ListView.view.width
+                                height: Style.space(48)
+                                radius: Style.cornerRadius
+                                color: root.repositorySourceIndex === 1
+                                  && index === root.selectedRepositoryIndex
+                                  ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14)
+                                  : "transparent"
+
+                                Column {
+                                  anchors.left: parent.left
+                                  anchors.right: parent.right
+                                  anchors.verticalCenter: parent.verticalCenter
+                                  anchors.leftMargin: Style.space(7)
+                                  anchors.rightMargin: Style.space(7)
+                                  spacing: Style.space(2)
+
+                                  Text {
+                                    width: parent.width
+                                    text: githubRepositoryDelegate.modelData.name_with_owner
+                                    color: root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                  }
+                                  Text {
+                                    width: parent.width
+                                    text: "Clone"
+                                      + (githubRepositoryDelegate.modelData.fork ? "  •  fork" : "")
+                                      + (githubRepositoryDelegate.modelData.archived ? "  •  archived" : "")
+                                    color: githubRepositoryDelegate.modelData.archived
+                                      ? root.urgent : root.mutedForeground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    elide: Text.ElideRight
+                                  }
+                                }
+
+                                MouseArea {
+                                  anchors.fill: parent
+                                  onClicked: {
+                                    root.repositorySourceIndex = 1
+                                    root.selectedRepositoryIndex = githubRepositoryDelegate.index
+                                  }
+                                  onDoubleClicked: root.activateRepository()
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+
+                      Text {
+                        visible: repositoryEngine.requestPending
+                          && (repositoryEngine.pendingMethod === "list_repositories"
+                              || repositoryEngine.pendingMethod === "clone_repository")
+                        width: parent.width
+                        text: repositoryEngine.pendingMethod === "clone_repository"
+                          ? "Cloning repository into the projects root…"
+                          : "Refreshing local and GitHub repositories…"
+                        color: root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+
+                      Text {
+                        visible: !!repositoryEngine.repositoryCatalog.local_error
+                        width: parent.width
+                        text: "Local discovery warning: "
+                          + repositoryEngine.repositoryCatalog.local_error
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+
+                      Text {
+                        visible: !!repositoryEngine.repositoryCatalog.github_error
+                        width: parent.width
+                        text: "GitHub unavailable: " + repositoryEngine.repositoryCatalog.github_error
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
                       }
                     }
 
-                    Text {
-                      visible: root.repositoryPathCandidates.length > 1
+                    Column {
+                      visible: root.draftStep === "path"
                       width: parent.width
-                      text: root.repositoryCandidateText()
-                      color: root.mutedForeground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      wrapMode: Text.WordWrap
-                    }
+                      spacing: Style.space(7)
 
-                    Text {
-                      text: "Goal"
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      font.bold: true
-                    }
+                      Text {
+                        width: parent.width
+                        text: "Use a repository outside the configured projects root. Tab completes directories through the Rust engine."
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
 
-                    TextField {
-                      id: goalField
-                      width: parent.width
-                      enabled: !engine.requestPending
-                      placeholderText: "Describe a small engineering goal"
-                      foreground: root.foreground
-                      accent: root.accent
+                      TextField {
+                        id: repositoryField
+                        width: parent.width
+                        enabled: !engine.requestPending
+                          || engine.pendingMethod === "complete_repository_path"
+                        placeholderText: "/absolute/path/to/repository"
+                        foreground: root.foreground
+                        accent: root.accent
+                        onTextEdited: root.repositoryPathCandidates = []
 
-                      Keys.onPressed: function(event) {
-                        if (event.key === Qt.Key_Escape) {
-                          root.cancelDraftEntry(); event.accepted = true
-                        } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
-                          repositoryField.forceActiveFocus(); event.accepted = true
-                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                          root.submitDraft(); event.accepted = true
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.returnToRepositoryBrowser(); event.accepted = true
+                          } else if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) {
+                            root.completeRepositoryPath(); event.accepted = true
+                          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            root.acceptManualRepositoryPath(); event.accepted = true
+                          }
                         }
+                      }
+
+                      Text {
+                        visible: root.repositoryPathCandidates.length > 1
+                        width: parent.width
+                        text: root.repositoryCandidateText()
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
                       }
                     }
 
-                    Row {
+                    Column {
+                      visible: root.draftStep === "goal"
+                      width: parent.width
                       spacing: Style.space(8)
 
-                      Button {
-                        text: engine.requestPending ? "Creating…" : "Create draft"
-                        bordered: true
-                        enabled: !engine.requestPending
-                        foreground: root.foreground
-                        accent: root.accent
-                        onClicked: root.submitDraft()
+                      Text {
+                        width: parent.width
+                        text: root.selectedRepositoryLabel + "\n" + root.selectedRepositoryPath
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WrapAnywhere
                       }
 
-                      Button {
-                        text: "Cancel"
+                      TextField {
+                        id: goalField
+                        width: parent.width
                         enabled: !engine.requestPending
+                        placeholderText: "Describe a small engineering goal"
                         foreground: root.foreground
                         accent: root.accent
-                        onClicked: root.cancelDraftEntry()
+
+                        Keys.onPressed: function(event) {
+                          if (event.key === Qt.Key_Escape) {
+                            root.cancelDraftEntry(); event.accepted = true
+                          } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+                            root.returnToRepositoryBrowser(); event.accepted = true
+                          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            root.submitDraft(); event.accepted = true
+                          }
+                        }
+                      }
+
+                      Row {
+                        spacing: Style.space(8)
+
+                        Button {
+                          text: engine.requestPending ? "Creating…" : "Create draft"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.submitDraft()
+                        }
+
+                        Button {
+                          text: "Back"
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.returnToRepositoryBrowser()
+                        }
                       }
                     }
 

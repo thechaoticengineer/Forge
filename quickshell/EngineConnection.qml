@@ -26,10 +26,18 @@ Item {
   property string pendingMethod: ""
   property string requestError: ""
   property int requestSequence: 0
+  property var repositoryCatalog: ({
+    project_roots: [],
+    local: [],
+    local_error: "",
+    github: [],
+    github_error: ""
+  })
 
   signal snapshotChanged()
   signal draftCreated()
   signal repositoryPathCompleted(string replacement, var candidates)
+  signal repositoryCloned(string nameWithOwner, string path)
   signal requestCompleted(string method)
 
   function reconnect() {
@@ -42,10 +50,29 @@ Item {
     Qt.callLater(function() { socket.connected = true })
   }
 
+  function abandonRequest() {
+    requestPending = false
+    pendingRequestId = ""
+    pendingMethod = ""
+    requestError = ""
+    socket.connected = false
+    Qt.callLater(function() { socket.connected = true })
+  }
+
   function createDraft(repository, goal) {
     return sendRequest("create_draft_run", {
       repository: String(repository || ""),
       goal: String(goal || "")
+    })
+  }
+
+  function listRepositories() {
+    return sendRequest("list_repositories", {})
+  }
+
+  function cloneRepository(nameWithOwner) {
+    return sendRequest("clone_repository", {
+      name_with_owner: String(nameWithOwner || "")
     })
   }
 
@@ -145,6 +172,11 @@ Item {
         pendingRequestId = ""
         pendingMethod = ""
         requestError = String(message.message || "The engine rejected the request")
+      } else if (!message.request_id && requestPending) {
+        requestPending = false
+        pendingRequestId = ""
+        pendingMethod = ""
+        requestError = String(message.message || "The engine rejected the request")
       } else {
         lastError = String(message.message || "The engine rejected a request")
       }
@@ -161,6 +193,37 @@ Item {
         repositoryPathCompleted(
           String(message.replacement || ""),
           message.candidates || []
+        )
+        requestCompleted(completedMethod)
+      }
+      return
+    }
+
+    if (message.type === "repository_catalog") {
+      if (message.request_id && message.request_id === pendingRequestId) {
+        var completedMethod = pendingMethod
+        requestPending = false
+        pendingRequestId = ""
+        pendingMethod = ""
+        requestError = ""
+        repositoryCatalog = message.catalog || {
+          project_roots: [], local: [], local_error: "", github: [], github_error: ""
+        }
+        requestCompleted(completedMethod)
+      }
+      return
+    }
+
+    if (message.type === "repository_cloned") {
+      if (message.request_id && message.request_id === pendingRequestId) {
+        var completedMethod = pendingMethod
+        requestPending = false
+        pendingRequestId = ""
+        pendingMethod = ""
+        requestError = ""
+        repositoryCloned(
+          String(message.name_with_owner || ""),
+          String(message.path || "")
         )
         requestCompleted(completedMethod)
       }

@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use orchestrator_core::{
     ipc::default_socket_path,
-    protocol::{ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, ServerMessage},
+    protocol::{
+        ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, RepositoryCatalog,
+        ServerMessage,
+    },
     state::{AgentKind, EngineSnapshot},
 };
 use tokio::{
@@ -42,11 +45,34 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// List local and GitHub repositories or clone a missing repository.
+    Repositories {
+        #[command(subcommand)]
+        command: RepositoryCommand,
+    },
     /// Check whether the engine is responsive.
     Ping,
     /// Show the current authoritative engine snapshot.
     Status {
         /// Print the snapshot as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RepositoryCommand {
+    /// List repositories from configured project roots and GitHub.
+    List {
+        /// Print the catalog as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clone a GitHub repository into the configured projects root.
+    Clone {
+        /// GitHub repository in owner/name form.
+        name_with_owner: String,
+        /// Print the result as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -145,8 +171,149 @@ async fn main() -> Result<()> {
             json,
         } => create_draft(&socket_path, repository, goal, json).await,
         Command::Plan { command } => plan_command(&socket_path, command).await,
+        Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
         Command::Status { json } => status(&socket_path, json).await,
+    }
+}
+
+async fn repository_command(socket_path: &PathBuf, command: RepositoryCommand) -> Result<()> {
+    match command {
+        RepositoryCommand::List { json } => {
+            let catalog = request_repository_catalog(socket_path).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&catalog).context("cannot encode catalog")?
+                );
+            } else {
+                print_repository_catalog(&catalog);
+            }
+        }
+        RepositoryCommand::Clone {
+            name_with_owner,
+            json,
+        } => {
+            let path = request_repository_clone(socket_path, &name_with_owner).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "name_with_owner": name_with_owner,
+                        "path": path,
+                    }))
+                    .context("cannot encode clone result")?
+                );
+            } else {
+                println!("Cloned {name_with_owner} to {path}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn request_repository_catalog(socket_path: &PathBuf) -> Result<RepositoryCatalog> {
+    let request_id = request_id();
+    let request = ClientMessage {
+        version: PROTOCOL_VERSION,
+        request_id: request_id.clone(),
+        request: ClientRequest::ListRepositories,
+    };
+    let stream = connect(socket_path).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    send_request(&mut write_half, &request).await?;
+    let mut reader = BufReader::new(read_half);
+    loop {
+        match read_message(&mut reader, Duration::from_secs(35)).await? {
+            ServerMessage::RepositoryCatalog {
+                request_id: response_id,
+                catalog,
+                ..
+            } if response_id == request_id => return Ok(catalog),
+            ServerMessage::Error {
+                request_id: response_id,
+                code,
+                message,
+                ..
+            } if response_id
+                .as_deref()
+                .is_none_or(|response_id| response_id == request_id) =>
+            {
+                bail!("engine rejected request ({code}): {message}")
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn request_repository_clone(socket_path: &PathBuf, name_with_owner: &str) -> Result<String> {
+    let request_id = request_id();
+    let request = ClientMessage {
+        version: PROTOCOL_VERSION,
+        request_id: request_id.clone(),
+        request: ClientRequest::CloneRepository {
+            name_with_owner: name_with_owner.to_owned(),
+        },
+    };
+    let stream = connect(socket_path).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    send_request(&mut write_half, &request).await?;
+    let mut reader = BufReader::new(read_half);
+    loop {
+        match read_message(&mut reader, Duration::from_mins(16)).await? {
+            ServerMessage::RepositoryCloned {
+                request_id: response_id,
+                path,
+                ..
+            } if response_id == request_id => return Ok(path),
+            ServerMessage::Error {
+                request_id: response_id,
+                code,
+                message,
+                ..
+            } if response_id
+                .as_deref()
+                .is_none_or(|response_id| response_id == request_id) =>
+            {
+                bail!("engine rejected request ({code}): {message}")
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_repository_catalog(catalog: &RepositoryCatalog) {
+    println!("Project roots: {}", catalog.project_roots.join(", "));
+    println!("Local repositories: {}", catalog.local.len());
+    for repository in &catalog.local {
+        println!(
+            "  {}  {}{}",
+            repository
+                .name_with_owner
+                .as_deref()
+                .unwrap_or(&repository.name),
+            repository.path,
+            if repository.dirty { "  dirty" } else { "" }
+        );
+    }
+    println!("GitHub repositories not cloned: {}", catalog.github.len());
+    for repository in &catalog.github {
+        println!(
+            "  {}{}{}",
+            repository.name_with_owner,
+            if repository.fork { "  fork" } else { "" },
+            if repository.archived {
+                "  archived"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(error) = &catalog.github_error {
+        println!("GitHub unavailable: {error}");
+    }
+    if let Some(error) = &catalog.local_error {
+        println!("Local discovery warning: {error}");
     }
 }
 
@@ -289,11 +456,14 @@ async fn send_workflow_request(
                 ..
             } if response_id == request_id => return Ok(snapshot),
             ServerMessage::Error {
-                request_id: Some(response_id),
+                request_id: response_id,
                 code,
                 message,
                 ..
-            } if response_id == request_id => {
+            } if response_id
+                .as_deref()
+                .is_none_or(|response_id| response_id == request_id) =>
+            {
                 bail!("engine rejected request ({code}): {message}")
             }
             _ => {}

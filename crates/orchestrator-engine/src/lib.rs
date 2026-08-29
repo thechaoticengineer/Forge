@@ -1,30 +1,70 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::{ExitStatus, Stdio},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use orchestrator_agents::{PlannerRunner, build_planning_prompt, validate_proposal};
 use orchestrator_core::{
-    protocol::{ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, ServerMessage},
+    protocol::{
+        ClientMessage, ClientRequest, GithubRepository, LocalRepository, MoveDirection,
+        PROTOCOL_VERSION, RepositoryCatalog, ServerMessage,
+    },
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, PlanProposal, PlanStatus,
         PlanSummary, ProposedTask, RunStatus,
     },
 };
-use orchestrator_git::inspect_repository;
+use orchestrator_git::{GitError, discover_repositories_until, inspect_repository};
 use orchestrator_store::{
     DraftRunInput, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput,
     StatePaths, StorageWorker, StoredSnapshot,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
+    process::Command as AsyncCommand,
     sync::watch,
+    time::timeout,
 };
+
+const GITHUB_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_mins(15);
+const LOCAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_DISCOVERY_WORK_BUDGET: Duration = Duration::from_secs(25);
+
+#[derive(Clone, Debug)]
+pub struct RepositorySettings {
+    pub project_roots: Vec<PathBuf>,
+    pub gh_bin: PathBuf,
+}
+
+impl RepositorySettings {
+    /// Uses `~/Projects` as the initial catalog root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `HOME` is missing or is not an absolute path.
+    pub fn discover() -> Result<Self> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .context("HOME is unavailable for the default projects root")?;
+        Ok(Self {
+            project_roots: vec![home.join("Projects")],
+            gh_bin: PathBuf::from("gh"),
+        })
+    }
+}
 
 /// Serves local IPC clients until the process receives an interrupt signal.
 ///
@@ -58,6 +98,21 @@ pub async fn serve_with_state_and_planner(
     state_paths: StatePaths,
     planner: PlannerRunner,
 ) -> Result<()> {
+    let repositories = RepositorySettings::discover()?;
+    serve_with_settings(socket_path, state_paths, planner, repositories).await
+}
+
+/// Serves local IPC clients with explicit state, agent, and repository settings.
+///
+/// # Errors
+///
+/// Returns an error when storage, the socket, or the listener cannot be initialized.
+pub async fn serve_with_settings(
+    socket_path: PathBuf,
+    state_paths: StatePaths,
+    planner: PlannerRunner,
+    repositories: RepositorySettings,
+) -> Result<()> {
     let storage = Arc::new(
         StorageWorker::start(state_paths).context("cannot initialize durable state storage")?,
     );
@@ -75,7 +130,14 @@ pub async fn serve_with_state_and_planner(
     let (state_sender, _state_receiver) = watch::channel(engine_snapshot(stored_snapshot));
     println!("engine listening at {}", socket_path.display());
 
-    let result = run_listener(&listener, state_sender, storage, Arc::new(planner)).await;
+    let result = run_listener(
+        &listener,
+        state_sender,
+        storage,
+        Arc::new(planner),
+        Arc::new(repositories),
+    )
+    .await;
     drop(listener);
     remove_owned_socket(&socket_path)?;
     result
@@ -86,6 +148,7 @@ async fn run_listener(
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
+    repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -98,12 +161,14 @@ async fn run_listener(
                 let client_state = state_sender.clone();
                 let client_storage = Arc::clone(&storage);
                 let client_planner = Arc::clone(&planner);
+                let client_repositories = Arc::clone(&repositories);
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(
                         stream,
                         client_state,
                         client_storage,
                         client_planner,
+                        client_repositories,
                     ).await {
                         eprintln!("IPC client disconnected after error: {error:#}");
                     }
@@ -118,6 +183,7 @@ async fn handle_client(
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
+    repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     let mut state_receiver = state_sender.subscribe();
     let (read_half, mut write_half) = stream.into_split();
@@ -141,6 +207,7 @@ async fn handle_client(
                     &state_sender,
                     &storage,
                     &planner,
+                    &repositories,
                     &mut write_half,
                 ).await?;
             }
@@ -164,14 +231,29 @@ async fn handle_request(
     state_sender: &watch::Sender<EngineSnapshot>,
     storage: &StorageWorker,
     planner: &PlannerRunner,
+    repositories: &RepositorySettings,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    let request: ClientMessage = match serde_json::from_str(line) {
-        Ok(request) => request,
+    let envelope: serde_json::Value = match serde_json::from_str(line) {
+        Ok(envelope) => envelope,
         Err(error) => {
             return send_message(
                 write_half,
                 &ServerMessage::error(None, "invalid_message", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let envelope_request_id = envelope
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let request: ClientMessage = match serde_json::from_value(envelope) {
+        Ok(request) => request,
+        Err(error) => {
+            return send_message(
+                write_half,
+                &ServerMessage::error(envelope_request_id, "invalid_message", error.to_string()),
             )
             .await;
         }
@@ -193,6 +275,32 @@ async fn handle_request(
     }
 
     let response = match request.request {
+        ClientRequest::ListRepositories => {
+            let catalog = list_repositories(repositories).await;
+            ServerMessage::RepositoryCatalog {
+                version: PROTOCOL_VERSION,
+                request_id: request.request_id,
+                catalog,
+            }
+        }
+        ClientRequest::CloneRepository { name_with_owner } => {
+            match clone_github_repository(&name_with_owner, repositories).await {
+                Ok(path) => match path_to_string(&path) {
+                    Ok(path) => ServerMessage::RepositoryCloned {
+                        version: PROTOCOL_VERSION,
+                        request_id: request.request_id,
+                        name_with_owner,
+                        path,
+                    },
+                    Err(error) => {
+                        ServerMessage::error(Some(request.request_id), error.code, error.message)
+                    }
+                },
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
         ClientRequest::CompleteRepositoryPath { path } => {
             match complete_repository_path(path).await {
                 Ok(completion) => ServerMessage::PathCompletion {
@@ -311,6 +419,622 @@ impl RequestFailure {
             message: format!("{context}: {error}"),
         }
     }
+}
+
+async fn list_repositories(settings: &RepositorySettings) -> RepositoryCatalog {
+    let roots = settings.project_roots.clone();
+    let local_task = async move {
+        timeout(
+            LOCAL_DISCOVERY_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                discover_repositories_until(&roots, Instant::now() + LOCAL_DISCOVERY_WORK_BUDGET)
+            }),
+        )
+        .await
+    };
+    let github_task = list_github_repositories(settings);
+    let (local_result, github_result) = tokio::join!(local_task, github_task);
+
+    let (discovered, local_error) = match local_result {
+        Ok(Ok(report)) => {
+            let warning = match (report.truncated, report.skipped_entries) {
+                (false, 0) => None,
+                (truncated, skipped) => Some(format!(
+                    "local discovery is incomplete{}{}",
+                    if truncated {
+                        ": directory scan limit reached"
+                    } else {
+                        ""
+                    },
+                    if skipped > 0 {
+                        format!("; {skipped} entries could not be inspected")
+                    } else {
+                        String::new()
+                    }
+                )),
+            };
+            (report.repositories, warning)
+        }
+        Ok(Err(error)) => (
+            Vec::new(),
+            Some(format!("local repository discovery task failed: {error}")),
+        ),
+        Err(_) => (
+            Vec::new(),
+            Some("local repository discovery timed out after 30 seconds".to_owned()),
+        ),
+    };
+    let local_names = discovered
+        .iter()
+        .filter_map(|repository| repository.github_name_with_owner.as_ref())
+        .map(|name| name.to_lowercase())
+        .collect::<HashSet<_>>();
+    let local = discovered
+        .into_iter()
+        .filter_map(|repository| {
+            let path = repository.state.root.to_str()?.to_owned();
+            let name = repository
+                .state
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())?
+                .to_owned();
+            Some(LocalRepository {
+                name,
+                path,
+                name_with_owner: repository.github_name_with_owner,
+                branch: repository.state.branch,
+                dirty: repository.state.dirty,
+            })
+        })
+        .collect();
+    let (github, github_error) = match github_result {
+        Ok(repositories) => (
+            repositories
+                .into_iter()
+                .filter(|repository| {
+                    !local_names.contains(&repository.name_with_owner.to_lowercase())
+                })
+                .collect(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(error.message)),
+    };
+
+    RepositoryCatalog {
+        project_roots: settings
+            .project_roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+        local,
+        local_error,
+        github,
+        github_error,
+    }
+}
+
+async fn list_github_repositories(
+    settings: &RepositorySettings,
+) -> Result<Vec<GithubRepository>, RequestFailure> {
+    let mut command = AsyncCommand::new(&settings.gh_bin);
+    command
+        .args([
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            "-f",
+            "per_page=100",
+            "-f",
+            "affiliation=owner,collaborator,organization_member",
+            "-f",
+            "sort=pushed",
+            "-f",
+            "direction=desc",
+            "/user/repos",
+        ])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = run_bounded_command(command, GITHUB_LIST_TIMEOUT, 8 * 1024 * 1024, 1024 * 1024)
+        .await
+        .map_err(|error| RequestFailure {
+            code: "github_unavailable",
+            message: format!("GitHub repository discovery failed: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(RequestFailure {
+            code: "github_unavailable",
+            message: format!(
+                "GitHub CLI could not list repositories: {}",
+                bounded_diagnostic(&output.stderr)
+            ),
+        });
+    }
+    if output.stdout_truncated {
+        return Err(RequestFailure {
+            code: "github_response_too_large",
+            message: "GitHub returned more than 8 MiB of repository metadata".to_owned(),
+        });
+    }
+    parse_github_repositories(&output.stdout)
+}
+
+fn parse_github_repositories(output: &[u8]) -> Result<Vec<GithubRepository>, RequestFailure> {
+    let pages: Vec<Vec<serde_json::Value>> =
+        serde_json::from_slice(output).map_err(|error| RequestFailure {
+            code: "invalid_github_response",
+            message: format!("GitHub returned invalid repository metadata: {error}"),
+        })?;
+    let mut repositories = Vec::new();
+    let mut seen = HashSet::new();
+    for repository in pages.into_iter().flatten() {
+        let Some(name_with_owner) = repository.get("full_name").and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        if !valid_github_name_with_owner(name_with_owner)
+            || !seen.insert(name_with_owner.to_lowercase())
+        {
+            continue;
+        }
+        let Some(name) = name_with_owner.split_once('/').map(|(_, name)| name) else {
+            continue;
+        };
+        repositories.push(GithubRepository {
+            name: name.to_owned(),
+            name_with_owner: name_with_owner.to_owned(),
+            url: repository
+                .get("html_url")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            archived: repository
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            fork: repository
+                .get("fork")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            pushed_at: repository
+                .get("pushed_at")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+        });
+    }
+    Ok(repositories)
+}
+
+async fn clone_github_repository(
+    name_with_owner: &str,
+    settings: &RepositorySettings,
+) -> Result<PathBuf, RequestFailure> {
+    if !valid_github_name_with_owner(name_with_owner) {
+        return Err(RequestFailure {
+            code: "invalid_github_repository",
+            message: "GitHub repository must use the owner/name form".to_owned(),
+        });
+    }
+
+    let existing = find_local_github_repository(name_with_owner, settings).await?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+
+    let Some(project_root) = settings.project_roots.first().cloned() else {
+        return Err(RequestFailure {
+            code: "projects_root_unavailable",
+            message: "no projects root is configured for cloning".to_owned(),
+        });
+    };
+    let (owner, name) = name_with_owner
+        .split_once('/')
+        .expect("validated GitHub repository should contain a slash");
+    let owner = owner.to_owned();
+    let name = name.to_owned();
+    let destination =
+        tokio::task::spawn_blocking(move || clone_destination(&project_root, &owner, &name))
+            .await
+            .map_err(|error| RequestFailure {
+                code: "clone_destination_failed",
+                message: format!("clone destination task failed: {error}"),
+            })??;
+    let cleanup_root = settings
+        .project_roots
+        .first()
+        .expect("clone requires a configured projects root")
+        .clone();
+
+    let mut command = AsyncCommand::new(&settings.gh_bin);
+    command
+        .args(["repo", "clone", name_with_owner])
+        .arg(&destination)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output =
+        match run_bounded_command(command, GITHUB_CLONE_TIMEOUT, 1024 * 1024, 1024 * 1024).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(failed_clone(
+                    format!("GitHub CLI clone failed: {error}"),
+                    destination,
+                    cleanup_root,
+                )
+                .await);
+            }
+        };
+    if !output.status.success() {
+        return Err(failed_clone(
+            format!(
+                "GitHub CLI could not clone {name_with_owner}: {}",
+                bounded_diagnostic(&output.stderr)
+            ),
+            destination,
+            cleanup_root,
+        )
+        .await);
+    }
+
+    let inspection_destination = destination.clone();
+    let inspection_root = cleanup_root.clone();
+    let inspection = tokio::task::spawn_blocking(move || {
+        inspect_cloned_repository(&inspection_destination, &inspection_root)
+    })
+    .await;
+    match inspection {
+        Ok(Ok(repository)) => Ok(repository),
+        Ok(Err(error)) => Err(failed_clone(error, destination, cleanup_root).await),
+        Err(error) => Err(failed_clone(
+            format!("cloned repository inspection task failed: {error}"),
+            destination,
+            cleanup_root,
+        )
+        .await),
+    }
+}
+
+async fn find_local_github_repository(
+    name_with_owner: &str,
+    settings: &RepositorySettings,
+) -> Result<Option<PathBuf>, RequestFailure> {
+    let roots = settings.project_roots.clone();
+    let requested = name_with_owner.to_owned();
+    timeout(
+        LOCAL_DISCOVERY_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let report =
+                discover_repositories_until(&roots, Instant::now() + LOCAL_DISCOVERY_WORK_BUDGET);
+            if report.truncated {
+                return Err("local repository discovery reached its safety limit".to_owned());
+            }
+            Ok(report.repositories.into_iter().find_map(|repository| {
+                repository
+                    .github_name_with_owner
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&requested))
+                    .then_some(repository.state.root)
+            }))
+        }),
+    )
+    .await
+    .map_err(|_| RequestFailure {
+        code: "repository_discovery_timeout",
+        message: "local repository discovery timed out before cloning".to_owned(),
+    })?
+    .map_err(|error| RequestFailure {
+        code: "repository_discovery_failed",
+        message: format!("local repository discovery failed: {error}"),
+    })?
+    .map_err(|message| RequestFailure {
+        code: "repository_discovery_failed",
+        message,
+    })
+}
+
+async fn failed_clone(
+    message: String,
+    destination: PathBuf,
+    project_root: PathBuf,
+) -> RequestFailure {
+    let cleanup =
+        tokio::task::spawn_blocking(move || remove_failed_clone(&destination, &project_root)).await;
+    let message = match cleanup {
+        Ok(Ok(())) => message,
+        Ok(Err(error)) => format!("{message}; failed clone cleanup requires attention: {error}"),
+        Err(error) => format!("{message}; failed clone cleanup task failed: {error}"),
+    };
+    RequestFailure {
+        code: "clone_failed",
+        message,
+    }
+}
+
+fn remove_failed_clone(destination: &Path, project_root: &Path) -> Result<(), String> {
+    let project_root = fs::canonicalize(project_root)
+        .map_err(|error| format!("cannot resolve projects root: {error}"))?;
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", destination.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "reserved destination became a symlink: {}",
+            destination.display()
+        ));
+    }
+    let canonical = fs::canonicalize(destination)
+        .map_err(|error| format!("cannot resolve {}: {error}", destination.display()))?;
+    if canonical == project_root || !canonical.starts_with(&project_root) {
+        return Err(format!(
+            "refusing to clean a path outside the projects root: {}",
+            canonical.display()
+        ));
+    }
+    fs::remove_dir_all(&canonical)
+        .map_err(|error| format!("cannot remove {}: {error}", canonical.display()))
+}
+
+fn inspect_cloned_repository(destination: &Path, project_root: &Path) -> Result<PathBuf, String> {
+    let project_root = fs::canonicalize(project_root)
+        .map_err(|error| format!("cannot resolve projects root after cloning: {error}"))?;
+    let destination = fs::canonicalize(destination)
+        .map_err(|error| format!("cannot resolve cloned repository: {error}"))?;
+    if !destination.starts_with(&project_root) {
+        return Err(format!(
+            "cloned repository resolved outside the configured projects root: {}",
+            destination.display()
+        ));
+    }
+    match inspect_repository(&destination) {
+        Ok(state) => Ok(state.root),
+        Err(GitError::MissingHead(_)) => Ok(destination),
+        Err(error) => Err(format!("cloned repository is invalid: {error}")),
+    }
+}
+
+fn clone_destination(
+    project_root: &Path,
+    owner: &str,
+    name: &str,
+) -> Result<PathBuf, RequestFailure> {
+    fs::create_dir_all(project_root).map_err(|error| RequestFailure {
+        code: "projects_root_unavailable",
+        message: format!("cannot create {}: {error}", project_root.display()),
+    })?;
+    let project_root = fs::canonicalize(project_root).map_err(|error| RequestFailure {
+        code: "projects_root_unavailable",
+        message: format!("cannot resolve {}: {error}", project_root.display()),
+    })?;
+    let simple = project_root.join(name);
+    match fs::create_dir(&simple) {
+        Ok(()) => return Ok(simple),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(RequestFailure {
+                code: "clone_destination_failed",
+                message: format!("cannot reserve {}: {error}", simple.display()),
+            });
+        }
+    }
+    let owner_directory = project_root.join(owner);
+    match fs::symlink_metadata(&owner_directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(RequestFailure {
+                code: "clone_destination_exists",
+                message: format!(
+                    "owner destination is not a regular directory: {}",
+                    owner_directory.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(&owner_directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata =
+                        fs::symlink_metadata(&owner_directory).map_err(|error| RequestFailure {
+                            code: "clone_destination_failed",
+                            message: format!(
+                                "cannot inspect {} after a clone race: {error}",
+                                owner_directory.display()
+                            ),
+                        })?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(RequestFailure {
+                            code: "clone_destination_exists",
+                            message: format!(
+                                "owner destination is not a regular directory: {}",
+                                owner_directory.display()
+                            ),
+                        });
+                    }
+                }
+                Err(error) => {
+                    return Err(RequestFailure {
+                        code: "clone_destination_failed",
+                        message: format!("cannot create {}: {error}", owner_directory.display()),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(RequestFailure {
+                code: "clone_destination_failed",
+                message: format!("cannot inspect {}: {error}", owner_directory.display()),
+            });
+        }
+    }
+    let namespaced = owner_directory.join(name);
+    if let Err(error) = fs::create_dir(&namespaced) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(RequestFailure {
+                code: "clone_destination_failed",
+                message: format!("cannot reserve {}: {error}", namespaced.display()),
+            });
+        }
+        return Err(RequestFailure {
+            code: "clone_destination_exists",
+            message: format!(
+                "both {} and {} already exist; choose or move the intended repository manually",
+                simple.display(),
+                namespaced.display()
+            ),
+        });
+    }
+    Ok(namespaced)
+}
+
+fn valid_github_name_with_owner(value: &str) -> bool {
+    let Some((owner, name)) = value.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && !name.contains('/')
+        && owner != "."
+        && owner != ".."
+        && name != "."
+        && name != ".."
+        && !name.eq_ignore_ascii_case(".git")
+        && owner
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && owner
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|character| character != '-')
+        && owner
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn bounded_diagnostic(bytes: &[u8]) -> String {
+    const LIMIT: usize = 4_096;
+    let start = bytes.len().saturating_sub(LIMIT);
+    let diagnostic = String::from_utf8_lossy(&bytes[start..]).trim().to_owned();
+    if diagnostic.is_empty() {
+        "no diagnostic output".to_owned()
+    } else {
+        diagnostic
+    }
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+}
+
+async fn run_bounded_command(
+    mut command: AsyncCommand,
+    duration: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<BoundedCommandOutput, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start process: {error}"))?;
+    let process_group = child.id().and_then(|id| i32::try_from(id).ok());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "process stdout is unavailable".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "process stderr is unavailable".to_owned())?;
+    let mut stdout_task = tokio::spawn(read_bounded_bytes(stdout, stdout_limit));
+    let mut stderr_task = tokio::spawn(read_bounded_bytes(stderr, stderr_limit));
+    let completion = async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("cannot wait for process: {error}"))?;
+        let stdout = (&mut stdout_task)
+            .await
+            .map_err(|error| format!("cannot join stdout reader: {error}"))?
+            .map_err(|error| format!("cannot read process stdout: {error}"))?;
+        let stderr = (&mut stderr_task)
+            .await
+            .map_err(|error| format!("cannot join stderr reader: {error}"))?
+            .map_err(|error| format!("cannot read process stderr: {error}"))?;
+        Ok::<_, String>(BoundedCommandOutput {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+        })
+    };
+
+    let Ok(output) = timeout(duration, completion).await else {
+        if process_group
+            .map(Pid::from_raw)
+            .is_none_or(|group| killpg(group, Signal::SIGKILL).is_err())
+        {
+            let _ = child.kill().await;
+        }
+        let _ = child.wait().await;
+        stdout_task.abort();
+        stderr_task.abort();
+        return Err(format!(
+            "process timed out after {} seconds",
+            duration.as_secs()
+        ));
+    };
+    output
+}
+
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_bytes<R>(mut reader: R, maximum: usize) -> std::io::Result<BoundedBytes>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = maximum.saturating_sub(bytes.len());
+        let retained = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(BoundedBytes { bytes, truncated })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -982,6 +1706,231 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_deduplicates_paginated_github_repositories() {
+        let output = br#"[[{"full_name":"owner/active","html_url":"https://github.com/owner/active","archived":false,"fork":false,"pushed_at":"2026-08-29T10:00:00Z"}],[{"full_name":"owner/active","html_url":"https://github.com/owner/active"},{"full_name":"team/archive","html_url":"https://github.com/team/archive","archived":true,"fork":true}]]"#;
+
+        let repositories = parse_github_repositories(output).expect("GitHub metadata should parse");
+
+        assert_eq!(repositories.len(), 2);
+        assert_eq!(repositories[0].name_with_owner, "owner/active");
+        assert!(repositories[1].archived);
+        assert!(repositories[1].fork);
+    }
+
+    #[test]
+    fn clone_destination_uses_owner_only_for_a_name_collision() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let projects = temporary.path().join("Projects");
+
+        let simple = clone_destination(&projects, "owner", "project")
+            .expect("simple destination should be selected");
+        assert_eq!(simple, projects.join("project"));
+        assert!(simple.is_dir());
+
+        let namespaced = clone_destination(&projects, "owner", "project")
+            .expect("namespaced destination should be selected");
+        assert_eq!(namespaced, projects.join("owner").join("project"));
+        assert!(namespaced.is_dir());
+
+        let error = clone_destination(&projects, "owner", "project")
+            .expect_err("both reserved destinations should be refused");
+        assert_eq!(error.code, "clone_destination_exists");
+    }
+
+    #[test]
+    fn rejects_unsafe_github_repository_names() {
+        for value in [
+            "owner/project",
+            "the-chaos/project.rs",
+            "owner/a_b",
+            "owner/.github",
+        ] {
+            assert!(valid_github_name_with_owner(value));
+        }
+        for value in [
+            "project",
+            "../project",
+            "-owner/project",
+            "owner-/project",
+            "owner/-project",
+            "owner/.git",
+            "owner/../project",
+            "owner/",
+        ] {
+            assert!(!valid_github_name_with_owner(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_process_output_while_draining_the_child() {
+        let mut command = AsyncCommand::new("/bin/sh");
+        command.args(["-c", "printf 'abcdefgh'; printf 'diagnostic' >&2"]);
+
+        let output = run_bounded_command(command, Duration::from_secs(2), 4, 5)
+            .await
+            .expect("fixture process should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"abcd");
+        assert_eq!(output.stderr, b"diagn");
+        assert!(output.stdout_truncated);
+    }
+
+    #[tokio::test]
+    async fn catalog_merges_local_and_github_identities_case_insensitively() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let projects = temporary.path().join("Projects");
+        let local = projects.join("Forge");
+        fs::create_dir_all(&local).expect("local repository directory should exist");
+        initialize_repository_at(&local);
+        git(
+            &local,
+            &["remote", "add", "origin", "git@github.com:Owner/Forge.git"],
+        );
+        let gh = temporary.path().join("gh");
+        fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s' '[[{\"full_name\":\"owner/forge\",\"html_url\":\"https://github.com/owner/forge\"},{\"full_name\":\"owner/remote\",\"html_url\":\"https://github.com/owner/remote\"}]]'\n",
+        )
+        .expect("fake GitHub CLI should be written");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))
+            .expect("fake GitHub CLI should be executable");
+
+        let catalog = list_repositories(&RepositorySettings {
+            project_roots: vec![projects],
+            gh_bin: gh,
+        })
+        .await;
+
+        assert_eq!(catalog.local.len(), 1);
+        assert_eq!(catalog.github.len(), 1);
+        assert_eq!(catalog.github[0].name_with_owner, "owner/remote");
+        assert_eq!(catalog.local_error, None);
+        assert_eq!(catalog.github_error, None);
+    }
+
+    #[tokio::test]
+    async fn clones_with_an_injected_github_cli_and_reuses_the_local_identity() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let source = temporary.path().join("source");
+        let projects = temporary.path().join("Projects");
+        fs::create_dir(&source).expect("source directory should exist");
+        initialize_repository_at(&source);
+        let gh = temporary.path().join("gh");
+        fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\ngit clone --quiet '{}' \"$4\"\ngit -C \"$4\" remote set-url origin git@github.com:owner/project.git\n",
+                source.display()
+            ),
+        )
+        .expect("fake GitHub CLI should be written");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))
+            .expect("fake GitHub CLI should be executable");
+        let settings = RepositorySettings {
+            project_roots: vec![projects.clone()],
+            gh_bin: gh,
+        };
+
+        let cloned = clone_github_repository("owner/project", &settings)
+            .await
+            .expect("repository should clone");
+        let reused = clone_github_repository("OWNER/PROJECT", &settings)
+            .await
+            .expect("existing identity should be reused");
+
+        assert_eq!(cloned, projects.join("project"));
+        assert_eq!(reused, cloned);
+    }
+
+    #[tokio::test]
+    async fn failed_clone_removes_its_reserved_destination() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let projects = temporary.path().join("Projects");
+        let gh = temporary.path().join("gh");
+        fs::write(&gh, "#!/bin/sh\nprintf 'network failed' >&2\nexit 2\n")
+            .expect("fake GitHub CLI should be written");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))
+            .expect("fake GitHub CLI should be executable");
+        let settings = RepositorySettings {
+            project_roots: vec![projects.clone()],
+            gh_bin: gh,
+        };
+
+        let failure = clone_github_repository("owner/project", &settings)
+            .await
+            .expect_err("clone should fail");
+
+        assert_eq!(failure.code, "clone_failed");
+        assert!(!projects.join("project").exists());
+        assert_eq!(
+            clone_destination(&projects, "owner", "project")
+                .expect("simple destination should be reusable"),
+            projects.join("project")
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_a_successfully_cloned_empty_repository() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let projects = temporary.path().join("Projects");
+        let gh = temporary.path().join("gh");
+        fs::write(
+            &gh,
+            "#!/bin/sh\ngit init --quiet \"$4\"\ngit -C \"$4\" remote add origin git@github.com:owner/empty.git\n",
+        )
+        .expect("fake GitHub CLI should be written");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))
+            .expect("fake GitHub CLI should be executable");
+        let settings = RepositorySettings {
+            project_roots: vec![projects.clone()],
+            gh_bin: gh,
+        };
+
+        let cloned = clone_github_repository("owner/empty", &settings)
+            .await
+            .expect("empty repository clone should be preserved");
+
+        assert_eq!(cloned, projects.join("empty"));
+        assert!(cloned.join(".git").is_dir());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_command_process_group() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let marker = temporary.path().join("orphaned");
+        let mut command = AsyncCommand::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("(sleep 1; touch '{}') & exit 0", marker.display()),
+        ]);
+
+        let failure = run_bounded_command(command, Duration::from_millis(50), 1024, 1024)
+            .await
+            .expect_err("command should time out");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        assert!(failure.contains("timed out"));
+        assert!(!marker.exists(), "grandchild should have been killed");
+    }
+
+    #[test]
+    fn clone_destination_does_not_follow_a_dangling_name_symlink() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let projects = temporary.path().join("Projects");
+        fs::create_dir(&projects).expect("projects root should exist");
+        std::os::unix::fs::symlink(temporary.path().join("outside"), projects.join("project"))
+            .expect("dangling symlink should be created");
+
+        let destination = clone_destination(&projects, "owner", "project")
+            .expect("owner destination should be used");
+
+        assert_eq!(destination, projects.join("owner").join("project"));
+        assert!(destination.is_dir());
+        assert!(!temporary.path().join("outside").exists());
+    }
+
+    #[test]
     fn rejects_relative_repository_path_completion() {
         let error = complete_repository_path_blocking("Projects/Fo")
             .expect_err("relative path completion should fail");
@@ -1225,12 +2174,16 @@ mod tests {
 
     fn initialized_repository() -> TempDir {
         let directory = TempDir::new().expect("repository directory should exist");
-        git(directory.path(), &["init", "--quiet"]);
-        fs::write(directory.path().join("README.md"), "test")
-            .expect("tracked file should be created");
-        git(directory.path(), &["add", "README.md"]);
+        initialize_repository_at(directory.path());
+        directory
+    }
+
+    fn initialize_repository_at(directory: &Path) {
+        git(directory, &["init", "--quiet"]);
+        fs::write(directory.join("README.md"), "test").expect("tracked file should be created");
+        git(directory, &["add", "README.md"]);
         git(
-            directory.path(),
+            directory,
             &[
                 "-c",
                 "user.name=Test User",
@@ -1242,7 +2195,6 @@ mod tests {
                 "test: initialize",
             ],
         );
-        directory
     }
 
     fn git(repository: &Path, arguments: &[&str]) {

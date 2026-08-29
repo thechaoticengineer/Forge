@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** The foundation and planning slice are implemented. The repository contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, constrained Codex and Claude Code planner adapters, a CLI, and reconnecting Omarchy bar-widget and panel entry points. The panel supports directional keyboard focus with arrow keys or `h`/`j`/`k`/`l`, engine-backed repository path completion with `Tab`, durable draft creation, structured plan generation, task editing and reordering, and plan approval or rejection. Isolated implementation, deterministic verification, independent review, and final change approval remain planned.
+> **Project status:** The foundation and planning slice are implemented. The repository contains a Rust engine, shared versioned IPC types, SQLite-backed run state, bounded local Git repository discovery, authenticated GitHub CLI discovery and explicit cloning, constrained Codex and Claude Code planner adapters, a CLI, and reconnecting Omarchy bar-widget and panel entry points. The panel supports a keyboard-driven Local/GitHub repository browser with shared search and manual-path fallback, durable draft creation, structured plan generation, task editing and reordering, and plan approval or rejection. Isolated implementation, deterministic verification, independent review, and final change approval remain planned.
 >
 > **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
@@ -170,7 +170,7 @@ The project should not fork built-in QML merely to copy its appearance. Compatib
 
 The intended end-to-end workflow is:
 
-1. The user opens a local Git repository.
+1. The user opens a local Git repository or explicitly clones a selected GitHub repository.
 2. The user describes a goal in natural language.
 3. An agent analyzes the repository and proposes a plan.
 4. The plan is shown as explicit tasks with acceptance criteria.
@@ -230,7 +230,9 @@ Destructive or consequential actions must not rely on single ambiguous keystroke
 
 The implemented planning panel already provides two explicit focus areas: the section list and the selected section's content. `Right` or `l` enters the content, while `Left` or `h` returns to the section list. `Up`/`Down` and `j`/`k` move within the focused area, and `Enter` opens or activates the focused target. Text fields retain normal character input.
 
-In the repository field, `Tab` requests directory completion from the Rust engine. A unique directory or shared prefix is inserted, and multiple matches are shown beneath the field. `Enter` then advances to the goal. This filesystem operation crosses the same structured local IPC boundary as the rest of the workflow; QML does not enumerate directories inside `omarchy-shell`. A richer keyboard-driven repository chooser remains planned.
+The repository chooser presents two searchable areas: local Git worktrees discovered below configured project roots and accessible GitHub repositories that are not already local. The initial project root is `~/Projects`; repeated `--projects-root /absolute/path` engine options can replace it. Local scanning is bounded and GitHub discovery uses the developer's existing authenticated `gh` CLI. `h`/`l` or Left/Right switches areas, `j`/`k` or Up/Down selects a repository, `/` focuses shared search, and `Enter` opens the local repository or explicitly clones the selected GitHub repository.
+
+Clones use `<projects-root>/<repository>` by default and fall back to `<projects-root>/<owner>/<repository>` on a name collision. The engine refuses to overwrite either destination. Manual absolute-path entry remains available with `p`; there, `Tab` requests directory completion from the Rust engine. All discovery and clone operations cross the structured local IPC boundary; QML does not enumerate the filesystem or launch Git and GitHub processes inside `omarchy-shell`. See [ADR-0005](docs/adr/0005-browse-local-and-github-repositories.md).
 
 ## Architecture Boundaries
 
@@ -389,7 +391,7 @@ The first milestone is a complete vertical slice that includes both the Rust eng
 
 1. Install or enable the Quickshell plugin on Omarchy.
 2. Summon the orchestrator from the Omarchy environment.
-3. Open a local Git repository through the panel.
+3. Open a local Git repository or clone one from GitHub through the panel.
 4. Describe a small software change.
 5. Inspect and approve the proposed plan.
 6. Watch Codex or Claude Code implement it in an isolated worktree.

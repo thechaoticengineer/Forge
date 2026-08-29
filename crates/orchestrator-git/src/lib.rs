@@ -1,11 +1,13 @@
-//! Read-only Git repository inspection.
+//! Local Git repository discovery and inspection.
 
 use std::{
+    collections::{HashSet, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     string::FromUtf8Error,
+    time::Instant,
 };
 
 use thiserror::Error;
@@ -17,6 +19,184 @@ pub struct RepositoryState {
     pub head_revision: String,
     pub branch: Option<String>,
     pub dirty: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredRepository {
+    pub state: RepositoryState,
+    pub origin_url: Option<String>,
+    pub github_name_with_owner: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryDiscovery {
+    pub repositories: Vec<DiscoveredRepository>,
+    pub truncated: bool,
+    pub skipped_entries: usize,
+}
+
+const MAX_DISCOVERY_DEPTH: usize = 4;
+const MAX_DISCOVERY_DIRECTORIES: usize = 4_000;
+
+/// Finds Git worktrees below the configured project roots without following
+/// symbolic links or descending into repositories and common build caches.
+#[must_use]
+pub fn discover_repositories(roots: &[PathBuf]) -> Vec<DiscoveredRepository> {
+    discover_repositories_with_report(roots).repositories
+}
+
+/// Finds repositories and reports whether safety bounds or filesystem errors
+/// made the result incomplete.
+#[must_use]
+pub fn discover_repositories_with_report(roots: &[PathBuf]) -> RepositoryDiscovery {
+    discover_repositories_inner(roots, None)
+}
+
+/// Finds repositories until a monotonic deadline, returning partial results
+/// with `truncated` set when the deadline is reached.
+#[must_use]
+pub fn discover_repositories_until(roots: &[PathBuf], deadline: Instant) -> RepositoryDiscovery {
+    discover_repositories_inner(roots, Some(deadline))
+}
+
+fn discover_repositories_inner(
+    roots: &[PathBuf],
+    deadline: Option<Instant>,
+) -> RepositoryDiscovery {
+    let mut repositories = Vec::new();
+    let mut seen = HashSet::new();
+    let mut visited = 0_usize;
+    let mut truncated = false;
+    let mut skipped_entries = 0_usize;
+
+    'roots: for root in roots {
+        let root = match fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                skipped_entries += 1;
+                continue;
+            }
+        };
+        let mut queue = VecDeque::from([(root, 0_usize)]);
+        while let Some((directory, depth)) = queue.pop_front() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                truncated = true;
+                break 'roots;
+            }
+            visited += 1;
+            if visited > MAX_DISCOVERY_DIRECTORIES {
+                truncated = true;
+                break 'roots;
+            }
+
+            if directory.join(".git").exists() {
+                match inspect_repository(&directory) {
+                    Ok(state) if seen.insert(state.root.clone()) => {
+                        let origin_url = repository_origin(&state.root);
+                        let github_name_with_owner =
+                            origin_url.as_deref().and_then(github_name_with_owner);
+                        repositories.push(DiscoveredRepository {
+                            state,
+                            origin_url,
+                            github_name_with_owner,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => skipped_entries += 1,
+                }
+                continue;
+            }
+
+            if depth >= MAX_DISCOVERY_DEPTH {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&directory) else {
+                skipped_entries += 1;
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    skipped_entries += 1;
+                    continue;
+                };
+                let Ok(file_type) = entry.file_type() else {
+                    skipped_entries += 1;
+                    continue;
+                };
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if name.starts_with('.') {
+                    if name != ".git" && path.join(".git").exists() {
+                        queue.push_back((path, depth + 1));
+                    }
+                    continue;
+                }
+                if !should_skip_directory(name) {
+                    queue.push_back((path, depth + 1));
+                }
+            }
+        }
+    }
+
+    repositories.sort_by(|left, right| {
+        left.state
+            .root
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&right.state.root.to_string_lossy().to_lowercase())
+    });
+    RepositoryDiscovery {
+        repositories,
+        truncated,
+        skipped_entries,
+    }
+}
+
+/// Extracts `owner/name` from common GitHub HTTPS and SSH remote forms.
+#[must_use]
+pub fn github_name_with_owner(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = trimmed.strip_prefix("ssh://git@github.com/") {
+        path
+    } else if let Some(path) = trimmed.strip_prefix("https://github.com/") {
+        path
+    } else {
+        trimmed.strip_prefix("http://github.com/")?
+    };
+    let mut components = path.split('/');
+    let owner = components.next()?;
+    let name = components.next()?;
+    if owner.is_empty() || name.is_empty() || components.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+fn repository_origin(repository: &Path) -> Option<String> {
+    let output = run_git(
+        repository,
+        &["config", "--get", "remote.origin.url"],
+        "reading origin remote",
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let origin = text_output(output, "reading origin remote").ok()?;
+    (!origin.is_empty()).then_some(origin)
+}
+
+fn should_skip_directory(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules" | "target" | "vendor" | "dist" | "build" | "__pycache__"
+    )
 }
 
 #[derive(Debug, Error)]
@@ -290,14 +470,91 @@ mod tests {
         assert!(matches!(error, GitError::RelativePath(_)));
     }
 
+    #[test]
+    fn discovers_nested_repositories_and_github_origins() {
+        let projects = TempDir::new().expect("projects root should exist");
+        let first = projects.path().join("Forge");
+        let second = projects.path().join("team").join("website");
+        let hidden = projects.path().join(".github");
+        fs::create_dir_all(&first).expect("first repository should be created");
+        fs::create_dir_all(&second).expect("second repository should be created");
+        fs::create_dir_all(&hidden).expect("hidden repository should be created");
+        initialize_repository(&first);
+        initialize_repository(&second);
+        initialize_repository(&hidden);
+        git(
+            &first,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:thechaoticengineer/Forge.git",
+            ],
+        );
+
+        let repositories = discover_repositories(&[projects.path().to_path_buf()]);
+
+        assert_eq!(repositories.len(), 3);
+        let forge = repositories
+            .iter()
+            .find(|repository| repository.state.root == first)
+            .expect("Forge should be discovered");
+        assert_eq!(
+            forge.github_name_with_owner.as_deref(),
+            Some("thechaoticengineer/Forge")
+        );
+        assert!(
+            repositories
+                .iter()
+                .any(|repository| repository.state.root == hidden)
+        );
+    }
+
+    #[test]
+    fn parses_supported_github_remote_forms() {
+        for remote in [
+            "git@github.com:owner/project.git",
+            "ssh://git@github.com/owner/project.git",
+            "https://github.com/owner/project",
+            "http://github.com/owner/project/",
+        ] {
+            assert_eq!(
+                github_name_with_owner(remote).as_deref(),
+                Some("owner/project")
+            );
+        }
+        assert_eq!(
+            github_name_with_owner("https://gitlab.com/owner/project"),
+            None
+        );
+        assert_eq!(github_name_with_owner("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn returns_partial_discovery_when_the_deadline_is_reached() {
+        let projects = TempDir::new().expect("projects root should exist");
+        let repository = projects.path().join("project");
+        fs::create_dir(&repository).expect("repository directory should exist");
+        initialize_repository(&repository);
+
+        let report = discover_repositories_until(&[projects.path().to_path_buf()], Instant::now());
+
+        assert!(report.truncated);
+        assert!(report.repositories.is_empty());
+    }
+
     fn initialized_repository() -> TempDir {
         let directory = TempDir::new().expect("temporary directory should exist");
-        git(directory.path(), &["init", "--quiet"]);
-        fs::write(directory.path().join("README.md"), "test")
-            .expect("tracked file should be created");
-        git(directory.path(), &["add", "README.md"]);
+        initialize_repository(directory.path());
+        directory
+    }
+
+    fn initialize_repository(directory: &Path) {
+        git(directory, &["init", "--quiet"]);
+        fs::write(directory.join("README.md"), "test").expect("tracked file should be created");
+        git(directory, &["add", "README.md"]);
         git(
-            directory.path(),
+            directory,
             &[
                 "-c",
                 "user.name=Test User",
@@ -309,7 +566,6 @@ mod tests {
                 "test: initialize",
             ],
         );
-        directory
     }
 
     fn git(repository: &Path, arguments: &[&str]) {

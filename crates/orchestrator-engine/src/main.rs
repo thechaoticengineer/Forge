@@ -21,6 +21,12 @@ struct Arguments {
     /// Override the Claude Code CLI executable.
     #[arg(long, default_value = "claude")]
     claude_bin: PathBuf,
+    /// Project root to scan and use for cloning (repeatable; defaults to ~/Projects).
+    #[arg(long = "projects-root")]
+    project_roots: Vec<PathBuf>,
+    /// Override the GitHub CLI executable.
+    #[arg(long, default_value = "gh")]
+    gh_bin: PathBuf,
 }
 
 #[tokio::main]
@@ -44,5 +50,20 @@ async fn main() -> Result<()> {
         codex: arguments.codex_bin,
         claude: arguments.claude_bin,
     });
-    orchestrator_engine::serve_with_state_and_planner(socket_path, state_paths, planner).await
+    let repositories = if arguments.project_roots.is_empty() {
+        let mut settings = orchestrator_engine::RepositorySettings::discover()?;
+        settings.gh_bin = arguments.gh_bin;
+        settings
+    } else {
+        for root in &arguments.project_roots {
+            if !root.is_absolute() {
+                bail!("projects root must be absolute: {}", root.display());
+            }
+        }
+        orchestrator_engine::RepositorySettings {
+            project_roots: arguments.project_roots,
+            gh_bin: arguments.gh_bin,
+        }
+    };
+    orchestrator_engine::serve_with_settings(socket_path, state_paths, planner, repositories).await
 }

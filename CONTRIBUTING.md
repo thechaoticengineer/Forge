@@ -65,12 +65,17 @@ The CLI and QML frontend connect to a running `orchestrator-engine` through the 
 
 ```text
 cargo run -p orchestrator-engine
+cargo run -p orchestrator-cli -- repositories list
+# Explicitly clones; replace owner/repository with the intended GitHub identity.
+cargo run -p orchestrator-cli -- repositories clone owner/repository
 cargo run -p orchestrator-cli -- draft --repository /absolute/path/to/repository --goal "Describe the change"
 cargo run -p orchestrator-cli -- status
 cargo run -p orchestrator-cli -- plan generate --agent codex
 cargo run -p orchestrator-cli -- plan move --task 3 --direction up
 cargo run -p orchestrator-cli -- plan approve
 ```
+
+The engine scans `~/Projects` by default. Pass one or more absolute `--projects-root` options to use a different catalog, for example `cargo run -p orchestrator-engine -- --projects-root /home/dev/Work --projects-root /home/dev/Experiments`. Remote repository discovery and cloning use the existing authenticated `gh` CLI; local discovery and manual paths remain available when GitHub is offline or unavailable.
 
 Use `--agent claude` to select Claude Code instead. Plan generation invokes the existing authenticated CLI and may consume its normal usage allowance. The engine grants the planner read-only access, validates its structured proposal, and records attempts, task revisions, decisions, and failures in SQLite. Run `build-orchestrator plan --help` for task editing, reordering, approval, and rejection commands.
 
