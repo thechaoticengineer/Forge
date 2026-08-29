@@ -66,9 +66,14 @@ The CLI and QML frontend connect to a running `orchestrator-engine` through the 
 cargo run -p orchestrator-engine
 cargo run -p orchestrator-cli -- draft --repository /absolute/path/to/repository --goal "Describe the change"
 cargo run -p orchestrator-cli -- status
+cargo run -p orchestrator-cli -- plan generate --agent codex
+cargo run -p orchestrator-cli -- plan move --task 3 --direction up
+cargo run -p orchestrator-cli -- plan approve
 ```
 
-The engine records the repository revision and working-tree condition in SQLite, and the current run survives engine or shell restarts. This is not yet the complete product workflow: planning, agent execution, verification, review, and final approval remain to be implemented.
+Use `--agent claude` to select Claude Code instead. Plan generation invokes the existing authenticated CLI and may consume its normal usage allowance. The engine grants the planner read-only access, validates its structured proposal, and records attempts, task revisions, decisions, and failures in SQLite. Run `build-orchestrator plan --help` for task editing, reordering, approval, and rejection commands.
+
+The current run survives engine or shell restarts. This is not yet the complete product workflow: isolated implementation, deterministic verification, independent review, and final change approval remain to be implemented.
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 

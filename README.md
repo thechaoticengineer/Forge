@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** Foundation development has started. The repository currently contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, a CLI, and reconnecting Omarchy bar-widget and panel entry points. A developer can create and recover a durable draft run from the CLI or panel; planning, agent execution, verification, review, and approval remain planned unless explicitly stated otherwise.
+> **Project status:** Foundation development has started. The repository currently contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, constrained Codex and Claude Code planner adapters, a CLI, and reconnecting Omarchy bar-widget and panel entry points. A developer can create a durable draft, ask either installed CLI for a structured plan, edit or reorder its tasks, and approve or reject it from the CLI or panel. Isolated implementation, deterministic verification, independent review, and final change approval remain planned unless explicitly stated otherwise.
 
 ## Vision
 
@@ -88,6 +88,8 @@ Codex and Claude Code should be treated as collaborating but independent workers
 An agent must never be the sole reviewer of its own implementation. Independent review does not replace deterministic verification or human approval; it adds a second reasoning path that can catch incorrect assumptions, incomplete work, unsafe changes, and maintainability problems.
 
 The first workflow should keep routing simple and visible: the user or a small deterministic policy chooses the planner, implementer, and reviewer. Smarter routing is a later capability. It may eventually consider task type, agent availability, retained context, previous results, and available usage limits, but none of that is required for the first complete workflow.
+
+The implemented planning slice keeps that choice explicit. The engine launches the selected authenticated CLI non-interactively with read-only planning permissions, sends its prompt over standard input, requires a shared structured plan schema, and validates the result before storing it. It does not select a model or use a direct model API. Planner processes and captured output are bounded, and failures remain inspectable and retryable. Implementation and independent review adapters are not implemented yet. See [ADR-0004](docs/adr/0004-run-planners-as-constrained-cli-processes.md).
 
 ## Omarchy and Quickshell Integration
 
@@ -303,7 +305,7 @@ Every run should preserve enough durable information to reconstruct both the res
 
 Run state belongs to the Rust engine and its durable storage, not to terminal scrollback or QML object lifetime. Restarting `omarchy-shell`, hot-reloading the plugin, hiding the panel, closing a terminal, or reconnecting the CLI must not erase or silently reset a run.
 
-The implemented storage foundation uses SQLite through the Rust engine. By default, its database is stored at `$XDG_STATE_HOME/omarchy-ai-build-orchestrator/state.db`, falling back to `~/.local/state/omarchy-ai-build-orchestrator/state.db`. The current schema preserves projects, draft runs, append-only audit events, and artifact metadata. It is intentionally only the first durable slice of the broader history described above. See [ADR-0003](docs/adr/0003-store-state-in-sqlite.md) for the storage decision and safety boundaries.
+The implemented storage foundation uses SQLite through the Rust engine. By default, its database is stored at `$XDG_STATE_HOME/omarchy-ai-build-orchestrator/state.db`, falling back to `~/.local/state/omarchy-ai-build-orchestrator/state.db`. The current schema preserves projects, draft runs, planner attempts and failure evidence, versioned plans, tasks, acceptance criteria, dependencies, human plan decisions, append-only audit events, and artifact metadata. It is intentionally only a slice of the broader history described above. See [ADR-0003](docs/adr/0003-store-state-in-sqlite.md) for the storage decision and safety boundaries.
 
 After recovery, the user should be able to understand what completed, what may have been interrupted, which operations are safe to retry, and what still requires attention. Recovery should favor explicit state reconciliation over replaying side effects blindly.
 
