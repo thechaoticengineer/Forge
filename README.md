@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** This repository is at the product-vision stage. The capabilities below are planned, not implemented, unless explicitly stated otherwise.
+> **Project status:** Foundation development has started. The repository currently contains a minimal Rust engine, shared versioned IPC types, a status CLI, and reconnecting Omarchy bar-widget and panel entry points. The end-to-end workshop capabilities below remain planned unless explicitly stated otherwise.
 
 ## Vision
 
@@ -241,12 +241,12 @@ Significant architectural choices and their reasoning are preserved as [Architec
 | Rust CLI | Expose the same projects, runs, actions, evidence, and approvals for shell use and automation |
 | Optional Rust TUI | Offer a terminal-native view over the same engine without duplicating workflow logic |
 
-The exact IPC protocol is intentionally undecided. Whatever is selected must be:
+The initial IPC transport is defined by [ADR-0002](docs/adr/0002-use-versioned-json-over-a-unix-socket.md): versioned, newline-delimited JSON over an owner-only Unix-domain socket below `$XDG_RUNTIME_DIR`. The engine sends an authoritative snapshot when a client connects, and clients reconnect and replace their local view after interruption. The evolving message contract must remain:
 
 - explicit and local;
 - structured and versionable;
 - observable enough to diagnose failures;
-- authenticated or permissioned appropriately for local state-changing actions;
+- permissioned appropriately for local state-changing actions;
 - resilient to partial messages, backpressure, disconnects, and duplicate delivery;
 - able to recover when the engine or frontend restarts independently.
 

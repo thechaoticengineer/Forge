@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for helping shape Omarchy AI Build Orchestrator. The project is still at the product-vision stage, so early contributions should strengthen the architecture, constraints, and first vertical slice rather than broaden the scope prematurely.
+Thank you for helping shape Omarchy AI Build Orchestrator. The project is at an early foundation stage, so contributions should strengthen the architecture, constraints, and first vertical slice rather than broaden the scope prematurely.
 
 The project name is temporary. Use the descriptive working title from the README until a permanent name is chosen.
 
@@ -51,7 +51,18 @@ The QML frontend must use the supported third-party plugin architecture and shar
 5. Review the final diff for scope, safety, and accidental generated files.
 6. Request independent review for agent-produced implementation work.
 
-Until build and test commands exist, documentation changes should at least be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
+The Rust workspace is pinned through `rust-toolchain.toml`. Run the relevant checks from the repository root:
+
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+omarchy plugin validate .
+```
+
+The `build-orchestrator status` and `build-orchestrator ping` commands connect to a running `orchestrator-engine` through the same local protocol used by the QML frontend. These commands currently expose only the foundation health and state snapshot; they do not yet implement the product workflow.
+
+Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 
 ## Commits
 

@@ -40,3 +40,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | ADR | Status | Decision |
 | --- | --- | --- |
 | [ADR-0001](0001-separate-engine-from-shell-frontend.md) | Accepted | Separate the Rust orchestration engine from the Omarchy shell frontend |
+| [ADR-0002](0002-use-versioned-json-over-a-unix-socket.md) | Accepted | Exchange versioned JSON messages over a private Unix-domain socket |

@@ -1,0 +1,21 @@
+[package]
+name = "orchestrator-cli"
+description = "Command-line interface for the software build orchestrator"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "build-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+orchestrator-core = { path = "../orchestrator-core" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

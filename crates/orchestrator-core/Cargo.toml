@@ -1,0 +1,17 @@
+[package]
+name = "orchestrator-core"
+description = "Shared state and protocol types for the software build orchestrator"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
