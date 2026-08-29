@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** Foundation development has started. The repository currently contains a minimal Rust engine, shared versioned IPC types, a status CLI, and reconnecting Omarchy bar-widget and panel entry points. The end-to-end workshop capabilities below remain planned unless explicitly stated otherwise.
+> **Project status:** Foundation development has started. The repository currently contains a Rust engine, shared versioned IPC types, SQLite-backed run state, read-only Git repository inspection, a CLI, and reconnecting Omarchy bar-widget and panel entry points. A developer can create and recover a durable draft run from the CLI or panel; planning, agent execution, verification, review, and approval remain planned unless explicitly stated otherwise.
 
 ## Vision
 
@@ -302,6 +302,8 @@ Every run should preserve enough durable information to reconstruct both the res
 - the final outcome and any unresolved follow-up.
 
 Run state belongs to the Rust engine and its durable storage, not to terminal scrollback or QML object lifetime. Restarting `omarchy-shell`, hot-reloading the plugin, hiding the panel, closing a terminal, or reconnecting the CLI must not erase or silently reset a run.
+
+The implemented storage foundation uses SQLite through the Rust engine. By default, its database is stored at `$XDG_STATE_HOME/omarchy-ai-build-orchestrator/state.db`, falling back to `~/.local/state/omarchy-ai-build-orchestrator/state.db`. The current schema preserves projects, draft runs, append-only audit events, and artifact metadata. It is intentionally only the first durable slice of the broader history described above. See [ADR-0003](docs/adr/0003-store-state-in-sqlite.md) for the storage decision and safety boundaries.
 
 After recovery, the user should be able to understand what completed, what may have been interrupted, which operations are safe to retry, and what still requires attention. Recovery should favor explicit state reconciliation over replaying side effects blindly.
 

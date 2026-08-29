@@ -60,7 +60,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 omarchy plugin validate .
 ```
 
-The `build-orchestrator status` and `build-orchestrator ping` commands connect to a running `orchestrator-engine` through the same local protocol used by the QML frontend. These commands currently expose only the foundation health and state snapshot; they do not yet implement the product workflow.
+The CLI and QML frontend connect to a running `orchestrator-engine` through the same local protocol. To exercise the current durable draft slice during development, start the engine and create a draft for an absolute local repository path:
+
+```text
+cargo run -p orchestrator-engine
+cargo run -p orchestrator-cli -- draft --repository /absolute/path/to/repository --goal "Describe the change"
+cargo run -p orchestrator-cli -- status
+```
+
+The engine records the repository revision and working-tree condition in SQLite, and the current run survives engine or shell restarts. This is not yet the complete product workflow: planning, agent execution, verification, review, and final approval remain to be implemented.
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 
