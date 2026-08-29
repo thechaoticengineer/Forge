@@ -11,6 +11,8 @@ These instructions apply to the entire repository.
 
 ## Architecture
 
+- Read applicable records under `docs/adr/` before changing architecture.
+- Record lasting architectural choices as ADRs. Supersede accepted ADRs with new records instead of rewriting their history.
 - Use Rust for orchestration, process management, durable state, Git integration, agent adapters, and CLI work.
 - Use Quickshell/QML for the primary Omarchy frontend. Do not make a TUI, browser dashboard, Electron app, GTK app, or generic cross-platform GUI the primary interface.
 - Keep QML thin and defensive. Agent processes, builds, tests, analyzers, Git operations, and durable state belong in the Rust engine.

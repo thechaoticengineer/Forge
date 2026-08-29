@@ -226,6 +226,8 @@ Destructive or consequential actions must not rely on single ambiguous keystroke
 
 All interfaces must share one orchestration model and one durable state. Business logic belongs in the Rust engine, not in QML, CLI presentation code, or a future TUI.
 
+Significant architectural choices and their reasoning are preserved as [Architecture Decision Records](docs/adr/). ADRs complement this product vision by recording the context, alternatives, and consequences behind decisions as the implementation evolves.
+
 | Boundary | Planned responsibility |
 | --- | --- |
 | Rust orchestration core | Run lifecycle, task graph, state transitions, assignment, review/correction loops, policy, and approvals |
