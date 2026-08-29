@@ -41,6 +41,7 @@ The **Changes**, **Verification**, and **Review** panel sections currently commu
 Planned usability follow-ups:
 
 - [x] Add a richer keyboard-driven repository chooser with shared search and manual-path fallback.
+- [x] Keep the repository chooser usable in constrained-height and narrow panel layouts.
 - [ ] Add current and previous run selection.
 - [ ] Add the searchable command palette and contextual action discovery.
 - [ ] Extend cursor-level keyboard focus to every actionable control introduced by later phases.
