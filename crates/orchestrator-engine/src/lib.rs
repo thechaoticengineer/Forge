@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -6,12 +7,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use orchestrator_agents::{PlannerRunner, build_planning_prompt, validate_proposal};
 use orchestrator_core::{
-    protocol::{ClientMessage, ClientRequest, PROTOCOL_VERSION, ServerMessage},
-    state::EngineSnapshot,
+    protocol::{ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, ServerMessage},
+    state::{
+        ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, PlanProposal, PlanStatus,
+        PlanSummary, ProposedTask, RunStatus,
+    },
 };
 use orchestrator_git::inspect_repository;
-use orchestrator_store::{DraftRunInput, StatePaths, StorageWorker, StoredSnapshot};
+use orchestrator_store::{
+    DraftRunInput, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput,
+    StatePaths, StorageWorker, StoredSnapshot,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
@@ -37,6 +45,19 @@ pub async fn serve(socket_path: PathBuf) -> Result<()> {
 /// socket cannot be prepared, another engine owns the socket, or the listener
 /// fails.
 pub async fn serve_with_state(socket_path: PathBuf, state_paths: StatePaths) -> Result<()> {
+    serve_with_state_and_planner(socket_path, state_paths, PlannerRunner::default()).await
+}
+
+/// Serves local IPC clients with explicit state paths and planner commands.
+///
+/// # Errors
+///
+/// Returns an error when storage, the socket, or the listener cannot be initialized.
+pub async fn serve_with_state_and_planner(
+    socket_path: PathBuf,
+    state_paths: StatePaths,
+    planner: PlannerRunner,
+) -> Result<()> {
     let storage = Arc::new(
         StorageWorker::start(state_paths).context("cannot initialize durable state storage")?,
     );
@@ -54,7 +75,7 @@ pub async fn serve_with_state(socket_path: PathBuf, state_paths: StatePaths) -> 
     let (state_sender, _state_receiver) = watch::channel(engine_snapshot(stored_snapshot));
     println!("engine listening at {}", socket_path.display());
 
-    let result = run_listener(&listener, state_sender, storage).await;
+    let result = run_listener(&listener, state_sender, storage, Arc::new(planner)).await;
     drop(listener);
     remove_owned_socket(&socket_path)?;
     result
@@ -64,6 +85,7 @@ async fn run_listener(
     listener: &UnixListener,
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
+    planner: Arc<PlannerRunner>,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -75,8 +97,14 @@ async fn run_listener(
                 let (stream, _) = accepted.context("cannot accept IPC client")?;
                 let client_state = state_sender.clone();
                 let client_storage = Arc::clone(&storage);
+                let client_planner = Arc::clone(&planner);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, client_state, client_storage).await {
+                    if let Err(error) = handle_client(
+                        stream,
+                        client_state,
+                        client_storage,
+                        client_planner,
+                    ).await {
                         eprintln!("IPC client disconnected after error: {error:#}");
                     }
                 });
@@ -89,6 +117,7 @@ async fn handle_client(
     stream: UnixStream,
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
+    planner: Arc<PlannerRunner>,
 ) -> Result<()> {
     let mut state_receiver = state_sender.subscribe();
     let (read_half, mut write_half) = stream.into_split();
@@ -107,7 +136,13 @@ async fn handle_client(
                 let Some(line) = line.context("cannot read IPC request")? else {
                     return Ok(());
                 };
-                handle_request(&line, &state_sender, &storage, &mut write_half).await?;
+                handle_request(
+                    &line,
+                    &state_sender,
+                    &storage,
+                    &planner,
+                    &mut write_half,
+                ).await?;
             }
             changed = state_receiver.changed() => {
                 if changed.is_err() {
@@ -123,10 +158,12 @@ async fn handle_client(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     line: &str,
     state_sender: &watch::Sender<EngineSnapshot>,
     storage: &StorageWorker,
+    planner: &PlannerRunner,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
     let request: ClientMessage = match serde_json::from_str(line) {
@@ -167,6 +204,75 @@ async fn handle_request(
                 }
             }
         }
+        ClientRequest::GeneratePlan { run_id, agent } => {
+            match generate_plan(run_id, agent, storage, planner, state_sender).await {
+                Ok(stored_snapshot) => {
+                    publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                    ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+                }
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
+        ClientRequest::UpdatePlanTask {
+            run_id,
+            plan_id,
+            task_id,
+            title,
+            description,
+            acceptance_criteria,
+        } => match update_plan_task(
+            run_id,
+            plan_id,
+            task_id,
+            title,
+            description,
+            acceptance_criteria,
+            storage,
+        )
+        .await
+        {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::MovePlanTask {
+            run_id,
+            plan_id,
+            task_id,
+            direction,
+        } => match move_plan_task(run_id, plan_id, task_id, direction, storage).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::ApprovePlan { run_id, plan_id } => {
+            match decide_plan(run_id, plan_id, true, None, storage).await {
+                Ok(stored_snapshot) => {
+                    publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                    ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+                }
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
+        ClientRequest::RejectPlan {
+            run_id,
+            plan_id,
+            reason,
+        } => match decide_plan(run_id, plan_id, false, reason, storage).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
         ClientRequest::GetSnapshot => {
             ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
         }
@@ -183,6 +289,15 @@ async fn handle_request(
 struct RequestFailure {
     code: &'static str,
     message: String,
+}
+
+impl RequestFailure {
+    fn storage(context: &str, error: impl std::fmt::Display) -> Self {
+        Self {
+            code: "storage_failed",
+            message: format!("{context}: {error}"),
+        }
+    }
 }
 
 async fn create_draft_run(
@@ -241,6 +356,257 @@ async fn create_draft_run(
         })
 }
 
+async fn generate_plan(
+    run_id: String,
+    agent: AgentKind,
+    storage: &StorageWorker,
+    planner: &PlannerRunner,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let run = load_active_run(storage, &run_id).await?;
+    if !matches!(run.run_status, RunStatus::Draft | RunStatus::Failed) {
+        return Err(RequestFailure {
+            code: "run_not_plannable",
+            message: "the active run is not ready to generate a plan".to_owned(),
+        });
+    }
+    let prompt = build_planning_prompt(&run);
+    let started = storage
+        .begin_plan_attempt(PlanAttemptInput {
+            run_id,
+            agent,
+            prompt: prompt.clone(),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot start planning", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(started.snapshot));
+
+    match planner
+        .generate(agent, Path::new(&run.repository), &prompt)
+        .await
+    {
+        Ok(output) => storage
+            .complete_plan_attempt(PlanAttemptSuccess {
+                attempt_id: started.attempt_id,
+                proposal: output.proposal,
+                final_output: output.final_output,
+                diagnostic_output: output.diagnostic_output,
+                exit_code: output.exit_code,
+            })
+            .await
+            .map_err(|error| RequestFailure::storage("cannot persist proposed plan", error)),
+        Err(failure) => {
+            let message = failure.message.clone();
+            let failed = storage
+                .fail_plan_attempt(PlanAttemptFailure {
+                    attempt_id: started.attempt_id,
+                    final_output: failure.final_output,
+                    diagnostic_output: failure.diagnostic_output,
+                    exit_code: failure.exit_code,
+                    error_message: failure.message,
+                })
+                .await
+                .map_err(|error| {
+                    RequestFailure::storage("cannot persist planner failure", error)
+                })?;
+            publish_newer_snapshot(state_sender, engine_snapshot(failed));
+            Err(RequestFailure {
+                code: "planner_failed",
+                message,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_plan_task(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    title: String,
+    description: String,
+    acceptance_criteria: Vec<String>,
+    storage: &StorageWorker,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let plan = load_current_proposal(storage, &run_id, &plan_id).await?;
+    let mut proposal = plan_to_proposal(&plan);
+    let task_index = plan
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| RequestFailure {
+            code: "task_not_found",
+            message: "the selected task is not part of the current plan".to_owned(),
+        })?;
+    proposal.tasks[task_index].title = title;
+    proposal.tasks[task_index].description = description;
+    proposal.tasks[task_index].acceptance_criteria = acceptance_criteria;
+    validate_proposal(&mut proposal).map_err(|message| RequestFailure {
+        code: "invalid_plan",
+        message,
+    })?;
+    storage
+        .revise_plan(PlanRevisionInput {
+            run_id,
+            based_on_plan_id: plan_id,
+            proposal,
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot persist plan revision", error))
+}
+
+async fn move_plan_task(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    direction: MoveDirection,
+    storage: &StorageWorker,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let plan = load_current_proposal(storage, &run_id, &plan_id).await?;
+    let current_index = plan
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| RequestFailure {
+            code: "task_not_found",
+            message: "the selected task is not part of the current plan".to_owned(),
+        })?;
+    let target_index = match direction {
+        MoveDirection::Up => current_index.checked_sub(1),
+        MoveDirection::Down => current_index
+            .checked_add(1)
+            .filter(|index| *index < plan.tasks.len()),
+    }
+    .ok_or_else(|| RequestFailure {
+        code: "invalid_move",
+        message: "the selected task cannot move farther in that direction".to_owned(),
+    })?;
+
+    let old_position_to_id: HashMap<u32, String> = plan
+        .tasks
+        .iter()
+        .map(|task| (task.position, task.id.clone()))
+        .collect();
+    let mut reordered = plan.tasks.clone();
+    reordered.swap(current_index, target_index);
+    let new_position_by_id: HashMap<String, u32> = reordered
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            (
+                task.id.clone(),
+                u32::try_from(index + 1).unwrap_or(u32::MAX),
+            )
+        })
+        .collect();
+
+    let mut proposal = PlanProposal {
+        summary: plan.summary.clone(),
+        tasks: reordered
+            .iter()
+            .map(|task| ProposedTask {
+                title: task.title.clone(),
+                description: task.description.clone(),
+                acceptance_criteria: task.acceptance_criteria.clone(),
+                depends_on: task
+                    .depends_on
+                    .iter()
+                    .filter_map(|position| old_position_to_id.get(position))
+                    .filter_map(|id| new_position_by_id.get(id))
+                    .copied()
+                    .collect(),
+            })
+            .collect(),
+    };
+    validate_proposal(&mut proposal).map_err(|message| RequestFailure {
+        code: "invalid_move",
+        message: format!("task move would violate plan dependencies: {message}"),
+    })?;
+    storage
+        .revise_plan(PlanRevisionInput {
+            run_id,
+            based_on_plan_id: plan_id,
+            proposal,
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot persist reordered plan", error))
+}
+
+async fn decide_plan(
+    run_id: String,
+    plan_id: String,
+    approved: bool,
+    reason: Option<String>,
+    storage: &StorageWorker,
+) -> Result<StoredSnapshot, RequestFailure> {
+    load_current_proposal(storage, &run_id, &plan_id).await?;
+    let reason = reason
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if reason
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 4_000)
+    {
+        return Err(RequestFailure {
+            code: "invalid_reason",
+            message: "rejection reason must not exceed 4,000 characters".to_owned(),
+        });
+    }
+    let result = if approved {
+        storage.approve_plan(run_id, plan_id).await
+    } else {
+        storage.reject_plan(run_id, plan_id, reason).await
+    };
+    result.map_err(|error| RequestFailure::storage("cannot persist plan decision", error))
+}
+
+async fn load_active_run(
+    storage: &StorageWorker,
+    run_id: &str,
+) -> Result<ActiveRunSummary, RequestFailure> {
+    let snapshot = storage
+        .current_snapshot()
+        .await
+        .map_err(|error| RequestFailure::storage("cannot load active run", error))?;
+    snapshot
+        .active_run
+        .filter(|run| run.id == run_id)
+        .ok_or_else(|| RequestFailure {
+            code: "run_not_found",
+            message: "the selected run is not the active run".to_owned(),
+        })
+}
+
+async fn load_current_proposal(
+    storage: &StorageWorker,
+    run_id: &str,
+    plan_id: &str,
+) -> Result<PlanSummary, RequestFailure> {
+    let run = load_active_run(storage, run_id).await?;
+    run.plan
+        .filter(|plan| plan.id == plan_id && plan.status == PlanStatus::Proposed)
+        .ok_or_else(|| RequestFailure {
+            code: "plan_not_current",
+            message: "the selected plan is not the current proposal".to_owned(),
+        })
+}
+
+fn plan_to_proposal(plan: &PlanSummary) -> PlanProposal {
+    PlanProposal {
+        summary: plan.summary.clone(),
+        tasks: plan
+            .tasks
+            .iter()
+            .map(|task| ProposedTask {
+                title: task.title.clone(),
+                description: task.description.clone(),
+                acceptance_criteria: task.acceptance_criteria.clone(),
+                depends_on: task.depends_on.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn path_to_string(path: &Path) -> Result<String, RequestFailure> {
     path.to_str()
         .map(str::to_owned)
@@ -251,11 +617,35 @@ fn path_to_string(path: &Path) -> Result<String, RequestFailure> {
 }
 
 fn engine_snapshot(stored: StoredSnapshot) -> EngineSnapshot {
+    let (status, requires_attention) =
+        stored
+            .active_run
+            .as_ref()
+            .map_or((EngineStatus::Idle, false), |run| match run.run_status {
+                RunStatus::Planning | RunStatus::Running => (EngineStatus::Running, false),
+                RunStatus::WaitingForUser => {
+                    if run
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.status == PlanStatus::Approved)
+                    {
+                        (EngineStatus::Idle, false)
+                    } else {
+                        (EngineStatus::WaitingForUser, true)
+                    }
+                }
+                RunStatus::Blocked => (EngineStatus::Blocked, true),
+                RunStatus::Failed => (EngineStatus::Failed, true),
+                RunStatus::Completed => (EngineStatus::Completed, false),
+                RunStatus::Draft | RunStatus::Rejected | RunStatus::Cancelled => {
+                    (EngineStatus::Idle, false)
+                }
+            });
     EngineSnapshot {
         sequence: stored.sequence,
-        status: orchestrator_core::state::EngineStatus::Idle,
+        status,
         active_run: stored.active_run,
-        requires_attention: false,
+        requires_attention,
     }
 }
 
@@ -438,6 +828,190 @@ mod tests {
                 .expect("snapshot should load"),
             StoredSnapshot::default()
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn generates_revises_and_approves_a_plan() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let draft = create_draft_run(
+            repository.path().display().to_string(),
+            "Add planning".to_owned(),
+            &storage,
+        )
+        .await
+        .expect("draft should be created");
+        let run_id = draft
+            .active_run
+            .as_ref()
+            .expect("run should exist")
+            .id
+            .clone();
+        let (state_sender, _receiver) = watch::channel(engine_snapshot(draft));
+
+        let fake_codex = state.path().join("codex");
+        let plan_json = serde_json::json!({
+            "summary": "Implement planning safely",
+            "tasks": [
+                {
+                    "title": "Inspect",
+                    "description": "Inspect current behavior.",
+                    "acceptance_criteria": ["Behavior is understood."],
+                    "depends_on": []
+                },
+                {
+                    "title": "Implement",
+                    "description": "Add the focused behavior.",
+                    "acceptance_criteria": ["Tests pass."],
+                    "depends_on": [1]
+                },
+                {
+                    "title": "Document",
+                    "description": "Document the implemented behavior.",
+                    "acceptance_criteria": ["Documentation is accurate."],
+                    "depends_on": [1]
+                }
+            ]
+        })
+        .to_string();
+        fs::write(
+            &fake_codex,
+            format!("#!/bin/sh\ninput=$(cat)\nprintf '%s' '{plan_json}'\n"),
+        )
+        .expect("fake Codex should be written");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("fake Codex should be executable");
+        let planner = PlannerRunner::new(orchestrator_agents::AgentCommands {
+            codex: fake_codex,
+            claude: state.path().join("unused-claude"),
+        });
+
+        let proposed = generate_plan(
+            run_id.clone(),
+            AgentKind::Codex,
+            &storage,
+            &planner,
+            &state_sender,
+        )
+        .await
+        .expect("planner should propose a plan");
+        let plan = proposed
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("plan should be visible")
+            .clone();
+        assert_eq!(plan.status, PlanStatus::Proposed);
+        assert_eq!(plan.tasks.len(), 3);
+        assert_eq!(state_sender.borrow().status, EngineStatus::Running);
+
+        let revised = update_plan_task(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[1].id.clone(),
+            "Implement the focused change".to_owned(),
+            plan.tasks[1].description.clone(),
+            plan.tasks[1].acceptance_criteria.clone(),
+            &storage,
+        )
+        .await
+        .expect("task edit should create a revision");
+        let revised_plan = revised
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("revised plan should exist")
+            .clone();
+        assert_eq!(revised_plan.revision, 2);
+        assert_eq!(revised_plan.tasks[1].title, "Implement the focused change");
+
+        let reordered = move_plan_task(
+            run_id.clone(),
+            revised_plan.id.clone(),
+            revised_plan.tasks[2].id.clone(),
+            MoveDirection::Up,
+            &storage,
+        )
+        .await
+        .expect("independent tasks should reorder");
+        let reordered_plan = reordered
+            .active_run
+            .as_ref()
+            .and_then(|run| run.plan.as_ref())
+            .expect("reordered plan should exist")
+            .clone();
+        assert_eq!(reordered_plan.revision, 3);
+        assert_eq!(reordered_plan.tasks[1].title, "Document");
+
+        let invalid_move = move_plan_task(
+            run_id.clone(),
+            reordered_plan.id.clone(),
+            reordered_plan.tasks[0].id.clone(),
+            MoveDirection::Down,
+            &storage,
+        )
+        .await
+        .expect_err("dependency-breaking move should fail");
+        assert_eq!(invalid_move.code, "invalid_move");
+
+        let approved = decide_plan(run_id, reordered_plan.id, true, None, &storage)
+            .await
+            .expect("plan should be approved");
+        assert_eq!(
+            approved
+                .active_run
+                .and_then(|run| run.plan)
+                .map(|plan| plan.status),
+            Some(PlanStatus::Approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_planner_process_failures() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let draft = create_draft_run(
+            repository.path().display().to_string(),
+            "Plan safely".to_owned(),
+            &storage,
+        )
+        .await
+        .expect("draft should be created");
+        let run_id = draft
+            .active_run
+            .as_ref()
+            .expect("run should exist")
+            .id
+            .clone();
+        let (state_sender, _receiver) = watch::channel(engine_snapshot(draft));
+        let failing = state.path().join("codex");
+        fs::write(&failing, "#!/bin/sh\nprintf 'auth failed' >&2\nexit 2\n")
+            .expect("fake Codex should be written");
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o700))
+            .expect("fake Codex should be executable");
+        let planner = PlannerRunner::new(orchestrator_agents::AgentCommands {
+            codex: failing,
+            claude: state.path().join("unused-claude"),
+        });
+
+        let failure = generate_plan(run_id, AgentKind::Codex, &storage, &planner, &state_sender)
+            .await
+            .expect_err("planner failure should be reported");
+        assert_eq!(failure.code, "planner_failed");
+        let snapshot = storage
+            .current_snapshot()
+            .await
+            .expect("failed snapshot should load");
+        assert_eq!(
+            snapshot.active_run.as_ref().map(|run| run.run_status),
+            Some(RunStatus::Failed)
+        );
+        assert_eq!(engine_snapshot(snapshot).status, EngineStatus::Failed);
     }
 
     fn initialized_repository() -> TempDir {

@@ -369,11 +369,17 @@ fn parse_proposal(agent: AgentKind, output: &str) -> Result<PlanProposal, String
     };
     let mut proposal: PlanProposal = serde_json::from_value(proposal_value)
         .map_err(|error| format!("planner output does not match the plan schema: {error}"))?;
-    normalize_and_validate(&mut proposal)?;
+    validate_proposal(&mut proposal)?;
     Ok(proposal)
 }
 
-fn normalize_and_validate(proposal: &mut PlanProposal) -> Result<(), String> {
+/// Normalizes and validates a plan before it enters durable workflow state.
+///
+/// # Errors
+///
+/// Returns a precise validation message for empty, oversized, duplicate, or
+/// non-topological plan content.
+pub fn validate_proposal(proposal: &mut PlanProposal) -> Result<(), String> {
     proposal.summary = proposal.summary.trim().to_owned();
     validate_text("plan summary", &proposal.summary, 4_000)?;
     if proposal.tasks.is_empty() || proposal.tasks.len() > MAX_TASKS {
@@ -525,7 +531,7 @@ mod tests {
         let mut forward = sample_proposal();
         forward.tasks[0].depends_on = vec![1];
         assert!(
-            normalize_and_validate(&mut forward)
+            validate_proposal(&mut forward)
                 .expect_err("forward dependency should fail")
                 .contains("earlier task")
         );
@@ -533,7 +539,7 @@ mod tests {
         let mut repeated = sample_proposal();
         repeated.tasks[1].depends_on = vec![1, 1];
         assert!(
-            normalize_and_validate(&mut repeated)
+            validate_proposal(&mut repeated)
                 .expect_err("repeated dependency should fail")
                 .contains("repeats dependency")
         );

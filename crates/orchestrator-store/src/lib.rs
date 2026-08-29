@@ -384,6 +384,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Starts a durable planner attempt and moves the run into planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run is unavailable, not plannable, or storage fails.
     pub async fn begin_plan_attempt(
         &self,
         input: PlanAttemptInput,
@@ -397,6 +402,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Stores a validated proposal and completes its planner attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is not running or storage fails.
     pub async fn complete_plan_attempt(
         &self,
         input: PlanAttemptSuccess,
@@ -410,6 +420,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Stores planner failure evidence and marks the run failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is not running or storage fails.
     pub async fn fail_plan_attempt(
         &self,
         input: PlanAttemptFailure,
@@ -423,6 +438,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Creates a new proposed revision without overwriting the prior plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the base plan is not current or storage fails.
     pub async fn revise_plan(
         &self,
         input: PlanRevisionInput,
@@ -436,6 +456,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Approves the current proposal transactionally with its audit event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan is not current or storage fails.
     pub async fn approve_plan(
         &self,
         run_id: String,
@@ -454,6 +479,11 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Rejects the current proposal and returns its run to draft state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan is not current or storage fails.
     pub async fn reject_plan(
         &self,
         run_id: String,

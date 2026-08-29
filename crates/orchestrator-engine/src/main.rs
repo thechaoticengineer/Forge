@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use orchestrator_agents::{AgentCommands, PlannerRunner};
 use orchestrator_core::ipc::default_socket_path;
 use orchestrator_store::StatePaths;
 
@@ -14,6 +15,12 @@ struct Arguments {
     /// Override the application state directory.
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// Override the Codex CLI executable.
+    #[arg(long, default_value = "codex")]
+    codex_bin: PathBuf,
+    /// Override the Claude Code CLI executable.
+    #[arg(long, default_value = "claude")]
+    claude_bin: PathBuf,
 }
 
 #[tokio::main]
@@ -24,14 +31,18 @@ async fn main() -> Result<()> {
         None => default_socket_path().context("cannot determine the engine socket path")?,
     };
 
-    match arguments.state_dir {
+    let state_paths = match arguments.state_dir {
         Some(state_directory) => {
             if !state_directory.is_absolute() {
                 bail!("state directory must be absolute");
             }
-            orchestrator_engine::serve_with_state(socket_path, StatePaths::new(state_directory))
-                .await
+            StatePaths::new(state_directory)
         }
-        None => orchestrator_engine::serve(socket_path).await,
-    }
+        None => StatePaths::discover().context("cannot determine state paths")?,
+    };
+    let planner = PlannerRunner::new(AgentCommands {
+        codex: arguments.codex_bin,
+        claude: arguments.claude_bin,
+    });
+    orchestrator_engine::serve_with_state_and_planner(socket_path, state_paths, planner).await
 }

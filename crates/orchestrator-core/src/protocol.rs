@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::state::EngineSnapshot;
+use crate::state::{AgentKind, EngineSnapshot};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -15,9 +15,46 @@ pub struct ClientMessage {
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ClientRequest {
-    CreateDraftRun { repository: String, goal: String },
+    CreateDraftRun {
+        repository: String,
+        goal: String,
+    },
+    GeneratePlan {
+        run_id: String,
+        agent: AgentKind,
+    },
+    UpdatePlanTask {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+        title: String,
+        description: String,
+        acceptance_criteria: Vec<String>,
+    },
+    MovePlanTask {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+        direction: MoveDirection,
+    },
+    ApprovePlan {
+        run_id: String,
+        plan_id: String,
+    },
+    RejectPlan {
+        run_id: String,
+        plan_id: String,
+        reason: Option<String>,
+    },
     GetSnapshot,
     Ping,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveDirection {
+    Up,
+    Down,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,6 +143,35 @@ mod tests {
             ClientRequest::CreateDraftRun {
                 repository: "/tmp/project".to_owned(),
                 goal: "Add a test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_plan_workflow_requests() {
+        let generate: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-3","method":"generate_plan","run_id":"run-1","agent":"claude"}"#,
+        )
+        .expect("generate request should parse");
+        assert_eq!(
+            generate.request,
+            ClientRequest::GeneratePlan {
+                run_id: "run-1".to_owned(),
+                agent: AgentKind::Claude,
+            }
+        );
+
+        let move_task: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-4","method":"move_plan_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-2","direction":"up"}"#,
+        )
+        .expect("move request should parse");
+        assert_eq!(
+            move_task.request,
+            ClientRequest::MovePlanTask {
+                run_id: "run-1".to_owned(),
+                plan_id: "plan-1".to_owned(),
+                task_id: "task-2".to_owned(),
+                direction: MoveDirection::Up,
             }
         );
     }

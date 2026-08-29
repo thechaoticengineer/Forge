@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+orchestrator-agents = { path = "../orchestrator-agents" }
 orchestrator-core = { path = "../orchestrator-core" }
 orchestrator-git = { path = "../orchestrator-git" }
 orchestrator-store = { path = "../orchestrator-store" }
