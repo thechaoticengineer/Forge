@@ -1,0 +1,19 @@
+[package]
+name = "orchestrator-agents"
+description = "Constrained Codex CLI and Claude Code CLI adapters"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+orchestrator-core = { path = "../orchestrator-core" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
