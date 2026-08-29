@@ -27,6 +27,14 @@ Item {
   property int draftSessionGeneration: 0
   property int cloneDraftSession: -1
 
+  readonly property real panelDesignHeight: window.height
+    / Math.max(0.01, Style.spacing.scale)
+  readonly property real panelDesignWidth: window.width
+    / Math.max(0.01, Style.spacing.scale)
+  readonly property bool compactDraftLayout: root.editingDraft
+    && root.panelDesignHeight < 620
+  readonly property bool compactWidthLayout: root.panelDesignWidth < 800
+
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id
     : "dev.omarchy-ai-build-orchestrator"
@@ -525,13 +533,15 @@ Item {
           else if (root.selectedSection === 1 && text === "x") root.beginRejectPlan()
         }
 
-        Column {
+        Item {
           anchors.fill: parent
           anchors.margins: Style.space(20)
-          spacing: Style.space(18)
 
           Row {
-            width: parent.width
+            id: headerRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
             spacing: Style.space(12)
 
             Column {
@@ -547,6 +557,7 @@ Item {
               }
 
               Text {
+                visible: !root.compactDraftLayout
                 text: "Omarchy AI Build Orchestrator is a temporary working title."
                 color: root.mutedForeground
                 font.family: root.fontFamily
@@ -576,19 +587,30 @@ Item {
           }
 
           Rectangle {
-            width: parent.width
+            id: headerDivider
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: headerRow.bottom
+            anchors.topMargin: Style.space(18)
             height: 1
             color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
           }
 
           Row {
-            width: parent.width
-            height: parent.height - Style.space(126)
+            id: workspaceRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: headerDivider.bottom
+            anchors.topMargin: Style.space(18)
+            anchors.bottom: footerText.top
+            anchors.bottomMargin: Style.space(18)
             spacing: Style.space(18)
 
             ListView {
               id: sectionList
-              width: Math.min(Style.space(220), parent.width * 0.32)
+              width: root.compactWidthLayout
+                ? Math.min(Style.space(150), parent.width * 0.26)
+                : Math.min(Style.space(220), parent.width * 0.32)
               height: parent.height
               model: sectionModel
               interactive: contentHeight > height
@@ -645,9 +667,12 @@ Item {
             Column {
               id: contentPane
               width: parent.width - sectionList.width - Style.space(19)
+              height: parent.height
               spacing: Style.space(14)
 
               Text {
+                id: contentTitle
+                visible: !root.compactDraftLayout
                 text: sectionModel.get(root.selectedSection).title
                 color: root.foreground
                 font.family: root.fontFamily
@@ -656,6 +681,8 @@ Item {
               }
 
               Text {
+                id: contentDescription
+                visible: !root.compactDraftLayout
                 width: parent.width
                 text: sectionModel.get(root.selectedSection).description
                 color: root.mutedForeground
@@ -667,20 +694,27 @@ Item {
               Rectangle {
                 id: contentSurface
                 width: parent.width
-                height: contentPane.parent.height - Style.space(92)
+                height: root.compactDraftLayout
+                  ? parent.height
+                  : Math.max(0, parent.height - contentTitle.height
+                    - contentDescription.height - parent.spacing * 2)
                 radius: Style.cornerRadius
                 color: root.surface
+                clip: true
                 border.width: root.focusArea === "content" ? 2 : 1
                 border.color: root.focusArea === "content"
                   ? root.accent
                   : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
 
                 Column {
+                  id: contentBody
                   anchors.fill: parent
                   anchors.margins: Style.space(16)
                   spacing: Style.space(10)
 
                   Text {
+                    id: contentHeading
+                    visible: !root.compactDraftLayout
                     text: {
                       if (root.selectedSection === 1) {
                         var plan = root.currentPlan()
@@ -747,11 +781,17 @@ Item {
                   }
 
                   Column {
+                    id: draftEditor
                     visible: root.selectedSection === 0 && root.editingDraft
                     width: parent.width
+                    height: root.compactDraftLayout
+                      ? Math.max(0, parent.height - (draftErrorText.visible
+                        ? draftErrorText.height + parent.spacing : 0))
+                      : implicitHeight
                     spacing: Style.space(8)
 
                     Text {
+                      id: draftStepTitle
                       text: root.draftStep === "goal" ? "Engineering goal" : "Choose a repository"
                       color: root.foreground
                       font.family: root.fontFamily
@@ -760,15 +800,31 @@ Item {
                     }
 
                     Column {
+                      id: repositoryBrowser
                       visible: root.draftStep === "repository"
                       width: parent.width
+                      height: root.compactDraftLayout
+                        ? Math.max(0, parent.height - draftStepTitle.height - parent.spacing)
+                        : implicitHeight
                       spacing: Style.space(7)
+
+                      property real fixedContentHeight: repositorySearchField.height
+                        + projectsRootText.height
+                        + (repositoryStatus.visible ? repositoryStatus.height : 0)
+                        + (localDiscoveryWarning.visible ? localDiscoveryWarning.height : 0)
+                        + (githubDiscoveryWarning.visible ? githubDiscoveryWarning.height : 0)
+                        + spacing * (2
+                          + (repositoryStatus.visible ? 1 : 0)
+                          + (localDiscoveryWarning.visible ? 1 : 0)
+                          + (githubDiscoveryWarning.visible ? 1 : 0))
 
                       TextField {
                         id: repositorySearchField
                         width: parent.width
                         enabled: true
-                        placeholderText: "Search local and GitHub repositories  (/ to focus)"
+                        placeholderText: root.compactWidthLayout
+                          ? "Search repositories  (/ to focus)"
+                          : "Search local and GitHub repositories  (/ to focus)"
                         foreground: root.foreground
                         accent: root.accent
                         onTextEdited: root.selectedRepositoryIndex = 0
@@ -788,6 +844,7 @@ Item {
                       }
 
                       Text {
+                        id: projectsRootText
                         width: parent.width
                         text: "Projects root: " + (repositoryEngine.repositoryCatalog.project_roots || []).join(", ")
                         color: root.mutedForeground
@@ -797,12 +854,18 @@ Item {
                       }
 
                       Row {
+                        id: repositoryLists
                         width: parent.width
-                        height: Style.space(245)
+                        height: root.compactDraftLayout
+                          ? Math.max(Style.space(80), parent.height - parent.fixedContentHeight)
+                          : Style.space(245)
                         spacing: Style.space(8)
 
                         Rectangle {
-                          width: (parent.width - parent.spacing) / 2
+                          visible: !root.compactWidthLayout || root.repositorySourceIndex === 0
+                          width: root.compactWidthLayout
+                            ? parent.width
+                            : (parent.width - parent.spacing) / 2
                           height: parent.height
                           radius: Style.cornerRadius
                           color: "transparent"
@@ -891,7 +954,10 @@ Item {
                         }
 
                         Rectangle {
-                          width: (parent.width - parent.spacing) / 2
+                          visible: !root.compactWidthLayout || root.repositorySourceIndex === 1
+                          width: root.compactWidthLayout
+                            ? parent.width
+                            : (parent.width - parent.spacing) / 2
                           height: parent.height
                           radius: Style.cornerRadius
                           color: "transparent"
@@ -981,6 +1047,7 @@ Item {
                       }
 
                       Text {
+                        id: repositoryStatus
                         visible: repositoryEngine.requestPending
                           && (repositoryEngine.pendingMethod === "list_repositories"
                               || repositoryEngine.pendingMethod === "clone_repository")
@@ -994,6 +1061,7 @@ Item {
                       }
 
                       Text {
+                        id: localDiscoveryWarning
                         visible: !!repositoryEngine.repositoryCatalog.local_error
                         width: parent.width
                         text: "Local discovery warning: "
@@ -1002,9 +1070,12 @@ Item {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         wrapMode: Text.WordWrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
                       }
 
                       Text {
+                        id: githubDiscoveryWarning
                         visible: !!repositoryEngine.repositoryCatalog.github_error
                         width: parent.width
                         text: "GitHub unavailable: " + repositoryEngine.repositoryCatalog.github_error
@@ -1012,6 +1083,8 @@ Item {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         wrapMode: Text.WordWrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
                       }
                     }
 
@@ -1117,6 +1190,7 @@ Item {
                     }
 
                     Text {
+                      id: draftErrorText
                       visible: root.draftError() !== ""
                       width: parent.width
                       text: root.draftError()
@@ -1124,6 +1198,8 @@ Item {
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
                       wrapMode: Text.WordWrap
+                      maximumLineCount: 2
+                      elide: Text.ElideRight
                     }
                   }
 
@@ -1569,10 +1645,15 @@ Item {
           }
 
           Text {
+            id: footerText
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
             text: root.footerHelp()
             color: root.mutedForeground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
           }
         }
       }
