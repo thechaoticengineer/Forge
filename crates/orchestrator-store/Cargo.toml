@@ -1,0 +1,18 @@
+[package]
+name = "orchestrator-store"
+description = "Durable SQLite state for the software build orchestrator"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

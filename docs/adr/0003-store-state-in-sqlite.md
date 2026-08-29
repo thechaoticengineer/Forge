@@ -92,4 +92,3 @@ PostgreSQL or another service would add installation, lifecycle, credentials, an
 - [ADR-0001](0001-separate-engine-from-shell-frontend.md)
 - [ADR-0002](0002-use-versioned-json-over-a-unix-socket.md)
 - [Product state and traceability vision](../../README.md#state-and-traceability)
-
