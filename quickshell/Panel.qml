@@ -12,6 +12,8 @@ Item {
   property var manifest: null
   property bool closingFromHost: false
   property int selectedSection: 0
+  property bool editingDraft: false
+  property string localDraftError: ""
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id
@@ -43,8 +45,56 @@ Item {
   }
 
   function moveSelection(delta) {
+    if (editingDraft) return
     var count = sectionModel.count
     selectedSection = ((selectedSection + delta) % count + count) % count
+  }
+
+  function beginDraftEntry() {
+    if (!engine.connected || engine.requestPending) return
+    selectedSection = 0
+    editingDraft = true
+    localDraftError = ""
+    engine.requestError = ""
+    Qt.callLater(function() { repositoryField.forceActiveFocus() })
+  }
+
+  function cancelDraftEntry() {
+    if (engine.requestPending) return
+    editingDraft = false
+    localDraftError = ""
+    repositoryField.focus = false
+    goalField.focus = false
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function submitDraft() {
+    var repository = repositoryField.text.trim()
+    var goal = goalField.text.trim()
+    if (repository === "") {
+      localDraftError = "Enter an absolute repository path"
+      repositoryField.forceActiveFocus()
+      return
+    }
+    if (goal === "") {
+      localDraftError = "Describe the engineering goal"
+      goalField.forceActiveFocus()
+      return
+    }
+
+    localDraftError = ""
+    engine.createDraft(repository, goal)
+  }
+
+  function draftError() {
+    return localDraftError || engine.requestError
+  }
+
+  function footerHelp() {
+    if (editingDraft) return "Tab  Next field    Enter  Continue or create    Esc  Cancel"
+    if (selectedSection === 0 && engine.activeRun) return "j/k  Navigate    n  New draft    r  Reconnect    Esc  Close"
+    if (selectedSection === 0) return "j/k  Navigate    Enter  Create draft    r  Reconnect    Esc  Close"
+    return "j/k or arrows  Navigate    r  Reconnect    Esc  Close"
   }
 
   function statusLabel() {
@@ -60,7 +110,15 @@ Item {
     return foreground
   }
 
-  EngineConnection { id: engine }
+  EngineConnection {
+    id: engine
+    onDraftCreated: {
+      root.editingDraft = false
+      repositoryField.text = ""
+      goalField.text = ""
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
 
   ListModel {
     id: sectionModel
@@ -107,13 +165,18 @@ Item {
       PanelKeyCatcher {
         id: keyCatcher
         anchors.fill: parent
+        blocked: repositoryField.activeFocus || goalField.activeFocus
         onMoveRequested: function(dx, dy) {
           if (dy !== 0) root.moveSelection(dy)
           else if (dx !== 0) root.moveSelection(dx)
         }
+        onActivateRequested: {
+          if (root.selectedSection === 0 && !root.editingDraft) root.beginDraftEntry()
+        }
         onCloseRequested: root.requestClose()
         onTextKey: function(text) {
           if (text === "r") engine.reconnect()
+          else if (text === "n") root.beginDraftEntry()
         }
 
         Column {
@@ -219,6 +282,7 @@ Item {
             }
 
             Column {
+              id: contentPane
               width: parent.width - sectionList.width - Style.space(19)
               spacing: Style.space(14)
 
@@ -241,7 +305,7 @@ Item {
 
               Rectangle {
                 width: parent.width
-                height: Style.space(150)
+                height: contentPane.parent.height - Style.space(92)
                 radius: Style.cornerRadius
                 color: root.surface
                 border.width: 1
@@ -253,7 +317,13 @@ Item {
                   spacing: Style.space(10)
 
                   Text {
-                    text: engine.connected ? "No active run" : "Start the Rust engine to connect"
+                    text: {
+                      if (root.selectedSection !== 0) return "Planned capability"
+                      if (!engine.connected) return "Start the Rust engine to connect"
+                      if (root.editingDraft) return "Create a durable draft run"
+                      if (engine.activeRun) return "Draft saved"
+                      return "No active run"
+                    }
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -261,14 +331,187 @@ Item {
                   }
 
                   Text {
+                    visible: root.selectedSection !== 0
                     width: parent.width
-                    text: engine.connected
-                      ? "The foundation currently proves the shared state boundary. Repository selection, planning, agent execution, verification, and review are not implemented yet."
-                      : "The panel remains safe and responsive while the engine is unavailable. It will reconnect automatically."
+                    text: sectionModel.get(root.selectedSection).description
                     color: root.mutedForeground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     wrapMode: Text.WordWrap
+                  }
+
+                  Text {
+                    visible: root.selectedSection === 0 && !engine.connected
+                    width: parent.width
+                    text: "The panel remains safe while the engine is unavailable and will reconnect automatically."
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 0 && engine.connected && !root.editingDraft && !engine.activeRun
+                    width: parent.width
+                    spacing: Style.space(12)
+
+                    Text {
+                      width: parent.width
+                      text: "Open a local Git repository and preserve an engineering goal. The engine will record its canonical path, current revision, branch, and working-tree condition without modifying it."
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Button {
+                      text: "Create draft"
+                      bordered: true
+                      foreground: root.foreground
+                      accent: root.accent
+                      onClicked: root.beginDraftEntry()
+                    }
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 0 && root.editingDraft
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      text: "Repository"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+
+                    TextField {
+                      id: repositoryField
+                      width: parent.width
+                      enabled: !engine.requestPending
+                      placeholderText: "/absolute/path/to/repository"
+                      foreground: root.foreground
+                      accent: root.accent
+
+                      Keys.onPressed: function(event) {
+                        if (event.key === Qt.Key_Escape) {
+                          root.cancelDraftEntry(); event.accepted = true
+                        } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                          goalField.forceActiveFocus(); event.accepted = true
+                        }
+                      }
+                    }
+
+                    Text {
+                      text: "Goal"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+
+                    TextField {
+                      id: goalField
+                      width: parent.width
+                      enabled: !engine.requestPending
+                      placeholderText: "Describe a small engineering goal"
+                      foreground: root.foreground
+                      accent: root.accent
+
+                      Keys.onPressed: function(event) {
+                        if (event.key === Qt.Key_Escape) {
+                          root.cancelDraftEntry(); event.accepted = true
+                        } else if (event.key === Qt.Key_Backtab || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+                          repositoryField.forceActiveFocus(); event.accepted = true
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                          root.submitDraft(); event.accepted = true
+                        }
+                      }
+                    }
+
+                    Row {
+                      spacing: Style.space(8)
+
+                      Button {
+                        text: engine.requestPending ? "Creating…" : "Create draft"
+                        bordered: true
+                        enabled: !engine.requestPending
+                        foreground: root.foreground
+                        accent: root.accent
+                        onClicked: root.submitDraft()
+                      }
+
+                      Button {
+                        text: "Cancel"
+                        enabled: !engine.requestPending
+                        foreground: root.foreground
+                        accent: root.accent
+                        onClicked: root.cancelDraftEntry()
+                      }
+                    }
+
+                    Text {
+                      visible: root.draftError() !== ""
+                      width: parent.width
+                      text: root.draftError()
+                      color: root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 0 && !root.editingDraft && !!engine.activeRun
+                    width: parent.width
+                    spacing: Style.space(8)
+
+                    Text {
+                      width: parent.width
+                      text: engine.activeRun ? engine.activeRun.goal : ""
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: engine.activeRun ? engine.activeRun.repository : ""
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideMiddle
+                    }
+
+                    Text {
+                      text: engine.activeRun
+                        ? ((engine.activeRun.branch || "detached HEAD") + "  •  "
+                           + String(engine.activeRun.base_revision || "").slice(0, 12) + "  •  "
+                           + (engine.activeRun.worktree_dirty ? "dirty working tree" : "clean working tree"))
+                        : ""
+                      color: engine.activeRun && engine.activeRun.worktree_dirty ? root.urgent : root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: "This draft survives engine and shell restarts. Planning and agent assignment are the next workflow stage and are not implemented yet."
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+
+                    Button {
+                      text: "New draft"
+                      foreground: root.foreground
+                      accent: root.accent
+                      onClicked: root.beginDraftEntry()
+                    }
                   }
 
                   Text {
@@ -286,7 +529,7 @@ Item {
           }
 
           Text {
-            text: "j/k or arrows  Navigate    r  Reconnect    Esc  Close"
+            text: root.footerHelp()
             color: root.mutedForeground
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall

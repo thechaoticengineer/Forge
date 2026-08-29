@@ -21,8 +21,13 @@ Item {
   property var activeRun: null
   property bool requiresAttention: false
   property string lastError: ""
+  property bool requestPending: false
+  property string pendingRequestId: ""
+  property string requestError: ""
+  property int requestSequence: 0
 
   signal snapshotChanged()
+  signal draftCreated()
 
   function reconnect() {
     if (socketPath === "") {
@@ -32,6 +37,28 @@ Item {
 
     socket.connected = false
     Qt.callLater(function() { socket.connected = true })
+  }
+
+  function createDraft(repository, goal) {
+    if (!socket.connected) {
+      requestError = "The orchestration engine is not connected"
+      return false
+    }
+    if (requestPending) return false
+
+    requestSequence++
+    pendingRequestId = "qml-" + Date.now() + "-" + requestSequence
+    requestPending = true
+    requestError = ""
+    socket.write(JSON.stringify({
+      version: 1,
+      request_id: pendingRequestId,
+      method: "create_draft_run",
+      repository: String(repository || ""),
+      goal: String(goal || "")
+    }) + "\n")
+    socket.flush()
+    return true
   }
 
   function acceptMessage(line) {
@@ -49,7 +76,13 @@ Item {
     }
 
     if (message.type === "error") {
-      lastError = String(message.message || "The engine rejected a request")
+      if (message.request_id && message.request_id === pendingRequestId) {
+        requestPending = false
+        pendingRequestId = ""
+        requestError = String(message.message || "The engine rejected the request")
+      } else {
+        lastError = String(message.message || "The engine rejected a request")
+      }
       return
     }
 
@@ -75,6 +108,12 @@ Item {
     requiresAttention = snapshot.requires_attention === true
     hasSnapshot = true
     lastError = ""
+    if (message.request_id && message.request_id === pendingRequestId) {
+      requestPending = false
+      pendingRequestId = ""
+      requestError = ""
+      draftCreated()
+    }
     snapshotChanged()
   }
 
@@ -95,6 +134,11 @@ Item {
       } else {
         root.engineStatus = "offline"
         root.lastError = "The orchestration engine is not available"
+        if (root.requestPending) {
+          root.requestPending = false
+          root.pendingRequestId = ""
+          root.requestError = "Connection lost before the engine responded"
+        }
         retryTimer.restart()
       }
     }
