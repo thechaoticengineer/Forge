@@ -1,11 +1,11 @@
 use std::{path::PathBuf, process};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use orchestrator_core::{
     ipc::default_socket_path,
-    protocol::{ClientMessage, ClientRequest, PROTOCOL_VERSION, ServerMessage},
-    state::EngineSnapshot,
+    protocol::{ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, ServerMessage},
+    state::{AgentKind, EngineSnapshot},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -37,6 +37,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Generate, revise, approve, or reject the active run's plan.
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
     /// Check whether the engine is responsive.
     Ping,
     /// Show the current authoritative engine snapshot.
@@ -45,6 +50,84 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    /// Ask Codex or Claude Code to inspect the repository and propose a plan.
+    Generate {
+        #[arg(long, value_enum)]
+        agent: AgentArgument,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit one task and create a new plan revision.
+    Edit {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        description: String,
+        /// Acceptance criterion; repeat for multiple criteria.
+        #[arg(long = "acceptance", required = true)]
+        acceptance_criteria: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move one task while preserving dependency validity.
+    Move {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long, value_enum)]
+        direction: DirectionArgument,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve the current proposed plan.
+    Approve {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reject the current proposed plan and return the run to draft state.
+    Reject {
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AgentArgument {
+    Codex,
+    Claude,
+}
+
+impl From<AgentArgument> for AgentKind {
+    fn from(value: AgentArgument) -> Self {
+        match value {
+            AgentArgument::Codex => Self::Codex,
+            AgentArgument::Claude => Self::Claude,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DirectionArgument {
+    Up,
+    Down,
+}
+
+impl From<DirectionArgument> for MoveDirection {
+    fn from(value: DirectionArgument) -> Self {
+        match value {
+            DirectionArgument::Up => Self::Up,
+            DirectionArgument::Down => Self::Down,
+        }
+    }
 }
 
 #[tokio::main]
@@ -61,6 +144,7 @@ async fn main() -> Result<()> {
             goal,
             json,
         } => create_draft(&socket_path, repository, goal, json).await,
+        Command::Plan { command } => plan_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
         Command::Status { json } => status(&socket_path, json).await,
     }
@@ -78,42 +162,140 @@ async fn create_draft(
         .to_str()
         .context("repository path is not valid UTF-8")?
         .to_owned();
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::CreateDraftRun { repository, goal },
+        Duration::from_secs(10),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+async fn plan_command(socket_path: &PathBuf, command: PlanCommand) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let (request, json, response_timeout) = match command {
+        PlanCommand::Generate { agent, json } => (
+            ClientRequest::GeneratePlan {
+                run_id: run.id.clone(),
+                agent: agent.into(),
+            },
+            json,
+            Duration::from_mins(11),
+        ),
+        PlanCommand::Edit {
+            task,
+            title,
+            description,
+            acceptance_criteria,
+            json,
+        } => {
+            let plan = run.plan.as_ref().context("the active run has no plan")?;
+            let task = plan
+                .tasks
+                .get(
+                    task.checked_sub(1)
+                        .context("task position must be at least 1")?,
+                )
+                .context("task position is outside the current plan")?;
+            (
+                ClientRequest::UpdatePlanTask {
+                    run_id: run.id.clone(),
+                    plan_id: plan.id.clone(),
+                    task_id: task.id.clone(),
+                    title,
+                    description,
+                    acceptance_criteria,
+                },
+                json,
+                Duration::from_secs(10),
+            )
+        }
+        PlanCommand::Move {
+            task,
+            direction,
+            json,
+        } => {
+            let plan = run.plan.as_ref().context("the active run has no plan")?;
+            let task = plan
+                .tasks
+                .get(
+                    task.checked_sub(1)
+                        .context("task position must be at least 1")?,
+                )
+                .context("task position is outside the current plan")?;
+            (
+                ClientRequest::MovePlanTask {
+                    run_id: run.id.clone(),
+                    plan_id: plan.id.clone(),
+                    task_id: task.id.clone(),
+                    direction: direction.into(),
+                },
+                json,
+                Duration::from_secs(10),
+            )
+        }
+        PlanCommand::Approve { json } => {
+            let plan = run.plan.as_ref().context("the active run has no plan")?;
+            (
+                ClientRequest::ApprovePlan {
+                    run_id: run.id.clone(),
+                    plan_id: plan.id.clone(),
+                },
+                json,
+                Duration::from_secs(10),
+            )
+        }
+        PlanCommand::Reject { reason, json } => {
+            let plan = run.plan.as_ref().context("the active run has no plan")?;
+            (
+                ClientRequest::RejectPlan {
+                    run_id: run.id.clone(),
+                    plan_id: plan.id.clone(),
+                    reason,
+                },
+                json,
+                Duration::from_secs(10),
+            )
+        }
+    };
+    let snapshot = send_workflow_request(socket_path, request, response_timeout).await?;
+    print_result(&snapshot, json)
+}
+
+async fn send_workflow_request(
+    socket_path: &PathBuf,
+    request: ClientRequest,
+    response_timeout: Duration,
+) -> Result<EngineSnapshot> {
     let request_id = request_id();
     let request = ClientMessage {
         version: PROTOCOL_VERSION,
         request_id: request_id.clone(),
-        request: ClientRequest::CreateDraftRun { repository, goal },
+        request,
     };
-
     let stream = connect(socket_path).await?;
     let (read_half, mut write_half) = stream.into_split();
     send_request(&mut write_half, &request).await?;
     let mut reader = BufReader::new(read_half);
-
     loop {
-        match read_message(&mut reader).await? {
+        match read_message(&mut reader, response_timeout).await? {
             ServerMessage::Snapshot {
                 request_id: Some(response_id),
                 snapshot,
                 ..
-            } if response_id == request_id => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&snapshot)
-                            .context("cannot encode snapshot")?
-                    );
-                } else {
-                    print_snapshot(&snapshot);
-                }
-                return Ok(());
-            }
+            } if response_id == request_id => return Ok(snapshot),
             ServerMessage::Error {
                 request_id: Some(response_id),
                 code,
                 message,
                 ..
-            } if response_id == request_id => bail!("engine rejected draft ({code}): {message}"),
+            } if response_id == request_id => {
+                bail!("engine rejected request ({code}): {message}")
+            }
             _ => {}
         }
     }
@@ -126,20 +308,28 @@ async fn connect(socket_path: &PathBuf) -> Result<UnixStream> {
 }
 
 async fn status(socket_path: &PathBuf, json: bool) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    print_result(&snapshot, json)
+}
+
+async fn fetch_snapshot(socket_path: &PathBuf) -> Result<EngineSnapshot> {
     let stream = connect(socket_path).await?;
     let mut reader = BufReader::new(stream);
-    let message = read_message(&mut reader).await?;
+    let message = read_message(&mut reader, Duration::from_secs(10)).await?;
     let ServerMessage::Snapshot { snapshot, .. } = message else {
         bail!("engine did not send a state snapshot after connection");
     };
+    Ok(snapshot)
+}
 
+fn print_result(snapshot: &EngineSnapshot, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&snapshot).context("cannot encode snapshot")?
         );
     } else {
-        print_snapshot(&snapshot);
+        print_snapshot(snapshot);
     }
     Ok(())
 }
@@ -157,7 +347,7 @@ async fn ping(socket_path: &PathBuf) -> Result<()> {
 
     let mut reader = BufReader::new(read_half);
     loop {
-        match read_message(&mut reader).await? {
+        match read_message(&mut reader, Duration::from_secs(10)).await? {
             ServerMessage::Pong {
                 request_id: response_id,
                 ..
@@ -183,12 +373,12 @@ where
         .context("cannot send request")
 }
 
-async fn read_message<R>(reader: &mut R) -> Result<ServerMessage>
+async fn read_message<R>(reader: &mut R, response_timeout: Duration) -> Result<ServerMessage>
 where
     R: AsyncBufReadExt + Unpin,
 {
     let mut line = String::new();
-    let read = timeout(Duration::from_secs(10), reader.read_line(&mut line))
+    let read = timeout(response_timeout, reader.read_line(&mut line))
         .await
         .context("engine response timed out")?
         .context("cannot read engine response")?;
@@ -215,6 +405,34 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
                 "Working tree: {}",
                 if run.worktree_dirty { "dirty" } else { "clean" }
             );
+            if let Some(error) = &run.last_error {
+                println!("Last error: {error}");
+            }
+            if let Some(plan) = &run.plan {
+                println!(
+                    "Plan: revision {} · {} · {}",
+                    plan.revision,
+                    plan.planner.as_str(),
+                    plan.status.as_str()
+                );
+                println!("Plan summary: {}", plan.summary);
+                for task in &plan.tasks {
+                    println!("  {}. {}", task.position, task.title);
+                    println!("     {}", task.description);
+                    for criterion in &task.acceptance_criteria {
+                        println!("     - {criterion}");
+                    }
+                    if !task.depends_on.is_empty() {
+                        let dependencies = task
+                            .depends_on
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("     Depends on: {dependencies}");
+                    }
+                }
+            }
         }
         None => println!("Active run: none"),
     }
