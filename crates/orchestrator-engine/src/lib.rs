@@ -2212,15 +2212,9 @@ mod tests {
             claude: state.path().join("unused-claude"),
         });
 
-        let proposed = generate_plan(
-            run_id.clone(),
-            AgentKind::Codex,
-            &storage,
-            &planner,
-            &state_sender,
-        )
-        .await
-        .expect("planner should propose a plan");
+        let proposed =
+            generate_plan_past_a_busy_executable(run_id.clone(), &storage, &planner, &state_sender)
+                .await;
         let plan = proposed
             .active_run
             .as_ref()
@@ -2517,15 +2511,9 @@ mod tests {
             claude: state.path().join("unused-claude"),
         });
 
-        let proposed = generate_plan(
-            run_id.clone(),
-            AgentKind::Codex,
-            storage,
-            &planner,
-            &state_sender,
-        )
-        .await
-        .expect("planner should propose a plan");
+        let proposed =
+            generate_plan_past_a_busy_executable(run_id.clone(), storage, &planner, &state_sender)
+                .await;
         let plan = proposed
             .active_run
             .and_then(|run| run.plan)
@@ -2538,6 +2526,36 @@ mod tests {
             .and_then(|run| run.plan)
             .expect("approved plan should be visible");
         (run_id, plan)
+    }
+
+    /// A sibling test that spawns a process can inherit the write descriptor of
+    /// a fake planner this test just created, so the kernel reports `ETXTBSY`
+    /// until that unrelated child execs. Only the test fixture is racy, so retry
+    /// here rather than teaching the engine to retry a real CLI.
+    async fn generate_plan_past_a_busy_executable(
+        run_id: String,
+        storage: &StorageWorker,
+        planner: &PlannerRunner,
+        state_sender: &watch::Sender<EngineSnapshot>,
+    ) -> StoredSnapshot {
+        for _ in 0..20 {
+            match generate_plan(
+                run_id.clone(),
+                AgentKind::Codex,
+                storage,
+                planner,
+                state_sender,
+            )
+            .await
+            {
+                Ok(snapshot) => return snapshot,
+                Err(failure) if failure.message.contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(failure) => panic!("planner should propose a plan: {failure:?}"),
+            }
+        }
+        panic!("the fake planner stayed busy for every attempt");
     }
 
     fn initialized_repository() -> TempDir {
