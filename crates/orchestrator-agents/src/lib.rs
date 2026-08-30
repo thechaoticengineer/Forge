@@ -563,10 +563,7 @@ mod tests {
         let runner = PlannerRunner::new(AgentCommands { codex, claude });
 
         for agent in [AgentKind::Codex, AgentKind::Claude] {
-            let result = runner
-                .generate(agent, temporary.path(), "Plan the change")
-                .await
-                .expect("adapter should return a plan");
+            let result = generate_past_a_busy_executable(&runner, agent, temporary.path()).await;
             assert_eq!(result.proposal, sample_proposal());
             assert_eq!(result.exit_code, 0);
         }
@@ -597,6 +594,27 @@ mod tests {
         fs::write(path, contents).expect("fake CLI should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .expect("fake CLI should be executable");
+    }
+
+    /// A sibling test that spawns a process can inherit the write descriptor of
+    /// a fake CLI this test just created, so the kernel reports `ETXTBSY` until
+    /// that unrelated child execs. Only the test fixture is racy, so retry here
+    /// rather than teaching the adapter to retry a real CLI.
+    async fn generate_past_a_busy_executable(
+        runner: &PlannerRunner,
+        agent: AgentKind,
+        repository: &Path,
+    ) -> PlannerOutput {
+        for _ in 0..20 {
+            match runner.generate(agent, repository, "Plan the change").await {
+                Ok(output) => return output,
+                Err(failure) if failure.message.contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(failure) => panic!("adapter should return a plan: {failure:?}"),
+            }
+        }
+        panic!("the fake CLI stayed busy for every attempt");
     }
 
     fn sample_run() -> ActiveRunSummary {
