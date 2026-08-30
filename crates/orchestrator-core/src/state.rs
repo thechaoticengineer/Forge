@@ -50,6 +50,8 @@ pub enum TaskWorktreeStatus {
     Ready,
     /// The directory is gone; the record is kept as history.
     Missing,
+    /// The directory exists but no longer matches its record.
+    Diverged,
     /// Creation failed or was interrupted; the task can be retried.
     Failed,
     /// Removed deliberately by the user.
@@ -63,6 +65,7 @@ impl TaskWorktreeStatus {
             Self::Reserved => "reserved",
             Self::Ready => "ready",
             Self::Missing => "missing",
+            Self::Diverged => "diverged",
             Self::Failed => "failed",
             Self::Retired => "retired",
         }

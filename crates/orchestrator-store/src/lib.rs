@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
+const WORKTREES_DIRECTORY: &str = "worktrees";
 const LATEST_SCHEMA_VERSION: i64 = 3;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -99,6 +100,7 @@ pub struct StatePaths {
     root: PathBuf,
     database: PathBuf,
     artifacts: PathBuf,
+    worktrees: PathBuf,
 }
 
 impl StatePaths {
@@ -108,6 +110,7 @@ impl StatePaths {
         Self {
             database: root.join(DATABASE_FILE),
             artifacts: root.join(ARTIFACTS_DIRECTORY),
+            worktrees: root.join(WORKTREES_DIRECTORY),
             root,
         }
     }
@@ -169,6 +172,12 @@ impl StatePaths {
     #[must_use]
     pub fn artifacts(&self) -> &Path {
         &self.artifacts
+    }
+
+    /// Root of the engine-owned task worktrees described by ADR-0006.
+    #[must_use]
+    pub fn worktrees(&self) -> &Path {
+        &self.worktrees
     }
 }
 
@@ -294,8 +303,10 @@ enum Command {
         error_message: String,
         reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     },
-    MarkTaskWorktreeMissing {
+    SettleTaskWorktree {
         worktree_id: String,
+        status: TaskWorktreeStatus,
+        detail: Option<String>,
         reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     },
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -615,19 +626,25 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
-    /// Records that a previously ready worktree directory has disappeared.
+    /// Records that a previously ready worktree has disappeared or no longer
+    /// matches its record.
     ///
     /// # Errors
     ///
-    /// Returns an error when the worktree is not live or storage fails.
-    pub async fn mark_task_worktree_missing(
+    /// Returns an error when the worktree is not ready, the status is not a
+    /// reconciliation outcome, or storage fails.
+    pub async fn settle_task_worktree(
         &self,
         worktree_id: String,
+        status: TaskWorktreeStatus,
+        detail: Option<String>,
     ) -> Result<StoredSnapshot, StorageError> {
         let (reply_sender, reply_receiver) = oneshot::channel();
         self.sender
-            .send(Command::MarkTaskWorktreeMissing {
+            .send(Command::SettleTaskWorktree {
                 worktree_id,
+                status,
+                detail,
                 reply: reply_sender,
             })
             .map_err(|_| StorageError::WorkerStopped)?;
@@ -701,11 +718,16 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
                     Some(&error_message),
                 ));
             }
-            Command::MarkTaskWorktreeMissing { worktree_id, reply } => {
+            Command::SettleTaskWorktree {
+                worktree_id,
+                status,
+                detail,
+                reply,
+            } => {
                 let _ = reply.send(database.settle_task_worktree(
                     &worktree_id,
-                    TaskWorktreeStatus::Missing,
-                    None,
+                    status,
+                    detail.as_deref(),
                 ));
             }
             Command::CurrentSnapshot(reply) => {
@@ -728,6 +750,7 @@ impl Database {
     fn open(paths: &StatePaths) -> Result<Self, StorageError> {
         ensure_private_directory(paths.root())?;
         ensure_private_directory(paths.artifacts())?;
+        ensure_private_directory(paths.worktrees())?;
 
         let mut connection = Connection::open(paths.database())?;
         set_file_mode(paths.database(), 0o600)?;
@@ -1205,6 +1228,7 @@ impl Database {
         let (expected, kind) = match status {
             TaskWorktreeStatus::Failed => ("reserved", "worktree_failed"),
             TaskWorktreeStatus::Missing => ("ready", "worktree_missing"),
+            TaskWorktreeStatus::Diverged => ("ready", "worktree_diverged"),
             other => {
                 return Err(StorageError::InvalidWorktreeStatus(
                     other.as_str().to_owned(),
@@ -1544,6 +1568,7 @@ fn parse_worktree_status(status: &str) -> Result<TaskWorktreeStatus, StorageErro
         "reserved" => Ok(TaskWorktreeStatus::Reserved),
         "ready" => Ok(TaskWorktreeStatus::Ready),
         "missing" => Ok(TaskWorktreeStatus::Missing),
+        "diverged" => Ok(TaskWorktreeStatus::Diverged),
         "failed" => Ok(TaskWorktreeStatus::Failed),
         "retired" => Ok(TaskWorktreeStatus::Retired),
         _ => Err(StorageError::InvalidWorktreeStatus(status.to_owned())),
@@ -2209,7 +2234,11 @@ mod tests {
         );
 
         let missing = worker
-            .mark_task_worktree_missing(reserved.worktree_id.clone())
+            .settle_task_worktree(
+                reserved.worktree_id.clone(),
+                TaskWorktreeStatus::Missing,
+                None,
+            )
             .await
             .expect("missing worktree should persist");
         assert_eq!(

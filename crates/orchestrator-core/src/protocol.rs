@@ -53,6 +53,11 @@ pub enum ClientRequest {
         plan_id: String,
         reason: Option<String>,
     },
+    CreateTaskWorktree {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+    },
     GetSnapshot,
     Ping,
 }
@@ -306,6 +311,23 @@ mod tests {
         assert_eq!(json["type"], "path_completion");
         assert_eq!(json["replacement"], "/home/dev/Projects/");
         assert_eq!(json["candidates"][0], "/home/dev/Projects/");
+    }
+
+    #[test]
+    fn parses_create_task_worktree_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-worktree","method":"create_task_worktree","run_id":"run-1","plan_id":"plan-1","task_id":"task-1"}"#,
+        )
+        .expect("worktree request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::CreateTaskWorktree {
+                run_id: "run-1".to_owned(),
+                plan_id: "plan-1".to_owned(),
+                task_id: "task-1".to_owned(),
+            }
+        );
     }
 
     #[test]

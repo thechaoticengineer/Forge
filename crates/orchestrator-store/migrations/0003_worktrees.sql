@@ -4,7 +4,7 @@ CREATE TABLE task_worktrees (
     plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
     task_id TEXT NOT NULL REFERENCES plan_tasks(id) ON DELETE RESTRICT,
     status TEXT NOT NULL CHECK (
-        status IN ('reserved', 'ready', 'missing', 'failed', 'retired')
+        status IN ('reserved', 'ready', 'missing', 'diverged', 'failed', 'retired')
     ),
     branch TEXT NOT NULL CHECK (length(trim(branch)) > 0),
     path TEXT NOT NULL CHECK (length(trim(path)) > 0),

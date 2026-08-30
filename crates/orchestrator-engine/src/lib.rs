@@ -21,13 +21,17 @@ use orchestrator_core::{
     },
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, PlanProposal, PlanStatus,
-        PlanSummary, ProposedTask, RunStatus,
+        PlanSummary, ProposedTask, RunStatus, TaskWorktreeStatus,
     },
 };
-use orchestrator_git::{GitError, discover_repositories_until, inspect_repository};
+use orchestrator_git::{
+    GitError, TaskWorktreeRequest, TaskWorktreeState, discover_repositories_until,
+    inspect_repository, prune_missing_worktrees, task_branch_name, task_worktree_path,
+    task_worktree_state,
+};
 use orchestrator_store::{
     DraftRunInput, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput,
-    StatePaths, StorageWorker, StoredSnapshot,
+    StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -120,6 +124,7 @@ pub async fn serve_with_settings(
         .current_snapshot()
         .await
         .context("cannot restore durable engine state")?;
+    let stored_snapshot = reconcile_task_worktrees(&storage, stored_snapshot).await;
     prepare_socket(&socket_path).await?;
 
     let listener = UnixListener::bind(&socket_path)
@@ -388,6 +393,17 @@ async fn handle_request(
             plan_id,
             reason,
         } => match decide_plan(run_id, plan_id, false, reason, storage).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::CreateTaskWorktree {
+            run_id,
+            plan_id,
+            task_id,
+        } => match prepare_task_worktree(run_id, plan_id, task_id, storage, state_sender).await {
             Ok(stored_snapshot) => {
                 publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
                 ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
@@ -1443,6 +1459,149 @@ async fn decide_plan(
     result.map_err(|error| RequestFailure::storage("cannot persist plan decision", error))
 }
 
+/// Records an intended task worktree, then creates it. The durable record is
+/// written first so an interrupted engine leaves a retryable reservation rather
+/// than an unexplained directory. See ADR-0006.
+async fn prepare_task_worktree(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    storage: &StorageWorker,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let run = load_active_run(storage, &run_id).await?;
+    let plan = run
+        .plan
+        .as_ref()
+        .filter(|plan| plan.id == plan_id && plan.status == PlanStatus::Approved)
+        .ok_or_else(|| RequestFailure {
+            code: "plan_not_approved",
+            message: "isolated implementation requires the run's approved plan".to_owned(),
+        })?;
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| RequestFailure {
+            code: "task_not_found",
+            message: "the selected task is not part of the approved plan".to_owned(),
+        })?;
+
+    let branch = task_branch_name(&run.id, task.position, &task.title);
+    let path = task_worktree_path(
+        storage.paths().worktrees(),
+        &run.id,
+        task.position,
+        &task.title,
+    );
+    let reserved = storage
+        .reserve_task_worktree(TaskWorktreeReservation {
+            run_id: run.id.clone(),
+            plan_id,
+            task_id,
+            branch: branch.clone(),
+            path: path_to_string(&path)?,
+            base_revision: run.base_revision.clone(),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot reserve the task worktree", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(reserved.snapshot));
+
+    let request = TaskWorktreeRequest {
+        repository: PathBuf::from(&run.repository),
+        path,
+        branch,
+        base_revision: run.base_revision,
+    };
+    let created =
+        tokio::task::spawn_blocking(move || orchestrator_git::create_task_worktree(&request))
+            .await
+            .map_err(|error| format!("task worktree creation task failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+
+    match created {
+        Ok(worktree) => storage
+            .confirm_task_worktree(reserved.worktree_id, worktree.repository_dirty)
+            .await
+            .map_err(|error| RequestFailure::storage("cannot confirm the task worktree", error)),
+        Err(message) => {
+            let failed = storage
+                .fail_task_worktree(reserved.worktree_id, message.clone())
+                .await
+                .map_err(|error| {
+                    RequestFailure::storage("cannot record the worktree failure", error)
+                })?;
+            publish_newer_snapshot(state_sender, engine_snapshot(failed));
+            Err(RequestFailure {
+                code: "worktree_failed",
+                message,
+            })
+        }
+    }
+}
+
+/// Compares recorded worktrees with the filesystem at startup and records what
+/// diverged instead of repairing it. See ADR-0006.
+async fn reconcile_task_worktrees(
+    storage: &StorageWorker,
+    snapshot: StoredSnapshot,
+) -> StoredSnapshot {
+    let Some(run) = snapshot.active_run.as_ref() else {
+        return snapshot;
+    };
+    let repository = PathBuf::from(&run.repository);
+    let recorded: Vec<_> = run
+        .worktrees
+        .iter()
+        .filter(|worktree| worktree.status == TaskWorktreeStatus::Ready)
+        .map(|worktree| {
+            (
+                worktree.id.clone(),
+                PathBuf::from(&worktree.path),
+                worktree.branch.clone(),
+            )
+        })
+        .collect();
+    if recorded.is_empty() {
+        return snapshot;
+    }
+
+    let mut reconciled = snapshot;
+    for (worktree_id, path, branch) in recorded {
+        let repository = repository.clone();
+        let inspected =
+            tokio::task::spawn_blocking(move || task_worktree_state(&repository, &path, &branch))
+                .await;
+        let (status, detail) = match inspected {
+            Ok(Ok(TaskWorktreeState::Ready { .. })) => continue,
+            Ok(Ok(TaskWorktreeState::Missing)) => (TaskWorktreeStatus::Missing, None),
+            Ok(Ok(TaskWorktreeState::Diverged(detail))) => {
+                (TaskWorktreeStatus::Diverged, Some(detail))
+            }
+            Ok(Err(error)) => (TaskWorktreeStatus::Diverged, Some(error.to_string())),
+            Err(error) => (
+                TaskWorktreeStatus::Diverged,
+                Some(format!("worktree reconciliation task failed: {error}")),
+            ),
+        };
+        match storage
+            .settle_task_worktree(worktree_id, status, detail)
+            .await
+        {
+            Ok(updated) => reconciled = updated,
+            Err(error) => eprintln!("cannot record task worktree reconciliation: {error}"),
+        }
+    }
+
+    let pruned = repository.clone();
+    if let Ok(Err(error)) =
+        tokio::task::spawn_blocking(move || prune_missing_worktrees(&pruned)).await
+    {
+        eprintln!("cannot prune missing worktree records: {error}");
+    }
+    reconciled
+}
+
 async fn load_active_run(
     storage: &StorageWorker,
     run_id: &str,
@@ -2170,6 +2329,209 @@ mod tests {
             Some(RunStatus::Failed)
         );
         assert_eq!(engine_snapshot(snapshot).status, EngineStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn creates_an_isolated_worktree_for_an_approved_task() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let paths = StatePaths::new(state.path().join("store"));
+        let storage = StorageWorker::start(paths.clone()).expect("storage should start");
+        fs::write(repository.path().join("in-progress.txt"), "user work")
+            .expect("uncommitted user work should exist");
+
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+
+        let created = prepare_task_worktree(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect("the approved task should get a worktree");
+
+        let worktrees = created.active_run.expect("run should be active").worktrees;
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].status, TaskWorktreeStatus::Ready);
+        assert!(worktrees[0].branch.starts_with("orchestrator/"));
+        assert!(
+            worktrees[0].path.starts_with(
+                paths
+                    .worktrees()
+                    .to_str()
+                    .expect("worktree root should be UTF-8")
+            ),
+            "worktrees live in engine state, not in the user's repository"
+        );
+        assert!(
+            worktrees[0].repository_dirty,
+            "the user's uncommitted work is recorded, not absorbed"
+        );
+        assert!(Path::new(&worktrees[0].path).join("README.md").is_file());
+        assert!(
+            !Path::new(&worktrees[0].path)
+                .join("in-progress.txt")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(repository.path().join("in-progress.txt"))
+                .expect("user work should survive"),
+            "user work"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_refused_worktree_as_a_retryable_failure() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+        // The engine must not adopt a branch the developer already owns.
+        git(
+            repository.path(),
+            &[
+                "branch",
+                &task_branch_name(&run_id, 1, &plan.tasks[0].title),
+            ],
+        );
+
+        let error = prepare_task_worktree(
+            run_id,
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect_err("an existing branch should be refused");
+
+        assert_eq!(error.code, "worktree_failed");
+        let worktrees = storage
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should be active")
+            .worktrees;
+        assert_eq!(worktrees[0].status, TaskWorktreeStatus::Failed);
+        assert!(
+            worktrees[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("already exists")),
+            "the refusal is preserved for the user: {:?}",
+            worktrees[0].last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciles_a_worktree_that_disappeared_while_the_engine_was_stopped() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+        let created = prepare_task_worktree(
+            run_id,
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect("worktree should be created");
+        let path = created.active_run.expect("run should be active").worktrees[0]
+            .path
+            .clone();
+        fs::remove_dir_all(&path).expect("the user removed the directory");
+
+        let snapshot = storage
+            .current_snapshot()
+            .await
+            .expect("snapshot should load");
+        let reconciled = reconcile_task_worktrees(&storage, snapshot).await;
+
+        assert_eq!(
+            reconciled
+                .active_run
+                .expect("run should be active")
+                .worktrees[0]
+                .status,
+            TaskWorktreeStatus::Missing
+        );
+    }
+
+    /// Drives a run through planning to an approved plan using a fake planner.
+    async fn approved_plan(
+        repository: &Path,
+        storage: &StorageWorker,
+        state: &TempDir,
+    ) -> (String, PlanSummary) {
+        let draft = create_draft_run(
+            repository.display().to_string(),
+            "Implement the change".to_owned(),
+            storage,
+        )
+        .await
+        .expect("draft should be created");
+        let run_id = draft
+            .active_run
+            .as_ref()
+            .expect("run should exist")
+            .id
+            .clone();
+        let (state_sender, _receiver) = watch::channel(engine_snapshot(draft));
+
+        let fake_codex = state.path().join("planner-codex");
+        let plan_json = serde_json::json!({
+            "summary": "Implement the change safely",
+            "tasks": [{
+                "title": "Implement the change",
+                "description": "Make the smallest verified change.",
+                "acceptance_criteria": ["Tests pass."],
+                "depends_on": []
+            }]
+        })
+        .to_string();
+        fs::write(
+            &fake_codex,
+            format!("#!/bin/sh\ninput=$(cat)\nprintf '%s' '{plan_json}'\n"),
+        )
+        .expect("fake Codex should be written");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("fake Codex should be executable");
+        let planner = PlannerRunner::new(orchestrator_agents::AgentCommands {
+            codex: fake_codex,
+            claude: state.path().join("unused-claude"),
+        });
+
+        let proposed = generate_plan(
+            run_id.clone(),
+            AgentKind::Codex,
+            storage,
+            &planner,
+            &state_sender,
+        )
+        .await
+        .expect("planner should propose a plan");
+        let plan = proposed
+            .active_run
+            .and_then(|run| run.plan)
+            .expect("plan should be visible");
+        let approved = decide_plan(run_id.clone(), plan.id.clone(), true, None, storage)
+            .await
+            .expect("plan should be approved");
+        let plan = approved
+            .active_run
+            .and_then(|run| run.plan)
+            .expect("approved plan should be visible");
+        (run_id, plan)
     }
 
     fn initialized_repository() -> TempDir {

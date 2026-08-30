@@ -45,6 +45,11 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// Create the isolated Git worktree for one approved task.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// List local and GitHub repositories or clone a missing repository.
     Repositories {
         #[command(subcommand)]
@@ -73,6 +78,18 @@ enum RepositoryCommand {
         /// GitHub repository in owner/name form.
         name_with_owner: String,
         /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    /// Create the task worktree and its reserved branch.
+    Create {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
         #[arg(long)]
         json: bool,
     },
@@ -171,6 +188,7 @@ async fn main() -> Result<()> {
             json,
         } => create_draft(&socket_path, repository, goal, json).await,
         Command::Plan { command } => plan_command(&socket_path, command).await,
+        Command::Worktree { command } => worktree_command(&socket_path, command).await,
         Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
         Command::Status { json } => status(&socket_path, json).await,
@@ -333,6 +351,37 @@ async fn create_draft(
         socket_path,
         ClientRequest::CreateDraftRun { repository, goal },
         Duration::from_secs(10),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+async fn worktree_command(socket_path: &PathBuf, command: WorktreeCommand) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let WorktreeCommand::Create { task, json } = command;
+    let plan = run
+        .plan
+        .as_ref()
+        .context("the active run has no approved plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task.checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the approved plan")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::CreateTaskWorktree {
+            run_id: run.id.clone(),
+            plan_id: plan.id.clone(),
+            task_id: task.id.clone(),
+        },
+        Duration::from_secs(120),
     )
     .await?;
     print_result(&snapshot, json)
@@ -577,6 +626,23 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
             );
             if let Some(error) = &run.last_error {
                 println!("Last error: {error}");
+            }
+            if !run.worktrees.is_empty() {
+                println!("Task worktrees: {}", run.worktrees.len());
+                for worktree in &run.worktrees {
+                    println!("  {}  {}", worktree.status.as_str(), worktree.branch);
+                    println!("     {}", worktree.path);
+                    if worktree.repository_dirty {
+                        println!(
+                            "     The repository had uncommitted work; \
+                             the agent works from {}",
+                            worktree.base_revision
+                        );
+                    }
+                    if let Some(error) = &worktree.last_error {
+                        println!("     {error}");
+                    }
+                }
             }
             if let Some(plan) = &run.plan {
                 println!(
