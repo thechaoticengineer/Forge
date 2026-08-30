@@ -100,6 +100,7 @@ pub enum WorktreeError {
 pub fn task_slug(title: &str) -> String {
     let mut slug = String::with_capacity(MAX_SLUG_LENGTH);
     let mut pending_separator = false;
+    let mut bounded = false;
     for character in title.chars() {
         if character.is_ascii_alphanumeric() {
             if pending_separator && !slug.is_empty() {
@@ -108,12 +109,22 @@ pub fn task_slug(title: &str) -> String {
             pending_separator = false;
             slug.push(character.to_ascii_lowercase());
             if slug.len() >= MAX_SLUG_LENGTH {
+                bounded = true;
                 break;
             }
         } else {
             pending_separator = true;
         }
     }
+
+    // A branch name outlives its run, so end it on a whole word rather than
+    // mid-word, unless doing so would leave too little of the title.
+    if bounded {
+        if let Some(boundary) = slug.rfind('-').filter(|end| *end >= MAX_SLUG_LENGTH / 2) {
+            slug.truncate(boundary);
+        }
+    }
+
     if slug.is_empty() {
         FALLBACK_SLUG.to_owned()
     } else {
@@ -481,6 +492,15 @@ mod tests {
         assert_eq!(task_slug("  ../../etc/passwd  "), "etc-passwd");
         assert_eq!(task_slug("🙂"), FALLBACK_SLUG);
         assert!(task_slug(&"long".repeat(40)).len() <= MAX_SLUG_LENGTH);
+        assert_eq!(
+            task_slug("Add panel-side worktree actions and task associations"),
+            "add-panel-side-worktree-actions-and-task",
+            "a bounded slug ends on a whole word"
+        );
+        assert!(
+            !task_slug(&"word ".repeat(30)).ends_with('-'),
+            "a bounded slug never ends on a separator"
+        );
 
         let branch = task_branch_name("019-run", 2, "Refuse dirty worktrees");
         assert_eq!(branch, "orchestrator/019-run/2-refuse-dirty-worktrees");
