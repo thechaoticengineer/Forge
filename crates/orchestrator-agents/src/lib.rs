@@ -48,8 +48,7 @@ pub const PLAN_SCHEMA: &str = r#"{
           },
           "depends_on": {
             "type": "array",
-            "items": { "type": "integer", "minimum": 1, "maximum": 20 },
-            "uniqueItems": true
+            "items": { "type": "integer", "minimum": 1, "maximum": 20 }
           }
         }
       }
@@ -543,6 +542,32 @@ mod tests {
                 .expect_err("repeated dependency should fail")
                 .contains("repeats dependency")
         );
+    }
+
+    #[test]
+    fn plan_schema_avoids_keywords_the_structured_output_apis_reject() {
+        let schema: serde_json::Value =
+            serde_json::from_str(PLAN_SCHEMA).expect("plan schema should be valid JSON");
+
+        // Codex rejects the request outright with `invalid_json_schema` when the
+        // schema carries a keyword its structured-output mode does not permit.
+        // Rust validation, not the schema, is authoritative for these rules.
+        let mut pending = vec![&schema];
+        while let Some(node) = pending.pop() {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    for rejected in ["uniqueItems", "minContains", "maxContains"] {
+                        assert!(
+                            !fields.contains_key(rejected),
+                            "plan schema must not use `{rejected}`"
+                        );
+                    }
+                    pending.extend(fields.values());
+                }
+                serde_json::Value::Array(items) => pending.extend(items.iter()),
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]
