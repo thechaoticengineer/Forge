@@ -119,10 +119,8 @@ pub fn task_slug(title: &str) -> String {
 
     // A branch name outlives its run, so end it on a whole word rather than
     // mid-word, unless doing so would leave too little of the title.
-    if bounded {
-        if let Some(boundary) = slug.rfind('-').filter(|end| *end >= MAX_SLUG_LENGTH / 2) {
-            slug.truncate(boundary);
-        }
+    if bounded && let Some(boundary) = slug.rfind('-').filter(|end| *end >= MAX_SLUG_LENGTH / 2) {
+        slug.truncate(boundary);
     }
 
     if slug.is_empty() {
