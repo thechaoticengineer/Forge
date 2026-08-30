@@ -49,7 +49,9 @@ The engine will refuse, before running `git worktree add`, when:
 - the repository already has a linked worktree registered at that path;
 - the durable record for that task already names a different branch or path.
 
-The engine will never pass `--force` to `git worktree add`, `git worktree remove`, `git checkout`, or `git branch -D`, and will never create a task branch outside the reserved prefix. A failed creation rolls back only the directory the engine itself reserved, and reports a rollback failure for manual inspection instead of deleting an unverified path.
+The engine will never pass `--force` to `git worktree add`, `git worktree remove`, `git checkout`, or `git branch -D`, and will never create a task branch outside the reserved prefix.
+
+A failed creation rolls back only what the engine itself reserved. `git worktree add` creates the task branch before it can fail, so rollback removes the reserved directory, prunes the incomplete registration, and deletes the reserved branch through a compare-and-delete that only succeeds while that branch still points exactly at the base revision. A branch that has moved is left alone. Any part of the rollback that fails is reported for manual inspection rather than escalated to a forced removal.
 
 Uncommitted and untracked changes in the user's primary worktree do not block worktree creation, because a linked worktree does not read or modify them. That condition is recorded and surfaced so the user knows the agent is working from the committed base revision and cannot see their in-progress edits.
 
@@ -60,7 +62,7 @@ A recorded worktree has an explicit lifecycle state: reserved, ready, missing, o
 - the engine removes only worktrees it created and recorded;
 - removal requires a clean worktree with no commits that exist nowhere else, and is otherwise refused and reported;
 - removal is an explicit user action, never an automatic consequence of a run ending, failing, or being cancelled;
-- task branches are never deleted by the engine in this phase;
+- task branches are never deleted by the engine in this phase, apart from the compare-and-delete rollback of a branch a failed creation had just reserved;
 - a worktree whose directory has disappeared is marked missing and its Git registration is pruned; the record is kept as history.
 
 On startup the engine reconciles recorded worktrees against the filesystem and `git worktree list` and marks divergence instead of repairing it silently. A worktree reserved but never confirmed ready is treated the way an interrupted planner attempt already is: marked failed, with an audit event, so the user can retry rather than see permanently pending state.

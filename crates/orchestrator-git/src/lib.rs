@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    ffi::OsStr,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -11,6 +12,14 @@ use std::{
 };
 
 use thiserror::Error;
+
+mod worktree;
+
+pub use worktree::{
+    TASK_BRANCH_PREFIX, TaskWorktree, TaskWorktreeRequest, TaskWorktreeState, WorktreeError,
+    create_task_worktree, prune_missing_worktrees, registered_worktrees, task_branch_name,
+    task_slug, task_worktree_path, task_worktree_state,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryState {
@@ -351,9 +360,9 @@ fn worktree_is_dirty(repository: &Path) -> Result<bool, GitError> {
     }
 }
 
-fn checked_git(
+pub(crate) fn checked_git<S: AsRef<OsStr>>(
     repository: &Path,
-    arguments: &[&str],
+    arguments: &[S],
     operation: &'static str,
 ) -> Result<Output, GitError> {
     let output = run_git(repository, arguments, operation)?;
@@ -364,9 +373,9 @@ fn checked_git(
     }
 }
 
-fn run_git(
+pub(crate) fn run_git<S: AsRef<OsStr>>(
     repository: &Path,
-    arguments: &[&str],
+    arguments: &[S],
     operation: &'static str,
 ) -> Result<Output, GitError> {
     Command::new("git")
@@ -378,7 +387,7 @@ fn run_git(
         .map_err(|source| GitError::StartGit { operation, source })
 }
 
-fn command_error(output: &Output, operation: &'static str) -> GitError {
+pub(crate) fn command_error(output: &Output, operation: &'static str) -> GitError {
     GitError::GitCommand {
         operation,
         status: output.status.code(),
@@ -386,7 +395,7 @@ fn command_error(output: &Output, operation: &'static str) -> GitError {
     }
 }
 
-fn text_output(output: Output, operation: &'static str) -> Result<String, GitError> {
+pub(crate) fn text_output(output: Output, operation: &'static str) -> Result<String, GitError> {
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
         .map_err(|source| GitError::NonUtf8 { operation, source })
