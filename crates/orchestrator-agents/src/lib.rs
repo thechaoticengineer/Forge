@@ -609,6 +609,7 @@ mod tests {
             worktree_dirty: true,
             run_status: RunStatus::Draft,
             plan: None,
+            worktrees: Vec::new(),
             last_error: None,
         }
     }

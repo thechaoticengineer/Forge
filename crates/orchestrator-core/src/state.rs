@@ -36,6 +36,50 @@ pub struct ActiveRunSummary {
     pub worktree_dirty: bool,
     pub run_status: RunStatus,
     pub plan: Option<PlanSummary>,
+    pub worktrees: Vec<TaskWorktreeSummary>,
+    pub last_error: Option<String>,
+}
+
+/// Lifecycle of one engine-owned task worktree. See ADR-0006.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorktreeStatus {
+    /// Recorded and reserved, but not yet confirmed on disk.
+    Reserved,
+    /// Present, registered, and on its own task branch.
+    Ready,
+    /// The directory is gone; the record is kept as history.
+    Missing,
+    /// Creation failed or was interrupted; the task can be retried.
+    Failed,
+    /// Removed deliberately by the user.
+    Retired,
+}
+
+impl TaskWorktreeStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Ready => "ready",
+            Self::Missing => "missing",
+            Self::Failed => "failed",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskWorktreeSummary {
+    pub id: String,
+    pub task_id: String,
+    pub status: TaskWorktreeStatus,
+    pub branch: String,
+    pub path: String,
+    pub base_revision: String,
+    /// Whether the user's primary checkout had uncommitted work when this
+    /// worktree was created; the agent cannot see it.
+    pub repository_dirty: bool,
     pub last_error: Option<String>,
 }
 

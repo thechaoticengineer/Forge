@@ -12,6 +12,7 @@ use std::{
 
 use orchestrator_core::state::{
     ActiveRunSummary, AgentKind, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary, RunStatus,
+    TaskWorktreeStatus, TaskWorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -21,13 +22,18 @@ use tokio::sync::oneshot;
 const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (
         2,
         "planning",
         include_str!("../migrations/0002_planning.sql"),
+    ),
+    (
+        3,
+        "worktrees",
+        include_str!("../migrations/0003_worktrees.sql"),
     ),
 ];
 
@@ -66,6 +72,8 @@ pub enum StorageError {
     InvalidRunStatus(String),
     #[error("database returned an invalid plan status: {0}")]
     InvalidPlanStatus(String),
+    #[error("database returned an invalid worktree status: {0}")]
+    InvalidWorktreeStatus(String),
     #[error("database returned an invalid agent kind: {0}")]
     InvalidAgentKind(String),
     #[error("run does not exist: {0}")]
@@ -76,6 +84,10 @@ pub enum StorageError {
     AttemptNotRunning(String),
     #[error("plan does not exist or is not the current proposal: {0}")]
     PlanNotCurrent(String),
+    #[error("task is not ready for isolated implementation: {0}")]
+    TaskNotImplementable(String),
+    #[error("task worktree does not exist or is no longer reserved: {0}")]
+    WorktreeNotReserved(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -214,6 +226,22 @@ pub struct PlanRevisionInput {
     pub proposal: PlanProposal,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskWorktreeReservation {
+    pub run_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub branch: String,
+    pub path: String,
+    pub base_revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservedTaskWorktree {
+    pub worktree_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -250,6 +278,24 @@ enum Command {
         run_id: String,
         plan_id: String,
         reason: Option<String>,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
+    ReserveTaskWorktree(
+        TaskWorktreeReservation,
+        oneshot::Sender<Result<ReservedTaskWorktree, StorageError>>,
+    ),
+    ConfirmTaskWorktree {
+        worktree_id: String,
+        repository_dirty: bool,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
+    FailTaskWorktree {
+        worktree_id: String,
+        error_message: String,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
+    MarkTaskWorktreeMissing {
+        worktree_id: String,
         reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     },
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -503,6 +549,92 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Records an intended task worktree before any Git command runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the task is not part of the run's approved plan,
+    /// the task already holds a live worktree, or storage fails.
+    pub async fn reserve_task_worktree(
+        &self,
+        input: TaskWorktreeReservation,
+    ) -> Result<ReservedTaskWorktree, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ReserveTaskWorktree(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Marks a reserved worktree as present on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worktree is no longer reserved or storage fails.
+    pub async fn confirm_task_worktree(
+        &self,
+        worktree_id: String,
+        repository_dirty: bool,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ConfirmTaskWorktree {
+                worktree_id,
+                repository_dirty,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Records why a reserved worktree could not be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worktree is no longer reserved or storage fails.
+    pub async fn fail_task_worktree(
+        &self,
+        worktree_id: String,
+        error_message: String,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::FailTaskWorktree {
+                worktree_id,
+                error_message,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Records that a previously ready worktree directory has disappeared.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the worktree is not live or storage fails.
+    pub async fn mark_task_worktree_missing(
+        &self,
+        worktree_id: String,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::MarkTaskWorktreeMissing {
+                worktree_id,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -548,6 +680,34 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
                 let _ =
                     reply.send(database.decide_plan(&run_id, &plan_id, false, reason.as_deref()));
             }
+            Command::ReserveTaskWorktree(input, reply) => {
+                let _ = reply.send(database.reserve_task_worktree(&input));
+            }
+            Command::ConfirmTaskWorktree {
+                worktree_id,
+                repository_dirty,
+                reply,
+            } => {
+                let _ = reply.send(database.confirm_task_worktree(&worktree_id, repository_dirty));
+            }
+            Command::FailTaskWorktree {
+                worktree_id,
+                error_message,
+                reply,
+            } => {
+                let _ = reply.send(database.settle_task_worktree(
+                    &worktree_id,
+                    TaskWorktreeStatus::Failed,
+                    Some(&error_message),
+                ));
+            }
+            Command::MarkTaskWorktreeMissing { worktree_id, reply } => {
+                let _ = reply.send(database.settle_task_worktree(
+                    &worktree_id,
+                    TaskWorktreeStatus::Missing,
+                    None,
+                ));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -574,6 +734,7 @@ impl Database {
         configure_connection(&connection)?;
         apply_migrations(&mut connection)?;
         recover_interrupted_planning(&mut connection)?;
+        recover_interrupted_worktrees(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -614,6 +775,7 @@ impl Database {
 
         if let Some(run) = &mut active_run {
             run.plan = self.load_latest_plan(&run.id)?;
+            run.worktrees = self.load_task_worktrees(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -686,6 +848,7 @@ impl Database {
                 worktree_dirty: input.worktree_dirty,
                 run_status: RunStatus::Draft,
                 plan: None,
+                worktrees: Vec::new(),
                 last_error: None,
             }),
         })
@@ -935,6 +1098,187 @@ impl Database {
         self.current_snapshot()
     }
 
+    fn reserve_task_worktree(
+        &self,
+        input: &TaskWorktreeReservation,
+    ) -> Result<ReservedTaskWorktree, StorageError> {
+        let created_at = unix_milliseconds()?;
+        let worktree_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+
+        let approved = transaction
+            .query_row(
+                "SELECT 1 FROM plans p \
+                 JOIN runs r ON r.id = p.run_id \
+                 JOIN plan_tasks t ON t.plan_id = p.id \
+                 WHERE p.id = ?2 AND p.run_id = ?1 AND t.id = ?3 \
+                   AND p.status = 'approved' \
+                   AND p.revision = (SELECT max(revision) FROM plans WHERE run_id = ?1) \
+                   AND r.status NOT IN ('completed', 'rejected', 'cancelled')",
+                (&input.run_id, &input.plan_id, &input.task_id),
+                |_| Ok(true),
+            )
+            .optional()?;
+        if approved.is_none() {
+            return Err(if run_exists(&transaction, &input.run_id)? {
+                StorageError::TaskNotImplementable(input.task_id.clone())
+            } else {
+                StorageError::RunNotFound(input.run_id.clone())
+            });
+        }
+
+        transaction.execute(
+            "INSERT INTO task_worktrees(\
+                id, run_id, plan_id, task_id, status, branch, path, \
+                base_revision, repository_dirty, created_at, updated_at\
+             ) VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7, 0, ?8, ?8)",
+            (
+                &worktree_id,
+                &input.run_id,
+                &input.plan_id,
+                &input.task_id,
+                &input.branch,
+                &input.path,
+                &input.base_revision,
+                created_at,
+            ),
+        )?;
+        let payload = json!({
+            "worktree_id": worktree_id,
+            "task_id": input.task_id,
+            "branch": input.branch,
+            "path": input.path,
+            "base_revision": input.base_revision,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'worktree_reserved', 'engine', ?2, ?3)",
+            (&input.run_id, payload.to_string(), created_at),
+        )?;
+        transaction.commit()?;
+
+        Ok(ReservedTaskWorktree {
+            worktree_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn confirm_task_worktree(
+        &self,
+        worktree_id: &str,
+        repository_dirty: bool,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let confirmed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE task_worktrees SET \
+                status = 'ready', repository_dirty = ?2, last_error = NULL, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'reserved'",
+            (worktree_id, repository_dirty, confirmed_at),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::WorktreeNotReserved(worktree_id.to_owned()));
+        }
+        let (run_id, branch, path) = worktree_identity(&transaction, worktree_id)?;
+        let payload = json!({
+            "worktree_id": worktree_id,
+            "branch": branch,
+            "path": path,
+            "repository_dirty": repository_dirty,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'worktree_ready', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), confirmed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn settle_task_worktree(
+        &self,
+        worktree_id: &str,
+        status: TaskWorktreeStatus,
+        error_message: Option<&str>,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let settled_at = unix_milliseconds()?;
+        let (expected, kind) = match status {
+            TaskWorktreeStatus::Failed => ("reserved", "worktree_failed"),
+            TaskWorktreeStatus::Missing => ("ready", "worktree_missing"),
+            other => {
+                return Err(StorageError::InvalidWorktreeStatus(
+                    other.as_str().to_owned(),
+                ));
+            }
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE task_worktrees SET status = ?2, last_error = ?3, updated_at = ?4 \
+             WHERE id = ?1 AND status = ?5",
+            (
+                worktree_id,
+                status.as_str(),
+                error_message,
+                settled_at,
+                expected,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::WorktreeNotReserved(worktree_id.to_owned()));
+        }
+        let (run_id, branch, path) = worktree_identity(&transaction, worktree_id)?;
+        let payload = json!({
+            "worktree_id": worktree_id,
+            "branch": branch,
+            "path": path,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, ?2, 'engine', ?3, ?4)",
+            (&run_id, kind, payload.to_string(), settled_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn load_task_worktrees(&self, run_id: &str) -> Result<Vec<TaskWorktreeSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, status, branch, path, base_revision, \
+                    repository_dirty, last_error \
+             FROM task_worktrees WHERE run_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+
+        let mut worktrees = Vec::new();
+        for row in rows {
+            let (id, task_id, status, branch, path, base_revision, repository_dirty, last_error) =
+                row?;
+            worktrees.push(TaskWorktreeSummary {
+                id,
+                task_id,
+                status: parse_worktree_status(&status)?,
+                branch,
+                path,
+                base_revision,
+                repository_dirty,
+                last_error,
+            });
+        }
+        Ok(worktrees)
+    }
+
     fn load_latest_plan(&self, run_id: &str) -> Result<Option<PlanSummary>, StorageError> {
         let plan = self
             .connection
@@ -1169,6 +1513,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         worktree_dirty: row.get(5)?,
         run_status,
         plan: None,
+        worktrees: Vec::new(),
         last_error: row.get(7)?,
     })
 }
@@ -1178,6 +1523,30 @@ fn parse_agent_kind(agent: &str) -> Result<AgentKind, StorageError> {
         "codex" => Ok(AgentKind::Codex),
         "claude" => Ok(AgentKind::Claude),
         _ => Err(StorageError::InvalidAgentKind(agent.to_owned())),
+    }
+}
+
+fn worktree_identity(
+    transaction: &Transaction<'_>,
+    worktree_id: &str,
+) -> Result<(String, String, String), StorageError> {
+    transaction
+        .query_row(
+            "SELECT run_id, branch, path FROM task_worktrees WHERE id = ?1",
+            [worktree_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(Into::into)
+}
+
+fn parse_worktree_status(status: &str) -> Result<TaskWorktreeStatus, StorageError> {
+    match status {
+        "reserved" => Ok(TaskWorktreeStatus::Reserved),
+        "ready" => Ok(TaskWorktreeStatus::Ready),
+        "missing" => Ok(TaskWorktreeStatus::Missing),
+        "failed" => Ok(TaskWorktreeStatus::Failed),
+        "retired" => Ok(TaskWorktreeStatus::Retired),
+        _ => Err(StorageError::InvalidWorktreeStatus(status.to_owned())),
     }
 }
 
@@ -1321,6 +1690,53 @@ fn recover_interrupted_planning(connection: &mut Connection) -> Result<(), Stora
     Ok(())
 }
 
+/// Settles worktrees that were reserved but never confirmed, so an interrupted
+/// engine leaves a retryable record instead of a permanently pending one.
+fn recover_interrupted_worktrees(connection: &mut Connection) -> Result<(), StorageError> {
+    let interrupted = {
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, branch, path FROM task_worktrees WHERE status = 'reserved'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+
+    let recovered_at = unix_milliseconds()?;
+    let error_message = "engine stopped before the task worktree was created";
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (worktree_id, run_id, branch, path) in interrupted {
+        transaction.execute(
+            "UPDATE task_worktrees SET \
+                status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'reserved'",
+            (&worktree_id, error_message, recovered_at),
+        )?;
+        let payload = json!({
+            "worktree_id": worktree_id,
+            "branch": branch,
+            "path": path,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'worktree_interrupted', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), recovered_at),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
     let created = match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1444,7 +1860,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 2);
+        assert_eq!(migration_count, 3);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -1581,8 +1997,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             }
         ));
     }
@@ -1757,6 +2173,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn records_a_task_worktree_before_and_after_it_exists() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("reservation should persist");
+        let pending = reserved
+            .snapshot
+            .active_run
+            .as_ref()
+            .expect("run should be active")
+            .worktrees
+            .clone();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, TaskWorktreeStatus::Reserved);
+        assert_eq!(pending[0].task_id, task_id);
+        assert!(!pending[0].repository_dirty);
+
+        let ready = worker
+            .confirm_task_worktree(reserved.worktree_id.clone(), true)
+            .await
+            .expect("confirmation should persist");
+        let worktrees = ready.active_run.expect("run should be active").worktrees;
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].status, TaskWorktreeStatus::Ready);
+        assert!(
+            worktrees[0].repository_dirty,
+            "the primary checkout condition is preserved for the user"
+        );
+
+        let missing = worker
+            .mark_task_worktree_missing(reserved.worktree_id.clone())
+            .await
+            .expect("missing worktree should persist");
+        assert_eq!(
+            missing.active_run.expect("run should be active").worktrees[0].status,
+            TaskWorktreeStatus::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_second_live_worktree_and_allows_a_retry_after_failure() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+
+        let first = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("first reservation should persist");
+        let conflict = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 2))
+            .await
+            .expect_err("a task holds at most one live worktree");
+        assert!(matches!(conflict, StorageError::Sqlite(_)));
+
+        let failed = worker
+            .fail_task_worktree(first.worktree_id, "Git refused the destination".to_owned())
+            .await
+            .expect("failure should persist");
+        assert_eq!(
+            failed.active_run.expect("run should be active").worktrees[0]
+                .last_error
+                .as_deref(),
+            Some("Git refused the destination")
+        );
+
+        let retried = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("a failed record should not block a retry");
+        let worktrees = retried
+            .snapshot
+            .active_run
+            .expect("run should be active")
+            .worktrees;
+        assert_eq!(worktrees.len(), 2, "history is preserved beside the retry");
+        assert_eq!(worktrees[0].status, TaskWorktreeStatus::Failed);
+        assert_eq!(worktrees[1].status, TaskWorktreeStatus::Reserved);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_worktree_for_a_plan_that_is_not_approved() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, task_id) = proposed_plan(&worker).await;
+
+        let error = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect_err("an unapproved plan cannot reserve a worktree");
+        assert!(matches!(error, StorageError::TaskNotImplementable(_)));
+    }
+
+    #[tokio::test]
+    async fn recovers_an_interrupted_reservation_as_failed() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("reservation should persist");
+        drop(worker);
+
+        let reopened = StorageWorker::start(paths).expect("storage should recover");
+        let worktrees = reopened
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should remain active")
+            .worktrees;
+        assert_eq!(worktrees[0].status, TaskWorktreeStatus::Failed);
+        assert_eq!(
+            worktrees[0].last_error.as_deref(),
+            Some("engine stopped before the task worktree was created")
+        );
+    }
+
     #[test]
     fn refuses_a_symlink_as_the_state_root() {
         let temporary = TempDir::new().expect("temporary directory should exist");
@@ -1791,6 +2335,64 @@ mod tests {
             .permissions()
             .mode()
             & 0o777
+    }
+
+    fn reservation(
+        run_id: &str,
+        plan_id: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> TaskWorktreeReservation {
+        TaskWorktreeReservation {
+            run_id: run_id.to_owned(),
+            plan_id: plan_id.to_owned(),
+            task_id: task_id.to_owned(),
+            branch: format!("orchestrator/run/{attempt}-inspect-behavior"),
+            path: format!("/tmp/state/worktrees/run/{attempt}-inspect-behavior"),
+            base_revision: "0123456789012345678901234567890123456789".to_owned(),
+        }
+    }
+
+    /// Drives a run to a proposed plan and returns its run, plan, and first task.
+    async fn proposed_plan(worker: &StorageWorker) -> (String, String, String) {
+        let draft = worker
+            .create_draft_run(draft_input("Implement the change", false))
+            .await
+            .expect("draft should persist");
+        let run_id = draft.active_run.expect("run should exist").id;
+        let started = worker
+            .begin_plan_attempt(PlanAttemptInput {
+                run_id: run_id.clone(),
+                agent: AgentKind::Codex,
+                prompt: "Propose a plan".to_owned(),
+            })
+            .await
+            .expect("attempt should start");
+        let proposed = worker
+            .complete_plan_attempt(PlanAttemptSuccess {
+                attempt_id: started.attempt_id,
+                proposal: sample_proposal(),
+                final_output: "{}".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("proposal should persist");
+        let plan = proposed
+            .active_run
+            .and_then(|run| run.plan)
+            .expect("plan should be visible");
+        (run_id, plan.id, plan.tasks[0].id.clone())
+    }
+
+    /// Drives a run all the way to an approved plan.
+    async fn approved_plan(worker: &StorageWorker) -> (String, String, String) {
+        let (run_id, plan_id, task_id) = proposed_plan(worker).await;
+        worker
+            .approve_plan(run_id.clone(), plan_id.clone())
+            .await
+            .expect("plan should be approved");
+        (run_id, plan_id, task_id)
     }
 
     fn draft_input(goal: &str, worktree_dirty: bool) -> DraftRunInput {
