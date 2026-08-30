@@ -50,7 +50,7 @@ Planned usability follow-ups:
 
 ## Phase 2 — Isolated Implementation
 
-This is the next major implementation phase.
+This phase is partly implemented. A task can be given an isolated worktree; running an implementing agent inside one cannot.
 
 - [x] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
 - [x] Refuse to overwrite or absorb existing user changes.
@@ -61,6 +61,8 @@ This is the next major implementation phase.
 - [ ] Let the user pause, cancel, redirect, or add context without losing run history.
 - [ ] Preserve prompts, responses, changed files, failed approaches, and retries.
 - [ ] Open the exact task worktree from the interface.
+- [ ] Show recorded task worktrees, their branches, and their status in the panel.
+- [ ] Retire a task worktree and its branch through an explicit confirmed action.
 
 ## Phase 3 — Deterministic Verification
 
@@ -94,6 +96,7 @@ This is the next major implementation phase.
 ## Phase 6 — Omarchy Integration and Recovery Hardening
 
 - [ ] Define installation and lifecycle management for the Rust engine alongside the shell plugin.
+- [ ] Shut the engine down cleanly on `SIGTERM` as well as `SIGINT`.
 - [ ] Add a conflict-checked Omarchy key binding for summoning or hiding the panel.
 - [ ] Send Omarchy notifications for blocked, failed, completed, and waiting-for-user events.
 - [ ] Verify live theme changes, light and dark themes, display scaling, and varied monitor sizes.
