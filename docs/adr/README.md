@@ -44,3 +44,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0003](0003-store-state-in-sqlite.md) | Accepted | Keep authoritative state in SQLite and large artifacts in files |
 | [ADR-0004](0004-run-planners-as-constrained-cli-processes.md) | Accepted | Run Codex and Claude planners as bounded, read-only CLI subprocesses |
 | [ADR-0005](0005-browse-local-and-github-repositories.md) | Accepted | Discover local projects and clone GitHub repositories through the Rust engine |
+| [ADR-0006](0006-isolate-task-implementation-in-git-worktrees.md) | Accepted | Give each implementation task an isolated Git worktree and reserved task branch |

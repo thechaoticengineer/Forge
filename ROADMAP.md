@@ -50,7 +50,7 @@ Planned usability follow-ups:
 
 This is the next major implementation phase.
 
-- [ ] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
+- [x] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
 - [ ] Refuse to overwrite or absorb existing user changes.
 - [ ] Create and record an isolated Git worktree for each implementation task.
 - [ ] Let the user assign Codex CLI or Claude Code CLI as implementer.
