@@ -1504,7 +1504,13 @@ async fn prepare_task_worktree(
             base_revision: run.base_revision.clone(),
         })
         .await
-        .map_err(|error| RequestFailure::storage("cannot reserve the task worktree", error))?;
+        .map_err(|error| match error {
+            orchestrator_store::StorageError::WorktreeAlreadyLive => RequestFailure {
+                code: "worktree_exists",
+                message: error.to_string(),
+            },
+            other => RequestFailure::storage("cannot reserve the task worktree", other),
+        })?;
     publish_newer_snapshot(state_sender, engine_snapshot(reserved.snapshot));
 
     let request = TaskWorktreeRequest {

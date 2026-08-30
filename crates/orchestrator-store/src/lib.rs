@@ -89,6 +89,8 @@ pub enum StorageError {
     TaskNotImplementable(String),
     #[error("task worktree does not exist or is no longer reserved: {0}")]
     WorktreeNotReserved(String),
+    #[error("this task already has a live worktree; retire it before creating another")]
+    WorktreeAlreadyLive,
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -1150,22 +1152,33 @@ impl Database {
             });
         }
 
-        transaction.execute(
-            "INSERT INTO task_worktrees(\
+        transaction
+            .execute(
+                "INSERT INTO task_worktrees(\
                 id, run_id, plan_id, task_id, status, branch, path, \
                 base_revision, repository_dirty, created_at, updated_at\
              ) VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7, 0, ?8, ?8)",
-            (
-                &worktree_id,
-                &input.run_id,
-                &input.plan_id,
-                &input.task_id,
-                &input.branch,
-                &input.path,
-                &input.base_revision,
-                created_at,
-            ),
-        )?;
+                (
+                    &worktree_id,
+                    &input.run_id,
+                    &input.plan_id,
+                    &input.task_id,
+                    &input.branch,
+                    &input.path,
+                    &input.base_revision,
+                    created_at,
+                ),
+            )
+            .map_err(|error| {
+                // The live partial indexes are the reservation itself, so a
+                // constraint violation here means the task, branch, or
+                // directory is already held rather than that storage broke.
+                if is_constraint_violation(&error) {
+                    StorageError::WorktreeAlreadyLive
+                } else {
+                    StorageError::Sqlite(error)
+                }
+            })?;
         let payload = json!({
             "worktree_id": worktree_id,
             "task_id": input.task_id,
@@ -1561,6 +1574,14 @@ fn worktree_identity(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(Into::into)
+}
+
+fn is_constraint_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation
+    )
 }
 
 fn parse_worktree_status(status: &str) -> Result<TaskWorktreeStatus, StorageError> {
@@ -2262,7 +2283,7 @@ mod tests {
             .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 2))
             .await
             .expect_err("a task holds at most one live worktree");
-        assert!(matches!(conflict, StorageError::Sqlite(_)));
+        assert!(matches!(conflict, StorageError::WorktreeAlreadyLive));
 
         let failed = worker
             .fail_task_worktree(first.worktree_id, "Git refused the destination".to_owned())
