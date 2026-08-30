@@ -79,7 +79,15 @@ The engine scans `~/Projects` by default. Pass one or more absolute `--projects-
 
 Use `--agent claude` to select Claude Code instead. Plan generation invokes the existing authenticated CLI and may consume its normal usage allowance. The engine grants the planner read-only access, validates its structured proposal, and records attempts, task revisions, decisions, and failures in SQLite. Run `build-orchestrator plan --help` for task editing, reordering, approval, and rejection commands.
 
-The current run survives engine or shell restarts. This is not yet the complete product workflow: isolated implementation, deterministic verification, independent review, and final change approval remain to be implemented.
+Once a plan is approved, each task can be given an isolated Git worktree:
+
+```text
+cargo run -p orchestrator-cli -- worktree create --task 1
+```
+
+The worktree and its `orchestrator/`-prefixed branch are created below the engine state directory, never inside the selected repository, and the engine refuses instead of forcing when a branch, directory, or base revision would conflict. `status` shows each recorded worktree and whether the repository had uncommitted work the agent cannot see.
+
+The current run survives engine or shell restarts. This is not yet the complete product workflow: running an implementing agent inside the worktree, deterministic verification, independent review, and final change approval remain to be implemented.
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 

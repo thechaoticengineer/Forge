@@ -8,7 +8,9 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 ## Current Position
 
-The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it. The next major slice is isolated implementation in a protected Git worktree.
+The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
+
+Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. Assigning an implementing agent to that worktree and supervising it is the next slice; the worktree lifecycle is currently reachable from the CLI only.
 
 The **Changes**, **Verification**, and **Review** panel sections currently communicate product direction but do not yet run those stages.
 
@@ -52,7 +54,7 @@ This is the next major implementation phase.
 
 - [x] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
 - [x] Refuse to overwrite or absorb existing user changes.
-- [ ] Create and record an isolated Git worktree for each implementation task.
+- [x] Create and record an isolated Git worktree for each implementation task.
 - [ ] Let the user assign Codex CLI or Claude Code CLI as implementer.
 - [ ] Run the implementer under explicit process supervision owned by the Rust engine.
 - [ ] Stream structured activity and progress to the Omarchy panel.
