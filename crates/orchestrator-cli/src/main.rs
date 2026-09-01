@@ -10,7 +10,7 @@ use orchestrator_core::{
     },
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, ImplementationContinuationKind,
-        ImplementationStatus, TaskWorktreeStatus,
+        ImplementationStatus, ReviewPolicy, TaskWorktreeStatus,
     },
 };
 use tokio::{
@@ -60,6 +60,17 @@ enum Command {
         task: usize,
         #[arg(long, value_enum)]
         agent: AgentArgument,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a fresh independent review of one completed implementation.
+    Review {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        /// Reviewer routing and fallback policy.
+        #[arg(long, value_enum, default_value = "cross-provider-or-fresh-session")]
+        policy: ReviewPolicyArgument,
         #[arg(long)]
         json: bool,
     },
@@ -202,6 +213,21 @@ enum AgentArgument {
     Claude,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReviewPolicyArgument {
+    CrossProviderRequired,
+    CrossProviderOrFreshSession,
+}
+
+impl From<ReviewPolicyArgument> for ReviewPolicy {
+    fn from(value: ReviewPolicyArgument) -> Self {
+        match value {
+            ReviewPolicyArgument::CrossProviderRequired => Self::CrossProviderRequired,
+            ReviewPolicyArgument::CrossProviderOrFreshSession => Self::CrossProviderOrFreshSession,
+        }
+    }
+}
+
 impl From<AgentArgument> for AgentKind {
     fn from(value: AgentArgument) -> Self {
         match value {
@@ -244,6 +270,9 @@ async fn main() -> Result<()> {
         Command::Worktree { command } => worktree_command(&socket_path, command).await,
         Command::Implement { task, agent, json } => {
             implement_task(&socket_path, task, agent.into(), json).await
+        }
+        Command::Review { task, policy, json } => {
+            review_task(&socket_path, task, policy.into(), json).await
         }
         Command::Cancel { attempt, json } => {
             cancel_implementation(&socket_path, attempt, json).await
@@ -526,6 +555,63 @@ async fn implement_task(
     print_result(&snapshot, json)
 }
 
+async fn review_task(
+    socket_path: &PathBuf,
+    task_position: usize,
+    policy: ReviewPolicy,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let plan = run
+        .plan
+        .as_ref()
+        .context("the active run has no approved plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task_position
+                .checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the approved plan")?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .rev()
+        .find(|worktree| {
+            worktree.task_id == task.id && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .context("the task has no ready worktree")?;
+    let implementation = run
+        .implementation_attempts
+        .iter()
+        .rev()
+        .find(|attempt| {
+            attempt.task_id == task.id
+                && attempt.worktree_id == worktree.id
+                && attempt.status == ImplementationStatus::Completed
+        })
+        .context("the task has no completed implementation in its ready worktree")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::RunTaskReview {
+            run_id: run.id.clone(),
+            plan_id: plan.id.clone(),
+            task_id: task.id.clone(),
+            worktree_id: worktree.id.clone(),
+            implementation_attempt_id: implementation.id.clone(),
+            policy,
+        },
+        Duration::from_mins(21),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
 async fn cancel_implementation(
     socket_path: &PathBuf,
     attempt_id: Option<String>,
@@ -745,7 +831,7 @@ async fn send_workflow_request(
                 request_id: Some(response_id),
                 snapshot,
                 ..
-            } if response_id == request_id => return Ok(snapshot),
+            } if response_id == request_id => return Ok(*snapshot),
             ServerMessage::Error {
                 request_id: response_id,
                 code,
@@ -780,7 +866,7 @@ async fn fetch_snapshot(socket_path: &PathBuf) -> Result<EngineSnapshot> {
     let ServerMessage::Snapshot { snapshot, .. } = message else {
         bail!("engine did not send a state snapshot after connection");
     };
-    Ok(snapshot)
+    Ok(*snapshot)
 }
 
 fn print_result(snapshot: &EngineSnapshot, json: bool) -> Result<()> {
@@ -887,6 +973,7 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
                 }
             }
             print_implementation(run);
+            print_reviews(run);
             if let Some(plan) = &run.plan {
                 println!(
                     "Plan: revision {} · {} · {}",
@@ -963,6 +1050,37 @@ fn print_implementation(run: &ActiveRunSummary) {
                 activity.kind.as_str(),
                 activity.message
             );
+        }
+    }
+}
+
+fn print_reviews(run: &ActiveRunSummary) {
+    if run.review_attempts.is_empty() {
+        return;
+    }
+    println!("Independent review attempts: {}", run.review_attempts.len());
+    for attempt in &run.review_attempts {
+        println!(
+            "  {}  {} -> {}  task {}  {}",
+            attempt.status.as_str(),
+            attempt.implementer.as_str(),
+            attempt.reviewer.as_str(),
+            attempt.task_id,
+            attempt.independence.as_str(),
+        );
+        if let Some(result) = &attempt.result {
+            println!("     {}", result.summary);
+            for finding in &result.findings {
+                println!(
+                    "     - {}: {} ({})",
+                    finding.severity.as_str(),
+                    finding.summary,
+                    finding.evidence
+                );
+            }
+        }
+        if let Some(error) = &attempt.error_message {
+            println!("     {error}");
         }
     }
 }

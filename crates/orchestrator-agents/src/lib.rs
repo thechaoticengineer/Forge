@@ -15,7 +15,8 @@ use nix::{
 };
 use orchestrator_core::state::{
     ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationContinuationKind,
-    ImplementationStopReason, PlanProposal, PlanTaskSummary, TaskWorktreeSummary,
+    ImplementationStopReason, PlanProposal, PlanTaskSummary, ReviewResult, ReviewSeverity,
+    ReviewVerdict, TaskWorktreeSummary,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -60,6 +61,37 @@ pub const PLAN_SCHEMA: &str = r#"{
             "type": "array",
             "items": { "type": "integer", "minimum": 1, "maximum": 20 }
           }
+        }
+      }
+    }
+  }
+}"#;
+
+pub const REVIEW_SCHEMA: &str = r#"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approved", "changes_requested", "blocked"]
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "findings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "summary", "evidence"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "major", "minor"]
+          },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "evidence": { "type": "string", "minLength": 1, "maxLength": 4000 }
         }
       }
     }
@@ -251,6 +283,191 @@ impl PlannerRunner {
 
     fn command_path(&self, agent: AgentKind) -> &Path {
         self.commands.command_path(agent)
+    }
+}
+
+/// Runs a read-only, non-persistent reviewer session and validates its verdict.
+#[derive(Clone, Debug)]
+pub struct ReviewerRunner {
+    commands: AgentCommands,
+    timeout: Duration,
+}
+
+impl Default for ReviewerRunner {
+    fn default() -> Self {
+        Self::new(AgentCommands::default())
+    }
+}
+
+impl ReviewerRunner {
+    #[must_use]
+    pub const fn new(commands: AgentCommands) -> Self {
+        Self {
+            commands,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Reviews one task in a fresh provider process with read-only permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded evidence when the process cannot start, times out,
+    /// fails, exceeds output limits, or returns an invalid verdict.
+    pub async fn review(
+        &self,
+        agent: AgentKind,
+        worktree: &Path,
+        prompt: &str,
+    ) -> Result<ReviewerOutput, ReviewerFailure> {
+        let (command, _schema_file) = self.prepare_command(agent, worktree)?;
+        let output = run_command(
+            command,
+            self.commands.command_path(agent),
+            agent,
+            "reviewer",
+            prompt,
+            self.timeout,
+            RunControl::default(),
+        )
+        .await
+        .map_err(ReviewerFailure::from)?;
+        let exit_code = output.status.code();
+        if output.stdout.truncated || output.stderr.truncated {
+            return Err(ReviewerFailure {
+                message: "reviewer output exceeded the configured capture limit".to_owned(),
+                final_output: output.stdout.text,
+                diagnostic_output: output.stderr.text,
+                exit_code,
+                launch_failed: false,
+            });
+        }
+        if !output.status.success() {
+            return Err(ReviewerFailure {
+                message: format!(
+                    "{} CLI exited unsuccessfully{}",
+                    agent.as_str(),
+                    exit_code.map_or_else(String::new, |code| format!(" with status {code}"))
+                ),
+                final_output: output.stdout.text,
+                diagnostic_output: output.stderr.text,
+                exit_code,
+                launch_failed: false,
+            });
+        }
+        let result =
+            parse_review_result(agent, &output.stdout.text).map_err(|message| ReviewerFailure {
+                message,
+                final_output: output.stdout.text.clone(),
+                diagnostic_output: output.stderr.text.clone(),
+                exit_code,
+                launch_failed: false,
+            })?;
+        Ok(ReviewerOutput {
+            result,
+            final_output: output.stdout.text,
+            diagnostic_output: output.stderr.text,
+            exit_code: exit_code.unwrap_or(0),
+        })
+    }
+
+    fn prepare_command(
+        &self,
+        agent: AgentKind,
+        worktree: &Path,
+    ) -> Result<(Command, Option<NamedTempFile>), ReviewerFailure> {
+        match agent {
+            AgentKind::Codex => {
+                let mut file = NamedTempFile::new().map_err(|error| ReviewerFailure {
+                    message: format!("cannot create review schema file: {error}"),
+                    final_output: String::new(),
+                    diagnostic_output: String::new(),
+                    exit_code: None,
+                    launch_failed: false,
+                })?;
+                file.write_all(REVIEW_SCHEMA.as_bytes())
+                    .map_err(|error| ReviewerFailure {
+                        message: format!("cannot write review schema file: {error}"),
+                        final_output: String::new(),
+                        diagnostic_output: String::new(),
+                        exit_code: None,
+                        launch_failed: false,
+                    })?;
+                let mut command = Command::new(&self.commands.codex);
+                command.args([
+                    "exec",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--sandbox",
+                    "read-only",
+                    "--color",
+                    "never",
+                    "--output-schema",
+                ]);
+                command.arg(file.path());
+                command.arg("-C").arg(worktree).arg("-");
+                Ok((command, Some(file)))
+            }
+            AgentKind::Claude => {
+                let mut command = Command::new(&self.commands.claude);
+                command.args([
+                    "--print",
+                    "--safe-mode",
+                    "--disable-slash-commands",
+                    "--permission-mode",
+                    "plan",
+                    "--tools",
+                    "Read,Glob,Grep",
+                    "--output-format",
+                    "json",
+                    "--json-schema",
+                    REVIEW_SCHEMA,
+                    "--no-session-persistence",
+                ]);
+                command.current_dir(worktree);
+                Ok((command, None))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewerOutput {
+    pub result: ReviewResult,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewerFailure {
+    pub message: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: Option<i32>,
+    /// True only when the reviewer could not be launched at all. Policies may
+    /// use this to permit a fresh-session fallback without overriding a real
+    /// cross-provider verdict or malformed response.
+    pub launch_failed: bool,
+}
+
+impl From<PlannerFailure> for ReviewerFailure {
+    fn from(failure: PlannerFailure) -> Self {
+        let launch_failed = failure.message.starts_with("cannot start ");
+        Self {
+            launch_failed,
+            message: failure.message,
+            final_output: failure.final_output,
+            diagnostic_output: failure.diagnostic_output,
+            exit_code: failure.exit_code,
+        }
     }
 }
 
@@ -844,6 +1061,42 @@ pub fn build_implementation_continuation_prompt(
     )
 }
 
+/// Builds the evidence-only prompt for a fresh independent review session.
+#[must_use]
+pub fn build_review_prompt(
+    run: &ActiveRunSummary,
+    task: &PlanTaskSummary,
+    worktree: &TaskWorktreeSummary,
+    implementer: AgentKind,
+    change_evidence: &str,
+) -> String {
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are the independent reviewer for one implementation task. The implementer was {}. This is a fresh review session: do not assume the implementer's conclusions are correct. Inspect the worktree read-only and judge the actual changes against the approved task.\n\n\
+         Run goal:\n{}\n\n\
+         Approved task {}: {}\n{}\n\n\
+         Acceptance criteria:\n{}\n\n\
+         Worktree: {}\nBase revision: {}\nTask branch: {}\n\n\
+         Engine-captured change evidence:\n{}\n\n\
+         Return `approved` only when the change satisfies the task and has no critical or major finding. Return `changes_requested` for actionable defects. Return `blocked` when evidence is insufficient or a product, architecture, security, or destructive-operation decision is required. Do not edit files, commit, merge, push, or rely on the implementer's prose.",
+        implementer.as_str(),
+        run.goal,
+        task.position,
+        task.title,
+        task.description,
+        criteria,
+        worktree.path,
+        worktree.base_revision,
+        worktree.branch,
+        change_evidence,
+    )
+}
+
 fn parse_proposal(agent: AgentKind, output: &str) -> Result<PlanProposal, String> {
     let value: serde_json::Value = serde_json::from_str(output.trim())
         .map_err(|error| format!("{} CLI returned invalid JSON: {error}", agent.as_str()))?;
@@ -865,6 +1118,74 @@ fn parse_proposal(agent: AgentKind, output: &str) -> Result<PlanProposal, String
         .map_err(|error| format!("planner output does not match the plan schema: {error}"))?;
     validate_proposal(&mut proposal)?;
     Ok(proposal)
+}
+
+fn parse_review_result(agent: AgentKind, output: &str) -> Result<ReviewResult, String> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).map_err(|error| {
+        format!(
+            "{} CLI returned invalid review JSON: {error}",
+            agent.as_str()
+        )
+    })?;
+    let result_value = match agent {
+        AgentKind::Codex => value,
+        AgentKind::Claude => {
+            if let Some(structured) = value.get("structured_output") {
+                structured.clone()
+            } else if let Some(result) = value.get("result").and_then(serde_json::Value::as_str) {
+                serde_json::from_str(result).map_err(|error| {
+                    format!("Claude CLI result did not contain valid review JSON: {error}")
+                })?
+            } else {
+                value
+            }
+        }
+    };
+    let mut result: ReviewResult = serde_json::from_value(result_value)
+        .map_err(|error| format!("reviewer output does not match the review schema: {error}"))?;
+    validate_review_result(&mut result)?;
+    Ok(result)
+}
+
+/// Normalizes and validates a structured independent-review verdict.
+///
+/// # Errors
+///
+/// Returns an error for oversized, empty, or internally inconsistent output.
+pub fn validate_review_result(result: &mut ReviewResult) -> Result<(), String> {
+    result.summary = result.summary.trim().to_owned();
+    validate_text("review summary", &result.summary, 4_000)?;
+    if result.findings.len() > 50 {
+        return Err("review must not contain more than 50 findings".to_owned());
+    }
+    for (index, finding) in result.findings.iter_mut().enumerate() {
+        finding.summary = finding.summary.trim().to_owned();
+        finding.evidence = finding.evidence.trim().to_owned();
+        validate_text(
+            &format!("review finding {} summary", index + 1),
+            &finding.summary,
+            1_000,
+        )?;
+        validate_text(
+            &format!("review finding {} evidence", index + 1),
+            &finding.evidence,
+            4_000,
+        )?;
+    }
+    if result.verdict == ReviewVerdict::Approved
+        && result.findings.iter().any(|finding| {
+            matches!(
+                finding.severity,
+                ReviewSeverity::Critical | ReviewSeverity::Major
+            )
+        })
+    {
+        return Err("an approved review cannot contain critical or major findings".to_owned());
+    }
+    if result.verdict == ReviewVerdict::ChangesRequested && result.findings.is_empty() {
+        return Err("changes_requested requires at least one finding".to_owned());
+    }
+    Ok(())
 }
 
 /// Normalizes and validates a plan before it enters durable workflow state.
@@ -1323,7 +1644,7 @@ mod tests {
 
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    use orchestrator_core::state::{ProposedTask, RunStatus};
+    use orchestrator_core::state::{ProposedTask, ReviewFinding, RunStatus};
     use tempfile::TempDir;
 
     #[test]
@@ -1379,6 +1700,95 @@ mod tests {
                 .expect("Claude plan should parse"),
             sample_proposal()
         );
+    }
+
+    #[test]
+    fn builds_an_evidence_only_review_prompt() {
+        let run = sample_run();
+        let task = PlanTaskSummary {
+            id: "task-1".to_owned(),
+            position: 1,
+            title: "Implement the change".to_owned(),
+            description: "Make the focused edit.".to_owned(),
+            acceptance_criteria: vec!["The behavior is covered.".to_owned()],
+            depends_on: Vec::new(),
+        };
+        let worktree = TaskWorktreeSummary {
+            id: "worktree-1".to_owned(),
+            task_id: task.id.clone(),
+            status: orchestrator_core::state::TaskWorktreeStatus::Ready,
+            branch: "orchestrator/run/1-implement".to_owned(),
+            path: "/tmp/worktree".to_owned(),
+            base_revision: "0123456789".to_owned(),
+            repository_dirty: false,
+            last_error: None,
+        };
+        let prompt = build_review_prompt(
+            &run,
+            &task,
+            &worktree,
+            AgentKind::Codex,
+            "Git status:\n M src/lib.rs",
+        );
+        assert!(prompt.contains("fresh review session"));
+        assert!(prompt.contains("implementer was codex"));
+        assert!(prompt.contains("The behavior is covered"));
+        assert!(prompt.contains("M src/lib.rs"));
+        assert!(prompt.contains("Do not edit files"));
+    }
+
+    #[tokio::test]
+    async fn runs_reviewers_in_fresh_structured_sessions() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let codex = temporary.path().join("codex");
+        let claude = temporary.path().join("claude");
+        let result = sample_review_result();
+        let direct = serde_json::to_string(&result).expect("review should serialize");
+        let wrapped = serde_json::json!({ "structured_output": result }).to_string();
+        write_executable(
+            &codex,
+            &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{direct}'\n"),
+        );
+        write_executable(
+            &claude,
+            &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{wrapped}'\n"),
+        );
+        let runner = ReviewerRunner::new(AgentCommands { codex, claude });
+        for agent in [AgentKind::Codex, AgentKind::Claude] {
+            let output = runner
+                .review(agent, temporary.path(), "Review")
+                .await
+                .expect("review should complete");
+            assert_eq!(output.result, sample_review_result());
+        }
+    }
+
+    #[test]
+    fn rejects_approval_with_major_findings() {
+        let mut result = sample_review_result();
+        result.findings.push(ReviewFinding {
+            severity: ReviewSeverity::Major,
+            summary: "Incorrect behavior".to_owned(),
+            evidence: "src/lib.rs does not satisfy the criterion".to_owned(),
+        });
+        assert!(
+            validate_review_result(&mut result)
+                .expect_err("major finding should reject approval")
+                .contains("cannot contain critical or major")
+        );
+    }
+
+    #[test]
+    fn permits_review_fallback_only_for_launch_failure() {
+        let unavailable = ReviewerFailure::from(PlannerFailure::new(
+            "cannot start claude CLI at /missing: not found".to_owned(),
+        ));
+        let timeout = ReviewerFailure::from(PlannerFailure::new(
+            "claude CLI exceeded the reviewer timeout".to_owned(),
+        ));
+
+        assert!(unavailable.launch_failed);
+        assert!(!timeout.launch_failed);
     }
 
     #[test]
@@ -1462,10 +1872,20 @@ mod tests {
             codex: failing.clone(),
             claude: failing,
         });
-        let failure = runner
-            .generate(AgentKind::Codex, temporary.path(), "Plan")
-            .await
-            .expect_err("nonzero exit should fail");
+        let mut failure = None;
+        for _ in 0..20 {
+            let current = runner
+                .generate(AgentKind::Codex, temporary.path(), "Plan")
+                .await
+                .expect_err("nonzero exit should fail");
+            if current.message.contains("Text file busy") {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            failure = Some(current);
+            break;
+        }
+        let failure = failure.expect("the fake CLI should become executable");
         assert_eq!(failure.exit_code, Some(2));
         assert_eq!(failure.final_output, "partial");
         assert_eq!(failure.diagnostic_output, "not authenticated");
@@ -1817,6 +2237,7 @@ mod tests {
             worktrees: Vec::new(),
             implementation_attempts: Vec::new(),
             implementation_activity: Vec::new(),
+            review_attempts: Vec::new(),
             last_error: None,
         }
     }
@@ -1838,6 +2259,14 @@ mod tests {
                     depends_on: vec![1],
                 },
             ],
+        }
+    }
+
+    fn sample_review_result() -> ReviewResult {
+        ReviewResult {
+            verdict: ReviewVerdict::Approved,
+            summary: "The implementation satisfies the approved task.".to_owned(),
+            findings: Vec::new(),
         }
     }
 }

@@ -84,6 +84,9 @@ Once a plan is approved, each task can be given an isolated Git worktree:
 ```text
 cargo run -p orchestrator-cli -- worktree create --task 1
 cargo run -p orchestrator-cli -- implement --task 1 --agent codex
+# After a successful implementation, prefer the other provider and allow a
+# same-provider fallback only as a distinct fresh session.
+cargo run -p orchestrator-cli -- review --task 1 --policy cross-provider-or-fresh-session
 # From another terminal while an implementation is running:
 cargo run -p orchestrator-cli -- pause
 cargo run -p orchestrator-cli -- resume
@@ -96,7 +99,7 @@ The worktree and its `orchestrator/`-prefixed branch are created below the engin
 
 The implementation command can also use `--agent claude`. The engine records the assignment before launching the agent, confines writes to the ready task worktree, supervises bounded output and process lifetime, and preserves success or failure evidence. A successful agent exit does not mean the task is verified or approved.
 
-The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can pause, resume, cancel, redirect, or add context while preserving partial worktree changes and linked attempt history. A paused process remains owned by the live engine and is recovered as interrupted if the engine exits. Deterministic verification, independent review, and final change approval remain to be implemented.
+The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can pause, resume, cancel, redirect, or add context while preserving partial worktree changes and linked attempt history. A paused process remains owned by the live engine and is recovered as interrupted if the engine exits. Independent review is available from the CLI with durable structured verdicts and findings. Deterministic verification, review correction loops, Review-panel presentation, and final change approval remain to be implemented.
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 

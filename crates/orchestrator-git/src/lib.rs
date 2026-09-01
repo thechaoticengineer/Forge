@@ -46,6 +46,62 @@ pub struct RepositoryDiscovery {
 
 const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_DISCOVERY_DIRECTORIES: usize = 4_000;
+const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
+/// Captures bounded, read-only Git evidence for an independent reviewer.
+///
+/// The status includes untracked paths, while the patch compares tracked
+/// content with the task's recorded base revision. Reviewers may inspect an
+/// untracked path directly from the read-only worktree.
+///
+/// # Errors
+///
+/// Returns an error when the path is not a repository, the base revision is
+/// invalid, Git fails, or its output is not UTF-8.
+pub fn review_change_evidence(worktree: &Path, base_revision: &str) -> Result<String, GitError> {
+    if !(4..=64).contains(&base_revision.len())
+        || !base_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitError::MissingHead(worktree.to_path_buf()));
+    }
+    let repository = inspect_repository(worktree)?;
+    let status = review_text_output(
+        checked_git(
+            &repository.root,
+            &["status", "--short", "--untracked-files=all"],
+            "capturing review status",
+        )?,
+        "capturing review status",
+    )?;
+    let patch = review_text_output(
+        checked_git(
+            &repository.root,
+            &["diff", "--no-ext-diff", "--no-color", base_revision, "--"],
+            "capturing review diff",
+        )?,
+        "capturing review diff",
+    )?;
+    let mut evidence = format!("Git status:\n{status}\n\nPatch from {base_revision}:\n{patch}");
+    if evidence.len() > MAX_REVIEW_DIFF_BYTES {
+        evidence.truncate(floor_char_boundary(&evidence, MAX_REVIEW_DIFF_BYTES));
+        evidence.push_str("\n[review evidence truncated at 2 MiB]");
+    }
+    Ok(evidence)
+}
+
+fn floor_char_boundary(value: &str, maximum: usize) -> usize {
+    let mut boundary = maximum.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn review_text_output(output: Output, operation: &'static str) -> Result<String, GitError> {
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim_end().to_owned())
+        .map_err(|source| GitError::NonUtf8 { operation, source })
+}
 
 /// Finds Git worktrees below the configured project roots without following
 /// symbolic links or descending into repositories and common build caches.
@@ -477,6 +533,25 @@ mod tests {
         let error = inspect_repository(Path::new("relative"))
             .expect_err("relative repository path should fail");
         assert!(matches!(error, GitError::RelativePath(_)));
+    }
+
+    #[test]
+    fn captures_bounded_review_change_evidence() {
+        let repository = initialized_repository();
+        let base = inspect_repository(repository.path())
+            .expect("repository should inspect")
+            .head_revision;
+        fs::write(repository.path().join("README.md"), "changed")
+            .expect("tracked file should change");
+        fs::write(repository.path().join("new.txt"), "new").expect("untracked file should exist");
+
+        let evidence = review_change_evidence(repository.path(), &base)
+            .expect("review evidence should be captured");
+
+        assert!(evidence.contains(" M README.md"));
+        assert!(evidence.contains("?? new.txt"));
+        assert!(evidence.contains("-test"));
+        assert!(evidence.contains("+changed"));
     }
 
     #[test]

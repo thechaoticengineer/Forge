@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AgentKind, EngineSnapshot, ImplementationContinuationKind};
+use crate::state::{AgentKind, EngineSnapshot, ImplementationContinuationKind, ReviewPolicy};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -83,6 +83,14 @@ pub enum ClientRequest {
         kind: ImplementationContinuationKind,
         instruction: String,
     },
+    RunTaskReview {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+        worktree_id: String,
+        implementation_attempt_id: String,
+        policy: ReviewPolicy,
+    },
     GetSnapshot,
     Ping,
 }
@@ -118,7 +126,7 @@ pub enum ServerMessage {
         version: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
-        snapshot: EngineSnapshot,
+        snapshot: Box<EngineSnapshot>,
     },
     Pong {
         version: u16,
@@ -172,7 +180,7 @@ impl ServerMessage {
         Self::Snapshot {
             version: PROTOCOL_VERSION,
             request_id,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }
     }
 
@@ -231,6 +239,7 @@ mod tests {
         let run = snapshot.active_run.expect("run should decode");
         assert!(run.implementation_attempts.is_empty());
         assert!(run.implementation_activity.is_empty());
+        assert!(run.review_attempts.is_empty());
     }
 
     #[test]
@@ -426,6 +435,26 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 worktree_id: "worktree-1".to_owned(),
                 agent: AgentKind::Claude,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_independent_review_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-review","method":"run_task_review","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session"}"#,
+        )
+        .expect("review request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::RunTaskReview {
+                run_id: "run-1".to_owned(),
+                plan_id: "plan-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                worktree_id: "worktree-1".to_owned(),
+                implementation_attempt_id: "implementation-1".to_owned(),
+                policy: ReviewPolicy::CrossProviderOrFreshSession,
             }
         );
     }

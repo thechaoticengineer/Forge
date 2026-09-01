@@ -41,7 +41,139 @@ pub struct ActiveRunSummary {
     pub implementation_attempts: Vec<ImplementationAttemptSummary>,
     #[serde(default)]
     pub implementation_activity: Vec<ImplementationActivitySummary>,
+    #[serde(default)]
+    pub review_attempts: Vec<ReviewAttemptSummary>,
     pub last_error: Option<String>,
+}
+
+/// Policy used to choose an independent reviewer for an implementation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPolicy {
+    CrossProviderRequired,
+    CrossProviderOrFreshSession,
+}
+
+impl ReviewPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossProviderRequired => "cross_provider_required",
+            Self::CrossProviderOrFreshSession => "cross_provider_or_fresh_session",
+        }
+    }
+}
+
+/// How the reviewer is independent from the implementation attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewIndependence {
+    CrossProvider,
+    FreshSessionFallback,
+}
+
+impl ReviewIndependence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossProvider => "cross_provider",
+            Self::FreshSessionFallback => "fresh_session_fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    Running,
+    Approved,
+    ChangesRequested,
+    Blocked,
+    Failed,
+}
+
+impl ReviewStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes_requested",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Approved,
+    ChangesRequested,
+    Blocked,
+}
+
+impl ReviewVerdict {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes_requested",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSeverity {
+    Critical,
+    Major,
+    Minor,
+}
+
+impl ReviewSeverity {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Major => "major",
+            Self::Minor => "minor",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFinding {
+    pub severity: ReviewSeverity,
+    pub summary: String,
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewResult {
+    pub verdict: ReviewVerdict,
+    pub summary: String,
+    pub findings: Vec<ReviewFinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewAttemptSummary {
+    pub id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub implementer: AgentKind,
+    pub reviewer: AgentKind,
+    pub policy: ReviewPolicy,
+    pub independence: ReviewIndependence,
+    pub status: ReviewStatus,
+    pub result: Option<ReviewResult>,
+    pub error_message: Option<String>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
 }
 
 /// One bounded, durable activity update emitted by an implementation agent.
@@ -217,6 +349,14 @@ impl AgentKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+        }
+    }
+
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Codex => Self::Claude,
+            Self::Claude => Self::Codex,
         }
     }
 }

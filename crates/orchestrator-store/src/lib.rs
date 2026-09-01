@@ -13,8 +13,9 @@ use std::{
 use orchestrator_core::state::{
     ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationActivitySummary,
     ImplementationAttemptSummary, ImplementationContinuationKind, ImplementationStatus,
-    ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary, RunStatus,
-    TaskWorktreeStatus, TaskWorktreeSummary,
+    ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary,
+    ReviewAttemptSummary, ReviewIndependence, ReviewPolicy, ReviewResult, ReviewStatus,
+    ReviewVerdict, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -25,7 +26,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -54,6 +55,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "implementation_controls",
         include_str!("../migrations/0006_implementation_controls.sql"),
     ),
+    (
+        7,
+        "independent_reviews",
+        include_str!("../migrations/0007_independent_reviews.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -77,6 +83,8 @@ pub enum StorageError {
     },
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("cannot serialize or parse durable JSON: {0}")]
+    Json(String),
     #[error("database schema version {found} is newer than supported version {supported}")]
     FutureSchema { found: i64, supported: i64 },
     #[error("SQLite did not enable write-ahead logging; active mode is {0}")]
@@ -101,6 +109,12 @@ pub enum StorageError {
     InvalidImplementationContinuationKind(String),
     #[error("database returned an invalid implementation stop reason: {0}")]
     InvalidImplementationStopReason(String),
+    #[error("database returned an invalid review policy: {0}")]
+    InvalidReviewPolicy(String),
+    #[error("database returned invalid review independence: {0}")]
+    InvalidReviewIndependence(String),
+    #[error("database returned an invalid review status: {0}")]
+    InvalidReviewStatus(String),
     #[error("run does not exist: {0}")]
     RunNotFound(String),
     #[error("run is not ready for planning: {0}")]
@@ -123,6 +137,10 @@ pub enum StorageError {
     InvalidImplementationActivity,
     #[error("database returned an invalid implementation activity kind: {0}")]
     InvalidImplementationActivityKind(String),
+    #[error("task review is not ready to run: {0}")]
+    ReviewNotReady(String),
+    #[error("review attempt does not exist or is no longer running: {0}")]
+    ReviewAttemptNotRunning(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -344,6 +362,44 @@ pub struct ImplementationContinuationReservation {
     pub instruction: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttemptInput {
+    pub run_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub implementer: AgentKind,
+    pub reviewer: AgentKind,
+    pub policy: ReviewPolicy,
+    pub independence: ReviewIndependence,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedReviewAttempt {
+    pub attempt_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttemptSuccess {
+    pub attempt_id: String,
+    pub result: ReviewResult,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttemptFailure {
+    pub attempt_id: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: Option<i32>,
+    pub error_message: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -429,6 +485,18 @@ enum Command {
     },
     ReserveImplementationContinuation(
         ImplementationContinuationReservation,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    BeginReviewAttempt(
+        ReviewAttemptInput,
+        oneshot::Sender<Result<StartedReviewAttempt, StorageError>>,
+    ),
+    CompleteReviewAttempt(
+        ReviewAttemptSuccess,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    FailReviewAttempt(
+        ReviewAttemptFailure,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -914,6 +982,64 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Records reviewer identity and independence before starting a fresh
+    /// read-only review process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the completed implementation, worktree, policy,
+    /// or run state does not match, or storage is unavailable.
+    pub async fn begin_review_attempt(
+        &self,
+        input: ReviewAttemptInput,
+    ) -> Result<StartedReviewAttempt, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::BeginReviewAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists a validated independent-review verdict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running, its result
+    /// cannot be serialized, or storage is unavailable.
+    pub async fn complete_review_attempt(
+        &self,
+        input: ReviewAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CompleteReviewAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists reviewer process or structured-output failure evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running or storage is
+    /// unavailable.
+    pub async fn fail_review_attempt(
+        &self,
+        input: ReviewAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::FailReviewAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -925,6 +1051,7 @@ impl Drop for StorageWorker {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
     while let Ok(command) = receiver.recv() {
         match command {
@@ -1017,6 +1144,15 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             Command::ReserveImplementationContinuation(input, reply) => {
                 let _ = reply.send(database.reserve_implementation_continuation(&input));
             }
+            Command::BeginReviewAttempt(input, reply) => {
+                let _ = reply.send(database.begin_review_attempt(&input));
+            }
+            Command::CompleteReviewAttempt(input, reply) => {
+                let _ = reply.send(database.complete_review_attempt(&input));
+            }
+            Command::FailReviewAttempt(input, reply) => {
+                let _ = reply.send(database.fail_review_attempt(&input));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -1046,6 +1182,7 @@ impl Database {
         recover_interrupted_planning(&mut connection)?;
         recover_interrupted_worktrees(&mut connection)?;
         recover_interrupted_implementations(&mut connection)?;
+        recover_interrupted_reviews(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -1089,6 +1226,7 @@ impl Database {
             run.worktrees = self.load_task_worktrees(&run.id)?;
             run.implementation_attempts = self.load_implementation_attempts(&run.id)?;
             run.implementation_activity = self.load_implementation_activity(&run.id)?;
+            run.review_attempts = self.load_review_attempts(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -1164,6 +1302,7 @@ impl Database {
                 worktrees: Vec::new(),
                 implementation_attempts: Vec::new(),
                 implementation_activity: Vec::new(),
+                review_attempts: Vec::new(),
                 last_error: None,
             }),
         })
@@ -2006,6 +2145,219 @@ impl Database {
         self.current_snapshot()
     }
 
+    fn begin_review_attempt(
+        &self,
+        input: &ReviewAttemptInput,
+    ) -> Result<StartedReviewAttempt, StorageError> {
+        let valid_independence = match input.independence {
+            ReviewIndependence::CrossProvider => input.reviewer != input.implementer,
+            ReviewIndependence::FreshSessionFallback => {
+                input.policy == ReviewPolicy::CrossProviderOrFreshSession
+                    && input.reviewer == input.implementer
+            }
+        };
+        if !valid_independence || input.prompt.trim().is_empty() {
+            return Err(StorageError::ReviewNotReady(input.task_id.clone()));
+        }
+        let started_at = unix_milliseconds()?;
+        let attempt_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        let ready = transaction
+            .query_row(
+                "SELECT 1 FROM implementation_attempts i \
+                 JOIN task_worktrees w ON w.id = i.worktree_id \
+                 JOIN plans p ON p.id = i.plan_id \
+                 JOIN runs r ON r.id = i.run_id \
+                 WHERE i.id = ?5 AND i.run_id = ?1 AND i.plan_id = ?2 \
+                   AND i.task_id = ?3 AND i.worktree_id = ?4 AND i.agent = ?6 \
+                   AND i.status = 'completed' AND w.status = 'ready' \
+                   AND p.status = 'approved' AND r.status IN ('waiting_for_user', 'failed')",
+                (
+                    &input.run_id,
+                    &input.plan_id,
+                    &input.task_id,
+                    &input.worktree_id,
+                    &input.implementation_attempt_id,
+                    input.implementer.as_str(),
+                ),
+                |_| Ok(true),
+            )
+            .optional()?;
+        if ready.is_none() {
+            return Err(if run_exists(&transaction, &input.run_id)? {
+                StorageError::ReviewNotReady(input.task_id.clone())
+            } else {
+                StorageError::RunNotFound(input.run_id.clone())
+            });
+        }
+        let changed = transaction.execute(
+            "UPDATE runs SET status = 'running', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status IN ('waiting_for_user', 'failed')",
+            (&input.run_id, started_at),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ReviewNotReady(input.task_id.clone()));
+        }
+        transaction.execute(
+            "INSERT INTO review_attempts(\
+                id, run_id, plan_id, task_id, worktree_id, implementation_attempt_id, \
+                implementer, reviewer, policy, independence, status, prompt, started_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', ?11, ?12)",
+            (
+                &attempt_id,
+                &input.run_id,
+                &input.plan_id,
+                &input.task_id,
+                &input.worktree_id,
+                &input.implementation_attempt_id,
+                input.implementer.as_str(),
+                input.reviewer.as_str(),
+                input.policy.as_str(),
+                input.independence.as_str(),
+                &input.prompt,
+                started_at,
+            ),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "task_id": input.task_id,
+            "implementation_attempt_id": input.implementation_attempt_id,
+            "implementer": input.implementer,
+            "reviewer": input.reviewer,
+            "policy": input.policy,
+            "independence": input.independence,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'review_started', ?2, ?3, ?4)",
+            (
+                &input.run_id,
+                input.reviewer.as_str(),
+                payload.to_string(),
+                started_at,
+            ),
+        )?;
+        transaction.commit()?;
+        Ok(StartedReviewAttempt {
+            attempt_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn complete_review_attempt(
+        &self,
+        input: &ReviewAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, reviewer) = running_review_attempt(&transaction, &input.attempt_id)?;
+        let status = match input.result.verdict {
+            ReviewVerdict::Approved => ReviewStatus::Approved,
+            ReviewVerdict::ChangesRequested => ReviewStatus::ChangesRequested,
+            ReviewVerdict::Blocked => ReviewStatus::Blocked,
+        };
+        let result_json = serde_json::to_string(&input.result)
+            .map_err(|error| StorageError::Json(error.to_string()))?;
+        let changed = transaction.execute(
+            "UPDATE review_attempts SET status = ?2, result_json = ?3, final_output = ?4, \
+                diagnostic_output = ?5, exit_code = ?6, completed_at = ?7 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                status.as_str(),
+                &result_json,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ReviewAttemptNotRunning(
+                input.attempt_id.clone(),
+            ));
+        }
+        let run_status = if status == ReviewStatus::Blocked {
+            "blocked"
+        } else {
+            "waiting_for_user"
+        };
+        transaction.execute(
+            "UPDATE runs SET status = ?2, last_error = NULL, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, run_status, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "reviewer": reviewer,
+            "verdict": input.result.verdict,
+            "finding_count": input.result.findings.len(),
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'review_completed', ?2, ?3, ?4)",
+            (
+                &run_id,
+                reviewer.as_str(),
+                payload.to_string(),
+                completed_at,
+            ),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn fail_review_attempt(
+        &self,
+        input: &ReviewAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, reviewer) = running_review_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE review_attempts SET status = 'failed', final_output = ?2, \
+                diagnostic_output = ?3, exit_code = ?4, error_message = ?5, completed_at = ?6 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                &input.error_message,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ReviewAttemptNotRunning(
+                input.attempt_id.clone(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, &input.error_message, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "reviewer": reviewer,
+            "error": input.error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'review_failed', ?2, ?3, ?4)",
+            (
+                &run_id,
+                reviewer.as_str(),
+                payload.to_string(),
+                completed_at,
+            ),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
     fn load_implementation_activity(
         &self,
         run_id: &str,
@@ -2118,6 +2470,75 @@ impl Database {
                     .transpose()?,
                 pending_user_instruction,
                 exit_code,
+                error_message,
+                started_at,
+                completed_at,
+            });
+        }
+        Ok(attempts)
+    }
+
+    fn load_review_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ReviewAttemptSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, worktree_id, implementation_attempt_id, implementer, \
+                    reviewer, policy, independence, status, result_json, error_message, \
+                    started_at, completed_at \
+             FROM review_attempts WHERE run_id = ?1 ORDER BY started_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+            ))
+        })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                implementer,
+                reviewer,
+                policy,
+                independence,
+                status,
+                result_json,
+                error_message,
+                started_at,
+                completed_at,
+            ) = row?;
+            let result = result_json
+                .map(|value| {
+                    serde_json::from_str::<ReviewResult>(&value)
+                        .map_err(|error| StorageError::Json(error.to_string()))
+                })
+                .transpose()?;
+            attempts.push(ReviewAttemptSummary {
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                implementer: parse_agent_kind(&implementer)?,
+                reviewer: parse_agent_kind(&reviewer)?,
+                policy: parse_review_policy(&policy)?,
+                independence: parse_review_independence(&independence)?,
+                status: parse_review_status(&status)?,
+                result,
                 error_message,
                 started_at,
                 completed_at,
@@ -2297,6 +2718,30 @@ fn running_implementation_attempt(
     Ok((run_id, task_id, worktree_id, parse_agent_kind(&agent)?))
 }
 
+fn running_review_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+) -> Result<(String, String, AgentKind), StorageError> {
+    let attempt = transaction
+        .query_row(
+            "SELECT run_id, task_id, reviewer FROM review_attempts \
+             WHERE id = ?1 AND status = 'running'",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((run_id, task_id, reviewer)) = attempt else {
+        return Err(StorageError::ReviewAttemptNotRunning(attempt_id.to_owned()));
+    };
+    Ok((run_id, task_id, parse_agent_kind(&reviewer)?))
+}
+
 fn current_proposed_plan_agent(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -2427,6 +2872,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         worktrees: Vec::new(),
         implementation_attempts: Vec::new(),
         implementation_activity: Vec::new(),
+        review_attempts: Vec::new(),
         last_error: row.get(7)?,
     })
 }
@@ -2436,6 +2882,33 @@ fn parse_agent_kind(agent: &str) -> Result<AgentKind, StorageError> {
         "codex" => Ok(AgentKind::Codex),
         "claude" => Ok(AgentKind::Claude),
         _ => Err(StorageError::InvalidAgentKind(agent.to_owned())),
+    }
+}
+
+fn parse_review_policy(value: &str) -> Result<ReviewPolicy, StorageError> {
+    match value {
+        "cross_provider_required" => Ok(ReviewPolicy::CrossProviderRequired),
+        "cross_provider_or_fresh_session" => Ok(ReviewPolicy::CrossProviderOrFreshSession),
+        _ => Err(StorageError::InvalidReviewPolicy(value.to_owned())),
+    }
+}
+
+fn parse_review_independence(value: &str) -> Result<ReviewIndependence, StorageError> {
+    match value {
+        "cross_provider" => Ok(ReviewIndependence::CrossProvider),
+        "fresh_session_fallback" => Ok(ReviewIndependence::FreshSessionFallback),
+        _ => Err(StorageError::InvalidReviewIndependence(value.to_owned())),
+    }
+}
+
+fn parse_review_status(value: &str) -> Result<ReviewStatus, StorageError> {
+    match value {
+        "running" => Ok(ReviewStatus::Running),
+        "approved" => Ok(ReviewStatus::Approved),
+        "changes_requested" => Ok(ReviewStatus::ChangesRequested),
+        "blocked" => Ok(ReviewStatus::Blocked),
+        "failed" => Ok(ReviewStatus::Failed),
+        _ => Err(StorageError::InvalidReviewStatus(value.to_owned())),
     }
 }
 
@@ -2791,6 +3264,54 @@ fn recover_interrupted_implementations(connection: &mut Connection) -> Result<()
     Ok(())
 }
 
+fn recover_interrupted_reviews(connection: &mut Connection) -> Result<(), StorageError> {
+    let interrupted = {
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, task_id, reviewer FROM review_attempts WHERE status = 'running'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+    let recovered_at = unix_milliseconds()?;
+    let error_message = "engine stopped before the reviewer completed";
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (attempt_id, run_id, task_id, reviewer) in interrupted {
+        transaction.execute(
+            "UPDATE review_attempts SET status = 'failed', error_message = ?2, completed_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&attempt_id, error_message, recovered_at),
+        )?;
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, error_message, recovered_at),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "task_id": task_id,
+            "reviewer": reviewer,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'review_interrupted', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), recovered_at),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn retryable_continuation(
     transaction: &Transaction<'_>,
     attempt_id: &str,
@@ -2958,7 +3479,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 6);
+        assert_eq!(migration_count, 7);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -3095,8 +3616,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 7,
-                supported: 6
+                found: 8,
+                supported: 7
             }
         ));
     }

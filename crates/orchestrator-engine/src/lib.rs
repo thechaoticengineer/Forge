@@ -15,9 +15,9 @@ use nix::{
 };
 use orchestrator_agents::{
     ImplementerActivity, ImplementerControl, ImplementerControlRequest, ImplementerRunner,
-    ImplementerStopHandle, ImplementerStopRequestResult, PlannerRunner,
+    ImplementerStopHandle, ImplementerStopRequestResult, PlannerRunner, ReviewerRunner,
     build_implementation_continuation_prompt, build_implementation_prompt, build_planning_prompt,
-    implementer_stop_channel, validate_proposal,
+    build_review_prompt, implementer_stop_channel, validate_proposal,
 };
 use orchestrator_core::{
     protocol::{
@@ -27,20 +27,21 @@ use orchestrator_core::{
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, ImplementationContinuationKind,
         ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
-        PlanTaskSummary, ProposedTask, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
+        PlanTaskSummary, ProposedTask, ReviewIndependence, ReviewPolicy, RunStatus,
+        TaskWorktreeStatus, TaskWorktreeSummary,
     },
 };
 use orchestrator_git::{
     GitError, TaskWorktreeRequest, TaskWorktreeState, discover_repositories_until,
-    inspect_repository, prune_missing_worktrees, task_branch_name, task_worktree_path,
-    task_worktree_state,
+    inspect_repository, prune_missing_worktrees, review_change_evidence, task_branch_name,
+    task_worktree_path, task_worktree_state,
 };
 use orchestrator_store::{
     DraftRunInput, ImplementationActivityInput, ImplementationAttemptCancellation,
     ImplementationAttemptFailure, ImplementationAttemptInput, ImplementationAttemptSuccess,
     ImplementationContinuationReservation, PlanAttemptFailure, PlanAttemptInput,
-    PlanAttemptSuccess, PlanRevisionInput, StatePaths, StorageWorker, StoredSnapshot,
-    TaskWorktreeReservation,
+    PlanAttemptSuccess, PlanRevisionInput, ReviewAttemptFailure, ReviewAttemptInput,
+    ReviewAttemptSuccess, StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -242,6 +243,7 @@ pub async fn serve_with_settings(
     repositories: RepositorySettings,
 ) -> Result<()> {
     let implementer = ImplementerRunner::new(planner.commands().clone());
+    let reviewer = ReviewerRunner::new(planner.commands().clone());
     let storage = Arc::new(
         StorageWorker::start(state_paths).context("cannot initialize durable state storage")?,
     );
@@ -267,6 +269,7 @@ pub async fn serve_with_settings(
         storage,
         Arc::new(planner),
         Arc::new(implementer),
+        Arc::new(reviewer),
         implementation_controls,
         Arc::new(repositories),
     )
@@ -276,12 +279,14 @@ pub async fn serve_with_settings(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_listener(
     listener: &UnixListener,
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
     implementer: Arc<ImplementerRunner>,
+    reviewer: Arc<ReviewerRunner>,
     implementation_controls: Arc<ImplementationControls>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
@@ -297,6 +302,7 @@ async fn run_listener(
                 let client_storage = Arc::clone(&storage);
                 let client_planner = Arc::clone(&planner);
                 let client_implementer = Arc::clone(&implementer);
+                let client_reviewer = Arc::clone(&reviewer);
                 let client_implementation_controls = Arc::clone(&implementation_controls);
                 let client_repositories = Arc::clone(&repositories);
                 tokio::spawn(async move {
@@ -306,6 +312,7 @@ async fn run_listener(
                         client_storage,
                         client_planner,
                         client_implementer,
+                        client_reviewer,
                         client_implementation_controls,
                         client_repositories,
                     ).await {
@@ -317,12 +324,14 @@ async fn run_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: UnixStream,
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
     implementer: Arc<ImplementerRunner>,
+    reviewer: Arc<ReviewerRunner>,
     implementation_controls: Arc<ImplementationControls>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
@@ -349,6 +358,7 @@ async fn handle_client(
                     &storage,
                     &planner,
                     &implementer,
+                    &reviewer,
                     &implementation_controls,
                     &repositories,
                     &mut write_half,
@@ -375,6 +385,7 @@ async fn handle_request(
     storage: &StorageWorker,
     planner: &PlannerRunner,
     implementer: &ImplementerRunner,
+    reviewer: &ReviewerRunner,
     implementation_controls: &ImplementationControls,
     repositories: &RepositorySettings,
     write_half: &mut OwnedWriteHalf,
@@ -644,6 +655,32 @@ async fn handle_request(
             storage,
             implementer,
             implementation_controls,
+            state_sender,
+        )
+        .await
+        {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::RunTaskReview {
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            implementation_attempt_id,
+            policy,
+        } => match run_task_review(
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            implementation_attempt_id,
+            policy,
+            storage,
+            reviewer,
             state_sender,
         )
         .await
@@ -2311,6 +2348,206 @@ fn strip_terminal_controls(raw: &str) -> String {
     output
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_task_review(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    worktree_id: String,
+    implementation_attempt_id: String,
+    policy: ReviewPolicy,
+    storage: &StorageWorker,
+    reviewer_runner: &ReviewerRunner,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let snapshot = storage
+        .current_snapshot()
+        .await
+        .map_err(|error| RequestFailure::storage("cannot load review context", error))?;
+    let run = snapshot.active_run.as_ref().ok_or_else(|| RequestFailure {
+        code: "run_not_found",
+        message: "there is no active run to review".to_owned(),
+    })?;
+    if run.id != run_id {
+        return Err(RequestFailure {
+            code: "run_not_found",
+            message: "the requested run is not active".to_owned(),
+        });
+    }
+    let plan = run
+        .plan
+        .as_ref()
+        .filter(|plan| plan.id == plan_id && plan.status == PlanStatus::Approved)
+        .ok_or_else(|| RequestFailure {
+            code: "plan_not_approved",
+            message: "independent review requires the run's approved plan".to_owned(),
+        })?;
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "task_not_found",
+            message: "the selected task is not part of the approved plan".to_owned(),
+        })?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .find(|worktree| {
+            worktree.id == worktree_id
+                && worktree.task_id == task_id
+                && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "worktree_not_ready",
+            message: "the selected task worktree is not ready for review".to_owned(),
+        })?;
+    let implementation = run
+        .implementation_attempts
+        .iter()
+        .find(|attempt| {
+            attempt.id == implementation_attempt_id
+                && attempt.task_id == task_id
+                && attempt.worktree_id == worktree_id
+                && attempt.status == ImplementationStatus::Completed
+        })
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "implementation_not_completed",
+            message: "independent review requires a completed implementation attempt".to_owned(),
+        })?;
+    if run.review_attempts.iter().any(|attempt| {
+        attempt.implementation_attempt_id == implementation_attempt_id
+            && attempt.status == orchestrator_core::state::ReviewStatus::Approved
+    }) {
+        return Err(RequestFailure {
+            code: "implementation_already_approved",
+            message: "this implementation attempt already has an approved independent review"
+                .to_owned(),
+        });
+    }
+    let worktree_path = PathBuf::from(&worktree.path);
+    let evidence =
+        review_change_evidence(&worktree_path, &worktree.base_revision).map_err(|error| {
+            RequestFailure {
+                code: "review_evidence_failed",
+                message: format!("cannot capture review evidence: {error}"),
+            }
+        })?;
+    let evidence = format!(
+        "Deterministic verification: not yet available in this Forge version. The reviewer must block when a required criterion cannot be established from repository evidence.\n\n{evidence}"
+    );
+    let prompt = build_review_prompt(run, &task, &worktree, implementation.agent, &evidence);
+    let primary_reviewer = implementation.agent.other();
+    let primary = execute_review_attempt(
+        ReviewAttemptInput {
+            run_id: run_id.clone(),
+            plan_id: plan_id.clone(),
+            task_id: task_id.clone(),
+            worktree_id: worktree_id.clone(),
+            implementation_attempt_id: implementation_attempt_id.clone(),
+            implementer: implementation.agent,
+            reviewer: primary_reviewer,
+            policy,
+            independence: ReviewIndependence::CrossProvider,
+            prompt: prompt.clone(),
+        },
+        &worktree_path,
+        storage,
+        reviewer_runner,
+        state_sender,
+    )
+    .await?;
+    match primary {
+        ReviewExecution::Settled(snapshot) => Ok(snapshot),
+        ReviewExecution::LaunchFailed(snapshot) => {
+            if policy == ReviewPolicy::CrossProviderRequired {
+                return Ok(snapshot);
+            }
+            execute_review_attempt(
+                ReviewAttemptInput {
+                    run_id,
+                    plan_id,
+                    task_id,
+                    worktree_id,
+                    implementation_attempt_id,
+                    implementer: implementation.agent,
+                    reviewer: implementation.agent,
+                    policy,
+                    independence: ReviewIndependence::FreshSessionFallback,
+                    prompt,
+                },
+                &worktree_path,
+                storage,
+                reviewer_runner,
+                state_sender,
+            )
+            .await
+            .map(|outcome| match outcome {
+                ReviewExecution::Settled(snapshot) | ReviewExecution::LaunchFailed(snapshot) => {
+                    snapshot
+                }
+            })
+        }
+    }
+}
+
+enum ReviewExecution {
+    Settled(StoredSnapshot),
+    LaunchFailed(StoredSnapshot),
+}
+
+async fn execute_review_attempt(
+    input: ReviewAttemptInput,
+    worktree: &Path,
+    storage: &StorageWorker,
+    reviewer_runner: &ReviewerRunner,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<ReviewExecution, RequestFailure> {
+    let reviewer = input.reviewer;
+    let prompt = input.prompt.clone();
+    let started = storage
+        .begin_review_attempt(input)
+        .await
+        .map_err(|error| RequestFailure::storage("cannot begin independent review", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(started.snapshot));
+    match reviewer_runner.review(reviewer, worktree, &prompt).await {
+        Ok(output) => storage
+            .complete_review_attempt(ReviewAttemptSuccess {
+                attempt_id: started.attempt_id,
+                result: output.result,
+                final_output: output.final_output,
+                diagnostic_output: output.diagnostic_output,
+                exit_code: output.exit_code,
+            })
+            .await
+            .map(ReviewExecution::Settled)
+            .map_err(|error| RequestFailure::storage("cannot complete independent review", error)),
+        Err(failure) => {
+            let launch_failed = failure.launch_failed;
+            let snapshot = storage
+                .fail_review_attempt(ReviewAttemptFailure {
+                    attempt_id: started.attempt_id,
+                    final_output: failure.final_output,
+                    diagnostic_output: failure.diagnostic_output,
+                    exit_code: failure.exit_code,
+                    error_message: failure.message,
+                })
+                .await
+                .map_err(|error| {
+                    RequestFailure::storage("cannot fail independent review", error)
+                })?;
+            if launch_failed {
+                Ok(ReviewExecution::LaunchFailed(snapshot))
+            } else {
+                Ok(ReviewExecution::Settled(snapshot))
+            }
+        }
+    }
+}
+
 struct ImplementationContext {
     run: ActiveRunSummary,
     task: PlanTaskSummary,
@@ -2524,10 +2761,14 @@ fn engine_snapshot(stored: StoredSnapshot) -> EngineSnapshot {
                 }
                 RunStatus::Planning | RunStatus::Running => (EngineStatus::Running, false),
                 RunStatus::WaitingForUser => {
-                    if run
-                        .plan
-                        .as_ref()
-                        .is_some_and(|plan| plan.status == PlanStatus::Approved)
+                    let review_needs_attention = run.review_attempts.last().is_some_and(|review| {
+                        review.status == orchestrator_core::state::ReviewStatus::ChangesRequested
+                    });
+                    if !review_needs_attention
+                        && run
+                            .plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.status == PlanStatus::Approved)
                     {
                         (EngineStatus::Idle, false)
                     } else {
@@ -3345,6 +3586,108 @@ mod tests {
             "implemented"
         );
         assert!(!repository.path().join("implemented.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn routes_review_to_the_other_provider_in_a_fresh_attempt() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+        let created = prepare_task_worktree(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect("worktree should be created");
+        let worktree = created
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .worktrees[0]
+            .clone();
+        let fake_codex = state.path().join("review-implementer-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\ninput=$(cat)\nprintf implemented > implemented.txt\n",
+        )
+        .expect("fake implementer should be written");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("fake implementer should be executable");
+        let implementer = ImplementerRunner::new(orchestrator_agents::AgentCommands {
+            codex: fake_codex,
+            claude: state.path().join("unused-implementation-claude"),
+        });
+        let implementation_controls = ImplementationControls::default();
+        let implementation_snapshot = run_task_implementation(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            worktree.id.clone(),
+            AgentKind::Codex,
+            &storage,
+            &implementer,
+            &implementation_controls,
+            &state_sender,
+        )
+        .await
+        .expect("implementation should complete");
+        let implementation_id = implementation_snapshot
+            .active_run
+            .as_ref()
+            .and_then(|run| run.implementation_attempts.last())
+            .expect("implementation should be stored")
+            .id
+            .clone();
+        let fake_claude = state.path().join("reviewer-claude");
+        let review = serde_json::json!({
+            "structured_output": {
+                "verdict": "approved",
+                "summary": "The implementation satisfies the approved task.",
+                "findings": []
+            }
+        });
+        fs::write(
+            &fake_claude,
+            format!("#!/bin/sh\ninput=$(cat)\nprintf '%s' '{review}'\n"),
+        )
+        .expect("fake reviewer should be written");
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o700))
+            .expect("fake reviewer should be executable");
+        let reviewer = ReviewerRunner::new(orchestrator_agents::AgentCommands {
+            codex: state.path().join("unused-review-codex"),
+            claude: fake_claude,
+        });
+
+        let review_snapshot = run_task_review(
+            run_id,
+            plan.id,
+            plan.tasks[0].id.clone(),
+            worktree.id,
+            implementation_id.clone(),
+            ReviewPolicy::CrossProviderRequired,
+            &storage,
+            &reviewer,
+            &state_sender,
+        )
+        .await
+        .expect("review should settle");
+        let run = review_snapshot.active_run.expect("run should stay active");
+        let review = run.review_attempts.last().expect("review should be stored");
+
+        assert_eq!(review.implementation_attempt_id, implementation_id);
+        assert_eq!(review.implementer, AgentKind::Codex);
+        assert_eq!(review.reviewer, AgentKind::Claude);
+        assert_eq!(review.independence, ReviewIndependence::CrossProvider);
+        assert_eq!(
+            review.status,
+            orchestrator_core::state::ReviewStatus::Approved
+        );
     }
 
     #[tokio::test]

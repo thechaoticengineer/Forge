@@ -12,7 +12,7 @@ The foundation and planning workflow are implemented. A developer can open the O
 
 Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; changed-file and retry evidence are the next implementation slice.
 
-The **Changes**, **Verification**, and **Review** panel sections currently communicate product direction but do not yet run those stages.
+The CLI can now run and persist a fresh independent review, preferring the provider that did not implement the task and recording an explicit same-provider fresh-session fallback when policy permits it. The **Changes**, **Verification**, and **Review** panel sections still communicate product direction and do not yet run those stages.
 
 ## Phase 0 — Foundation
 
@@ -76,9 +76,9 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 
 ## Phase 4 — Independent Review and Correction
 
-- [ ] Assign review to the agent that did not implement the change.
+- [x] Assign review to the agent that did not implement the change, with an explicit fresh-session fallback policy.
 - [ ] Give the reviewer the approved plan, acceptance criteria, diff, and verification evidence.
-- [ ] Store findings with severity, evidence, status, and disposition.
+- [ ] Store findings with severity, evidence, status, and disposition. Verdicts, severity, and evidence are implemented; disposition remains.
 - [ ] Present findings in the **Review** section instead of hiding them in agent transcripts.
 - [ ] Return specific accepted findings to the implementer for correction.
 - [ ] Repeat verification and independent review after corrections.
