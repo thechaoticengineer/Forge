@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::state::{AgentKind, EngineSnapshot};
+use crate::state::{AgentKind, EngineSnapshot, ImplementationContinuationKind};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -68,6 +68,20 @@ pub enum ClientRequest {
     CancelTaskImplementation {
         run_id: String,
         attempt_id: String,
+    },
+    PauseTaskImplementation {
+        run_id: String,
+        attempt_id: String,
+    },
+    ResumeTaskImplementation {
+        run_id: String,
+        attempt_id: String,
+    },
+    ContinueTaskImplementation {
+        run_id: String,
+        attempt_id: String,
+        kind: ImplementationContinuationKind,
+        instruction: String,
     },
     GetSnapshot,
     Ping,
@@ -243,6 +257,35 @@ mod tests {
             ClientRequest::CreateDraftRun {
                 repository: "/tmp/project".to_owned(),
                 goal: "Add a test".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_implementation_control_and_continuation_requests() {
+        let pause: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-pause","method":"pause_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
+        )
+        .expect("pause request should parse");
+        assert_eq!(
+            pause.request,
+            ClientRequest::PauseTaskImplementation {
+                run_id: "run-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+            }
+        );
+
+        let continuation: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-continue","method":"continue_task_implementation","run_id":"run-1","attempt_id":"attempt-1","kind":"additional_context","instruction":"Preserve the compatibility path"}"#,
+        )
+        .expect("continuation request should parse");
+        assert_eq!(
+            continuation.request,
+            ClientRequest::ContinueTaskImplementation {
+                run_id: "run-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                kind: ImplementationContinuationKind::AdditionalContext,
+                instruction: "Preserve the compatibility path".to_owned(),
             }
         );
     }

@@ -10,7 +10,7 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity for that attempt and offers an explicit confirmed cancellation that retains partial work. Worktree creation and assignment remain CLI-only; pause, redirection, and additional context are the next implementation controls.
+Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; changed-file and retry evidence are the next implementation slice.
 
 The **Changes**, **Verification**, and **Review** panel sections currently communicate product direction but do not yet run those stages.
 
@@ -50,7 +50,7 @@ Planned usability follow-ups:
 
 ## Phase 2 — Isolated Implementation
 
-This phase is partly implemented. A task can be given an isolated worktree and a user-selected implementing agent can run inside it under engine supervision. Recent categorized activity is durable and visible in the Omarchy panel, where the user can cancel a running attempt without deleting partial work.
+This phase is partly implemented. A task can be given an isolated worktree and a user-selected implementing agent can run inside it under engine supervision. Recent categorized activity is durable and visible in the Omarchy panel, where the user can pause or resume the supervised process group, cancel it, or start a linked continuation with a redirect or additional context without deleting partial work.
 
 - [x] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
 - [x] Refuse to overwrite or absorb existing user changes.
@@ -59,7 +59,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [x] Run the implementer under explicit process supervision owned by the Rust engine.
 - [x] Stream bounded categorized activity and progress to the Omarchy panel.
 - [x] Let the user explicitly cancel an implementation without losing run history or partial work.
-- [ ] Let the user pause, redirect, or add context without losing run history.
+- [x] Let the user pause, redirect, or add context without losing run history.
 - [ ] Preserve prompts, responses, changed files, failed approaches, and retries.
 - [ ] Open the exact task worktree from the interface.
 - [ ] Show recorded task worktrees, their branches, and their status in the panel.

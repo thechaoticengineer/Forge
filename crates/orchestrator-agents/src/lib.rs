@@ -5,6 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -13,15 +14,15 @@ use nix::{
     unistd::Pid,
 };
 use orchestrator_core::state::{
-    ActiveRunSummary, AgentKind, ImplementationActivityKind, PlanProposal, PlanTaskSummary,
-    TaskWorktreeSummary,
+    ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationContinuationKind,
+    ImplementationStopReason, PlanProposal, PlanTaskSummary, TaskWorktreeSummary,
 };
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::{mpsc, watch},
-    time::timeout,
+    sync::{mpsc, oneshot, watch},
+    time::{Instant, timeout},
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(10);
@@ -156,6 +157,7 @@ impl PlannerRunner {
                 diagnostic_output: stderr.text,
                 exit_code,
                 cancelled: false,
+                stop_reason: None,
             });
         }
         if !status.success() {
@@ -169,6 +171,7 @@ impl PlannerRunner {
                 diagnostic_output: stderr.text,
                 exit_code,
                 cancelled: false,
+                stop_reason: None,
             });
         }
 
@@ -178,6 +181,7 @@ impl PlannerRunner {
             diagnostic_output: stderr.text.clone(),
             exit_code,
             cancelled: false,
+            stop_reason: None,
         })?;
         Ok(PlannerOutput {
             proposal,
@@ -306,7 +310,27 @@ impl ImplementerRunner {
         worktree: &Path,
         prompt: &str,
         activity: Option<mpsc::Sender<ImplementerActivity>>,
-        cancellation: Option<watch::Receiver<bool>>,
+        cancellation: Option<ImplementerStopReceiver>,
+    ) -> Result<ImplementerOutput, ImplementerFailure> {
+        self.implement_with_controls(agent, worktree, prompt, activity, cancellation, None)
+            .await
+    }
+
+    /// Runs an implementer with streamed activity plus engine-owned process
+    /// group cancellation, pause, and resume controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded failure evidence under the same conditions as
+    /// [`Self::implement_with_activity`].
+    pub async fn implement_with_controls(
+        &self,
+        agent: AgentKind,
+        worktree: &Path,
+        prompt: &str,
+        activity: Option<mpsc::Sender<ImplementerActivity>>,
+        cancellation: Option<ImplementerStopReceiver>,
+        controls: Option<mpsc::Receiver<ImplementerControlRequest>>,
     ) -> Result<ImplementerOutput, ImplementerFailure> {
         let command = self.prepare_command(agent, worktree);
         let output = run_command(
@@ -319,6 +343,7 @@ impl ImplementerRunner {
             RunControl {
                 activity,
                 cancellation,
+                controls,
             },
         )
         .await
@@ -332,6 +357,7 @@ impl ImplementerRunner {
                 diagnostic_output: output.stderr.text,
                 exit_code,
                 cancelled: false,
+                stop_reason: None,
             });
         }
         if !output.status.success() {
@@ -345,6 +371,7 @@ impl ImplementerRunner {
                 diagnostic_output: output.stderr.text,
                 exit_code,
                 cancelled: false,
+                stop_reason: None,
             });
         }
 
@@ -407,6 +434,7 @@ pub struct ImplementerFailure {
     pub diagnostic_output: String,
     pub exit_code: Option<i32>,
     pub cancelled: bool,
+    pub stop_reason: Option<ImplementationStopReason>,
 }
 
 impl From<PlannerFailure> for ImplementerFailure {
@@ -417,6 +445,7 @@ impl From<PlannerFailure> for ImplementerFailure {
             diagnostic_output: failure.diagnostic_output,
             exit_code: failure.exit_code,
             cancelled: failure.cancelled,
+            stop_reason: failure.stop_reason,
         }
     }
 }
@@ -425,6 +454,93 @@ impl From<PlannerFailure> for ImplementerFailure {
 pub struct ImplementerActivity {
     pub kind: ImplementationActivityKind,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplementerControl {
+    Pause,
+    Resume,
+}
+
+pub struct ImplementerControlRequest {
+    pub control: ImplementerControl,
+    pub acknowledgement: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImplementerStopHandle {
+    state: Arc<Mutex<ImplementerStopState>>,
+    signal: watch::Sender<()>,
+}
+
+#[derive(Debug)]
+pub struct ImplementerStopReceiver {
+    state: Arc<Mutex<ImplementerStopState>>,
+    signal: watch::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImplementerStopRequestResult {
+    Accepted,
+    AlreadyRequested,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImplementerStopState {
+    Open,
+    Requested(ImplementationStopReason),
+    Closed,
+}
+
+#[must_use]
+pub fn implementer_stop_channel() -> (ImplementerStopHandle, ImplementerStopReceiver) {
+    let state = Arc::new(Mutex::new(ImplementerStopState::Open));
+    let (signal, receiver) = watch::channel(());
+    (
+        ImplementerStopHandle {
+            state: Arc::clone(&state),
+            signal,
+        },
+        ImplementerStopReceiver {
+            state,
+            signal: receiver,
+        },
+    )
+}
+
+impl ImplementerStopHandle {
+    #[must_use]
+    pub fn request(&self, reason: ImplementationStopReason) -> ImplementerStopRequestResult {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            ImplementerStopState::Open => {
+                *state = ImplementerStopState::Requested(reason);
+                self.signal.send_replace(());
+                ImplementerStopRequestResult::Accepted
+            }
+            ImplementerStopState::Requested(_) => ImplementerStopRequestResult::AlreadyRequested,
+            ImplementerStopState::Closed => ImplementerStopRequestResult::Closed,
+        }
+    }
+}
+
+impl ImplementerStopReceiver {
+    fn close(self) -> Option<ImplementationStopReason> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reason = match *state {
+            ImplementerStopState::Requested(reason) => Some(reason),
+            ImplementerStopState::Open | ImplementerStopState::Closed => None,
+        };
+        *state = ImplementerStopState::Closed;
+        reason
+    }
 }
 
 struct ProcessOutput {
@@ -436,9 +552,11 @@ struct ProcessOutput {
 #[derive(Default)]
 struct RunControl {
     activity: Option<mpsc::Sender<ImplementerActivity>>,
-    cancellation: Option<watch::Receiver<bool>>,
+    cancellation: Option<ImplementerStopReceiver>,
+    controls: Option<mpsc::Receiver<ImplementerControlRequest>>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_command(
     mut command: Command,
     command_path: &Path,
@@ -450,7 +568,8 @@ async fn run_command(
 ) -> Result<ProcessOutput, PlannerFailure> {
     let RunControl {
         activity,
-        cancellation,
+        mut cancellation,
+        controls,
     } = control;
     command
         .stdin(Stdio::piped())
@@ -458,25 +577,56 @@ async fn run_command(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        PlannerFailure::new(format!(
-            "cannot start {} CLI at {}: {error}",
-            agent.as_str(),
-            command_path.display()
-        ))
-    })?;
-    let process_group = child
-        .id()
-        .ok_or_else(|| PlannerFailure::new(format!("{role} process ID is unavailable")))?;
-    let mut process_guard = ProcessGroupGuard::new(process_group)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| PlannerFailure::new(format!("{role} stdout is unavailable")))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| PlannerFailure::new(format!("{role} stderr is unavailable")))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(close_before_wait_failure(
+                &mut cancellation,
+                PlannerFailure::new(format!(
+                    "cannot start {} CLI at {}: {error}",
+                    agent.as_str(),
+                    command_path.display()
+                )),
+                agent,
+                role,
+            ));
+        }
+    };
+    let Some(process_group) = child.id() else {
+        return Err(close_before_wait_failure(
+            &mut cancellation,
+            PlannerFailure::new(format!("{role} process ID is unavailable")),
+            agent,
+            role,
+        ));
+    };
+    let mut process_guard = match ProcessGroupGuard::new(process_group) {
+        Ok(guard) => guard,
+        Err(failure) => {
+            return Err(close_before_wait_failure(
+                &mut cancellation,
+                failure,
+                agent,
+                role,
+            ));
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return Err(close_before_wait_failure(
+            &mut cancellation,
+            PlannerFailure::new(format!("{role} stdout is unavailable")),
+            agent,
+            role,
+        ));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Err(close_before_wait_failure(
+            &mut cancellation,
+            PlannerFailure::new(format!("{role} stderr is unavailable")),
+            agent,
+            role,
+        ));
+    };
     let stdout_task = tokio::spawn(read_bounded_with_activity(
         stdout,
         MAX_STDOUT_BYTES,
@@ -497,21 +647,57 @@ async fn run_command(
         prompt,
         &mut process_guard,
         cancellation,
+        controls,
     )
     .await;
-    let stdout = join_output(stdout_task, role, "stdout").await?;
-    let stderr = join_output(stderr_task, role, "stderr").await?;
+    let stdout_result = join_output(stdout_task, role, "stdout").await;
+    let stderr_result = join_output(stderr_task, role, "stderr").await;
+    if let Err(failure) = &status_result
+        && failure.cancelled
+    {
+        return Err(PlannerFailure {
+            message: failure.message.clone(),
+            final_output: stdout_result
+                .as_ref()
+                .map_or_else(|_| String::new(), |output| output.text.clone()),
+            diagnostic_output: stderr_result
+                .as_ref()
+                .map_or_else(|_| String::new(), |output| output.text.clone()),
+            exit_code: None,
+            cancelled: true,
+            stop_reason: failure.stop_reason,
+        });
+    }
+    let stdout = stdout_result?;
+    let stderr = stderr_result?;
     let status = status_result.map_err(|failure| PlannerFailure {
         message: failure.message,
         final_output: stdout.text.clone(),
         diagnostic_output: stderr.text.clone(),
         exit_code: None,
         cancelled: failure.cancelled,
+        stop_reason: failure.stop_reason,
     })?;
     Ok(ProcessOutput {
         status,
         stdout,
         stderr,
+    })
+}
+
+fn close_before_wait_failure(
+    cancellation: &mut Option<ImplementerStopReceiver>,
+    failure: PlannerFailure,
+    agent: AgentKind,
+    role: &str,
+) -> PlannerFailure {
+    close_stop_receiver(cancellation).map_or(failure, |reason| PlannerFailure {
+        message: stop_reason_message(agent, role, reason),
+        final_output: String::new(),
+        diagnostic_output: String::new(),
+        exit_code: None,
+        cancelled: true,
+        stop_reason: Some(reason),
     })
 }
 
@@ -558,6 +744,7 @@ pub struct PlannerFailure {
     pub diagnostic_output: String,
     pub exit_code: Option<i32>,
     cancelled: bool,
+    stop_reason: Option<ImplementationStopReason>,
 }
 
 impl PlannerFailure {
@@ -568,6 +755,7 @@ impl PlannerFailure {
             diagnostic_output: String::new(),
             exit_code: None,
             cancelled: false,
+            stop_reason: None,
         }
     }
 }
@@ -632,6 +820,27 @@ pub fn build_implementation_prompt(
         worktree.base_revision,
         worktree.branch,
         worktree.path
+    )
+}
+
+#[must_use]
+pub fn build_implementation_continuation_prompt(
+    run: &ActiveRunSummary,
+    task: &PlanTaskSummary,
+    worktree: &TaskWorktreeSummary,
+    kind: ImplementationContinuationKind,
+    instruction: &str,
+) -> String {
+    let base = build_implementation_prompt(run, task, worktree);
+    let label = match kind {
+        ImplementationContinuationKind::Redirect => "User redirect",
+        ImplementationContinuationKind::AdditionalContext => "Additional user context",
+    };
+    format!(
+        "{base}\n\
+         This is a continuation after an earlier implementation process was stopped. Partial changes remain in the same worktree. Inspect them before editing, preserve useful work, and correct or extend them according to the instruction below.\n\n\
+         {label}:\n{}\n",
+        instruction.trim()
     )
 }
 
@@ -726,6 +935,7 @@ fn validate_text(label: &str, value: &str, maximum: usize) -> Result<(), String>
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn wait_for_child(
     child: &mut Child,
     duration: Duration,
@@ -733,56 +943,210 @@ async fn wait_for_child(
     role: &str,
     prompt: &str,
     process_guard: &mut ProcessGroupGuard,
-    mut cancellation: Option<watch::Receiver<bool>>,
+    mut cancellation: Option<ImplementerStopReceiver>,
+    mut controls: Option<mpsc::Receiver<ImplementerControlRequest>>,
 ) -> Result<std::process::ExitStatus, WaitFailure> {
-    let invocation = async {
-        send_prompt(child, agent, role, prompt)
-            .await
-            .map_err(|failure| failure.message)?;
-        child
-            .wait()
-            .await
-            .map_err(|error| format!("cannot wait for {} CLI: {error}", agent.as_str()))
-    };
-    let cancellation_requested = async {
-        let Some(receiver) = cancellation.as_mut() else {
-            std::future::pending::<()>().await;
-            return;
-        };
-        if *receiver.borrow() {
-            return;
-        }
-        while receiver.changed().await.is_ok() {
-            if *receiver.borrow() {
-                return;
+    let mut deadline = Box::pin(tokio::time::sleep(duration));
+    let mut paused_at = None;
+    let prompt_outcome = {
+        let prompt_delivery = send_prompt(child, agent, role, prompt);
+        tokio::pin!(prompt_delivery);
+        loop {
+            tokio::select! {
+                result = &mut prompt_delivery => break PromptDeliveryOutcome::Delivered(result),
+                () = &mut deadline, if paused_at.is_none() => {
+                    break PromptDeliveryOutcome::TimedOut;
+                }
+                reason = wait_for_stop_reason(&mut cancellation) => {
+                    break PromptDeliveryOutcome::Stopped(reason);
+                }
+                request = receive_implementer_control(&mut controls) => {
+                    let Some(request) = request else {
+                        controls = None;
+                        continue;
+                    };
+                    apply_implementer_control(
+                        request,
+                        process_guard,
+                        &mut paused_at,
+                        &mut deadline,
+                    );
+                }
             }
         }
-        std::future::pending::<()>().await;
     };
-    tokio::select! {
-        result = timeout(duration, invocation) => match result {
-        Ok(Ok(status)) => {
-            process_guard.kill_remaining();
-            Ok(status)
-        }
-        Ok(Err(message)) => {
+    match prompt_outcome {
+        PromptDeliveryOutcome::Delivered(Ok(())) => {}
+        PromptDeliveryOutcome::Delivered(Err(failure)) => {
+            if let Some(reason) = close_stop_receiver(&mut cancellation) {
+                process_guard.terminate(child).await;
+                return Err(stopped_wait_failure(agent, role, reason));
+            }
             process_guard.terminate(child).await;
-            Err(WaitFailure { message, cancelled: false })
+            return Err(WaitFailure {
+                message: failure.message,
+                cancelled: false,
+                stop_reason: None,
+            });
         }
-        Err(_) => {
+        PromptDeliveryOutcome::TimedOut => {
+            if let Some(reason) = close_stop_receiver(&mut cancellation) {
+                process_guard.terminate(child).await;
+                return Err(stopped_wait_failure(agent, role, reason));
+            }
             process_guard.terminate(child).await;
-            Err(WaitFailure {
+            return Err(WaitFailure {
                 message: format!("{} CLI exceeded the {role} timeout", agent.as_str()),
                 cancelled: false,
-            })
+                stop_reason: None,
+            });
         }
-        },
-        () = cancellation_requested => {
+        PromptDeliveryOutcome::Stopped(reason) => {
+            close_stop_receiver(&mut cancellation);
             process_guard.terminate(child).await;
-            Err(WaitFailure {
-                message: format!("{} {role} was cancelled by the user", agent.as_str()),
-                cancelled: true,
-            })
+            return Err(stopped_wait_failure(agent, role, reason));
+        }
+    }
+
+    loop {
+        tokio::select! {
+            result = child.wait() => {
+                let pending_stop = close_stop_receiver(&mut cancellation);
+                if let Some(reason) = pending_stop {
+                    process_guard.kill_remaining();
+                    return Err(stopped_wait_failure(agent, role, reason));
+                }
+                let status = result
+                    .map_err(|error| WaitFailure {
+                        message: format!("cannot wait for {} CLI: {error}", agent.as_str()),
+                        cancelled: false,
+                        stop_reason: None,
+                    })?;
+                process_guard.kill_remaining();
+                return Ok(status);
+            }
+            () = &mut deadline, if paused_at.is_none() => {
+                if let Some(reason) = close_stop_receiver(&mut cancellation) {
+                    process_guard.terminate(child).await;
+                    return Err(stopped_wait_failure(agent, role, reason));
+                }
+                process_guard.terminate(child).await;
+                return Err(WaitFailure {
+                    message: format!("{} CLI exceeded the {role} timeout", agent.as_str()),
+                    cancelled: false,
+                    stop_reason: None,
+                });
+            }
+            reason = wait_for_stop_reason(&mut cancellation) => {
+                close_stop_receiver(&mut cancellation);
+                process_guard.terminate(child).await;
+                return Err(stopped_wait_failure(agent, role, reason));
+            }
+            request = receive_implementer_control(&mut controls) => {
+                let Some(request) = request else {
+                    controls = None;
+                    continue;
+                };
+                apply_implementer_control(
+                    request,
+                    process_guard,
+                    &mut paused_at,
+                    &mut deadline,
+                );
+            }
+        }
+    }
+}
+
+enum PromptDeliveryOutcome {
+    Delivered(Result<(), PlannerFailure>),
+    Stopped(ImplementationStopReason),
+    TimedOut,
+}
+
+fn apply_implementer_control(
+    request: ImplementerControlRequest,
+    process_guard: &ProcessGroupGuard,
+    paused_at: &mut Option<Instant>,
+    deadline: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+) {
+    let result = match request.control {
+        ImplementerControl::Pause if paused_at.is_some() => {
+            Err("implementation is already paused".to_owned())
+        }
+        ImplementerControl::Resume if paused_at.is_none() => {
+            Err("implementation is not paused".to_owned())
+        }
+        ImplementerControl::Pause => process_guard.signal(Signal::SIGSTOP).map(|()| {
+            *paused_at = Some(Instant::now());
+        }),
+        ImplementerControl::Resume => process_guard.signal(Signal::SIGCONT).map(|()| {
+            if let Some(started) = paused_at.take() {
+                let reset_at = deadline.deadline() + started.elapsed();
+                deadline.as_mut().reset(reset_at);
+            }
+        }),
+    };
+    let _ = request.acknowledgement.send(result);
+}
+
+async fn wait_for_stop_reason(
+    cancellation: &mut Option<ImplementerStopReceiver>,
+) -> ImplementationStopReason {
+    let Some(receiver) = cancellation.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        let state = *receiver
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let ImplementerStopState::Requested(reason) = state {
+            return reason;
+        }
+        if receiver.signal.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+fn close_stop_receiver(
+    cancellation: &mut Option<ImplementerStopReceiver>,
+) -> Option<ImplementationStopReason> {
+    cancellation.take().and_then(ImplementerStopReceiver::close)
+}
+
+fn stopped_wait_failure(
+    agent: AgentKind,
+    role: &str,
+    reason: ImplementationStopReason,
+) -> WaitFailure {
+    WaitFailure {
+        message: stop_reason_message(agent, role, reason),
+        cancelled: true,
+        stop_reason: Some(reason),
+    }
+}
+
+async fn receive_implementer_control(
+    controls: &mut Option<mpsc::Receiver<ImplementerControlRequest>>,
+) -> Option<ImplementerControlRequest> {
+    let Some(receiver) = controls.as_mut() else {
+        return std::future::pending().await;
+    };
+    receiver.recv().await
+}
+
+fn stop_reason_message(agent: AgentKind, role: &str, reason: ImplementationStopReason) -> String {
+    match reason {
+        ImplementationStopReason::Cancelled => {
+            format!("{} {role} was cancelled by the user", agent.as_str())
+        }
+        ImplementationStopReason::Redirected => {
+            format!("{} {role} was stopped for a user redirect", agent.as_str())
+        }
+        ImplementationStopReason::ContextAdded => {
+            format!("{} {role} was stopped to add user context", agent.as_str())
         }
     }
 }
@@ -790,6 +1154,7 @@ async fn wait_for_child(
 struct WaitFailure {
     message: String,
     cancelled: bool,
+    stop_reason: Option<ImplementationStopReason>,
 }
 
 struct ProcessGroupGuard {
@@ -817,10 +1182,19 @@ impl ProcessGroupGuard {
         self.disarm();
     }
 
+    fn signal(&self, signal: Signal) -> Result<(), String> {
+        let process_group = self
+            .process_group
+            .ok_or_else(|| "implementation process group is no longer available".to_owned())?;
+        killpg(process_group, signal)
+            .map_err(|error| format!("cannot signal implementation process group: {error}"))
+    }
+
     async fn terminate(&mut self, child: &mut Child) {
         let Some(process_group) = self.process_group else {
             return;
         };
+        let _ = killpg(process_group, Signal::SIGCONT);
         let _ = killpg(process_group, Signal::SIGTERM);
         let exited = matches!(
             timeout(Duration::from_secs(5), child.wait()).await,
@@ -1143,6 +1517,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancels_while_prompt_delivery_is_blocked() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let stalled = temporary.path().join("stalled");
+        write_executable(&stalled, "#!/bin/sh\nsleep 60\n");
+        let runner = ImplementerRunner::new(AgentCommands {
+            codex: stalled.clone(),
+            claude: stalled,
+        })
+        .with_timeout(Duration::from_secs(10));
+        let prompt = "x".repeat(1024 * 1024);
+        let worktree = temporary.path().to_path_buf();
+        let (cancellation_sender, cancellation_receiver) = implementer_stop_channel();
+        let implementation = tokio::spawn(async move {
+            runner
+                .implement_with_activity(
+                    AgentKind::Codex,
+                    &worktree,
+                    &prompt,
+                    None,
+                    Some(cancellation_receiver),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            cancellation_sender.request(ImplementationStopReason::Cancelled),
+            ImplementerStopRequestResult::Accepted
+        );
+
+        let failure = timeout(Duration::from_secs(2), implementation)
+            .await
+            .expect("cancellation should interrupt prompt delivery")
+            .expect("implementation task should join")
+            .expect_err("cancelled implementation should not complete");
+        assert_eq!(
+            failure.stop_reason,
+            Some(ImplementationStopReason::Cancelled)
+        );
+    }
+
+    #[test]
+    fn stop_requests_are_latched_or_rejected_after_supervision_closes() {
+        let (stop, receiver) = implementer_stop_channel();
+        assert_eq!(
+            stop.request(ImplementationStopReason::Redirected),
+            ImplementerStopRequestResult::Accepted
+        );
+        assert_eq!(receiver.close(), Some(ImplementationStopReason::Redirected));
+        assert_eq!(
+            stop.request(ImplementationStopReason::Cancelled),
+            ImplementerStopRequestResult::Closed
+        );
+
+        let (late_stop, receiver) = implementer_stop_channel();
+        assert_eq!(receiver.close(), None);
+        assert_eq!(
+            late_stop.request(ImplementationStopReason::Cancelled),
+            ImplementerStopRequestResult::Closed
+        );
+    }
+
+    #[test]
+    fn accepted_stop_reason_owns_pre_wait_failures() {
+        let (stop, receiver) = implementer_stop_channel();
+        assert_eq!(
+            stop.request(ImplementationStopReason::ContextAdded),
+            ImplementerStopRequestResult::Accepted
+        );
+        let failure = close_before_wait_failure(
+            &mut Some(receiver),
+            PlannerFailure::new("provider setup failed".to_owned()),
+            AgentKind::Claude,
+            "implementer",
+        );
+        assert!(failure.cancelled);
+        assert_eq!(
+            failure.stop_reason,
+            Some(ImplementationStopReason::ContextAdded)
+        );
+
+        let (late_stop, receiver) = implementer_stop_channel();
+        let failure = close_before_wait_failure(
+            &mut Some(receiver),
+            PlannerFailure::new("provider setup failed".to_owned()),
+            AgentKind::Claude,
+            "implementer",
+        );
+        assert!(!failure.cancelled);
+        assert_eq!(failure.message, "provider setup failed");
+        assert_eq!(
+            late_stop.request(ImplementationStopReason::Cancelled),
+            ImplementerStopRequestResult::Closed
+        );
+    }
+
+    #[tokio::test]
     async fn streams_activity_and_cancels_the_implementation_process_group() {
         let temporary = TempDir::new().expect("temporary directory should exist");
         let stalled = temporary.path().join("stalled");
@@ -1156,7 +1626,7 @@ mod tests {
         });
         let worktree = temporary.path().to_path_buf();
         let (activity_sender, mut activity_receiver) = mpsc::channel(8);
-        let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+        let (cancellation_sender, cancellation_receiver) = implementer_stop_channel();
         let implementation = tokio::spawn(async move {
             runner
                 .implement_with_activity(
@@ -1178,9 +1648,10 @@ mod tests {
                     .expect("activity channel should remain open"),
             );
         }
-        cancellation_sender
-            .send(true)
-            .expect("supervisor should accept cancellation");
+        assert_eq!(
+            cancellation_sender.request(ImplementationStopReason::Cancelled),
+            ImplementerStopRequestResult::Accepted
+        );
         let failure = timeout(Duration::from_secs(10), implementation)
             .await
             .expect("cancelled implementation should stop promptly")
@@ -1188,6 +1659,10 @@ mod tests {
             .expect_err("cancelled implementation should not complete");
 
         assert!(failure.cancelled);
+        assert_eq!(
+            failure.stop_reason,
+            Some(ImplementationStopReason::Cancelled)
+        );
         assert!(failure.message.contains("cancelled by the user"));
         assert!(activity.iter().any(|item| {
             item.kind == ImplementationActivityKind::Output
@@ -1197,6 +1672,76 @@ mod tests {
             item.kind == ImplementationActivityKind::Diagnostic
                 && item.message.contains("inspecting")
         }));
+    }
+
+    #[tokio::test]
+    async fn pauses_the_process_group_without_consuming_timeout_budget() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let controlled = temporary.path().join("controlled");
+        write_executable(
+            &controlled,
+            "#!/bin/sh\nread prompt\nprintf 'ready\\n'\nsleep 0.1\nprintf 'finished\\n'\n",
+        );
+        let runner = ImplementerRunner::new(AgentCommands {
+            codex: controlled.clone(),
+            claude: controlled,
+        })
+        .with_timeout(Duration::from_millis(200));
+        let worktree = temporary.path().to_path_buf();
+        let (activity_sender, mut activity_receiver) = mpsc::channel(8);
+        let (_cancellation_sender, cancellation_receiver) = implementer_stop_channel();
+        let (control_sender, control_receiver) = mpsc::channel(2);
+        let implementation = tokio::spawn(async move {
+            runner
+                .implement_with_controls(
+                    AgentKind::Codex,
+                    &worktree,
+                    "Implement",
+                    Some(activity_sender),
+                    Some(cancellation_receiver),
+                    Some(control_receiver),
+                )
+                .await
+        });
+
+        let ready = timeout(Duration::from_secs(2), activity_receiver.recv())
+            .await
+            .expect("activity should arrive")
+            .expect("activity stream should stay open");
+        assert!(ready.message.contains("ready"));
+        let (pause_ack, pause_response) = oneshot::channel();
+        control_sender
+            .send(ImplementerControlRequest {
+                control: ImplementerControl::Pause,
+                acknowledgement: pause_ack,
+            })
+            .await
+            .expect("pause should be delivered");
+        pause_response
+            .await
+            .expect("pause should be acknowledged")
+            .expect("pause signal should succeed");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!implementation.is_finished());
+
+        let (resume_ack, resume_response) = oneshot::channel();
+        control_sender
+            .send(ImplementerControlRequest {
+                control: ImplementerControl::Resume,
+                acknowledgement: resume_ack,
+            })
+            .await
+            .expect("resume should be delivered");
+        resume_response
+            .await
+            .expect("resume should be acknowledged")
+            .expect("resume signal should succeed");
+        let output = timeout(Duration::from_secs(2), implementation)
+            .await
+            .expect("resumed implementation should finish")
+            .expect("implementation task should join")
+            .expect("paused time should not exhaust the timeout");
+        assert!(output.final_output.contains("finished"));
     }
 
     #[tokio::test]

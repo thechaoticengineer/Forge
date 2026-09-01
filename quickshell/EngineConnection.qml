@@ -46,6 +46,7 @@ Item {
       return
     }
 
+    requestError = ""
     socket.connected = false
     Qt.callLater(function() { socket.connected = true })
   }
@@ -133,6 +134,29 @@ Item {
     return sendRequest("cancel_task_implementation", {
       run_id: String(runId || ""),
       attempt_id: String(attemptId || "")
+    })
+  }
+
+  function pauseImplementation(runId, attemptId) {
+    return sendRequest("pause_task_implementation", {
+      run_id: String(runId || ""),
+      attempt_id: String(attemptId || "")
+    })
+  }
+
+  function resumeImplementation(runId, attemptId) {
+    return sendRequest("resume_task_implementation", {
+      run_id: String(runId || ""),
+      attempt_id: String(attemptId || "")
+    })
+  }
+
+  function continueImplementation(runId, attemptId, kind, instruction) {
+    return sendRequest("continue_task_implementation", {
+      run_id: String(runId || ""),
+      attempt_id: String(attemptId || ""),
+      kind: String(kind || ""),
+      instruction: String(instruction || "")
     })
   }
 

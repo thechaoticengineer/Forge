@@ -83,6 +83,44 @@ pub enum ImplementationStatus {
     Cancelled,
 }
 
+/// Why a continuation attempt was started from an earlier implementation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationContinuationKind {
+    Redirect,
+    AdditionalContext,
+}
+
+impl ImplementationContinuationKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Redirect => "redirect",
+            Self::AdditionalContext => "additional_context",
+        }
+    }
+}
+
+/// Why an implementation attempt was stopped before normal completion.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationStopReason {
+    Cancelled,
+    Redirected,
+    ContextAdded,
+}
+
+impl ImplementationStopReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Redirected => "redirected",
+            Self::ContextAdded => "context_added",
+        }
+    }
+}
+
 impl ImplementationStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -102,6 +140,18 @@ pub struct ImplementationAttemptSummary {
     pub worktree_id: String,
     pub agent: AgentKind,
     pub status: ImplementationStatus,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub parent_attempt_id: Option<String>,
+    #[serde(default)]
+    pub continuation_kind: Option<ImplementationContinuationKind>,
+    #[serde(default)]
+    pub stop_reason: Option<ImplementationStopReason>,
+    #[serde(default)]
+    pub pending_continuation_kind: Option<ImplementationContinuationKind>,
+    #[serde(default)]
+    pub pending_user_instruction: Option<String>,
     pub exit_code: Option<i32>,
     pub error_message: Option<String>,
     pub started_at: i64,

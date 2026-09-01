@@ -18,6 +18,7 @@ Item {
   property bool editingPlanTask: false
   property bool rejectingPlan: false
   property bool confirmingImplementationCancel: false
+  property string implementationInterventionMode: ""
   property string localDraftError: ""
   property var repositoryPathCandidates: []
   property string draftStep: "repository"
@@ -62,6 +63,10 @@ Item {
   }
 
   function requestClose() {
+    if (implementationInterventionMode !== "") {
+      cancelImplementationIntervention()
+      return
+    }
     if (confirmingImplementationCancel) {
       confirmingImplementationCancel = false
       return
@@ -87,7 +92,7 @@ Item {
   }
 
   function moveNavigation(dx, dy) {
-    if (confirmingImplementationCancel) return
+    if (confirmingImplementationCancel || implementationInterventionMode !== "") return
     if (editingDraft && draftStep === "repository") {
       if (dx !== 0) {
         repositorySourceIndex = Math.max(0, Math.min(1, repositorySourceIndex + dx))
@@ -395,6 +400,16 @@ Item {
     return attempt && attempt.status === "running" ? attempt : null
   }
 
+  function pendingContinuationAttempt() {
+    var attempts = engine.activeRun && engine.activeRun.implementation_attempts
+      ? engine.activeRun.implementation_attempts : []
+    for (var i = attempts.length - 1; i >= 0; i--) {
+      if (attempts[i].pending_continuation_kind
+          && attempts[i].pending_user_instruction) return attempts[i]
+    }
+    return null
+  }
+
   function implementationTaskTitle(attempt) {
     var plan = root.currentPlan()
     if (!attempt || !plan || !plan.tasks) return "approved task"
@@ -417,7 +432,9 @@ Item {
   }
 
   function beginImplementationCancel() {
-    if (!runningImplementationAttempt() || controlEngine.requestPending) return
+    if (!runningImplementationAttempt() || controlEngine.requestPending
+        || continuationEngine.requestPending
+        || implementationInterventionMode !== "") return
     confirmingImplementationCancel = true
   }
 
@@ -425,6 +442,59 @@ Item {
     var attempt = runningImplementationAttempt()
     if (!attempt || !engine.activeRun || controlEngine.requestPending) return
     controlEngine.cancelImplementation(engine.activeRun.id, attempt.id)
+  }
+
+  function toggleImplementationPause() {
+    var attempt = runningImplementationAttempt()
+    if (!attempt || !engine.activeRun || controlEngine.requestPending
+        || continuationEngine.requestPending || confirmingImplementationCancel
+        || implementationInterventionMode !== "") return
+    if (attempt.paused)
+      controlEngine.resumeImplementation(engine.activeRun.id, attempt.id)
+    else
+      controlEngine.pauseImplementation(engine.activeRun.id, attempt.id)
+  }
+
+  function beginImplementationIntervention(mode) {
+    if (!runningImplementationAttempt() || continuationEngine.requestPending
+        || controlEngine.requestPending || confirmingImplementationCancel) return
+    implementationInterventionMode = mode
+    implementationInstructionField.text = ""
+    Qt.callLater(function() { implementationInstructionField.forceActiveFocus() })
+  }
+
+  function cancelImplementationIntervention() {
+    implementationInterventionMode = ""
+    implementationInstructionField.text = ""
+    implementationInstructionField.focus = false
+    continuationEngine.requestError = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function submitImplementationIntervention() {
+    var attempt = runningImplementationAttempt()
+    var instruction = implementationInstructionField.text.trim()
+    if (!attempt || !engine.activeRun || instruction === ""
+        || continuationEngine.requestPending) return
+    var kind = implementationInterventionMode === "redirect"
+      ? "redirect" : "additional_context"
+    if (continuationEngine.continueImplementation(
+          engine.activeRun.id, attempt.id, kind, instruction)) {
+      implementationInterventionMode = ""
+      implementationInstructionField.focus = false
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+
+  function retryPendingContinuation() {
+    var attempt = pendingContinuationAttempt()
+    if (!attempt || !engine.activeRun || continuationEngine.requestPending) return
+    continuationEngine.continueImplementation(
+      engine.activeRun.id,
+      attempt.id,
+      attempt.pending_continuation_kind,
+      attempt.pending_user_instruction
+    )
   }
 
   function footerHelp() {
@@ -437,6 +507,8 @@ Item {
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
     if (confirmingImplementationCancel)
       return "Enter  Confirm cancellation    Esc  Keep running"
+    if (implementationInterventionMode !== "")
+      return "Enter  Submit instruction    Esc  Keep current attempt"
     if (focusArea === "sections")
       return "j/k or ↑/↓  Sections    l/→ or Enter  Open    r  Reconnect    Esc  Close"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
@@ -444,7 +516,7 @@ Item {
     if (selectedSection === 1)
       return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
     if (selectedSection === 0 && runningImplementationAttempt())
-      return "h/←  Sections    x  Cancel implementation    r  Reconnect    Esc  Close"
+      return "h/←  Sections    p  Pause/resume    i  Redirect    a  Add context    x  Cancel"
     if (selectedSection === 0 && engine.activeRun)
       return "h/←  Sections    Enter/n  New draft    r  Reconnect    Esc  Close"
     if (selectedSection === 0)
@@ -499,6 +571,14 @@ Item {
         root.selectedTaskIndex = 0
       if (!root.runningImplementationAttempt())
         root.confirmingImplementationCancel = false
+      if (!root.runningImplementationAttempt() && !continuationEngine.requestPending)
+        root.implementationInterventionMode = ""
+      var latestAttempt = root.latestImplementationAttempt()
+      if (continuationEngine.requestPending && latestAttempt
+          && latestAttempt.status === "running" && latestAttempt.parent_attempt_id) {
+        continuationEngine.abandonRequest()
+        root.implementationInterventionMode = ""
+      }
     }
   }
 
@@ -507,6 +587,16 @@ Item {
     onRequestCompleted: function(method) {
       if (method === "cancel_task_implementation")
         root.confirmingImplementationCancel = false
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+
+
+  EngineConnection {
+    id: continuationEngine
+    onRequestCompleted: function(method) {
+      if (method === "continue_task_implementation")
+        root.implementationInterventionMode = ""
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
@@ -578,6 +668,7 @@ Item {
           || repositorySearchField.activeFocus
           || taskTitleField.activeFocus || taskDescriptionField.activeFocus
           || taskCriteriaField.activeFocus || rejectionReasonField.activeFocus
+          || implementationInstructionField.activeFocus
         onMoveRequested: function(dx, dy) {
           root.moveNavigation(dx, dy)
         }
@@ -593,6 +684,9 @@ Item {
           if (text === "r") engine.reconnect()
           else if (text === "n") root.beginDraftEntry()
           else if (root.selectedSection === 0 && text === "x") root.beginImplementationCancel()
+          else if (root.selectedSection === 0 && text === "p") root.toggleImplementationPause()
+          else if (root.selectedSection === 0 && text === "i") root.beginImplementationIntervention("redirect")
+          else if (root.selectedSection === 0 && text === "a") root.beginImplementationIntervention("additional_context")
           else if (root.selectedSection === 1 && text === "c") root.generatePlan("codex")
           else if (root.selectedSection === 1 && text === "d") root.generatePlan("claude")
           else if (root.selectedSection === 1 && text === "e") root.beginPlanTaskEdit()
@@ -800,7 +894,8 @@ Item {
                       if (engine.activeRun) {
                         var implementation = root.latestImplementationAttempt()
                         if (implementation && implementation.status === "running")
-                          return implementation.agent + " is implementing"
+                          return implementation.agent + (implementation.paused
+                            ? " implementation paused" : " is implementing")
                         if (implementation)
                           return "Implementation " + implementation.status
                         return "Draft saved"
@@ -1338,7 +1433,7 @@ Item {
                           if (!attempt) return ""
                           return attempt.agent + "  •  "
                             + root.implementationTaskTitle(attempt) + "  •  "
-                            + attempt.status
+                            + (attempt.paused ? "paused" : attempt.status)
                         }
                         color: root.runningImplementationAttempt()
                           ? root.accent
@@ -1418,17 +1513,126 @@ Item {
                         wrapMode: Text.WordWrap
                       }
 
-                      Row {
+                      Flow {
                         visible: !!root.runningImplementationAttempt()
                           && !root.confirmingImplementationCancel
+                          && root.implementationInterventionMode === ""
+                        width: parent.width
                         spacing: Style.space(8)
 
                         Button {
-                          text: "Cancel implementation"
+                          text: root.runningImplementationAttempt()
+                            && root.runningImplementationAttempt().paused ? "Resume" : "Pause"
                           enabled: !controlEngine.requestPending
                           foreground: root.foreground
                           accent: root.accent
+                          onClicked: root.toggleImplementationPause()
+                        }
+                        Button {
+                          text: "Redirect"
+                          enabled: !controlEngine.requestPending && !continuationEngine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginImplementationIntervention("redirect")
+                        }
+                        Button {
+                          text: "Add context"
+                          enabled: !controlEngine.requestPending && !continuationEngine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginImplementationIntervention("additional_context")
+                        }
+                        Button {
+                          text: "Cancel"
+                          enabled: !controlEngine.requestPending
+                          foreground: root.foreground
+                          accent: root.urgent
                           onClicked: root.beginImplementationCancel()
+                        }
+                      }
+
+                      Column {
+                        visible: !root.runningImplementationAttempt()
+                          && !!root.pendingContinuationAttempt()
+                        width: parent.width
+                        spacing: Style.space(7)
+
+                        Text {
+                          width: parent.width
+                          text: {
+                            var pending = root.pendingContinuationAttempt()
+                            if (!pending) return ""
+                            return "A " + pending.pending_continuation_kind.replace(/_/g, " ")
+                              + " instruction was saved before the engine stopped. Retry it to continue from the retained worktree."
+                          }
+                          color: root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                          text: continuationEngine.requestPending
+                            ? "Starting continuation…" : "Retry saved continuation"
+                          bordered: true
+                          enabled: !continuationEngine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.retryPendingContinuation()
+                        }
+                      }
+
+                      Column {
+                        visible: root.implementationInterventionMode !== ""
+                        width: parent.width
+                        spacing: Style.space(7)
+
+                        Text {
+                          width: parent.width
+                          text: root.implementationInterventionMode === "redirect"
+                            ? "Redirect the implementation. The current process will stop and a linked continuation will inspect its partial changes."
+                            : "Add context. The current process will stop and a linked continuation will inspect its partial changes."
+                          color: root.mutedForeground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        TextField {
+                          id: implementationInstructionField
+                          width: parent.width
+                          enabled: !continuationEngine.requestPending
+                          placeholderText: root.implementationInterventionMode === "redirect"
+                            ? "Describe the corrected approach" : "Provide the additional context"
+                          foreground: root.foreground
+                          accent: root.accent
+                          Keys.onPressed: function(event) {
+                            if (event.key === Qt.Key_Escape) {
+                              root.cancelImplementationIntervention(); event.accepted = true
+                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                              root.submitImplementationIntervention(); event.accepted = true
+                            }
+                          }
+                        }
+
+                        Row {
+                          spacing: Style.space(8)
+                          Button {
+                            text: "Submit"
+                            bordered: true
+                            enabled: !continuationEngine.requestPending
+                              && implementationInstructionField.text.trim() !== ""
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.submitImplementationIntervention()
+                          }
+                          Button {
+                            text: "Keep current attempt"
+                            enabled: !continuationEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.cancelImplementationIntervention()
+                          }
                         }
                       }
 
@@ -1475,8 +1679,10 @@ Item {
 
                       Text {
                         visible: controlEngine.requestError !== ""
+                          || continuationEngine.requestError !== ""
                         width: parent.width
-                        text: controlEngine.requestError
+                        text: controlEngine.requestError !== ""
+                          ? controlEngine.requestError : continuationEngine.requestError
                         color: root.urgent
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall

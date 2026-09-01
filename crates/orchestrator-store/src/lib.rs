@@ -12,8 +12,9 @@ use std::{
 
 use orchestrator_core::state::{
     ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationActivitySummary,
-    ImplementationAttemptSummary, ImplementationStatus, PlanProposal, PlanStatus, PlanSummary,
-    PlanTaskSummary, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
+    ImplementationAttemptSummary, ImplementationContinuationKind, ImplementationStatus,
+    ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary, RunStatus,
+    TaskWorktreeStatus, TaskWorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -24,7 +25,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -47,6 +48,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         5,
         "implementation_activity",
         include_str!("../migrations/0005_implementation_activity.sql"),
+    ),
+    (
+        6,
+        "implementation_controls",
+        include_str!("../migrations/0006_implementation_controls.sql"),
     ),
 ];
 
@@ -91,6 +97,10 @@ pub enum StorageError {
     InvalidAgentKind(String),
     #[error("database returned an invalid implementation status: {0}")]
     InvalidImplementationStatus(String),
+    #[error("database returned an invalid implementation continuation kind: {0}")]
+    InvalidImplementationContinuationKind(String),
+    #[error("database returned an invalid implementation stop reason: {0}")]
+    InvalidImplementationStopReason(String),
     #[error("run does not exist: {0}")]
     RunNotFound(String),
     #[error("run is not ready for planning: {0}")]
@@ -283,6 +293,9 @@ pub struct ImplementationAttemptInput {
     pub worktree_id: String,
     pub agent: AgentKind,
     pub prompt: String,
+    pub parent_attempt_id: Option<String>,
+    pub continuation_kind: Option<ImplementationContinuationKind>,
+    pub user_instruction: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -321,6 +334,14 @@ pub struct ImplementationAttemptCancellation {
     pub final_output: String,
     pub diagnostic_output: String,
     pub error_message: String,
+    pub stop_reason: ImplementationStopReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationContinuationReservation {
+    pub attempt_id: String,
+    pub kind: ImplementationContinuationKind,
+    pub instruction: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -399,6 +420,15 @@ enum Command {
     ),
     CancelImplementationAttempt(
         ImplementationAttemptCancellation,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    SetImplementationPaused {
+        attempt_id: String,
+        paused: bool,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
+    ReserveImplementationContinuation(
+        ImplementationContinuationReservation,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -836,6 +866,54 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Records whether a live implementation process group is paused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running, already has the
+    /// requested state, or storage fails.
+    pub async fn set_implementation_paused(
+        &self,
+        attempt_id: String,
+        paused: bool,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SetImplementationPaused {
+                attempt_id,
+                paused,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Durably records a continuation instruction before the current process
+    /// is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running, another
+    /// continuation is already pending, the instruction is invalid, or
+    /// storage fails.
+    pub async fn reserve_implementation_continuation(
+        &self,
+        input: ImplementationContinuationReservation,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ReserveImplementationContinuation(
+                input,
+                reply_sender,
+            ))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -928,6 +1006,16 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             }
             Command::CancelImplementationAttempt(input, reply) => {
                 let _ = reply.send(database.cancel_implementation_attempt(&input));
+            }
+            Command::SetImplementationPaused {
+                attempt_id,
+                paused,
+                reply,
+            } => {
+                let _ = reply.send(database.set_implementation_paused(&attempt_id, paused));
+            }
+            Command::ReserveImplementationContinuation(input, reply) => {
+                let _ = reply.send(database.reserve_implementation_continuation(&input));
             }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
@@ -1481,6 +1569,7 @@ impl Database {
         self.current_snapshot()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_implementation_attempt(
         &self,
         input: &ImplementationAttemptInput,
@@ -1514,6 +1603,43 @@ impl Database {
             });
         }
 
+        match (
+            input.parent_attempt_id.as_deref(),
+            input.continuation_kind,
+            input.user_instruction.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(parent_id), Some(kind), Some(instruction))
+                if !instruction.trim().is_empty() && instruction.chars().count() <= 20_000 =>
+            {
+                let valid_parent = transaction
+                    .query_row(
+                        "SELECT 1 FROM implementation_attempts \
+                         WHERE id = ?1 AND run_id = ?2 AND plan_id = ?3 AND task_id = ?4 \
+                           AND worktree_id = ?5 AND agent = ?6 \
+                           AND status IN ('completed', 'failed', 'cancelled') \
+                           AND pending_continuation_kind = ?7 \
+                           AND pending_user_instruction = ?8",
+                        (
+                            parent_id,
+                            &input.run_id,
+                            &input.plan_id,
+                            &input.task_id,
+                            &input.worktree_id,
+                            input.agent.as_str(),
+                            kind.as_str(),
+                            instruction,
+                        ),
+                        |_| Ok(true),
+                    )
+                    .optional()?;
+                if valid_parent.is_none() {
+                    return Err(StorageError::ImplementationNotReady(input.task_id.clone()));
+                }
+            }
+            _ => return Err(StorageError::ImplementationNotReady(input.task_id.clone())),
+        }
+
         let changed = transaction.execute(
             "UPDATE runs SET status = 'running', last_error = NULL, updated_at = ?2 \
              WHERE id = ?1 AND status IN ('waiting_for_user', 'failed')",
@@ -1524,8 +1650,9 @@ impl Database {
         }
         transaction.execute(
             "INSERT INTO implementation_attempts(\
-                id, run_id, plan_id, task_id, worktree_id, agent, status, prompt, started_at\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+                id, run_id, plan_id, task_id, worktree_id, agent, status, prompt, started_at, \
+                parent_attempt_id, continuation_kind, user_instruction\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11)",
             (
                 &attempt_id,
                 &input.run_id,
@@ -1535,13 +1662,38 @@ impl Database {
                 input.agent.as_str(),
                 &input.prompt,
                 started_at,
+                &input.parent_attempt_id,
+                input
+                    .continuation_kind
+                    .map(ImplementationContinuationKind::as_str),
+                &input.user_instruction,
             ),
         )?;
+        if let Some(parent_attempt_id) = &input.parent_attempt_id {
+            let consumed = transaction.execute(
+                "UPDATE implementation_attempts SET \
+                    pending_continuation_kind = NULL, pending_user_instruction = NULL \
+                 WHERE id = ?1 AND pending_continuation_kind = ?2 \
+                   AND pending_user_instruction = ?3",
+                (
+                    parent_attempt_id,
+                    input
+                        .continuation_kind
+                        .map(ImplementationContinuationKind::as_str),
+                    &input.user_instruction,
+                ),
+            )?;
+            if consumed != 1 {
+                return Err(StorageError::ImplementationNotReady(input.task_id.clone()));
+            }
+        }
         let payload = json!({
             "attempt_id": attempt_id,
             "task_id": input.task_id,
             "worktree_id": input.worktree_id,
             "agent": input.agent,
+            "parent_attempt_id": input.parent_attempt_id,
+            "continuation_kind": input.continuation_kind,
         });
         transaction.execute(
             "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
@@ -1572,7 +1724,7 @@ impl Database {
         let changed = transaction.execute(
             "UPDATE implementation_attempts SET \
                 status = 'completed', final_output = ?2, diagnostic_output = ?3, \
-                exit_code = ?4, completed_at = ?5 \
+                exit_code = ?4, completed_at = ?5, paused_at = NULL \
              WHERE id = ?1 AND status = 'running'",
             (
                 &input.attempt_id,
@@ -1616,10 +1768,11 @@ impl Database {
         let transaction = self.connection.unchecked_transaction()?;
         let (run_id, task_id, worktree_id, agent) =
             running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let retryable_continuation = retryable_continuation(&transaction, &input.attempt_id)?;
         let changed = transaction.execute(
             "UPDATE implementation_attempts SET \
                 status = 'failed', final_output = ?2, diagnostic_output = ?3, \
-                exit_code = ?4, error_message = ?5, completed_at = ?6 \
+                exit_code = ?4, error_message = ?5, completed_at = ?6, paused_at = NULL \
              WHERE id = ?1 AND status = 'running'",
             (
                 &input.attempt_id,
@@ -1635,6 +1788,7 @@ impl Database {
                 input.attempt_id.clone(),
             ));
         }
+        restore_retryable_continuation(&transaction, retryable_continuation.as_ref())?;
         transaction.execute(
             "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
              WHERE id = ?1 AND status = 'running'",
@@ -1709,7 +1863,11 @@ impl Database {
         let changed = transaction.execute(
             "UPDATE implementation_attempts SET \
                 status = 'cancelled', final_output = ?2, diagnostic_output = ?3, \
-                error_message = ?4, completed_at = ?5 \
+                error_message = ?4, completed_at = ?5, stop_reason = ?6, paused_at = NULL, \
+                pending_continuation_kind = CASE WHEN ?6 = 'cancelled' THEN NULL \
+                    ELSE pending_continuation_kind END, \
+                pending_user_instruction = CASE WHEN ?6 = 'cancelled' THEN NULL \
+                    ELSE pending_user_instruction END \
              WHERE id = ?1 AND status = 'running'",
             (
                 &input.attempt_id,
@@ -1717,6 +1875,7 @@ impl Database {
                 &input.diagnostic_output,
                 &input.error_message,
                 completed_at,
+                input.stop_reason.as_str(),
             ),
         )?;
         if changed != 1 {
@@ -1734,11 +1893,114 @@ impl Database {
             "task_id": task_id,
             "worktree_id": worktree_id,
             "agent": agent,
+            "stop_reason": input.stop_reason,
         });
         transaction.execute(
             "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
-             VALUES (?1, 'implementation_cancelled', 'user', ?2, ?3)",
-            (&run_id, payload.to_string(), completed_at),
+             VALUES (?1, ?2, 'user', ?3, ?4)",
+            (
+                &run_id,
+                match input.stop_reason {
+                    ImplementationStopReason::Cancelled => "implementation_cancelled",
+                    ImplementationStopReason::Redirected => "implementation_redirected",
+                    ImplementationStopReason::ContextAdded => "implementation_context_added",
+                },
+                payload.to_string(),
+                completed_at,
+            ),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn set_implementation_paused(
+        &self,
+        attempt_id: &str,
+        paused: bool,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let changed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, worktree_id, agent) =
+            running_implementation_attempt(&transaction, attempt_id)?;
+        let changed = if paused {
+            transaction.execute(
+                "UPDATE implementation_attempts SET paused_at = ?2 \
+                 WHERE id = ?1 AND status = 'running' AND paused_at IS NULL",
+                (attempt_id, changed_at),
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE implementation_attempts SET paused_at = NULL \
+                 WHERE id = ?1 AND status = 'running' AND paused_at IS NOT NULL",
+                [attempt_id],
+            )?
+        };
+        if changed != 1 {
+            return Err(StorageError::ImplementationAttemptNotRunning(
+                attempt_id.to_owned(),
+            ));
+        }
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, ?2, 'user', ?3, ?4)",
+            (
+                &run_id,
+                if paused {
+                    "implementation_paused"
+                } else {
+                    "implementation_resumed"
+                },
+                payload.to_string(),
+                changed_at,
+            ),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn reserve_implementation_continuation(
+        &self,
+        input: &ImplementationContinuationReservation,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let instruction = input.instruction.trim();
+        if instruction.is_empty() || instruction.chars().count() > 20_000 {
+            return Err(StorageError::ImplementationNotReady(
+                input.attempt_id.clone(),
+            ));
+        }
+        let requested_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, worktree_id, agent) =
+            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE implementation_attempts SET \
+                pending_continuation_kind = ?2, pending_user_instruction = ?3 \
+             WHERE id = ?1 AND status = 'running' \
+               AND pending_continuation_kind IS NULL AND pending_user_instruction IS NULL",
+            (&input.attempt_id, input.kind.as_str(), instruction),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationNotReady(
+                input.attempt_id.clone(),
+            ));
+        }
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+            "continuation_kind": input.kind,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_continuation_requested', 'user', ?2, ?3)",
+            (&run_id, payload.to_string(), requested_at),
         )?;
         transaction.commit()?;
         self.current_snapshot()
@@ -1789,8 +2051,10 @@ impl Database {
         run_id: &str,
     ) -> Result<Vec<ImplementationAttemptSummary>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, task_id, worktree_id, agent, status, exit_code, error_message, \
-                    started_at, completed_at \
+            "SELECT id, task_id, worktree_id, agent, status, paused_at IS NOT NULL, \
+                    parent_attempt_id, continuation_kind, stop_reason, \
+                    pending_continuation_kind, pending_user_instruction, \
+                    exit_code, error_message, started_at, completed_at \
              FROM implementation_attempts WHERE run_id = ?1 ORDER BY started_at, rowid",
         )?;
         let rows = statement.query_map([run_id], |row| {
@@ -1800,10 +2064,16 @@ impl Database {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, Option<i32>>(5)?,
+                row.get::<_, bool>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<i32>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, Option<i64>>(14)?,
             ))
         })?;
 
@@ -1815,6 +2085,12 @@ impl Database {
                 worktree_id,
                 agent,
                 status,
+                paused,
+                parent_attempt_id,
+                continuation_kind,
+                stop_reason,
+                pending_continuation_kind,
+                pending_user_instruction,
                 exit_code,
                 error_message,
                 started_at,
@@ -1826,6 +2102,21 @@ impl Database {
                 worktree_id,
                 agent: parse_agent_kind(&agent)?,
                 status: parse_implementation_status(&status)?,
+                paused,
+                parent_attempt_id,
+                continuation_kind: continuation_kind
+                    .as_deref()
+                    .map(parse_implementation_continuation_kind)
+                    .transpose()?,
+                stop_reason: stop_reason
+                    .as_deref()
+                    .map(parse_implementation_stop_reason)
+                    .transpose()?,
+                pending_continuation_kind: pending_continuation_kind
+                    .as_deref()
+                    .map(parse_implementation_continuation_kind)
+                    .transpose()?,
+                pending_user_instruction,
                 exit_code,
                 error_message,
                 started_at,
@@ -2158,6 +2449,31 @@ fn parse_implementation_status(status: &str) -> Result<ImplementationStatus, Sto
     }
 }
 
+fn parse_implementation_continuation_kind(
+    kind: &str,
+) -> Result<ImplementationContinuationKind, StorageError> {
+    match kind {
+        "redirect" => Ok(ImplementationContinuationKind::Redirect),
+        "additional_context" => Ok(ImplementationContinuationKind::AdditionalContext),
+        _ => Err(StorageError::InvalidImplementationContinuationKind(
+            kind.to_owned(),
+        )),
+    }
+}
+
+fn parse_implementation_stop_reason(
+    reason: &str,
+) -> Result<ImplementationStopReason, StorageError> {
+    match reason {
+        "cancelled" => Ok(ImplementationStopReason::Cancelled),
+        "redirected" => Ok(ImplementationStopReason::Redirected),
+        "context_added" => Ok(ImplementationStopReason::ContextAdded),
+        _ => Err(StorageError::InvalidImplementationStopReason(
+            reason.to_owned(),
+        )),
+    }
+}
+
 fn parse_implementation_activity_kind(
     kind: &str,
 ) -> Result<ImplementationActivityKind, StorageError> {
@@ -2393,7 +2709,9 @@ fn recover_interrupted_worktrees(connection: &mut Connection) -> Result<(), Stor
 fn recover_interrupted_implementations(connection: &mut Connection) -> Result<(), StorageError> {
     let interrupted = {
         let mut statement = connection.prepare(
-            "SELECT id, run_id, task_id, worktree_id, agent \
+            "SELECT id, run_id, task_id, worktree_id, agent, parent_attempt_id, \
+                    continuation_kind, user_instruction, pending_continuation_kind, \
+                    pending_user_instruction \
              FROM implementation_attempts WHERE status = 'running'",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2403,6 +2721,11 @@ fn recover_interrupted_implementations(connection: &mut Connection) -> Result<()
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
@@ -2414,13 +2737,38 @@ fn recover_interrupted_implementations(connection: &mut Connection) -> Result<()
     let recovered_at = unix_milliseconds()?;
     let error_message = "engine stopped before the implementer completed";
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (attempt_id, run_id, task_id, worktree_id, agent) in interrupted {
+    for (
+        attempt_id,
+        run_id,
+        task_id,
+        worktree_id,
+        agent,
+        parent_attempt_id,
+        continuation_kind,
+        user_instruction,
+        pending_continuation_kind,
+        pending_user_instruction,
+    ) in interrupted
+    {
+        let retryable_continuation = match (
+            parent_attempt_id,
+            continuation_kind,
+            user_instruction,
+            pending_continuation_kind,
+            pending_user_instruction,
+        ) {
+            (Some(parent_id), Some(kind), Some(instruction), None, None) => {
+                Some((parent_id, kind, instruction))
+            }
+            _ => None,
+        };
         transaction.execute(
             "UPDATE implementation_attempts SET \
-                status = 'failed', error_message = ?2, completed_at = ?3 \
+                status = 'failed', error_message = ?2, completed_at = ?3, paused_at = NULL \
              WHERE id = ?1 AND status = 'running'",
             (&attempt_id, error_message, recovered_at),
         )?;
+        restore_retryable_continuation(&transaction, retryable_continuation.as_ref())?;
         transaction.execute(
             "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
              WHERE id = ?1 AND status = 'running'",
@@ -2440,6 +2788,50 @@ fn recover_interrupted_implementations(connection: &mut Connection) -> Result<()
         )?;
     }
     transaction.commit()?;
+    Ok(())
+}
+
+fn retryable_continuation(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+) -> Result<Option<(String, String, String)>, StorageError> {
+    let metadata = transaction.query_row(
+        "SELECT parent_attempt_id, continuation_kind, user_instruction, \
+                pending_continuation_kind, pending_user_instruction \
+         FROM implementation_attempts WHERE id = ?1",
+        [attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
+    Ok(match metadata {
+        (Some(parent_id), Some(kind), Some(instruction), None, None) => {
+            Some((parent_id, kind, instruction))
+        }
+        _ => None,
+    })
+}
+
+fn restore_retryable_continuation(
+    transaction: &Transaction<'_>,
+    continuation: Option<&(String, String, String)>,
+) -> Result<(), StorageError> {
+    let Some((parent_attempt_id, kind, instruction)) = continuation else {
+        return Ok(());
+    };
+    transaction.execute(
+        "UPDATE implementation_attempts SET \
+            pending_continuation_kind = ?2, pending_user_instruction = ?3 \
+         WHERE id = ?1 AND pending_continuation_kind IS NULL \
+           AND pending_user_instruction IS NULL",
+        (parent_attempt_id, kind, instruction),
+    )?;
     Ok(())
 }
 
@@ -2566,7 +2958,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 5);
+        assert_eq!(migration_count, 6);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -2703,8 +3095,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 6,
-                supported: 5
+                found: 7,
+                supported: 6
             }
         ));
     }
@@ -2865,7 +3257,7 @@ mod tests {
             .expect("attempt should start");
         drop(worker);
 
-        let reopened = StorageWorker::start(paths).expect("storage should recover");
+        let reopened = StorageWorker::start(paths.clone()).expect("storage should recover");
         let run = reopened
             .current_snapshot()
             .await
@@ -3035,6 +3427,9 @@ mod tests {
                 worktree_id: worktree_id.clone(),
                 agent: AgentKind::Claude,
                 prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
             })
             .await
             .expect("implementation should start");
@@ -3121,6 +3516,9 @@ mod tests {
                 worktree_id: reserved.worktree_id,
                 agent: AgentKind::Codex,
                 prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
             })
             .await
             .expect("implementation should start");
@@ -3132,6 +3530,14 @@ mod tests {
             })
             .await
             .expect("activity should persist");
+        worker
+            .reserve_implementation_continuation(ImplementationContinuationReservation {
+                attempt_id: started.attempt_id.clone(),
+                kind: ImplementationContinuationKind::Redirect,
+                instruction: "Use a different API".to_owned(),
+            })
+            .await
+            .expect("a competing continuation should be reserved");
 
         let cancelled = worker
             .cancel_implementation_attempt(ImplementationAttemptCancellation {
@@ -3139,6 +3545,7 @@ mod tests {
                 final_output: "partial result".to_owned(),
                 diagnostic_output: "Inspecting files".to_owned(),
                 error_message: "codex implementer was cancelled by the user".to_owned(),
+                stop_reason: ImplementationStopReason::Cancelled,
             })
             .await
             .expect("cancellation should persist");
@@ -3148,8 +3555,265 @@ mod tests {
             run.implementation_attempts[0].status,
             ImplementationStatus::Cancelled
         );
+        assert!(
+            run.implementation_attempts[0]
+                .pending_continuation_kind
+                .is_none()
+        );
+        assert!(
+            run.implementation_attempts[0]
+                .pending_user_instruction
+                .is_none()
+        );
         assert_eq!(run.implementation_activity.len(), 1);
         assert_eq!(run.implementation_activity[0].message, "Inspecting files");
+    }
+
+    #[tokio::test]
+    async fn persists_pause_and_linked_implementation_continuation() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let worker = StorageWorker::start(StatePaths::new(temporary.path().join("state")))
+            .expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        let worktree_id = reserved.worktree_id;
+        worker
+            .confirm_task_worktree(worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        let started = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id: plan_id.clone(),
+                task_id: task_id.clone(),
+                worktree_id: worktree_id.clone(),
+                agent: AgentKind::Codex,
+                prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
+            })
+            .await
+            .expect("implementation should start");
+        let paused = worker
+            .set_implementation_paused(started.attempt_id.clone(), true)
+            .await
+            .expect("pause should persist");
+        assert!(
+            paused
+                .active_run
+                .as_ref()
+                .expect("run should stay active")
+                .implementation_attempts[0]
+                .paused
+        );
+        worker
+            .set_implementation_paused(started.attempt_id.clone(), false)
+            .await
+            .expect("resume should persist");
+        worker
+            .reserve_implementation_continuation(ImplementationContinuationReservation {
+                attempt_id: started.attempt_id.clone(),
+                kind: ImplementationContinuationKind::Redirect,
+                instruction: "Use the corrected approach".to_owned(),
+            })
+            .await
+            .expect("continuation instruction should be reserved before stopping");
+        worker
+            .cancel_implementation_attempt(ImplementationAttemptCancellation {
+                attempt_id: started.attempt_id.clone(),
+                final_output: "partial change".to_owned(),
+                diagnostic_output: String::new(),
+                error_message: "stopped for redirect".to_owned(),
+                stop_reason: ImplementationStopReason::Redirected,
+            })
+            .await
+            .expect("redirect stop should persist");
+
+        let continuation = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id,
+                plan_id,
+                task_id,
+                worktree_id,
+                agent: AgentKind::Codex,
+                prompt: "Inspect partial changes and use the corrected approach".to_owned(),
+                parent_attempt_id: Some(started.attempt_id.clone()),
+                continuation_kind: Some(ImplementationContinuationKind::Redirect),
+                user_instruction: Some("Use the corrected approach".to_owned()),
+            })
+            .await
+            .expect("linked continuation should start");
+        let run = continuation
+            .snapshot
+            .active_run
+            .expect("run should stay active");
+        assert_eq!(run.implementation_attempts.len(), 2);
+        assert_eq!(
+            run.implementation_attempts[0].stop_reason,
+            Some(ImplementationStopReason::Redirected)
+        );
+        assert_eq!(
+            run.implementation_attempts[1].parent_attempt_id.as_deref(),
+            Some(started.attempt_id.as_str())
+        );
+        assert_eq!(
+            run.implementation_attempts[1].continuation_kind,
+            Some(ImplementationContinuationKind::Redirect)
+        );
+        assert!(
+            run.implementation_attempts[0]
+                .pending_continuation_kind
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recovers_a_reserved_continuation_after_engine_interruption() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        let worktree_id = reserved.worktree_id;
+        worker
+            .confirm_task_worktree(worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        let started = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id: plan_id.clone(),
+                task_id: task_id.clone(),
+                worktree_id: worktree_id.clone(),
+                agent: AgentKind::Claude,
+                prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
+            })
+            .await
+            .expect("implementation should start");
+        worker
+            .reserve_implementation_continuation(ImplementationContinuationReservation {
+                attempt_id: started.attempt_id.clone(),
+                kind: ImplementationContinuationKind::AdditionalContext,
+                instruction: "Keep the public API stable".to_owned(),
+            })
+            .await
+            .expect("continuation should be durable before stopping");
+        drop(worker);
+
+        let reopened = StorageWorker::start(paths.clone()).expect("storage should recover");
+        let recovered = reopened
+            .current_snapshot()
+            .await
+            .expect("recovered snapshot should load");
+        let parent = &recovered
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .implementation_attempts[0];
+        assert_eq!(parent.status, ImplementationStatus::Failed);
+        assert_eq!(
+            parent.pending_continuation_kind,
+            Some(ImplementationContinuationKind::AdditionalContext)
+        );
+        assert_eq!(
+            parent.pending_user_instruction.as_deref(),
+            Some("Keep the public API stable")
+        );
+
+        let continued = reopened
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id: plan_id.clone(),
+                task_id: task_id.clone(),
+                worktree_id: worktree_id.clone(),
+                agent: AgentKind::Claude,
+                prompt: "Inspect partial changes and keep the public API stable".to_owned(),
+                parent_attempt_id: Some(started.attempt_id.clone()),
+                continuation_kind: Some(ImplementationContinuationKind::AdditionalContext),
+                user_instruction: Some("Keep the public API stable".to_owned()),
+            })
+            .await
+            .expect("reserved continuation should remain startable");
+        assert_eq!(
+            continued
+                .snapshot
+                .active_run
+                .expect("run should stay active")
+                .implementation_attempts
+                .len(),
+            2
+        );
+
+        drop(reopened);
+        let recovered_child = StorageWorker::start(paths.clone())
+            .expect("storage should recover a continuation interrupted before launch");
+        let recovered = recovered_child
+            .current_snapshot()
+            .await
+            .expect("recovered continuation snapshot should load");
+        let attempts = &recovered
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .implementation_attempts;
+        assert_eq!(attempts[1].status, ImplementationStatus::Failed);
+        assert_eq!(
+            attempts[0].pending_continuation_kind,
+            Some(ImplementationContinuationKind::AdditionalContext)
+        );
+        assert_eq!(
+            attempts[0].pending_user_instruction.as_deref(),
+            Some("Keep the public API stable")
+        );
+
+        let retried = recovered_child
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id,
+                plan_id,
+                task_id,
+                worktree_id,
+                agent: AgentKind::Claude,
+                prompt: "Retry with the saved context".to_owned(),
+                parent_attempt_id: Some(started.attempt_id.clone()),
+                continuation_kind: Some(ImplementationContinuationKind::AdditionalContext),
+                user_instruction: Some("Keep the public API stable".to_owned()),
+            })
+            .await
+            .expect("recovered continuation should remain retryable");
+        let failed = recovered_child
+            .fail_implementation_attempt(ImplementationAttemptFailure {
+                attempt_id: retried.attempt_id,
+                final_output: String::new(),
+                diagnostic_output: "provider executable not found".to_owned(),
+                exit_code: None,
+                error_message: "cannot start Claude CLI".to_owned(),
+            })
+            .await
+            .expect("launch failure should persist");
+        let attempts = &failed
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .implementation_attempts;
+        assert_eq!(
+            attempts[0].pending_continuation_kind,
+            Some(ImplementationContinuationKind::AdditionalContext)
+        );
+        assert_eq!(
+            attempts[0].pending_user_instruction.as_deref(),
+            Some("Keep the public API stable")
+        );
     }
 
     #[tokio::test]
@@ -3174,6 +3838,9 @@ mod tests {
                 worktree_id: reserved.worktree_id,
                 agent: AgentKind::Codex,
                 prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
             })
             .await
             .expect("implementation should start");

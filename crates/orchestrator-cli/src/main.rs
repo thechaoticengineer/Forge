@@ -9,7 +9,8 @@ use orchestrator_core::{
         ServerMessage,
     },
     state::{
-        ActiveRunSummary, AgentKind, EngineSnapshot, ImplementationStatus, TaskWorktreeStatus,
+        ActiveRunSummary, AgentKind, EngineSnapshot, ImplementationContinuationKind,
+        ImplementationStatus, TaskWorktreeStatus,
     },
 };
 use tokio::{
@@ -67,6 +68,38 @@ enum Command {
         /// Running attempt ID; defaults to the active run's running attempt.
         #[arg(long)]
         attempt: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause the active supervised implementation process group.
+    Pause {
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume the active paused implementation process group.
+    Resume {
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the current attempt and continue with a changed instruction.
+    Redirect {
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long)]
+        instruction: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the current attempt and continue with additional context.
+    Context {
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long)]
+        instruction: String,
         #[arg(long)]
         json: bool,
     },
@@ -214,6 +247,40 @@ async fn main() -> Result<()> {
         }
         Command::Cancel { attempt, json } => {
             cancel_implementation(&socket_path, attempt, json).await
+        }
+        Command::Pause { attempt, json } => {
+            control_implementation(&socket_path, attempt, true, json).await
+        }
+        Command::Resume { attempt, json } => {
+            control_implementation(&socket_path, attempt, false, json).await
+        }
+        Command::Redirect {
+            attempt,
+            instruction,
+            json,
+        } => {
+            continue_implementation(
+                &socket_path,
+                attempt,
+                ImplementationContinuationKind::Redirect,
+                instruction,
+                json,
+            )
+            .await
+        }
+        Command::Context {
+            attempt,
+            instruction,
+            json,
+        } => {
+            continue_implementation(
+                &socket_path,
+                attempt,
+                ImplementationContinuationKind::AdditionalContext,
+                instruction,
+                json,
+            )
+            .await
         }
         Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
@@ -485,6 +552,81 @@ async fn cancel_implementation(
     )
     .await?;
     print_result(&snapshot, json)
+}
+
+async fn control_implementation(
+    socket_path: &PathBuf,
+    attempt_id: Option<String>,
+    pause: bool,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot.active_run.context("there is no active run")?;
+    let attempt_id = running_attempt_id(&run, attempt_id)?;
+    let request = if pause {
+        ClientRequest::PauseTaskImplementation {
+            run_id: run.id,
+            attempt_id,
+        }
+    } else {
+        ClientRequest::ResumeTaskImplementation {
+            run_id: run.id,
+            attempt_id,
+        }
+    };
+    let snapshot = send_workflow_request(socket_path, request, Duration::from_secs(10)).await?;
+    print_result(&snapshot, json)
+}
+
+async fn continue_implementation(
+    socket_path: &PathBuf,
+    attempt_id: Option<String>,
+    kind: ImplementationContinuationKind,
+    instruction: String,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot.active_run.context("there is no active run")?;
+    let attempt_id = continuation_attempt_id(&run, attempt_id)?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::ContinueTaskImplementation {
+            run_id: run.id,
+            attempt_id,
+            kind,
+            instruction,
+        },
+        Duration::from_mins(61),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+fn running_attempt_id(run: &ActiveRunSummary, requested: Option<String>) -> Result<String> {
+    requested
+        .or_else(|| {
+            run.implementation_attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.status == ImplementationStatus::Running)
+                .map(|attempt| attempt.id.clone())
+        })
+        .context("the active run has no running implementation")
+}
+
+fn continuation_attempt_id(run: &ActiveRunSummary, requested: Option<String>) -> Result<String> {
+    requested
+        .or_else(|| {
+            run.implementation_attempts
+                .iter()
+                .rev()
+                .find(|attempt| {
+                    attempt.status == ImplementationStatus::Running
+                        || attempt.pending_continuation_kind.is_some()
+                })
+                .map(|attempt| attempt.id.clone())
+        })
+        .context("the active run has no running or pending implementation continuation")
 }
 
 async fn plan_command(socket_path: &PathBuf, command: PlanCommand) -> Result<()> {
@@ -791,11 +933,18 @@ fn print_implementation(run: &ActiveRunSummary) {
         );
         for attempt in &run.implementation_attempts {
             println!(
-                "  {}  {}  task {}",
+                "  {}{}  {}  task {}",
                 attempt.status.as_str(),
+                if attempt.paused { " (paused)" } else { "" },
                 attempt.agent.as_str(),
                 attempt.task_id
             );
+            if let Some(kind) = attempt.continuation_kind {
+                println!("     continuation: {}", kind.as_str());
+            }
+            if let Some(reason) = attempt.stop_reason {
+                println!("     stopped: {}", reason.as_str());
+            }
             if let Some(exit_code) = attempt.exit_code {
                 println!("     exit code: {exit_code}");
             }

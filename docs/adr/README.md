@@ -47,3 +47,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0006](0006-isolate-task-implementation-in-git-worktrees.md) | Accepted | Give each implementation task an isolated Git worktree and reserved task branch |
 | [ADR-0007](0007-supervise-implementation-agents-in-task-worktrees.md) | Accepted | Run explicitly assigned implementation agents under engine supervision in task worktrees |
 | [ADR-0008](0008-persist-bounded-implementation-activity-and-cancel-process-groups.md) | Accepted | Persist bounded implementation activity and let the engine cancel supervised process groups |
+| [ADR-0009](0009-control-and-continue-running-implementations.md) | Accepted | Pause supervised process groups and continue implementations with durable user instructions |

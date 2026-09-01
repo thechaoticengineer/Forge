@@ -14,8 +14,10 @@ use nix::{
     unistd::Pid,
 };
 use orchestrator_agents::{
-    ImplementerActivity, ImplementerRunner, PlannerRunner, build_implementation_prompt,
-    build_planning_prompt, validate_proposal,
+    ImplementerActivity, ImplementerControl, ImplementerControlRequest, ImplementerRunner,
+    ImplementerStopHandle, ImplementerStopRequestResult, PlannerRunner,
+    build_implementation_continuation_prompt, build_implementation_prompt, build_planning_prompt,
+    implementer_stop_channel, validate_proposal,
 };
 use orchestrator_core::{
     protocol::{
@@ -23,9 +25,9 @@ use orchestrator_core::{
         PROTOCOL_VERSION, RepositoryCatalog, ServerMessage,
     },
     state::{
-        ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, PlanProposal, PlanStatus,
-        PlanSummary, PlanTaskSummary, ProposedTask, RunStatus, TaskWorktreeStatus,
-        TaskWorktreeSummary,
+        ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, ImplementationContinuationKind,
+        ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
+        PlanTaskSummary, ProposedTask, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
     },
 };
 use orchestrator_git::{
@@ -36,14 +38,15 @@ use orchestrator_git::{
 use orchestrator_store::{
     DraftRunInput, ImplementationActivityInput, ImplementationAttemptCancellation,
     ImplementationAttemptFailure, ImplementationAttemptInput, ImplementationAttemptSuccess,
-    PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput, StatePaths,
-    StorageWorker, StoredSnapshot, TaskWorktreeReservation,
+    ImplementationContinuationReservation, PlanAttemptFailure, PlanAttemptInput,
+    PlanAttemptSuccess, PlanRevisionInput, StatePaths, StorageWorker, StoredSnapshot,
+    TaskWorktreeReservation,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     process::Command as AsyncCommand,
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
     time::timeout,
 };
 
@@ -61,7 +64,8 @@ struct ImplementationControls {
 
 struct ActiveImplementationControl {
     run_id: String,
-    cancellation: watch::Sender<bool>,
+    cancellation: ImplementerStopHandle,
+    controls: mpsc::Sender<ImplementerControlRequest>,
 }
 
 impl ImplementationControls {
@@ -69,13 +73,15 @@ impl ImplementationControls {
         &self,
         run_id: String,
         attempt_id: String,
-        cancellation: watch::Sender<bool>,
+        cancellation: ImplementerStopHandle,
+        controls: mpsc::Sender<ImplementerControlRequest>,
     ) {
         self.active.lock().await.insert(
             attempt_id,
             ActiveImplementationControl {
                 run_id,
                 cancellation,
+                controls,
             },
         );
     }
@@ -84,7 +90,12 @@ impl ImplementationControls {
         self.active.lock().await.remove(attempt_id);
     }
 
-    async fn cancel(&self, run_id: &str, attempt_id: &str) -> Result<(), RequestFailure> {
+    async fn stop(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        reason: ImplementationStopReason,
+    ) -> Result<(), RequestFailure> {
         let active = self.active.lock().await;
         let control = active.get(attempt_id).ok_or_else(|| RequestFailure {
             code: "implementation_not_running",
@@ -96,10 +107,66 @@ impl ImplementationControls {
                 message: "the implementation attempt does not belong to this run".to_owned(),
             });
         }
-        control.cancellation.send(true).map_err(|_| RequestFailure {
-            code: "implementation_not_running",
-            message: "the implementation supervisor is no longer available".to_owned(),
-        })
+        match control.cancellation.request(reason) {
+            ImplementerStopRequestResult::Accepted => Ok(()),
+            ImplementerStopRequestResult::AlreadyRequested => Err(RequestFailure {
+                code: "implementation_stop_pending",
+                message: "another stop request already owns this implementation transition"
+                    .to_owned(),
+            }),
+            ImplementerStopRequestResult::Closed => Err(RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation supervisor is no longer available".to_owned(),
+            }),
+        }
+    }
+
+    async fn control(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        requested: ImplementerControl,
+    ) -> Result<(), RequestFailure> {
+        let controls = {
+            let active = self.active.lock().await;
+            let control = active.get(attempt_id).ok_or_else(|| RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation attempt is no longer running".to_owned(),
+            })?;
+            if control.run_id != run_id {
+                return Err(RequestFailure {
+                    code: "implementation_not_running",
+                    message: "the implementation attempt does not belong to this run".to_owned(),
+                });
+            }
+            control.controls.clone()
+        };
+        let (acknowledgement, response) = oneshot::channel();
+        controls
+            .send(ImplementerControlRequest {
+                control: requested,
+                acknowledgement,
+            })
+            .await
+            .map_err(|_| RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation supervisor is no longer available".to_owned(),
+            })?;
+        timeout(Duration::from_secs(5), response)
+            .await
+            .map_err(|_| RequestFailure {
+                code: "implementation_control_timeout",
+                message: "the implementation supervisor did not acknowledge the control".to_owned(),
+            })?
+            .map_err(|_| RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation supervisor stopped before acknowledging the control"
+                    .to_owned(),
+            })?
+            .map_err(|message| RequestFailure {
+                code: "implementation_control_failed",
+                message,
+            })
     }
 }
 
@@ -509,7 +576,10 @@ async fn handle_request(
             Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
         },
         ClientRequest::CancelTaskImplementation { run_id, attempt_id } => {
-            match implementation_controls.cancel(&run_id, &attempt_id).await {
+            match implementation_controls
+                .stop(&run_id, &attempt_id, ImplementationStopReason::Cancelled)
+                .await
+            {
                 Ok(()) => match wait_for_implementation_settlement(
                     state_sender,
                     &attempt_id,
@@ -527,6 +597,63 @@ async fn handle_request(
                 }
             }
         }
+        ClientRequest::PauseTaskImplementation { run_id, attempt_id } => {
+            match set_implementation_paused(
+                &run_id,
+                &attempt_id,
+                true,
+                storage,
+                implementation_controls,
+                state_sender,
+            )
+            .await
+            {
+                Ok(snapshot) => ServerMessage::snapshot(snapshot, Some(request.request_id)),
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
+        ClientRequest::ResumeTaskImplementation { run_id, attempt_id } => {
+            match set_implementation_paused(
+                &run_id,
+                &attempt_id,
+                false,
+                storage,
+                implementation_controls,
+                state_sender,
+            )
+            .await
+            {
+                Ok(snapshot) => ServerMessage::snapshot(snapshot, Some(request.request_id)),
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
+        ClientRequest::ContinueTaskImplementation {
+            run_id,
+            attempt_id,
+            kind,
+            instruction,
+        } => match continue_task_implementation(
+            run_id,
+            attempt_id,
+            kind,
+            instruction,
+            storage,
+            implementer,
+            implementation_controls,
+            state_sender,
+        )
+        .await
+        {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
         ClientRequest::GetSnapshot => {
             ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
         }
@@ -572,6 +699,48 @@ async fn wait_for_implementation_settlement(
         code: "cancellation_timeout",
         message: "the implementation did not stop within the cancellation timeout".to_owned(),
     })?
+}
+
+async fn set_implementation_paused(
+    run_id: &str,
+    attempt_id: &str,
+    paused: bool,
+    storage: &StorageWorker,
+    implementation_controls: &ImplementationControls,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<EngineSnapshot, RequestFailure> {
+    let requested = if paused {
+        ImplementerControl::Pause
+    } else {
+        ImplementerControl::Resume
+    };
+    implementation_controls
+        .control(run_id, attempt_id, requested)
+        .await?;
+    match storage
+        .set_implementation_paused(attempt_id.to_owned(), paused)
+        .await
+    {
+        Ok(stored) => {
+            let snapshot = engine_snapshot(stored);
+            publish_newer_snapshot(state_sender, snapshot.clone());
+            Ok(snapshot)
+        }
+        Err(error) => {
+            let rollback = if paused {
+                ImplementerControl::Resume
+            } else {
+                ImplementerControl::Pause
+            };
+            let _ = implementation_controls
+                .control(run_id, attempt_id, rollback)
+                .await;
+            Err(RequestFailure::storage(
+                "cannot persist implementation control",
+                error,
+            ))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1710,9 +1879,168 @@ async fn run_task_implementation(
     implementation_controls: &ImplementationControls,
     state_sender: &watch::Sender<EngineSnapshot>,
 ) -> Result<StoredSnapshot, RequestFailure> {
+    run_task_implementation_attempt(
+        run_id,
+        plan_id,
+        task_id,
+        worktree_id,
+        agent,
+        None,
+        storage,
+        implementer,
+        implementation_controls,
+        state_sender,
+    )
+    .await
+}
+
+struct ImplementationContinuation {
+    parent_attempt_id: String,
+    kind: ImplementationContinuationKind,
+    instruction: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn continue_task_implementation(
+    run_id: String,
+    attempt_id: String,
+    kind: ImplementationContinuationKind,
+    instruction: String,
+    storage: &StorageWorker,
+    implementer: &ImplementerRunner,
+    implementation_controls: &ImplementationControls,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let instruction = instruction.trim().to_owned();
+    if instruction.is_empty() {
+        return Err(RequestFailure {
+            code: "invalid_instruction",
+            message: "continuation instruction must not be empty".to_owned(),
+        });
+    }
+    if instruction.chars().count() > 20_000 {
+        return Err(RequestFailure {
+            code: "invalid_instruction",
+            message: "continuation instruction must not exceed 20,000 characters".to_owned(),
+        });
+    }
+
+    let run = load_active_run(storage, &run_id).await?;
+    let attempt = run
+        .implementation_attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "implementation_not_found",
+            message: "the implementation attempt does not exist in the active run".to_owned(),
+        })?;
+    let plan_id = run
+        .plan
+        .as_ref()
+        .filter(|plan| plan.status == PlanStatus::Approved)
+        .map(|plan| plan.id.clone())
+        .ok_or_else(|| RequestFailure {
+            code: "plan_not_approved",
+            message: "implementation continuation requires the approved plan".to_owned(),
+        })?;
+    let stop_reason = match kind {
+        ImplementationContinuationKind::Redirect => ImplementationStopReason::Redirected,
+        ImplementationContinuationKind::AdditionalContext => ImplementationStopReason::ContextAdded,
+    };
+    match (
+        attempt.pending_continuation_kind,
+        attempt.pending_user_instruction.as_deref(),
+    ) {
+        (None, None) if attempt.status == ImplementationStatus::Running => {
+            let reserved = storage
+                .reserve_implementation_continuation(ImplementationContinuationReservation {
+                    attempt_id: attempt_id.clone(),
+                    kind,
+                    instruction: instruction.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    RequestFailure::storage("cannot reserve implementation continuation", error)
+                })?;
+            publish_newer_snapshot(state_sender, engine_snapshot(reserved));
+        }
+        (Some(pending_kind), Some(pending_instruction))
+            if pending_kind == kind && pending_instruction == instruction => {}
+        (Some(_), Some(_)) => {
+            return Err(RequestFailure {
+                code: "continuation_already_pending",
+                message: "a different continuation instruction is already pending".to_owned(),
+            });
+        }
+        _ => {
+            return Err(RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation is not running and has no pending continuation"
+                    .to_owned(),
+            });
+        }
+    }
+
+    if attempt.status == ImplementationStatus::Running {
+        match implementation_controls
+            .stop(&run_id, &attempt_id, stop_reason)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if error.code == "implementation_not_running" => {}
+            Err(error) => return Err(error),
+        }
+        wait_for_implementation_settlement(state_sender, &attempt_id, Duration::from_secs(10))
+            .await?;
+    }
+
+    run_task_implementation_attempt(
+        run_id,
+        plan_id,
+        attempt.task_id,
+        attempt.worktree_id,
+        attempt.agent,
+        Some(ImplementationContinuation {
+            parent_attempt_id: attempt_id,
+            kind,
+            instruction,
+        }),
+        storage,
+        implementer,
+        implementation_controls,
+        state_sender,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_task_implementation_attempt(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    worktree_id: String,
+    agent: AgentKind,
+    continuation: Option<ImplementationContinuation>,
+    storage: &StorageWorker,
+    implementer: &ImplementerRunner,
+    implementation_controls: &ImplementationControls,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
     let context =
         load_implementation_context(storage, &run_id, &plan_id, &task_id, &worktree_id).await?;
-    let prompt = build_implementation_prompt(&context.run, &context.task, &context.worktree);
+    let prompt = continuation.as_ref().map_or_else(
+        || build_implementation_prompt(&context.run, &context.task, &context.worktree),
+        |continuation| {
+            build_implementation_continuation_prompt(
+                &context.run,
+                &context.task,
+                &context.worktree,
+                continuation.kind,
+                &continuation.instruction,
+            )
+        },
+    );
     let worktree_path = context.worktree.path.clone();
     let started = storage
         .begin_implementation_attempt(ImplementationAttemptInput {
@@ -1722,6 +2050,13 @@ async fn run_task_implementation(
             worktree_id,
             agent,
             prompt: prompt.clone(),
+            parent_attempt_id: continuation
+                .as_ref()
+                .map(|continuation| continuation.parent_attempt_id.clone()),
+            continuation_kind: continuation.as_ref().map(|continuation| continuation.kind),
+            user_instruction: continuation
+                .as_ref()
+                .map(|continuation| continuation.instruction.clone()),
         })
         .await
         .map_err(|error| match error {
@@ -1734,22 +2069,30 @@ async fn run_task_implementation(
     let attempt_id = started.attempt_id;
     let (activity_sender, mut activity_receiver) =
         mpsc::channel(IMPLEMENTATION_ACTIVITY_CHANNEL_CAPACITY);
-    let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+    let (cancellation_sender, cancellation_receiver) = implementer_stop_channel();
+    let (control_sender, control_receiver) = mpsc::channel(4);
     implementation_controls
-        .register(run_id, attempt_id.clone(), cancellation_sender.clone())
+        .register(
+            run_id,
+            attempt_id.clone(),
+            cancellation_sender.clone(),
+            control_sender,
+        )
         .await;
     publish_newer_snapshot(state_sender, engine_snapshot(started.snapshot));
 
-    let implementation = implementer.implement_with_activity(
+    let implementation = implementer.implement_with_controls(
         agent,
         Path::new(&worktree_path),
         &prompt,
         Some(activity_sender),
         Some(cancellation_receiver),
+        Some(control_receiver),
     );
     tokio::pin!(implementation);
     let mut activity_open = true;
     let mut activity_error = None;
+    let mut activity_failure_owns_stop = false;
     let result = loop {
         tokio::select! {
             result = &mut implementation => break result,
@@ -1764,7 +2107,9 @@ async fn run_task_implementation(
                         ).await
                     {
                         activity_error = Some(error);
-                        let _ = cancellation_sender.send(true);
+                        activity_failure_owns_stop = cancellation_sender
+                            .request(ImplementationStopReason::Cancelled)
+                            == ImplementerStopRequestResult::Accepted;
                     }
                 } else {
                     activity_open = false;
@@ -1786,6 +2131,28 @@ async fn run_task_implementation(
     }
 
     if let Some(error) = activity_error {
+        if !activity_failure_owns_stop
+            && let Err(failure) = &result
+            && failure.cancelled
+        {
+            return storage
+                .cancel_implementation_attempt(ImplementationAttemptCancellation {
+                    attempt_id,
+                    final_output: failure.final_output.clone(),
+                    diagnostic_output: failure.diagnostic_output.clone(),
+                    error_message: failure.message.clone(),
+                    stop_reason: failure
+                        .stop_reason
+                        .unwrap_or(ImplementationStopReason::Cancelled),
+                })
+                .await
+                .map_err(|storage_error| {
+                    RequestFailure::storage(
+                        "cannot persist implementation cancellation",
+                        storage_error,
+                    )
+                });
+        }
         let (final_output, diagnostic_output, exit_code) = match result {
             Ok(output) => (
                 output.final_output,
@@ -1839,6 +2206,9 @@ async fn run_task_implementation(
                         final_output: failure.final_output,
                         diagnostic_output: failure.diagnostic_output,
                         error_message: failure.message,
+                        stop_reason: failure
+                            .stop_reason
+                            .unwrap_or(ImplementationStopReason::Cancelled),
                     })
                     .await
                     .map_err(|error| {
@@ -2145,6 +2515,13 @@ fn engine_snapshot(stored: StoredSnapshot) -> EngineSnapshot {
             .active_run
             .as_ref()
             .map_or((EngineStatus::Idle, false), |run| match run.run_status {
+                RunStatus::Running
+                    if run.implementation_attempts.iter().any(|attempt| {
+                        attempt.status == ImplementationStatus::Running && attempt.paused
+                    }) =>
+                {
+                    (EngineStatus::WaitingForUser, true)
+                }
                 RunStatus::Planning | RunStatus::Running => (EngineStatus::Running, false),
                 RunStatus::WaitingForUser => {
                     if run
@@ -2277,6 +2654,32 @@ fn remove_owned_socket(socket_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_stop_request_owns_the_implementation_transition() {
+        let controls = ImplementationControls::default();
+        let (stop_sender, _stop_receiver) = implementer_stop_channel();
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        controls
+            .register(
+                "run-1".to_owned(),
+                "attempt-1".to_owned(),
+                stop_sender,
+                control_sender,
+            )
+            .await;
+
+        controls
+            .stop("run-1", "attempt-1", ImplementationStopReason::Cancelled)
+            .await
+            .expect("first stop should be accepted");
+        let error = controls
+            .stop("run-1", "attempt-1", ImplementationStopReason::Redirected)
+            .await
+            .expect_err("competing stop should be refused");
+
+        assert_eq!(error.code, "implementation_stop_pending");
+    }
 
     use std::process::Command;
 
@@ -3026,7 +3429,7 @@ mod tests {
             }
         };
         implementation_controls
-            .cancel(&run_id, &attempt_id)
+            .stop(&run_id, &attempt_id, ImplementationStopReason::Cancelled)
             .await
             .expect("running attempt should accept cancellation");
         let cancelled = timeout(Duration::from_secs(10), implementation)

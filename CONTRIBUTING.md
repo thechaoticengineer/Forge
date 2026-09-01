@@ -85,6 +85,10 @@ Once a plan is approved, each task can be given an isolated Git worktree:
 cargo run -p orchestrator-cli -- worktree create --task 1
 cargo run -p orchestrator-cli -- implement --task 1 --agent codex
 # From another terminal while an implementation is running:
+cargo run -p orchestrator-cli -- pause
+cargo run -p orchestrator-cli -- resume
+cargo run -p orchestrator-cli -- redirect --instruction "Use the compatibility path instead"
+cargo run -p orchestrator-cli -- context --instruction "The public API must remain stable"
 cargo run -p orchestrator-cli -- cancel
 ```
 
@@ -92,7 +96,7 @@ The worktree and its `orchestrator/`-prefixed branch are created below the engin
 
 The implementation command can also use `--agent claude`. The engine records the assignment before launching the agent, confines writes to the ready task worktree, supervises bounded output and process lifetime, and preserves success or failure evidence. A successful agent exit does not mean the task is verified or approved.
 
-The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can explicitly cancel a running attempt while preserving its partial worktree changes. Pause, redirection, additional context, deterministic verification, independent review, and final change approval remain to be implemented.
+The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can pause, resume, cancel, redirect, or add context while preserving partial worktree changes and linked attempt history. A paused process remains owned by the live engine and is recovered as interrupted if the engine exits. Deterministic verification, independent review, and final change approval remain to be implemented.
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 
