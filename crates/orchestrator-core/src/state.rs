@@ -39,7 +39,38 @@ pub struct ActiveRunSummary {
     pub worktrees: Vec<TaskWorktreeSummary>,
     #[serde(default)]
     pub implementation_attempts: Vec<ImplementationAttemptSummary>,
+    #[serde(default)]
+    pub implementation_activity: Vec<ImplementationActivitySummary>,
     pub last_error: Option<String>,
+}
+
+/// One bounded, durable activity update emitted by an implementation agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImplementationActivitySummary {
+    pub sequence: u64,
+    pub attempt_id: String,
+    pub task_id: String,
+    pub agent: AgentKind,
+    pub kind: ImplementationActivityKind,
+    pub message: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationActivityKind {
+    Output,
+    Diagnostic,
+}
+
+impl ImplementationActivityKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Output => "output",
+            Self::Diagnostic => "diagnostic",
+        }
+    }
 }
 
 /// Durable state of one supervised implementation-agent invocation.

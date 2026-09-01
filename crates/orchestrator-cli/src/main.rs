@@ -8,7 +8,9 @@ use orchestrator_core::{
         ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, RepositoryCatalog,
         ServerMessage,
     },
-    state::{AgentKind, EngineSnapshot, TaskWorktreeStatus},
+    state::{
+        ActiveRunSummary, AgentKind, EngineSnapshot, ImplementationStatus, TaskWorktreeStatus,
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -57,6 +59,14 @@ enum Command {
         task: usize,
         #[arg(long, value_enum)]
         agent: AgentArgument,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel the active supervised implementation and preserve partial work.
+    Cancel {
+        /// Running attempt ID; defaults to the active run's running attempt.
+        #[arg(long)]
+        attempt: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -201,6 +211,9 @@ async fn main() -> Result<()> {
         Command::Worktree { command } => worktree_command(&socket_path, command).await,
         Command::Implement { task, agent, json } => {
             implement_task(&socket_path, task, agent.into(), json).await
+        }
+        Command::Cancel { attempt, json } => {
+            cancel_implementation(&socket_path, attempt, json).await
         }
         Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
@@ -441,6 +454,34 @@ async fn implement_task(
             agent,
         },
         Duration::from_mins(61),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+async fn cancel_implementation(
+    socket_path: &PathBuf,
+    attempt_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot.active_run.context("there is no active run")?;
+    let attempt_id = attempt_id
+        .or_else(|| {
+            run.implementation_attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.status == ImplementationStatus::Running)
+                .map(|attempt| attempt.id.clone())
+        })
+        .context("the active run has no running implementation")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::CancelTaskImplementation {
+            run_id: run.id,
+            attempt_id,
+        },
+        Duration::from_secs(10),
     )
     .await?;
     print_result(&snapshot, json)
@@ -703,26 +744,7 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
                     }
                 }
             }
-            if !run.implementation_attempts.is_empty() {
-                println!(
-                    "Implementation attempts: {}",
-                    run.implementation_attempts.len()
-                );
-                for attempt in &run.implementation_attempts {
-                    println!(
-                        "  {}  {}  task {}",
-                        attempt.status.as_str(),
-                        attempt.agent.as_str(),
-                        attempt.task_id
-                    );
-                    if let Some(exit_code) = attempt.exit_code {
-                        println!("     exit code: {exit_code}");
-                    }
-                    if let Some(error) = &attempt.error_message {
-                        println!("     {error}");
-                    }
-                }
-            }
+            print_implementation(run);
             if let Some(plan) = &run.plan {
                 println!(
                     "Plan: revision {} · {} · {}",
@@ -759,6 +781,41 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
             "not required"
         }
     );
+}
+
+fn print_implementation(run: &ActiveRunSummary) {
+    if !run.implementation_attempts.is_empty() {
+        println!(
+            "Implementation attempts: {}",
+            run.implementation_attempts.len()
+        );
+        for attempt in &run.implementation_attempts {
+            println!(
+                "  {}  {}  task {}",
+                attempt.status.as_str(),
+                attempt.agent.as_str(),
+                attempt.task_id
+            );
+            if let Some(exit_code) = attempt.exit_code {
+                println!("     exit code: {exit_code}");
+            }
+            if let Some(error) = &attempt.error_message {
+                println!("     {error}");
+            }
+        }
+    }
+    if !run.implementation_activity.is_empty() {
+        println!("Recent implementation activity:");
+        let start = run.implementation_activity.len().saturating_sub(10);
+        for activity in &run.implementation_activity[start..] {
+            println!(
+                "  {}  {}: {}",
+                activity.agent.as_str(),
+                activity.kind.as_str(),
+                activity.message
+            );
+        }
+    }
 }
 
 fn request_id() -> String {

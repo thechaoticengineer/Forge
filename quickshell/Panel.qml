@@ -17,6 +17,7 @@ Item {
   property bool editingDraft: false
   property bool editingPlanTask: false
   property bool rejectingPlan: false
+  property bool confirmingImplementationCancel: false
   property string localDraftError: ""
   property var repositoryPathCandidates: []
   property string draftStep: "repository"
@@ -61,6 +62,10 @@ Item {
   }
 
   function requestClose() {
+    if (confirmingImplementationCancel) {
+      confirmingImplementationCancel = false
+      return
+    }
     if (editingDraft) {
       cancelDraftEntry()
       return
@@ -82,6 +87,7 @@ Item {
   }
 
   function moveNavigation(dx, dy) {
+    if (confirmingImplementationCancel) return
     if (editingDraft && draftStep === "repository") {
       if (dx !== 0) {
         repositorySourceIndex = Math.max(0, Math.min(1, repositorySourceIndex + dx))
@@ -118,6 +124,10 @@ Item {
   }
 
   function activateNavigation() {
+    if (confirmingImplementationCancel) {
+      confirmImplementationCancel()
+      return
+    }
     if (editingDraft && draftStep === "repository") {
       activateRepository()
       return
@@ -131,7 +141,8 @@ Item {
   }
 
   function beginDraftEntry() {
-    if (!engine.connected || engine.requestPending) return
+    if (!engine.connected || engine.requestPending
+        || (engine.activeRun && engine.activeRun.run_status === "running")) return
     selectedSection = 0
     focusArea = "content"
     editingDraft = true
@@ -373,6 +384,49 @@ Item {
     engine.movePlanTask(task.id, direction)
   }
 
+  function latestImplementationAttempt() {
+    var attempts = engine.activeRun && engine.activeRun.implementation_attempts
+      ? engine.activeRun.implementation_attempts : []
+    return attempts.length > 0 ? attempts[attempts.length - 1] : null
+  }
+
+  function runningImplementationAttempt() {
+    var attempt = latestImplementationAttempt()
+    return attempt && attempt.status === "running" ? attempt : null
+  }
+
+  function implementationTaskTitle(attempt) {
+    var plan = root.currentPlan()
+    if (!attempt || !plan || !plan.tasks) return "approved task"
+    for (var i = 0; i < plan.tasks.length; i++) {
+      if (plan.tasks[i].id === attempt.task_id)
+        return plan.tasks[i].position + ". " + plan.tasks[i].title
+    }
+    return "approved task"
+  }
+
+  function latestImplementationActivity() {
+    var attempt = latestImplementationAttempt()
+    var activity = engine.activeRun && engine.activeRun.implementation_activity
+      ? engine.activeRun.implementation_activity : []
+    if (!attempt) return []
+    var result = []
+    for (var i = 0; i < activity.length; i++)
+      if (activity[i].attempt_id === attempt.id) result.push(activity[i])
+    return result
+  }
+
+  function beginImplementationCancel() {
+    if (!runningImplementationAttempt() || controlEngine.requestPending) return
+    confirmingImplementationCancel = true
+  }
+
+  function confirmImplementationCancel() {
+    var attempt = runningImplementationAttempt()
+    if (!attempt || !engine.activeRun || controlEngine.requestPending) return
+    controlEngine.cancelImplementation(engine.activeRun.id, attempt.id)
+  }
+
   function footerHelp() {
     if (editingDraft && draftStep === "repository")
       return "h/l or ←/→  Source    j/k or ↑/↓  Repository    Enter  Open or clone    /  Search    p  Path    Esc  Cancel"
@@ -381,12 +435,16 @@ Item {
     if (editingDraft) return "Enter  Create draft    Shift+Tab  Repositories    Esc  Cancel"
     if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
+    if (confirmingImplementationCancel)
+      return "Enter  Confirm cancellation    Esc  Keep running"
     if (focusArea === "sections")
       return "j/k or ↑/↓  Sections    l/→ or Enter  Open    r  Reconnect    Esc  Close"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
       return "h/←  Sections    j/k or ↑/↓  Tasks    Enter/e  Edit    J/K  Reorder    a  Approve    x  Reject"
     if (selectedSection === 1)
       return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
+    if (selectedSection === 0 && runningImplementationAttempt())
+      return "h/←  Sections    x  Cancel implementation    r  Reconnect    Esc  Close"
     if (selectedSection === 0 && engine.activeRun)
       return "h/←  Sections    Enter/n  New draft    r  Reconnect    Esc  Close"
     if (selectedSection === 0)
@@ -439,9 +497,19 @@ Item {
         root.selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, root.selectedTaskIndex))
       else
         root.selectedTaskIndex = 0
+      if (!root.runningImplementationAttempt())
+        root.confirmingImplementationCancel = false
     }
   }
 
+  EngineConnection {
+    id: controlEngine
+    onRequestCompleted: function(method) {
+      if (method === "cancel_task_implementation")
+        root.confirmingImplementationCancel = false
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
 
   EngineConnection {
     id: repositoryEngine
@@ -524,6 +592,7 @@ Item {
           }
           if (text === "r") engine.reconnect()
           else if (text === "n") root.beginDraftEntry()
+          else if (root.selectedSection === 0 && text === "x") root.beginImplementationCancel()
           else if (root.selectedSection === 1 && text === "c") root.generatePlan("codex")
           else if (root.selectedSection === 1 && text === "d") root.generatePlan("claude")
           else if (root.selectedSection === 1 && text === "e") root.beginPlanTaskEdit()
@@ -728,7 +797,14 @@ Item {
                       if (root.selectedSection !== 0) return "Planned capability"
                       if (!engine.connected) return "Start the Rust engine to connect"
                       if (root.editingDraft) return "Create a durable draft run"
-                      if (engine.activeRun) return "Draft saved"
+                      if (engine.activeRun) {
+                        var implementation = root.latestImplementationAttempt()
+                        if (implementation && implementation.status === "running")
+                          return implementation.agent + " is implementing"
+                        if (implementation)
+                          return "Implementation " + implementation.status
+                        return "Draft saved"
+                      }
                       return "No active run"
                     }
                     color: root.foreground
@@ -1240,6 +1316,7 @@ Item {
 
                     Text {
                       width: parent.width
+                      visible: !root.latestImplementationAttempt()
                       text: engine.activeRun && engine.activeRun.plan
                         ? "The plan is durable. Open the Plan section to inspect its tasks and decision state."
                         : "This draft survives engine and shell restarts. Open the Plan section to choose Codex or Claude as the read-only planner."
@@ -1249,8 +1326,167 @@ Item {
                       wrapMode: Text.WordWrap
                     }
 
+                    Column {
+                      visible: !!root.latestImplementationAttempt()
+                      width: parent.width
+                      spacing: Style.space(7)
+
+                      Text {
+                        width: parent.width
+                        text: {
+                          var attempt = root.latestImplementationAttempt()
+                          if (!attempt) return ""
+                          return attempt.agent + "  •  "
+                            + root.implementationTaskTitle(attempt) + "  •  "
+                            + attempt.status
+                        }
+                        color: root.runningImplementationAttempt()
+                          ? root.accent
+                          : (root.latestImplementationAttempt()
+                             && root.latestImplementationAttempt().status === "failed"
+                             ? root.urgent : root.foreground)
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                        wrapMode: Text.WordWrap
+                      }
+
+                      Text {
+                        visible: root.latestImplementationActivity().length === 0
+                        width: parent.width
+                        text: root.runningImplementationAttempt()
+                          ? "Waiting for the agent's first activity update…"
+                          : "No activity output was recorded for this attempt."
+                        color: root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+
+                      ListView {
+                        id: implementationActivityView
+                        visible: root.latestImplementationActivity().length > 0
+                        width: parent.width
+                        height: root.panelDesignHeight < 620
+                          ? Style.space(105) : Style.space(155)
+                        clip: true
+                        spacing: Style.space(4)
+                        model: root.latestImplementationActivity()
+
+                        onCountChanged: positionViewAtEnd()
+
+                        delegate: Rectangle {
+                          id: activityDelegate
+                          required property var modelData
+                          width: ListView.view.width
+                          height: activityText.implicitHeight + Style.space(10)
+                          radius: Style.cornerRadius
+                          color: Qt.rgba(
+                            root.foreground.r,
+                            root.foreground.g,
+                            root.foreground.b,
+                            activityDelegate.modelData.kind === "diagnostic" ? 0.08 : 0.04
+                          )
+
+                          Text {
+                            id: activityText
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: Style.space(5)
+                            text: activityDelegate.modelData.message || ""
+                            color: activityDelegate.modelData.kind === "diagnostic"
+                              ? root.mutedForeground : root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                          }
+                        }
+                      }
+
+                      Text {
+                        visible: !!root.latestImplementationAttempt()
+                          && !!root.latestImplementationAttempt().error_message
+                        width: parent.width
+                        text: root.latestImplementationAttempt()
+                          ? (root.latestImplementationAttempt().error_message || "") : ""
+                        color: root.latestImplementationAttempt()
+                          && root.latestImplementationAttempt().status === "cancelled"
+                          ? root.mutedForeground : root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+
+                      Row {
+                        visible: !!root.runningImplementationAttempt()
+                          && !root.confirmingImplementationCancel
+                        spacing: Style.space(8)
+
+                        Button {
+                          text: "Cancel implementation"
+                          enabled: !controlEngine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginImplementationCancel()
+                        }
+                      }
+
+                      Column {
+                        visible: root.confirmingImplementationCancel
+                        width: parent.width
+                        spacing: Style.space(7)
+
+                        Text {
+                          width: parent.width
+                          text: {
+                            var attempt = root.runningImplementationAttempt()
+                            return attempt
+                              ? "Stop " + attempt.agent + " on "
+                                + root.implementationTaskTitle(attempt)
+                                + "? Partial changes remain in the task worktree for inspection or retry."
+                              : ""
+                          }
+                          color: root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Row {
+                          spacing: Style.space(8)
+                          Button {
+                            text: controlEngine.requestPending ? "Cancelling…" : "Confirm cancel"
+                            bordered: true
+                            enabled: !controlEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.urgent
+                            onClicked: root.confirmImplementationCancel()
+                          }
+                          Button {
+                            text: "Keep running"
+                            enabled: !controlEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.confirmingImplementationCancel = false
+                          }
+                        }
+                      }
+
+                      Text {
+                        visible: controlEngine.requestError !== ""
+                        width: parent.width
+                        text: controlEngine.requestError
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+                    }
+
                     Button {
                       text: "New draft"
+                      enabled: !engine.activeRun || engine.activeRun.run_status !== "running"
                       foreground: root.foreground
                       accent: root.accent
                       onClicked: root.beginDraftEntry()
@@ -1482,7 +1718,9 @@ Item {
                       Text {
                         visible: root.currentPlan() && root.currentPlan().status === "approved"
                         width: parent.width
-                        text: "This plan is approved and durable. Isolated implementation is the next workflow stage and has not started."
+                        text: root.latestImplementationAttempt()
+                          ? "This plan is approved and durable. Open Overview to inspect the latest implementation attempt and its recent activity."
+                          : "This plan is approved and durable. Create the task worktree and assign an implementer from the CLI."
                         color: root.mutedForeground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall

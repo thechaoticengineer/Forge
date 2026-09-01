@@ -11,8 +11,9 @@ use std::{
 };
 
 use orchestrator_core::state::{
-    ActiveRunSummary, AgentKind, ImplementationAttemptSummary, ImplementationStatus, PlanProposal,
-    PlanStatus, PlanSummary, PlanTaskSummary, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
+    ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationActivitySummary,
+    ImplementationAttemptSummary, ImplementationStatus, PlanProposal, PlanStatus, PlanSummary,
+    PlanTaskSummary, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -23,7 +24,8 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
+const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (
@@ -40,6 +42,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         4,
         "implementation_attempts",
         include_str!("../migrations/0004_implementation_attempts.sql"),
+    ),
+    (
+        5,
+        "implementation_activity",
+        include_str!("../migrations/0005_implementation_activity.sql"),
     ),
 ];
 
@@ -102,6 +109,10 @@ pub enum StorageError {
     ImplementationNotReady(String),
     #[error("implementation attempt does not exist or is no longer running: {0}")]
     ImplementationAttemptNotRunning(String),
+    #[error("implementation activity is empty or exceeds the configured bound")]
+    InvalidImplementationActivity,
+    #[error("database returned an invalid implementation activity kind: {0}")]
+    InvalidImplementationActivityKind(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -297,6 +308,21 @@ pub struct ImplementationAttemptFailure {
     pub error_message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationActivityInput {
+    pub attempt_id: String,
+    pub kind: ImplementationActivityKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationAttemptCancellation {
+    pub attempt_id: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub error_message: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -365,6 +391,14 @@ enum Command {
     ),
     FailImplementationAttempt(
         ImplementationAttemptFailure,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    AppendImplementationActivity(
+        ImplementationActivityInput,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    CancelImplementationAttempt(
+        ImplementationAttemptCancellation,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -765,6 +799,43 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Appends one bounded activity update for a running implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running, the message is
+    /// outside its bound, or storage fails.
+    pub async fn append_implementation_activity(
+        &self,
+        input: ImplementationActivityInput,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::AppendImplementationActivity(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists a user-cancelled implementation and its retained partial output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running or storage fails.
+    pub async fn cancel_implementation_attempt(
+        &self,
+        input: ImplementationAttemptCancellation,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CancelImplementationAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -852,6 +923,12 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             Command::FailImplementationAttempt(input, reply) => {
                 let _ = reply.send(database.fail_implementation_attempt(&input));
             }
+            Command::AppendImplementationActivity(input, reply) => {
+                let _ = reply.send(database.append_implementation_activity(&input));
+            }
+            Command::CancelImplementationAttempt(input, reply) => {
+                let _ = reply.send(database.cancel_implementation_attempt(&input));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -923,6 +1000,7 @@ impl Database {
             run.plan = self.load_latest_plan(&run.id)?;
             run.worktrees = self.load_task_worktrees(&run.id)?;
             run.implementation_attempts = self.load_implementation_attempts(&run.id)?;
+            run.implementation_activity = self.load_implementation_activity(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -997,6 +1075,7 @@ impl Database {
                 plan: None,
                 worktrees: Vec::new(),
                 implementation_attempts: Vec::new(),
+                implementation_activity: Vec::new(),
                 last_error: None,
             }),
         })
@@ -1578,6 +1657,133 @@ impl Database {
         self.current_snapshot()
     }
 
+    fn append_implementation_activity(
+        &self,
+        input: &ImplementationActivityInput,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let message_length = input.message.chars().count();
+        if message_length == 0 || message_length > 8192 {
+            return Err(StorageError::InvalidImplementationActivity);
+        }
+        let created_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, _worktree_id, agent) =
+            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        transaction.execute(
+            "INSERT INTO implementation_activity(\
+                attempt_id, run_id, task_id, agent, kind, message, created_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                &input.attempt_id,
+                &run_id,
+                &task_id,
+                agent.as_str(),
+                input.kind.as_str(),
+                &input.message,
+                created_at,
+            ),
+        )?;
+        let activity_sequence = transaction.last_insert_rowid();
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "activity_sequence": activity_sequence,
+            "kind": input.kind,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_activity', ?2, ?3, ?4)",
+            (&run_id, agent.as_str(), payload.to_string(), created_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn cancel_implementation_attempt(
+        &self,
+        input: &ImplementationAttemptCancellation,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, worktree_id, agent) =
+            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE implementation_attempts SET \
+                status = 'cancelled', final_output = ?2, diagnostic_output = ?3, \
+                error_message = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                &input.error_message,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationAttemptNotRunning(
+                input.attempt_id.clone(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'waiting_for_user', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_cancelled', 'user', ?2, ?3)",
+            (&run_id, payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn load_implementation_activity(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ImplementationActivitySummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, attempt_id, task_id, agent, kind, message, created_at \
+             FROM (\
+               SELECT sequence, attempt_id, task_id, agent, kind, message, created_at \
+               FROM implementation_activity WHERE run_id = ?1 \
+               ORDER BY sequence DESC LIMIT ?2\
+             ) ORDER BY sequence",
+        )?;
+        let rows = statement.query_map((run_id, RECENT_IMPLEMENTATION_ACTIVITY_LIMIT), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+
+        let mut activity = Vec::new();
+        for row in rows {
+            let (sequence, attempt_id, task_id, agent, kind, message, created_at) = row?;
+            activity.push(ImplementationActivitySummary {
+                sequence: sequence_to_u64(sequence)?,
+                attempt_id,
+                task_id,
+                agent: parse_agent_kind(&agent)?,
+                kind: parse_implementation_activity_kind(&kind)?,
+                message,
+                created_at,
+            });
+        }
+        Ok(activity)
+    }
+
     fn load_implementation_attempts(
         &self,
         run_id: &str,
@@ -1929,6 +2135,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         plan: None,
         worktrees: Vec::new(),
         implementation_attempts: Vec::new(),
+        implementation_activity: Vec::new(),
         last_error: row.get(7)?,
     })
 }
@@ -1948,6 +2155,18 @@ fn parse_implementation_status(status: &str) -> Result<ImplementationStatus, Sto
         "failed" => Ok(ImplementationStatus::Failed),
         "cancelled" => Ok(ImplementationStatus::Cancelled),
         _ => Err(StorageError::InvalidImplementationStatus(status.to_owned())),
+    }
+}
+
+fn parse_implementation_activity_kind(
+    kind: &str,
+) -> Result<ImplementationActivityKind, StorageError> {
+    match kind {
+        "output" => Ok(ImplementationActivityKind::Output),
+        "diagnostic" => Ok(ImplementationActivityKind::Diagnostic),
+        _ => Err(StorageError::InvalidImplementationActivityKind(
+            kind.to_owned(),
+        )),
     }
 }
 
@@ -2347,7 +2566,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 4);
+        assert_eq!(migration_count, 5);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -2484,8 +2703,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 5,
-                supported: 4
+                found: 6,
+                supported: 5
             }
         ));
     }
@@ -2830,6 +3049,23 @@ mod tests {
             ImplementationStatus::Running
         );
 
+        let activity = worker
+            .append_implementation_activity(ImplementationActivityInput {
+                attempt_id: started.attempt_id.clone(),
+                kind: ImplementationActivityKind::Output,
+                message: "Editing the engine boundary".to_owned(),
+            })
+            .await
+            .expect("activity should persist");
+        let activity = &activity
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .implementation_activity;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].message, "Editing the engine boundary");
+        assert_eq!(activity[0].kind, ImplementationActivityKind::Output);
+
         let completed = worker
             .complete_implementation_attempt(ImplementationAttemptSuccess {
                 attempt_id: started.attempt_id,
@@ -2861,6 +3097,59 @@ mod tests {
                 .status,
             ImplementationStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_partial_activity_when_implementation_is_cancelled() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let worker = StorageWorker::start(StatePaths::new(temporary.path().join("state")))
+            .expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        worker
+            .confirm_task_worktree(reserved.worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        let started = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id,
+                plan_id,
+                task_id,
+                worktree_id: reserved.worktree_id,
+                agent: AgentKind::Codex,
+                prompt: "Implement the approved task".to_owned(),
+            })
+            .await
+            .expect("implementation should start");
+        worker
+            .append_implementation_activity(ImplementationActivityInput {
+                attempt_id: started.attempt_id.clone(),
+                kind: ImplementationActivityKind::Diagnostic,
+                message: "Inspecting files".to_owned(),
+            })
+            .await
+            .expect("activity should persist");
+
+        let cancelled = worker
+            .cancel_implementation_attempt(ImplementationAttemptCancellation {
+                attempt_id: started.attempt_id,
+                final_output: "partial result".to_owned(),
+                diagnostic_output: "Inspecting files".to_owned(),
+                error_message: "codex implementer was cancelled by the user".to_owned(),
+            })
+            .await
+            .expect("cancellation should persist");
+        let run = cancelled.active_run.expect("run should stay active");
+        assert_eq!(run.run_status, RunStatus::WaitingForUser);
+        assert_eq!(
+            run.implementation_attempts[0].status,
+            ImplementationStatus::Cancelled
+        );
+        assert_eq!(run.implementation_activity.len(), 1);
+        assert_eq!(run.implementation_activity[0].message, "Inspecting files");
     }
 
     #[tokio::test]

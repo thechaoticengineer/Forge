@@ -13,12 +13,14 @@ use nix::{
     unistd::Pid,
 };
 use orchestrator_core::state::{
-    ActiveRunSummary, AgentKind, PlanProposal, PlanTaskSummary, TaskWorktreeSummary,
+    ActiveRunSummary, AgentKind, ImplementationActivityKind, PlanProposal, PlanTaskSummary,
+    TaskWorktreeSummary,
 };
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
+    sync::{mpsc, watch},
     time::timeout,
 };
 
@@ -139,6 +141,7 @@ impl PlannerRunner {
             "planner",
             prompt,
             self.timeout,
+            RunControl::default(),
         )
         .await?;
         let stdout = output.stdout;
@@ -152,6 +155,7 @@ impl PlannerRunner {
                 final_output: stdout.text,
                 diagnostic_output: stderr.text,
                 exit_code,
+                cancelled: false,
             });
         }
         if !status.success() {
@@ -164,6 +168,7 @@ impl PlannerRunner {
                 final_output: stdout.text,
                 diagnostic_output: stderr.text,
                 exit_code,
+                cancelled: false,
             });
         }
 
@@ -172,6 +177,7 @@ impl PlannerRunner {
             final_output: stdout.text.clone(),
             diagnostic_output: stderr.text.clone(),
             exit_code,
+            cancelled: false,
         })?;
         Ok(PlannerOutput {
             proposal,
@@ -283,6 +289,25 @@ impl ImplementerRunner {
         worktree: &Path,
         prompt: &str,
     ) -> Result<ImplementerOutput, ImplementerFailure> {
+        self.implement_with_activity(agent, worktree, prompt, None, None)
+            .await
+    }
+
+    /// Runs an implementer while streaming bounded activity and accepting an
+    /// engine-owned cancellation signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded failure evidence when the CLI cannot start, is
+    /// cancelled, times out, exits unsuccessfully, or exceeds capture limits.
+    pub async fn implement_with_activity(
+        &self,
+        agent: AgentKind,
+        worktree: &Path,
+        prompt: &str,
+        activity: Option<mpsc::Sender<ImplementerActivity>>,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<ImplementerOutput, ImplementerFailure> {
         let command = self.prepare_command(agent, worktree);
         let output = run_command(
             command,
@@ -291,6 +316,10 @@ impl ImplementerRunner {
             "implementer",
             prompt,
             self.timeout,
+            RunControl {
+                activity,
+                cancellation,
+            },
         )
         .await
         .map_err(ImplementerFailure::from)?;
@@ -302,6 +331,7 @@ impl ImplementerRunner {
                 final_output: output.stdout.text,
                 diagnostic_output: output.stderr.text,
                 exit_code,
+                cancelled: false,
             });
         }
         if !output.status.success() {
@@ -314,6 +344,7 @@ impl ImplementerRunner {
                 final_output: output.stdout.text,
                 diagnostic_output: output.stderr.text,
                 exit_code,
+                cancelled: false,
             });
         }
 
@@ -375,6 +406,7 @@ pub struct ImplementerFailure {
     pub final_output: String,
     pub diagnostic_output: String,
     pub exit_code: Option<i32>,
+    pub cancelled: bool,
 }
 
 impl From<PlannerFailure> for ImplementerFailure {
@@ -384,14 +416,27 @@ impl From<PlannerFailure> for ImplementerFailure {
             final_output: failure.final_output,
             diagnostic_output: failure.diagnostic_output,
             exit_code: failure.exit_code,
+            cancelled: failure.cancelled,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementerActivity {
+    pub kind: ImplementationActivityKind,
+    pub message: String,
 }
 
 struct ProcessOutput {
     status: std::process::ExitStatus,
     stdout: BoundedOutput,
     stderr: BoundedOutput,
+}
+
+#[derive(Default)]
+struct RunControl {
+    activity: Option<mpsc::Sender<ImplementerActivity>>,
+    cancellation: Option<watch::Receiver<bool>>,
 }
 
 async fn run_command(
@@ -401,7 +446,12 @@ async fn run_command(
     role: &str,
     prompt: &str,
     duration: Duration,
+    control: RunControl,
 ) -> Result<ProcessOutput, PlannerFailure> {
+    let RunControl {
+        activity,
+        cancellation,
+    } = control;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -427,8 +477,18 @@ async fn run_command(
         .stderr
         .take()
         .ok_or_else(|| PlannerFailure::new(format!("{role} stderr is unavailable")))?;
-    let stdout_task = tokio::spawn(read_bounded(stdout, MAX_STDOUT_BYTES));
-    let stderr_task = tokio::spawn(read_bounded(stderr, MAX_STDERR_BYTES));
+    let stdout_task = tokio::spawn(read_bounded_with_activity(
+        stdout,
+        MAX_STDOUT_BYTES,
+        activity.clone(),
+        ImplementationActivityKind::Output,
+    ));
+    let stderr_task = tokio::spawn(read_bounded_with_activity(
+        stderr,
+        MAX_STDERR_BYTES,
+        activity,
+        ImplementationActivityKind::Diagnostic,
+    ));
     let status_result = wait_for_child(
         &mut child,
         duration,
@@ -436,15 +496,17 @@ async fn run_command(
         role,
         prompt,
         &mut process_guard,
+        cancellation,
     )
     .await;
     let stdout = join_output(stdout_task, role, "stdout").await?;
     let stderr = join_output(stderr_task, role, "stderr").await?;
-    let status = status_result.map_err(|message| PlannerFailure {
-        message,
+    let status = status_result.map_err(|failure| PlannerFailure {
+        message: failure.message,
         final_output: stdout.text.clone(),
         diagnostic_output: stderr.text.clone(),
         exit_code: None,
+        cancelled: failure.cancelled,
     })?;
     Ok(ProcessOutput {
         status,
@@ -495,6 +557,7 @@ pub struct PlannerFailure {
     pub final_output: String,
     pub diagnostic_output: String,
     pub exit_code: Option<i32>,
+    cancelled: bool,
 }
 
 impl PlannerFailure {
@@ -504,6 +567,7 @@ impl PlannerFailure {
             final_output: String::new(),
             diagnostic_output: String::new(),
             exit_code: None,
+            cancelled: false,
         }
     }
 }
@@ -669,7 +733,8 @@ async fn wait_for_child(
     role: &str,
     prompt: &str,
     process_guard: &mut ProcessGroupGuard,
-) -> Result<std::process::ExitStatus, String> {
+    mut cancellation: Option<watch::Receiver<bool>>,
+) -> Result<std::process::ExitStatus, WaitFailure> {
     let invocation = async {
         send_prompt(child, agent, role, prompt)
             .await
@@ -679,23 +744,52 @@ async fn wait_for_child(
             .await
             .map_err(|error| format!("cannot wait for {} CLI: {error}", agent.as_str()))
     };
-    match timeout(duration, invocation).await {
+    let cancellation_requested = async {
+        let Some(receiver) = cancellation.as_mut() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        if *receiver.borrow() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        result = timeout(duration, invocation) => match result {
         Ok(Ok(status)) => {
             process_guard.kill_remaining();
             Ok(status)
         }
         Ok(Err(message)) => {
             process_guard.terminate(child).await;
-            Err(message)
+            Err(WaitFailure { message, cancelled: false })
         }
         Err(_) => {
             process_guard.terminate(child).await;
-            Err(format!(
-                "{} CLI exceeded the {role} timeout",
-                agent.as_str()
-            ))
+            Err(WaitFailure {
+                message: format!("{} CLI exceeded the {role} timeout", agent.as_str()),
+                cancelled: false,
+            })
+        }
+        },
+        () = cancellation_requested => {
+            process_guard.terminate(child).await;
+            Err(WaitFailure {
+                message: format!("{} {role} was cancelled by the user", agent.as_str()),
+                cancelled: true,
+            })
         }
     }
+}
+
+struct WaitFailure {
+    message: String,
+    cancelled: bool,
 }
 
 struct ProcessGroupGuard {
@@ -753,24 +847,90 @@ struct BoundedOutput {
     truncated: bool,
 }
 
-async fn read_bounded<R>(reader: R, maximum: usize) -> std::io::Result<BoundedOutput>
+async fn read_bounded_with_activity<R>(
+    mut reader: R,
+    maximum: usize,
+    activity: Option<mpsc::Sender<ImplementerActivity>>,
+    kind: ImplementationActivityKind,
+) -> std::io::Result<BoundedOutput>
 where
     R: AsyncRead + Unpin,
 {
     let mut bytes = Vec::new();
-    let read_limit = u64::try_from(maximum)
-        .ok()
-        .and_then(|limit| limit.checked_add(1))
-        .ok_or_else(|| std::io::Error::other("planner output limit is invalid"))?;
-    reader.take(read_limit).read_to_end(&mut bytes).await?;
-    let truncated = bytes.len() > maximum;
-    if truncated {
-        bytes.truncate(maximum);
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    let mut pending_activity_bytes = Vec::new();
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = maximum.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        if retained > 0
+            && let Some(sender) = &activity
+        {
+            pending_activity_bytes.extend_from_slice(&buffer[..retained]);
+            emit_complete_utf8_activity(sender, kind, &mut pending_activity_bytes, false).await;
+        }
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count {
+            truncated = true;
+        }
+    }
+    if let Some(sender) = &activity {
+        emit_complete_utf8_activity(sender, kind, &mut pending_activity_bytes, true).await;
     }
     Ok(BoundedOutput {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated,
     })
+}
+
+async fn emit_complete_utf8_activity(
+    sender: &mpsc::Sender<ImplementerActivity>,
+    kind: ImplementationActivityKind,
+    pending: &mut Vec<u8>,
+    flush: bool,
+) {
+    loop {
+        if pending.is_empty() {
+            return;
+        }
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                let message = text.to_owned();
+                pending.clear();
+                let _ = sender.send(ImplementerActivity { kind, message }).await;
+                return;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let message = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    pending.drain(..valid);
+                    let _ = sender.send(ImplementerActivity { kind, message }).await;
+                    continue;
+                }
+                if let Some(invalid_length) = error.error_len() {
+                    pending.drain(..invalid_length);
+                    let _ = sender
+                        .send(ImplementerActivity {
+                            kind,
+                            message: "\u{fffd}".to_owned(),
+                        })
+                        .await;
+                    continue;
+                }
+                if flush {
+                    let message = String::from_utf8_lossy(pending).into_owned();
+                    pending.clear();
+                    let _ = sender.send(ImplementerActivity { kind, message }).await;
+                }
+                return;
+            }
+        }
+    }
 }
 
 async fn join_output(
@@ -982,6 +1142,96 @@ mod tests {
         assert!(failure.message.contains("implementer timeout"));
     }
 
+    #[tokio::test]
+    async fn streams_activity_and_cancels_the_implementation_process_group() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let stalled = temporary.path().join("stalled");
+        write_executable(
+            &stalled,
+            "#!/bin/sh\nread prompt\nprintf 'editing files\\n'\nprintf 'inspecting\\n' >&2\nsleep 60\n",
+        );
+        let runner = ImplementerRunner::new(AgentCommands {
+            codex: stalled.clone(),
+            claude: stalled,
+        });
+        let worktree = temporary.path().to_path_buf();
+        let (activity_sender, mut activity_receiver) = mpsc::channel(8);
+        let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+        let implementation = tokio::spawn(async move {
+            runner
+                .implement_with_activity(
+                    AgentKind::Codex,
+                    &worktree,
+                    "Implement",
+                    Some(activity_sender),
+                    Some(cancellation_receiver),
+                )
+                .await
+        });
+
+        let mut activity = Vec::new();
+        while activity.len() < 2 {
+            activity.push(
+                timeout(Duration::from_secs(2), activity_receiver.recv())
+                    .await
+                    .expect("activity should arrive before timeout")
+                    .expect("activity channel should remain open"),
+            );
+        }
+        cancellation_sender
+            .send(true)
+            .expect("supervisor should accept cancellation");
+        let failure = timeout(Duration::from_secs(10), implementation)
+            .await
+            .expect("cancelled implementation should stop promptly")
+            .expect("implementation task should join")
+            .expect_err("cancelled implementation should not complete");
+
+        assert!(failure.cancelled);
+        assert!(failure.message.contains("cancelled by the user"));
+        assert!(activity.iter().any(|item| {
+            item.kind == ImplementationActivityKind::Output
+                && item.message.contains("editing files")
+        }));
+        assert!(activity.iter().any(|item| {
+            item.kind == ImplementationActivityKind::Diagnostic
+                && item.message.contains("inspecting")
+        }));
+    }
+
+    #[tokio::test]
+    async fn preserves_utf8_code_points_split_across_output_reads() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut pending = vec![0xc3];
+
+        emit_complete_utf8_activity(
+            &sender,
+            ImplementationActivityKind::Output,
+            &mut pending,
+            false,
+        )
+        .await;
+        assert!(receiver.try_recv().is_err());
+
+        pending.push(0xa9);
+        emit_complete_utf8_activity(
+            &sender,
+            ImplementationActivityKind::Output,
+            &mut pending,
+            false,
+        )
+        .await;
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("completed UTF-8 should emit")
+                .message,
+            "é"
+        );
+        assert!(pending.is_empty());
+    }
+
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("fake CLI should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -1021,6 +1271,7 @@ mod tests {
             plan: None,
             worktrees: Vec::new(),
             implementation_attempts: Vec::new(),
+            implementation_activity: Vec::new(),
             last_error: None,
         }
     }

@@ -129,6 +129,13 @@ Item {
     })
   }
 
+  function cancelImplementation(runId, attemptId) {
+    return sendRequest("cancel_task_implementation", {
+      run_id: String(runId || ""),
+      attempt_id: String(attemptId || "")
+    })
+  }
+
   function sendRequest(method, payload) {
     if (!socket.connected) {
       requestError = "The orchestration engine is not connected"

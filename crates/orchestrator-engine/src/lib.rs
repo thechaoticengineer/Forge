@@ -14,8 +14,8 @@ use nix::{
     unistd::Pid,
 };
 use orchestrator_agents::{
-    ImplementerRunner, PlannerRunner, build_implementation_prompt, build_planning_prompt,
-    validate_proposal,
+    ImplementerActivity, ImplementerRunner, PlannerRunner, build_implementation_prompt,
+    build_planning_prompt, validate_proposal,
 };
 use orchestrator_core::{
     protocol::{
@@ -34,15 +34,16 @@ use orchestrator_git::{
     task_worktree_state,
 };
 use orchestrator_store::{
-    DraftRunInput, ImplementationAttemptFailure, ImplementationAttemptInput,
-    ImplementationAttemptSuccess, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess,
-    PlanRevisionInput, StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
+    DraftRunInput, ImplementationActivityInput, ImplementationAttemptCancellation,
+    ImplementationAttemptFailure, ImplementationAttemptInput, ImplementationAttemptSuccess,
+    PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput, StatePaths,
+    StorageWorker, StoredSnapshot, TaskWorktreeReservation,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     process::Command as AsyncCommand,
-    sync::watch,
+    sync::{Mutex, mpsc, watch},
     time::timeout,
 };
 
@@ -50,6 +51,57 @@ const GITHUB_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_mins(15);
 const LOCAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_DISCOVERY_WORK_BUDGET: Duration = Duration::from_secs(25);
+const IMPLEMENTATION_ACTIVITY_CHANNEL_CAPACITY: usize = 64;
+const MAX_IMPLEMENTATION_ACTIVITY_MESSAGE_CHARS: usize = 4_000;
+
+#[derive(Default)]
+struct ImplementationControls {
+    active: Mutex<HashMap<String, ActiveImplementationControl>>,
+}
+
+struct ActiveImplementationControl {
+    run_id: String,
+    cancellation: watch::Sender<bool>,
+}
+
+impl ImplementationControls {
+    async fn register(
+        &self,
+        run_id: String,
+        attempt_id: String,
+        cancellation: watch::Sender<bool>,
+    ) {
+        self.active.lock().await.insert(
+            attempt_id,
+            ActiveImplementationControl {
+                run_id,
+                cancellation,
+            },
+        );
+    }
+
+    async fn remove(&self, attempt_id: &str) {
+        self.active.lock().await.remove(attempt_id);
+    }
+
+    async fn cancel(&self, run_id: &str, attempt_id: &str) -> Result<(), RequestFailure> {
+        let active = self.active.lock().await;
+        let control = active.get(attempt_id).ok_or_else(|| RequestFailure {
+            code: "implementation_not_running",
+            message: "the implementation attempt is no longer running".to_owned(),
+        })?;
+        if control.run_id != run_id {
+            return Err(RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation attempt does not belong to this run".to_owned(),
+            });
+        }
+        control.cancellation.send(true).map_err(|_| RequestFailure {
+            code: "implementation_not_running",
+            message: "the implementation supervisor is no longer available".to_owned(),
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RepositorySettings {
@@ -139,6 +191,7 @@ pub async fn serve_with_settings(
         .with_context(|| format!("cannot protect engine socket at {}", socket_path.display()))?;
 
     let (state_sender, _state_receiver) = watch::channel(engine_snapshot(stored_snapshot));
+    let implementation_controls = Arc::new(ImplementationControls::default());
     println!("engine listening at {}", socket_path.display());
 
     let result = run_listener(
@@ -147,6 +200,7 @@ pub async fn serve_with_settings(
         storage,
         Arc::new(planner),
         Arc::new(implementer),
+        implementation_controls,
         Arc::new(repositories),
     )
     .await;
@@ -161,6 +215,7 @@ async fn run_listener(
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
     implementer: Arc<ImplementerRunner>,
+    implementation_controls: Arc<ImplementationControls>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     loop {
@@ -175,6 +230,7 @@ async fn run_listener(
                 let client_storage = Arc::clone(&storage);
                 let client_planner = Arc::clone(&planner);
                 let client_implementer = Arc::clone(&implementer);
+                let client_implementation_controls = Arc::clone(&implementation_controls);
                 let client_repositories = Arc::clone(&repositories);
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(
@@ -183,6 +239,7 @@ async fn run_listener(
                         client_storage,
                         client_planner,
                         client_implementer,
+                        client_implementation_controls,
                         client_repositories,
                     ).await {
                         eprintln!("IPC client disconnected after error: {error:#}");
@@ -199,6 +256,7 @@ async fn handle_client(
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
     implementer: Arc<ImplementerRunner>,
+    implementation_controls: Arc<ImplementationControls>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     let mut state_receiver = state_sender.subscribe();
@@ -224,6 +282,7 @@ async fn handle_client(
                     &storage,
                     &planner,
                     &implementer,
+                    &implementation_controls,
                     &repositories,
                     &mut write_half,
                 ).await?;
@@ -242,13 +301,14 @@ async fn handle_client(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_request(
     line: &str,
     state_sender: &watch::Sender<EngineSnapshot>,
     storage: &StorageWorker,
     planner: &PlannerRunner,
     implementer: &ImplementerRunner,
+    implementation_controls: &ImplementationControls,
     repositories: &RepositorySettings,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
@@ -437,6 +497,7 @@ async fn handle_request(
             agent,
             storage,
             implementer,
+            implementation_controls,
             state_sender,
         )
         .await
@@ -447,6 +508,25 @@ async fn handle_request(
             }
             Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
         },
+        ClientRequest::CancelTaskImplementation { run_id, attempt_id } => {
+            match implementation_controls.cancel(&run_id, &attempt_id).await {
+                Ok(()) => match wait_for_implementation_settlement(
+                    state_sender,
+                    &attempt_id,
+                    Duration::from_secs(10),
+                )
+                .await
+                {
+                    Ok(snapshot) => ServerMessage::snapshot(snapshot, Some(request.request_id)),
+                    Err(error) => {
+                        ServerMessage::error(Some(request.request_id), error.code, error.message)
+                    }
+                },
+                Err(error) => {
+                    ServerMessage::error(Some(request.request_id), error.code, error.message)
+                }
+            }
+        }
         ClientRequest::GetSnapshot => {
             ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
         }
@@ -457,6 +537,41 @@ async fn handle_request(
     };
 
     send_message(write_half, &response).await
+}
+
+async fn wait_for_implementation_settlement(
+    state_sender: &watch::Sender<EngineSnapshot>,
+    attempt_id: &str,
+    duration: Duration,
+) -> Result<EngineSnapshot, RequestFailure> {
+    let mut receiver = state_sender.subscribe();
+    timeout(duration, async {
+        loop {
+            let snapshot = receiver.borrow_and_update().clone();
+            let running = snapshot
+                .active_run
+                .as_ref()
+                .into_iter()
+                .flat_map(|run| &run.implementation_attempts)
+                .any(|attempt| {
+                    attempt.id == attempt_id
+                        && attempt.status == orchestrator_core::state::ImplementationStatus::Running
+                });
+            if !running {
+                return Ok(snapshot);
+            }
+            receiver.changed().await.map_err(|_| RequestFailure {
+                code: "implementation_not_running",
+                message: "the implementation supervisor stopped before cancellation settled"
+                    .to_owned(),
+            })?;
+        }
+    })
+    .await
+    .map_err(|_| RequestFailure {
+        code: "cancellation_timeout",
+        message: "the implementation did not stop within the cancellation timeout".to_owned(),
+    })?
 }
 
 #[derive(Debug)]
@@ -1583,7 +1698,7 @@ async fn prepare_task_worktree(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_task_implementation(
     run_id: String,
     plan_id: String,
@@ -1592,6 +1707,7 @@ async fn run_task_implementation(
     agent: AgentKind,
     storage: &StorageWorker,
     implementer: &ImplementerRunner,
+    implementation_controls: &ImplementationControls,
     state_sender: &watch::Sender<EngineSnapshot>,
 ) -> Result<StoredSnapshot, RequestFailure> {
     let context =
@@ -1600,7 +1716,7 @@ async fn run_task_implementation(
     let worktree_path = context.worktree.path.clone();
     let started = storage
         .begin_implementation_attempt(ImplementationAttemptInput {
-            run_id,
+            run_id: run_id.clone(),
             plan_id,
             task_id,
             worktree_id,
@@ -1615,15 +1731,97 @@ async fn run_task_implementation(
             },
             other => RequestFailure::storage("cannot start implementation", other),
         })?;
+    let attempt_id = started.attempt_id;
+    let (activity_sender, mut activity_receiver) =
+        mpsc::channel(IMPLEMENTATION_ACTIVITY_CHANNEL_CAPACITY);
+    let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+    implementation_controls
+        .register(run_id, attempt_id.clone(), cancellation_sender.clone())
+        .await;
     publish_newer_snapshot(state_sender, engine_snapshot(started.snapshot));
 
-    match implementer
-        .implement(agent, Path::new(&worktree_path), &prompt)
-        .await
-    {
+    let implementation = implementer.implement_with_activity(
+        agent,
+        Path::new(&worktree_path),
+        &prompt,
+        Some(activity_sender),
+        Some(cancellation_receiver),
+    );
+    tokio::pin!(implementation);
+    let mut activity_open = true;
+    let mut activity_error = None;
+    let result = loop {
+        tokio::select! {
+            result = &mut implementation => break result,
+            activity = activity_receiver.recv(), if activity_open => {
+                if let Some(activity) = activity {
+                    if activity_error.is_none()
+                        && let Err(error) = persist_implementation_activity(
+                            storage,
+                            state_sender,
+                            &attempt_id,
+                            activity,
+                        ).await
+                    {
+                        activity_error = Some(error);
+                        let _ = cancellation_sender.send(true);
+                    }
+                } else {
+                    activity_open = false;
+                }
+            }
+        }
+    };
+    implementation_controls.remove(&attempt_id).await;
+
+    while activity_error.is_none() {
+        let Ok(activity) = activity_receiver.try_recv() else {
+            break;
+        };
+        if let Err(error) =
+            persist_implementation_activity(storage, state_sender, &attempt_id, activity).await
+        {
+            activity_error = Some(error);
+        }
+    }
+
+    if let Some(error) = activity_error {
+        let (final_output, diagnostic_output, exit_code) = match result {
+            Ok(output) => (
+                output.final_output,
+                output.diagnostic_output,
+                Some(output.exit_code),
+            ),
+            Err(failure) => (
+                failure.final_output,
+                failure.diagnostic_output,
+                failure.exit_code,
+            ),
+        };
+        let message = format!("cannot persist implementation activity: {error}");
+        let failed = storage
+            .fail_implementation_attempt(ImplementationAttemptFailure {
+                attempt_id,
+                final_output,
+                diagnostic_output,
+                exit_code,
+                error_message: message.clone(),
+            })
+            .await
+            .map_err(|storage_error| {
+                RequestFailure::storage("cannot persist implementation failure", storage_error)
+            })?;
+        publish_newer_snapshot(state_sender, engine_snapshot(failed));
+        return Err(RequestFailure {
+            code: "implementation_failed",
+            message,
+        });
+    }
+
+    match result {
         Ok(output) => storage
             .complete_implementation_attempt(ImplementationAttemptSuccess {
-                attempt_id: started.attempt_id,
+                attempt_id,
                 final_output: output.final_output,
                 diagnostic_output: output.diagnostic_output,
                 exit_code: output.exit_code,
@@ -1634,9 +1832,22 @@ async fn run_task_implementation(
             }),
         Err(failure) => {
             let message = failure.message.clone();
+            if failure.cancelled {
+                return storage
+                    .cancel_implementation_attempt(ImplementationAttemptCancellation {
+                        attempt_id,
+                        final_output: failure.final_output,
+                        diagnostic_output: failure.diagnostic_output,
+                        error_message: failure.message,
+                    })
+                    .await
+                    .map_err(|error| {
+                        RequestFailure::storage("cannot persist implementation cancellation", error)
+                    });
+            }
             let failed = storage
                 .fail_implementation_attempt(ImplementationAttemptFailure {
-                    attempt_id: started.attempt_id,
+                    attempt_id,
                     final_output: failure.final_output,
                     diagnostic_output: failure.diagnostic_output,
                     exit_code: failure.exit_code,
@@ -1653,6 +1864,81 @@ async fn run_task_implementation(
             })
         }
     }
+}
+
+async fn persist_implementation_activity(
+    storage: &StorageWorker,
+    state_sender: &watch::Sender<EngineSnapshot>,
+    attempt_id: &str,
+    activity: ImplementerActivity,
+) -> Result<(), orchestrator_store::StorageError> {
+    for message in normalize_implementation_activity(&activity.message) {
+        let snapshot = storage
+            .append_implementation_activity(ImplementationActivityInput {
+                attempt_id: attempt_id.to_owned(),
+                kind: activity.kind,
+                message,
+            })
+            .await?;
+        publish_newer_snapshot(state_sender, engine_snapshot(snapshot));
+    }
+    Ok(())
+}
+
+fn normalize_implementation_activity(raw: &str) -> Vec<String> {
+    let sanitized = strip_terminal_controls(raw);
+    let mut messages = Vec::new();
+    for line in sanitized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut chunk = String::new();
+        let mut chunk_length = 0;
+        for character in line.chars() {
+            if chunk_length == MAX_IMPLEMENTATION_ACTIVITY_MESSAGE_CHARS {
+                messages.push(std::mem::take(&mut chunk));
+                chunk_length = 0;
+            }
+            chunk.push(character);
+            chunk_length += 1;
+        }
+        if !chunk.is_empty() {
+            messages.push(chunk);
+        }
+    }
+    messages
+}
+
+fn strip_terminal_controls(raw: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum EscapeState {
+        Text,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+    }
+
+    let mut state = EscapeState::Text;
+    let mut output = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match state {
+            EscapeState::Text if character == '\u{1b}' => state = EscapeState::Escape,
+            EscapeState::Text if character == '\n' || character == '\t' => output.push(character),
+            EscapeState::Text if !character.is_control() => output.push(character),
+            EscapeState::Escape if character == '[' => state = EscapeState::Csi,
+            EscapeState::Escape if character == ']' => state = EscapeState::Osc,
+            EscapeState::Escape => state = EscapeState::Text,
+            EscapeState::Csi if ('@'..='~').contains(&character) => state = EscapeState::Text,
+            EscapeState::Osc if character == '\u{7}' => state = EscapeState::Text,
+            EscapeState::Osc if character == '\u{1b}' => state = EscapeState::OscEscape,
+            EscapeState::OscEscape if character == '\\' => state = EscapeState::Text,
+            EscapeState::OscEscape => state = EscapeState::Osc,
+            EscapeState::Text | EscapeState::Csi | EscapeState::Osc => {}
+        }
+    }
+    output
 }
 
 struct ImplementationContext {
@@ -2292,6 +2578,21 @@ mod tests {
         assert_eq!(error.code, "invalid_path");
     }
 
+    #[test]
+    fn normalizes_implementation_activity_for_safe_snapshot_display() {
+        let activity = normalize_implementation_activity(
+            "\u{1b}]8;;https://example.com\u{1b}\\Editing src/main.rs\u{1b}]8;;\u{1b}\\\n\0\nDone\n",
+        );
+
+        assert_eq!(activity, vec!["Editing src/main.rs", "Done"]);
+
+        let long = normalize_implementation_activity(&"x".repeat(8_001));
+        assert_eq!(long.len(), 3);
+        assert_eq!(long[0].chars().count(), 4_000);
+        assert_eq!(long[1].chars().count(), 4_000);
+        assert_eq!(long[2], "x");
+    }
+
     #[tokio::test]
     async fn creates_a_durable_draft_from_repository_state() {
         let repository = initialized_repository();
@@ -2607,6 +2908,7 @@ mod tests {
             codex: fake_codex,
             claude: state.path().join("unused-claude"),
         });
+        let implementation_controls = ImplementationControls::default();
 
         let completed = run_task_implementation(
             run_id,
@@ -2616,6 +2918,7 @@ mod tests {
             AgentKind::Codex,
             &storage,
             &implementer,
+            &implementation_controls,
             &state_sender,
         )
         .await
@@ -2624,6 +2927,11 @@ mod tests {
 
         assert_eq!(run.run_status, RunStatus::WaitingForUser);
         assert_eq!(run.implementation_attempts.len(), 1);
+        assert_eq!(run.implementation_activity.len(), 1);
+        assert_eq!(
+            run.implementation_activity[0].message,
+            "changed implemented.txt"
+        );
         assert_eq!(
             run.implementation_attempts[0].status,
             orchestrator_core::state::ImplementationStatus::Completed
@@ -2634,6 +2942,109 @@ mod tests {
             "implemented"
         );
         assert!(!repository.path().join("implemented.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn cancels_a_supervised_implementation_and_preserves_activity() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, mut state_receiver) = watch::channel(EngineSnapshot::default());
+        let created = prepare_task_worktree(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect("worktree should be created");
+        let worktree = created
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .worktrees[0]
+            .clone();
+        let fake_codex = state.path().join("implementer-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\ninput=$(cat)\nprintf 'editing files\\n'\nsleep 60\n",
+        )
+        .expect("fake implementer should be written");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("fake implementer should be executable");
+        let implementer = ImplementerRunner::new(orchestrator_agents::AgentCommands {
+            codex: fake_codex,
+            claude: state.path().join("unused-claude"),
+        });
+        let implementation_controls = ImplementationControls::default();
+        let implementation = run_task_implementation(
+            run_id.clone(),
+            plan.id,
+            plan.tasks[0].id.clone(),
+            worktree.id,
+            AgentKind::Codex,
+            &storage,
+            &implementer,
+            &implementation_controls,
+            &state_sender,
+        );
+        tokio::pin!(implementation);
+
+        let mut running_attempt_id = None;
+        let attempt_id = loop {
+            tokio::select! {
+                result = &mut implementation => {
+                    panic!("implementation settled before cancellation: {result:?}");
+                }
+                changed = state_receiver.changed() => {
+                    changed.expect("state channel should remain open");
+                    let snapshot = state_receiver.borrow_and_update();
+                    if let Some(attempt) = snapshot
+                        .active_run
+                        .as_ref()
+                        .and_then(|run| run.implementation_attempts.last())
+                        .filter(|attempt| {
+                            attempt.status
+                                == orchestrator_core::state::ImplementationStatus::Running
+                        })
+                    {
+                        running_attempt_id = Some(attempt.id.clone());
+                    }
+                    if snapshot
+                        .active_run
+                        .as_ref()
+                        .is_some_and(|run| !run.implementation_activity.is_empty())
+                    {
+                        break running_attempt_id
+                            .clone()
+                            .expect("activity should belong to a running attempt");
+                    }
+                }
+            }
+        };
+        implementation_controls
+            .cancel(&run_id, &attempt_id)
+            .await
+            .expect("running attempt should accept cancellation");
+        let cancelled = timeout(Duration::from_secs(10), implementation)
+            .await
+            .expect("cancellation should settle promptly")
+            .expect("user cancellation should be a settled workflow result");
+        let run = cancelled.active_run.expect("run should stay active");
+
+        assert_eq!(run.run_status, RunStatus::WaitingForUser);
+        assert_eq!(
+            run.implementation_attempts[0].status,
+            orchestrator_core::state::ImplementationStatus::Cancelled
+        );
+        assert!(
+            run.implementation_activity
+                .iter()
+                .any(|activity| activity.message == "editing files")
+        );
     }
 
     #[tokio::test]

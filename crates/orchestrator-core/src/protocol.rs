@@ -65,6 +65,10 @@ pub enum ClientRequest {
         worktree_id: String,
         agent: AgentKind,
     },
+    CancelTaskImplementation {
+        run_id: String,
+        attempt_id: String,
+    },
     GetSnapshot,
     Ping,
 }
@@ -189,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_implementation_attempts_from_an_older_version_one_snapshot() {
+    fn defaults_implementation_fields_from_an_older_version_one_snapshot() {
         let run = serde_json::json!({
             "id": "run-1",
             "goal": "Implement safely",
@@ -210,13 +214,9 @@ mod tests {
         }))
         .expect("an older version-one snapshot should remain readable");
 
-        assert!(
-            snapshot
-                .active_run
-                .expect("run should decode")
-                .implementation_attempts
-                .is_empty()
-        );
+        let run = snapshot.active_run.expect("run should decode");
+        assert!(run.implementation_attempts.is_empty());
+        assert!(run.implementation_activity.is_empty());
     }
 
     #[test]
@@ -383,6 +383,22 @@ mod tests {
                 task_id: "task-1".to_owned(),
                 worktree_id: "worktree-1".to_owned(),
                 agent: AgentKind::Claude,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_cancel_task_implementation_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-cancel","method":"cancel_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
+        )
+        .expect("cancellation request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::CancelTaskImplementation {
+                run_id: "run-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
             }
         );
     }
