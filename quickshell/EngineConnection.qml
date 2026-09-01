@@ -130,6 +130,24 @@ Item {
     })
   }
 
+  function createTaskWorktree(runId, planId, taskId) {
+    return sendRequest("create_task_worktree", {
+      run_id: String(runId || ""),
+      plan_id: String(planId || ""),
+      task_id: String(taskId || "")
+    })
+  }
+
+  function runTaskImplementation(runId, planId, taskId, worktreeId, agent) {
+    return sendRequest("run_task_implementation", {
+      run_id: String(runId || ""),
+      plan_id: String(planId || ""),
+      task_id: String(taskId || ""),
+      worktree_id: String(worktreeId || ""),
+      agent: String(agent || "")
+    })
+  }
+
   function cancelImplementation(runId, attemptId) {
     return sendRequest("cancel_task_implementation", {
       run_id: String(runId || ""),

@@ -10,7 +10,7 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; richer prompt, retry, and worktree lifecycle presentation remains open.
+Each task of an approved plan is actionable in the Omarchy panel with its dependency declaration, worktree, branch, latest implementer attempt, failures, and next action visible in context. The panel can confirm creation of the recorded isolated worktree and launch a user-selected Codex or Claude implementer through the existing engine requests. Because task branches currently share the run's original base, dependent tasks are explicitly blocked in both the panel and engine until task-branch integration is designed; root tasks remain executable. The engine refuses conflicting worktree operations, supervises the bounded process, and preserves its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Opening and retiring exact worktrees and richer prompt history remain open.
 
 The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and integration actions remain open.
 
@@ -18,11 +18,11 @@ The CLI and panel can run a bounded completion pipeline: detected Rust and Omarc
 
 The immediate priority is to let a developer use the Omarchy panel to start the implementation workflow, not merely observe and control a process launched from the CLI. After the engine is available, an approved plan should be executable through final local task-commit approval without requiring a terminal command.
 
-- [ ] Present every approved task with its implementation readiness, dependency state, worktree, branch, assigned agent, latest attempt, and next available action.
-- [ ] Create a task worktree from the panel through the existing engine request, with a confirmation that explains the isolated branch and committed-base behavior.
-- [ ] Let the user choose Codex CLI or Claude Code CLI and start the implementation from the panel through the existing supervised engine request.
-- [ ] Keep worktree creation, agent selection, implementation launch, failure recovery, and retry usable with keyboard-only navigation.
-- [ ] Show actionable worktree and launch failures in the task context without losing the approved plan or creating duplicate side effects.
+- [x] Present every approved task with its implementation readiness, dependency state, worktree, branch, assigned agent, latest attempt, and next available action.
+- [x] Create a task worktree from the panel through the existing engine request, with a confirmation that explains the isolated branch and committed-base behavior.
+- [x] Let the user choose Codex CLI or Claude Code CLI and start the implementation from the panel through the existing supervised engine request.
+- [x] Keep worktree creation, agent selection, implementation launch, failure recovery, and retry usable with keyboard-only navigation.
+- [x] Show actionable worktree and launch failures in the task context without losing the approved plan or creating duplicate side effects.
 - [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
 
 The next operational step is managed engine installation and startup so opening the panel does not require manually launching the Rust process. Integrating an approved task commit into another local branch remains a separate consequential action: it requires a dedicated design decision, conflict checks, and explicit user approval, and must never be implied by final task approval.
@@ -121,7 +121,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 
 ## First Milestone Checklist
 
-The completed first milestone established the full engine workflow with real Omarchy visibility and decision controls. Starting a task worktree and its initial implementer remained CLI-only and is the UI-first self-hosting follow-up above.
+The completed first milestone established the full engine workflow with real Omarchy visibility and decision controls. The panel now starts task worktrees and implementers as well; the remaining proof for the UI-first self-hosting slice is exercising that complete path against this repository.
 
 - [x] Install or enable the validated Quickshell plugin.
 - [x] Summon the orchestrator panel from Omarchy.

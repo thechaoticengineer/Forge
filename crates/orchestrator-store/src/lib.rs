@@ -137,6 +137,8 @@ pub enum StorageError {
     PlanNotCurrent(String),
     #[error("task is not ready for isolated implementation: {0}")]
     TaskNotImplementable(String),
+    #[error("task dependencies cannot run until task-branch integration is implemented: {0}")]
+    TaskDependenciesNotIntegrated(String),
     #[error("task worktree does not exist or is no longer reserved: {0}")]
     WorktreeNotReserved(String),
     #[error("this task already has a live worktree; retire it before creating another")]
@@ -1752,6 +1754,19 @@ impl Database {
                 StorageError::RunNotFound(input.run_id.clone())
             });
         }
+        let has_dependencies = transaction
+            .query_row(
+                "SELECT 1 FROM plan_task_dependencies \
+                 WHERE plan_id = ?1 AND task_id = ?2 LIMIT 1",
+                (&input.plan_id, &input.task_id),
+                |_| Ok(true),
+            )
+            .optional()?;
+        if has_dependencies.is_some() {
+            return Err(StorageError::TaskDependenciesNotIntegrated(
+                input.task_id.clone(),
+            ));
+        }
 
         transaction
             .execute(
@@ -1912,6 +1927,19 @@ impl Database {
             } else {
                 StorageError::RunNotFound(input.run_id.clone())
             });
+        }
+        let has_dependencies = transaction
+            .query_row(
+                "SELECT 1 FROM plan_task_dependencies \
+                 WHERE plan_id = ?1 AND task_id = ?2 LIMIT 1",
+                (&input.plan_id, &input.task_id),
+                |_| Ok(true),
+            )
+            .optional()?;
+        if has_dependencies.is_some() {
+            return Err(StorageError::TaskDependenciesNotIntegrated(
+                input.task_id.clone(),
+            ));
         }
 
         match (
@@ -4470,6 +4498,34 @@ mod tests {
             .await
             .expect_err("an unapproved plan cannot reserve a worktree");
         assert!(matches!(error, StorageError::TaskNotImplementable(_)));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_worktree_for_a_task_with_unintegrated_dependencies() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, _) = approved_plan(&worker).await;
+        let snapshot = worker
+            .current_snapshot()
+            .await
+            .expect("snapshot should load");
+        let dependent_task_id = snapshot
+            .active_run
+            .and_then(|run| run.plan)
+            .and_then(|plan| plan.tasks.get(1).cloned())
+            .expect("the sample plan should have a dependent task")
+            .id;
+
+        let error = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &dependent_task_id, 2))
+            .await
+            .expect_err("a dependent task cannot start from the unchanged run base");
+        assert!(matches!(
+            error,
+            StorageError::TaskDependenciesNotIntegrated(task_id)
+                if task_id == dependent_task_id
+        ));
     }
 
     #[tokio::test]

@@ -1898,6 +1898,12 @@ async fn prepare_task_worktree(
             code: "task_not_found",
             message: "the selected task is not part of the approved plan".to_owned(),
         })?;
+    if !task.depends_on.is_empty() {
+        return Err(RequestFailure {
+            code: "task_dependencies_not_integrated",
+            message: "this task depends on earlier task branches; integration is not implemented, so the engine will not create an incomplete worktree".to_owned(),
+        });
+    }
 
     let branch = task_branch_name(&run.id, task.position, &task.title);
     let path = task_worktree_path(
@@ -1919,6 +1925,10 @@ async fn prepare_task_worktree(
         .map_err(|error| match error {
             orchestrator_store::StorageError::WorktreeAlreadyLive => RequestFailure {
                 code: "worktree_exists",
+                message: error.to_string(),
+            },
+            orchestrator_store::StorageError::TaskDependenciesNotIntegrated(_) => RequestFailure {
+                code: "task_dependencies_not_integrated",
                 message: error.to_string(),
             },
             other => RequestFailure::storage("cannot reserve the task worktree", other),
@@ -2153,6 +2163,10 @@ async fn run_task_implementation_attempt(
         .map_err(|error| match error {
             orchestrator_store::StorageError::ImplementationNotReady(_) => RequestFailure {
                 code: "implementation_not_ready",
+                message: error.to_string(),
+            },
+            orchestrator_store::StorageError::TaskDependenciesNotIntegrated(_) => RequestFailure {
+                code: "task_dependencies_not_integrated",
                 message: error.to_string(),
             },
             other => RequestFailure::storage("cannot start implementation", other),
@@ -3210,6 +3224,12 @@ async fn load_implementation_context(
             code: "task_not_found",
             message: "the selected task is not part of the approved plan".to_owned(),
         })?;
+    if !task.depends_on.is_empty() {
+        return Err(RequestFailure {
+            code: "task_dependencies_not_integrated",
+            message: "this task depends on earlier task branches; integration is not implemented, so the engine will not launch it against the run base".to_owned(),
+        });
+    }
     let worktree = run
         .worktrees
         .iter()
@@ -4176,6 +4196,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_to_create_a_worktree_for_an_unintegrated_dependent_task() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan_from_json(
+            repository.path(),
+            &storage,
+            &state,
+            serde_json::json!({
+                "summary": "Implement dependent changes safely",
+                "tasks": [
+                    {
+                        "title": "Add the foundation",
+                        "description": "Create the prerequisite change.",
+                        "acceptance_criteria": ["Foundation tests pass."],
+                        "depends_on": []
+                    },
+                    {
+                        "title": "Use the foundation",
+                        "description": "Build on the prerequisite change.",
+                        "acceptance_criteria": ["Dependent tests pass."],
+                        "depends_on": [1]
+                    }
+                ]
+            }),
+        )
+        .await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+
+        let failure = prepare_task_worktree(
+            run_id,
+            plan.id.clone(),
+            plan.tasks[1].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect_err("a dependent task cannot start from the unchanged run base");
+
+        assert_eq!(failure.code, "task_dependencies_not_integrated");
+        assert!(
+            storage
+                .current_snapshot()
+                .await
+                .expect("snapshot should load")
+                .active_run
+                .expect("run should remain active")
+                .worktrees
+                .is_empty(),
+            "the refusal must happen before reserving filesystem state"
+        );
+    }
+
+    #[tokio::test]
     async fn supervises_an_implementer_in_the_task_worktree() {
         let repository = initialized_repository();
         let state = TempDir::new().expect("state directory should exist");
@@ -4542,6 +4617,29 @@ mod tests {
         storage: &StorageWorker,
         state: &TempDir,
     ) -> (String, PlanSummary) {
+        approved_plan_from_json(
+            repository,
+            storage,
+            state,
+            serde_json::json!({
+                "summary": "Implement the change safely",
+                "tasks": [{
+                    "title": "Implement the change",
+                    "description": "Make the smallest verified change.",
+                    "acceptance_criteria": ["Tests pass."],
+                    "depends_on": []
+                }]
+            }),
+        )
+        .await
+    }
+
+    async fn approved_plan_from_json(
+        repository: &Path,
+        storage: &StorageWorker,
+        state: &TempDir,
+        plan_json: serde_json::Value,
+    ) -> (String, PlanSummary) {
         let draft = create_draft_run(
             repository.display().to_string(),
             "Implement the change".to_owned(),
@@ -4558,16 +4656,7 @@ mod tests {
         let (state_sender, _receiver) = watch::channel(engine_snapshot(draft));
 
         let fake_codex = state.path().join("planner-codex");
-        let plan_json = serde_json::json!({
-            "summary": "Implement the change safely",
-            "tasks": [{
-                "title": "Implement the change",
-                "description": "Make the smallest verified change.",
-                "acceptance_criteria": ["Tests pass."],
-                "depends_on": []
-            }]
-        })
-        .to_string();
+        let plan_json = plan_json.to_string();
         fs::write(
             &fake_codex,
             format!("#!/bin/sh\ninput=$(cat)\nprintf '%s' '{plan_json}'\n"),

@@ -17,6 +17,8 @@ Item {
   property bool editingDraft: false
   property bool editingPlanTask: false
   property bool rejectingPlan: false
+  property string taskActionMode: ""
+  property string taskActionTaskId: ""
   property bool confirmingImplementationCancel: false
   property string completionDecisionMode: ""
   property string implementationInterventionMode: ""
@@ -64,6 +66,10 @@ Item {
   }
 
   function requestClose() {
+    if (taskActionMode !== "") {
+      cancelTaskAction()
+      return
+    }
     if (completionDecisionMode !== "") {
       completionDecisionMode = ""
       return
@@ -98,7 +104,7 @@ Item {
 
   function moveNavigation(dx, dy) {
     if (confirmingImplementationCancel || completionDecisionMode !== ""
-        || implementationInterventionMode !== "") return
+        || implementationInterventionMode !== "" || taskActionMode !== "") return
     if (editingDraft && draftStep === "repository") {
       if (dx !== 0) {
         repositorySourceIndex = Math.max(0, Math.min(1, repositorySourceIndex + dx))
@@ -143,6 +149,11 @@ Item {
   }
 
   function activateNavigation() {
+    if (taskActionMode === "confirm_worktree") {
+      confirmTaskWorktree()
+      return
+    }
+    if (taskActionMode === "choose_agent") return
     if (completionDecisionMode !== "") {
       confirmCompletionDecision()
       return
@@ -160,7 +171,11 @@ Item {
       return
     }
     if (selectedSection === 0 && !editingDraft) beginDraftEntry()
-    else if (selectedSection === 1) beginPlanTaskEdit()
+    else if (selectedSection === 1) {
+      var plan = currentPlan()
+      if (plan && plan.status === "approved") beginSelectedTaskAction()
+      else beginPlanTaskEdit()
+    }
   }
 
   function beginDraftEntry() {
@@ -339,6 +354,160 @@ Item {
     if (!plan || !plan.tasks || plan.tasks.length === 0) return null
     selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex))
     return plan.tasks[selectedTaskIndex]
+  }
+
+  function taskById(taskId) {
+    var plan = currentPlan()
+    var tasks = plan && plan.tasks ? plan.tasks : []
+    for (var i = 0; i < tasks.length; i++)
+      if (tasks[i].id === taskId) return tasks[i]
+    return null
+  }
+
+  function latestRecordForTask(records, taskId) {
+    if (!records || !taskId) return null
+    for (var i = records.length - 1; i >= 0; i--)
+      if (records[i].task_id === taskId) return records[i]
+    return null
+  }
+
+  function latestWorktreeForTask(taskId) {
+    return latestRecordForTask(
+      engine.activeRun ? engine.activeRun.worktrees : [], taskId)
+  }
+
+  function readyWorktreeForTask(taskId) {
+    var worktrees = engine.activeRun ? engine.activeRun.worktrees || [] : []
+    for (var i = worktrees.length - 1; i >= 0; i--)
+      if (worktrees[i].task_id === taskId && worktrees[i].status === "ready")
+        return worktrees[i]
+    return null
+  }
+
+  function latestImplementationForTask(taskId) {
+    return latestRecordForTask(
+      engine.activeRun ? engine.activeRun.implementation_attempts : [], taskId)
+  }
+
+  function latestCommitForTask(taskId) {
+    return latestRecordForTask(
+      engine.activeRun ? engine.activeRun.task_commits : [], taskId)
+  }
+
+  function taskActionCode(task) {
+    var run = engine.activeRun
+    var plan = currentPlan()
+    if (!task || !run || !plan || plan.status !== "approved") return "unavailable"
+
+    var taskCommit = latestCommitForTask(task.id)
+    if (taskCommit) {
+      if (taskCommit.status === "proposed" || taskCommit.status === "reserved")
+        return "inspect"
+      if (taskCommit.status === "created") return "complete"
+      if (taskCommit.status === "rejected") return "rejected"
+    }
+
+    var attempt = latestImplementationForTask(task.id)
+    if (attempt && attempt.status === "running") return "running"
+    if ((task.depends_on || []).length > 0) return "dependencies_blocked"
+
+    var readyWorktree = readyWorktreeForTask(task.id)
+    if (attempt && attempt.status === "completed" && readyWorktree
+        && attempt.worktree_id === readyWorktree.id) return "finish"
+    if (run.run_status === "running") return "busy"
+
+    var worktree = latestWorktreeForTask(task.id)
+    if (!worktree || worktree.status === "failed") return "create_worktree"
+    if (worktree.status === "reserved") return "creating_worktree"
+    if (worktree.status === "ready")
+      return attempt && attempt.worktree_id === worktree.id
+        ? "retry_implementation" : "choose_agent"
+    return "worktree_unavailable"
+  }
+
+  function taskActionLabel(task) {
+    if (!task) return "Unavailable"
+    if (taskActionEngine.requestPending && taskActionTaskId === task.id) {
+      return taskActionEngine.pendingMethod === "create_task_worktree"
+        ? "Creating isolated worktree…" : "Implementation running…"
+    }
+    var code = taskActionCode(task)
+    if (code === "create_worktree") return "Ready to create worktree"
+    if (code === "creating_worktree") return "Worktree creation in progress"
+    if (code === "choose_agent") return "Ready to choose implementer"
+    if (code === "retry_implementation") return "Ready to retry implementation"
+    if (code === "running") return "Implementation running"
+    if (code === "busy") return "Waiting for the active implementation"
+    if (code === "dependencies_blocked")
+      return "Blocked until task-branch integration is implemented"
+    if (code === "finish") return "Ready for verification and review"
+    if (code === "inspect") return "Ready for final inspection"
+    if (code === "complete") return "Local task commit created"
+    if (code === "rejected") return "Final result rejected and preserved"
+    if (code === "worktree_unavailable") return "Worktree needs manual attention"
+    return "Awaiting an approved plan"
+  }
+
+  function taskActionTask() {
+    return taskById(taskActionTaskId)
+  }
+
+  function beginSelectedTaskAction() {
+    if (taskActionMode !== "" || taskActionEngine.requestPending) return
+    var task = selectedTask()
+    var code = taskActionCode(task)
+    if (code === "create_worktree") {
+      taskActionTaskId = task.id
+      taskActionEngine.requestError = ""
+      taskActionMode = "confirm_worktree"
+    } else if (code === "choose_agent" || code === "retry_implementation") {
+      taskActionTaskId = task.id
+      taskActionEngine.requestError = ""
+      taskActionMode = "choose_agent"
+    } else if (code === "running") {
+      selectedSection = 0
+    } else if (code === "finish" || code === "inspect") {
+      selectedSection = 2
+    }
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function cancelTaskAction() {
+    taskActionMode = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function launchSelectedTaskImplementation(agent) {
+    var task = selectedTask()
+    var code = taskActionCode(task)
+    if (!task || (code !== "choose_agent" && code !== "retry_implementation")) return
+    taskActionTaskId = task.id
+    taskActionEngine.requestError = ""
+    launchTaskImplementation(agent)
+  }
+
+  function confirmTaskWorktree() {
+    var task = taskActionTask()
+    var plan = currentPlan()
+    var run = engine.activeRun
+    if (!task || !plan || !run || taskActionEngine.requestPending) return
+    if (taskActionEngine.createTaskWorktree(run.id, plan.id, task.id))
+      taskActionMode = ""
+  }
+
+  function launchTaskImplementation(agent) {
+    var task = taskActionTask()
+    var plan = currentPlan()
+    var run = engine.activeRun
+    var worktree = task ? readyWorktreeForTask(task.id) : null
+    if (!task || !plan || !run || !worktree || taskActionEngine.requestPending) return
+    if (taskActionEngine.runTaskImplementation(
+          run.id, plan.id, task.id, worktree.id, agent))
+      taskActionMode = ""
+  }
+
+  function taskActionError(taskId) {
+    return taskActionTaskId === taskId ? taskActionEngine.requestError : ""
   }
 
   function generatePlan(agent) {
@@ -578,6 +747,10 @@ Item {
   }
 
   function footerHelp() {
+    if (taskActionMode === "confirm_worktree")
+      return "Enter  Create isolated worktree    Esc  Cancel"
+    if (taskActionMode === "choose_agent")
+      return "c  Start Codex    d  Start Claude    Esc  Cancel"
     if (editingDraft && draftStep === "repository")
       return "h/l or ←/→  Source    j/k or ↑/↓  Repository    Enter  Open or clone    /  Search    p  Path    Esc  Cancel"
     if (editingDraft && draftStep === "path")
@@ -597,6 +770,8 @@ Item {
       return "j/k or ↑/↓  Sections    l/→ or Enter  Open    r  Reconnect    Esc  Close"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
       return "h/←  Sections    j/k or ↑/↓  Tasks    Enter/e  Edit    J/K  Reorder    a  Approve    x  Reject"
+    if (selectedSection === 1 && currentPlan() && currentPlan().status === "approved")
+      return "h/←  Sections    j/k or ↑/↓  Tasks    Enter  Next action    c/d  Choose agent"
     if (selectedSection === 1)
       return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
     if (selectedSection === 2 && proposedTaskCommit())
@@ -678,6 +853,14 @@ Item {
     onRequestCompleted: function(method) {
       if (method === "cancel_task_implementation")
         root.confirmingImplementationCancel = false
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+
+  EngineConnection {
+    id: taskActionEngine
+    onRequestCompleted: function(method) {
+      root.taskActionMode = ""
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
@@ -765,7 +948,20 @@ Item {
         }
         onActivateRequested: root.activateNavigation()
         onCloseRequested: root.requestClose()
+        onDeleteRequested: {
+          if (root.taskActionMode !== "" || root.editingDraft
+              || root.editingPlanTask || root.rejectingPlan) return
+          if (root.selectedSection === 0) root.beginImplementationCancel()
+          else if (root.selectedSection === 1) root.beginRejectPlan()
+          else if (root.selectedSection === 2) root.beginCompletionDecision("reject")
+        }
         onTextKey: function(text) {
+          if (root.taskActionMode === "choose_agent") {
+            if (text === "c") root.launchTaskImplementation("codex")
+            else if (text === "d") root.launchTaskImplementation("claude")
+            return
+          }
+          if (root.taskActionMode === "confirm_worktree") return
           if (root.editingDraft && root.draftStep === "repository") {
             if (text === "/") root.beginRepositorySearch()
             else if (text === "p") root.beginManualRepositoryEntry()
@@ -778,6 +974,14 @@ Item {
           else if (root.selectedSection === 0 && text === "p") root.toggleImplementationPause()
           else if (root.selectedSection === 0 && text === "i") root.beginImplementationIntervention("redirect")
           else if (root.selectedSection === 0 && text === "a") root.beginImplementationIntervention("additional_context")
+          else if (root.selectedSection === 1 && text === "c"
+              && root.currentPlan() && root.currentPlan().status === "approved") {
+            root.launchSelectedTaskImplementation("codex")
+          }
+          else if (root.selectedSection === 1 && text === "d"
+              && root.currentPlan() && root.currentPlan().status === "approved") {
+            root.launchSelectedTaskImplementation("claude")
+          }
           else if (root.selectedSection === 1 && text === "c") root.generatePlan("codex")
           else if (root.selectedSection === 1 && text === "d") root.generatePlan("claude")
           else if (root.selectedSection === 1 && text === "e") root.beginPlanTaskEdit()
@@ -1897,7 +2101,13 @@ Item {
                       ListView {
                         id: planTaskList
                         width: parent.width
-                        height: Style.space(215)
+                        height: {
+                          var reserved = root.taskActionMode === ""
+                            ? Style.space(115) : Style.space(205)
+                          return Math.max(Style.space(90), Math.min(
+                            Style.space(270), contentBody.height
+                              - contentHeading.height - reserved))
+                        }
                         clip: true
                         spacing: Style.space(6)
                         model: root.currentPlan() && root.currentPlan().tasks
@@ -1955,12 +2165,96 @@ Item {
                             }
 
                             Text {
-                              visible: taskDelegate.modelData.depends_on
-                                && taskDelegate.modelData.depends_on.length > 0
-                              text: "Depends on: " + (taskDelegate.modelData.depends_on || []).join(", ")
+                              visible: root.currentPlan() && (root.currentPlan().status === "approved"
+                                || (taskDelegate.modelData.depends_on
+                                    && taskDelegate.modelData.depends_on.length > 0))
+                              width: parent.width
+                              text: (taskDelegate.modelData.depends_on || []).length > 0
+                                ? ("Dependencies: tasks "
+                                   + (taskDelegate.modelData.depends_on || []).join(", ")
+                                   + " • blocked until branch integration is implemented")
+                                : "Dependencies: none"
                               color: root.mutedForeground
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              visible: root.currentPlan() && root.currentPlan().status === "approved"
+                              width: parent.width
+                              text: {
+                                var worktree = root.latestWorktreeForTask(taskDelegate.modelData.id)
+                                if (!worktree) return "Worktree: not created"
+                                return "Worktree: " + worktree.status + " • " + worktree.branch
+                              }
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WrapAnywhere
+                            }
+
+                            Text {
+                              visible: root.currentPlan() && root.currentPlan().status === "approved"
+                                && !!root.latestWorktreeForTask(taskDelegate.modelData.id)
+                              width: parent.width
+                              text: {
+                                var worktree = root.latestWorktreeForTask(taskDelegate.modelData.id)
+                                return worktree ? worktree.path : ""
+                              }
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WrapAnywhere
+                            }
+
+                            Text {
+                              visible: root.currentPlan() && root.currentPlan().status === "approved"
+                              width: parent.width
+                              text: {
+                                var attempt = root.latestImplementationForTask(taskDelegate.modelData.id)
+                                return attempt
+                                  ? ("Implementer: " + attempt.agent + " • latest attempt "
+                                     + attempt.status + (attempt.paused ? " (paused)" : ""))
+                                  : "Implementer: unassigned"
+                              }
+                              color: root.mutedForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              visible: root.currentPlan() && root.currentPlan().status === "approved"
+                              width: parent.width
+                              text: "Next: " + root.taskActionLabel(taskDelegate.modelData)
+                              color: root.accent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              font.bold: true
+                              wrapMode: Text.WordWrap
+                            }
+
+                            Text {
+                              visible: {
+                                var worktree = root.latestWorktreeForTask(taskDelegate.modelData.id)
+                                var attempt = root.latestImplementationForTask(taskDelegate.modelData.id)
+                                return root.taskActionError(taskDelegate.modelData.id) !== ""
+                                  || (worktree && worktree.last_error)
+                                  || (attempt && attempt.error_message)
+                              }
+                              width: parent.width
+                              text: {
+                                var worktree = root.latestWorktreeForTask(taskDelegate.modelData.id)
+                                var attempt = root.latestImplementationForTask(taskDelegate.modelData.id)
+                                return root.taskActionError(taskDelegate.modelData.id)
+                                  || (worktree ? worktree.last_error : "")
+                                  || (attempt ? attempt.error_message : "")
+                              }
+                              color: root.urgent
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
                             }
                           }
 
@@ -1972,7 +2266,10 @@ Item {
                             }
                             onDoubleClicked: {
                               root.selectedTaskIndex = taskDelegate.index
-                              root.beginPlanTaskEdit()
+                              if (root.currentPlan() && root.currentPlan().status === "approved")
+                                root.beginSelectedTaskAction()
+                              else
+                                root.beginPlanTaskEdit()
                             }
                           }
                         }
@@ -2021,16 +2318,106 @@ Item {
                         }
                       }
 
-                      Text {
+                      Row {
                         visible: root.currentPlan() && root.currentPlan().status === "approved"
+                          && root.taskActionMode === ""
+                        spacing: Style.space(8)
+
+                        Button {
+                          text: {
+                            var code = root.taskActionCode(root.selectedTask())
+                            if (taskActionEngine.requestPending) return "Working…"
+                            if (code === "create_worktree") return "Create worktree"
+                            if (code === "choose_agent") return "Choose implementer"
+                            if (code === "retry_implementation") return "Retry implementation"
+                            if (code === "running") return "View activity"
+                            if (code === "finish") return "Prepare final inspection"
+                            if (code === "inspect") return "Inspect result"
+                            return "No action available"
+                          }
+                          bordered: true
+                          enabled: !taskActionEngine.requestPending
+                            && ["create_worktree", "choose_agent", "retry_implementation",
+                                "running", "finish", "inspect"].indexOf(
+                                  root.taskActionCode(root.selectedTask())) !== -1
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginSelectedTaskAction()
+                        }
+                      }
+
+                      Column {
+                        visible: root.taskActionMode !== ""
                         width: parent.width
-                        text: root.latestImplementationAttempt()
-                          ? "This plan is approved and durable. Open Overview to inspect the latest implementation attempt and its recent activity."
-                          : "This plan is approved and durable. Create the task worktree and assign an implementer from the CLI."
-                        color: root.mutedForeground
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        wrapMode: Text.WordWrap
+                        spacing: Style.space(8)
+
+                        Text {
+                          width: parent.width
+                          text: {
+                            var task = root.taskActionTask()
+                            if (!task) return "The selected task is no longer available."
+                            if (root.taskActionMode === "confirm_worktree") {
+                              var run = engine.activeRun
+                              var base = run ? String(run.base_revision || "").slice(0, 12) : ""
+                              var dirtyNote = run && run.worktree_dirty
+                                ? " The primary checkout has uncommitted work that the agent will not see."
+                                : ""
+                              return "Create an isolated worktree and reserved task branch for "
+                                + task.position + ". " + task.title
+                                + "? It starts from committed base " + base
+                                + ", stays outside the primary checkout, and will not merge or push."
+                                + dirtyNote
+                            }
+                            return "Choose the authenticated CLI that will implement "
+                              + task.position + ". " + task.title
+                              + ". The engine will supervise it inside the ready task worktree."
+                          }
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Row {
+                          spacing: Style.space(8)
+
+                          Button {
+                            visible: root.taskActionMode === "confirm_worktree"
+                            text: "Create isolated worktree"
+                            bordered: true
+                            enabled: !taskActionEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.confirmTaskWorktree()
+                          }
+
+                          Button {
+                            visible: root.taskActionMode === "choose_agent"
+                            text: "Codex"
+                            bordered: true
+                            enabled: !taskActionEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.launchTaskImplementation("codex")
+                          }
+
+                          Button {
+                            visible: root.taskActionMode === "choose_agent"
+                            text: "Claude"
+                            enabled: !taskActionEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.launchTaskImplementation("claude")
+                          }
+
+                          Button {
+                            text: "Cancel"
+                            enabled: !taskActionEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.cancelTaskAction()
+                          }
+                        }
                       }
                     }
 

@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** The first vertical workflow is implemented. The Rust engine can run detected Rust and Omarchy checks, persist command evidence, obtain a fresh independent review, return failed gates to a bounded fresh implementer correction session, and prepare an exact final tree for inspection. The CLI and Omarchy panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. Configurable project verification, semantic multi-commit splitting, merge, push, and deployment remain planned.
+> **Project status:** The first vertical workflow is implemented. The Omarchy panel can create an approved task's isolated worktree, launch a user-selected Codex or Claude implementer, show durable activity, and carry the task through deterministic checks, independent review, correction, and exact final-tree inspection. The CLI and panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. Managed engine startup, configurable project verification, semantic multi-commit splitting, merge, push, and deployment remain planned.
 >
 > **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
@@ -209,7 +209,7 @@ The main panel should be a first-class product interface, not a transcript viewe
 
 The default screen should summarize progress and prioritize actionable information. Detailed prompts, responses, stdout, stderr, and internal events remain one level deeper for users who need to investigate.
 
-The implemented panel makes **Overview**, **Plan**, **Changes**, **Verification**, and **Review** functional. **Changes** shows the exact final patch, changed-file summary, evidence status, proposed task commit, and explicit approval or rejection controls. Raw verification-output drill-down and semantic multi-commit splitting remain planned.
+The implemented panel makes **Overview**, **Plan**, **Changes**, **Verification**, and **Review** functional. **Plan** shows each approved task's dependency declaration, worktree and branch, latest implementer attempt, failures, and next action; it can create the isolated worktree and launch Codex or Claude with keyboard-only controls. Because every task branch currently starts from the run's shared base revision, tasks with dependencies are visibly blocked until an explicit task-branch integration design exists rather than being launched without their prerequisite changes. **Changes** shows the exact final patch, changed-file summary, evidence status, proposed task commit, and explicit approval or rejection controls. Raw verification-output drill-down and semantic multi-commit splitting remain planned.
 
 ### Keyboard-first operation
 
