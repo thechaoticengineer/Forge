@@ -395,6 +395,41 @@ Item {
     return attempts.length > 0 ? attempts[attempts.length - 1] : null
   }
 
+  function finishContext() {
+    var run = engine.activeRun
+    var plan = currentPlan()
+    var task = selectedTask()
+    if (!run || !plan || plan.status !== "approved" || !task) return null
+    var worktree = null
+    for (var i = (run.worktrees || []).length - 1; i >= 0; i--)
+      if (run.worktrees[i].task_id === task.id && run.worktrees[i].status === "ready") {
+        worktree = run.worktrees[i]; break
+      }
+    if (!worktree) return null
+    var implementation = null
+    for (var j = (run.implementation_attempts || []).length - 1; j >= 0; j--)
+      if (run.implementation_attempts[j].task_id === task.id
+          && run.implementation_attempts[j].worktree_id === worktree.id
+          && run.implementation_attempts[j].status === "completed") {
+        implementation = run.implementation_attempts[j]; break
+      }
+    return implementation ? ({ plan: plan, task: task, worktree: worktree, implementation: implementation }) : null
+  }
+
+  function latestTaskRecord(records) {
+    var context = finishContext()
+    if (!context || !records) return null
+    for (var i = records.length - 1; i >= 0; i--)
+      if (records[i].task_id === context.task.id) return records[i]
+    return null
+  }
+
+  function finishSelectedTask() {
+    var context = finishContext()
+    if (!context || engine.requestPending) return
+    engine.finishTask(context.plan.id, context.task.id, context.worktree.id, context.implementation.id)
+  }
+
   function runningImplementationAttempt() {
     var attempt = latestImplementationAttempt()
     return attempt && attempt.status === "running" ? attempt : null
@@ -2082,6 +2117,91 @@ Item {
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     wrapMode: Text.WordWrap
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 3
+                    width: parent.width
+                    spacing: Style.space(10)
+                    property var verification: root.latestTaskRecord(engine.activeRun ? engine.activeRun.verification_attempts : [])
+
+                    Button {
+                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Finishing…" : "Finish selected task"
+                      bordered: true
+                      enabled: root.finishContext() !== null && !engine.requestPending
+                      foreground: root.foreground
+                      accent: root.accent
+                      onClicked: root.finishSelectedTask()
+                    }
+                    Text {
+                      width: parent.width
+                      text: parent.verification ? "Latest verification: " + parent.verification.status : "No verification recorded for this task"
+                      color: parent.verification && parent.verification.status === "passed" ? root.accent : root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+                    Repeater {
+                      model: parent.verification ? parent.verification.commands : []
+                      Text {
+                        required property var modelData
+                        width: parent.width
+                        text: modelData.label + " — " + modelData.status
+                          + (modelData.exit_code === null ? "" : " (exit " + modelData.exit_code + ")")
+                        color: modelData.status === "passed" ? root.accent : root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+                    }
+                  }
+
+                  Column {
+                    visible: root.selectedSection === 4
+                    width: parent.width
+                    spacing: Style.space(10)
+                    property var review: root.latestTaskRecord(engine.activeRun ? engine.activeRun.review_attempts : [])
+                    property var taskCommit: root.latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
+
+                    Button {
+                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Reviewing…" : "Finish selected task"
+                      bordered: true
+                      enabled: root.finishContext() !== null && !engine.requestPending
+                      foreground: root.foreground
+                      accent: root.accent
+                      onClicked: root.finishSelectedTask()
+                    }
+                    Text {
+                      width: parent.width
+                      text: parent.review ? "Reviewer: " + parent.review.reviewer + " · "
+                        + parent.review.independence + " · " + parent.review.status
+                        : "No independent review recorded for this task"
+                      color: parent.review && parent.review.status === "approved" ? root.accent : root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      wrapMode: Text.WordWrap
+                    }
+                    Repeater {
+                      model: parent.review && parent.review.result ? parent.review.result.findings : []
+                      Text {
+                        required property var modelData
+                        width: parent.width
+                        text: modelData.severity + ": " + modelData.summary + " — " + modelData.evidence
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        wrapMode: Text.WordWrap
+                      }
+                    }
+                    Text {
+                      width: parent.width
+                      visible: parent.taskCommit !== null
+                      text: parent.taskCommit ? "Local commit: " + parent.taskCommit.status
+                        + (parent.taskCommit.commit_hash ? " · " + parent.taskCommit.commit_hash.slice(0, 12) : "") : ""
+                      color: parent.taskCommit && parent.taskCommit.status === "created" ? root.accent : root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
                   }
                 }
               }

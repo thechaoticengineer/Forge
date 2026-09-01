@@ -43,7 +43,93 @@ pub struct ActiveRunSummary {
     pub implementation_activity: Vec<ImplementationActivitySummary>,
     #[serde(default)]
     pub review_attempts: Vec<ReviewAttemptSummary>,
+    #[serde(default)]
+    pub verification_attempts: Vec<VerificationAttemptSummary>,
+    #[serde(default)]
+    pub task_commits: Vec<TaskCommitSummary>,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    Running,
+    Passed,
+    Failed,
+    InfrastructureError,
+}
+
+impl VerificationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::InfrastructureError => "infrastructure_error",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationCommandResult {
+    pub label: String,
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub working_directory: String,
+    pub status: VerificationStatus,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerificationAttemptSummary {
+    pub id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub status: VerificationStatus,
+    pub commands: Vec<VerificationCommandResult>,
+    pub error_message: Option<String>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCommitStatus {
+    Reserved,
+    Created,
+    Failed,
+}
+
+impl TaskCommitStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Created => "created",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskCommitSummary {
+    pub id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub verification_attempt_id: String,
+    pub review_attempt_id: String,
+    pub status: TaskCommitStatus,
+    pub message: String,
+    pub commit_hash: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
 }
 
 /// Policy used to choose an independent reviewer for an implementation.

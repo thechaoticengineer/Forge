@@ -74,6 +74,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Verify, independently review, correct, and optionally commit one task.
+    Finish {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long, value_enum, default_value = "cross-provider-or-fresh-session")]
+        policy: ReviewPolicyArgument,
+        /// Maximum fresh correction sessions after failed gates.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
+        max_corrections: u8,
+        /// Run the gates without creating the final local commit.
+        #[arg(long)]
+        no_commit: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Cancel the active supervised implementation and preserve partial work.
     Cancel {
         /// Running attempt ID; defaults to the active run's running attempt.
@@ -273,6 +289,23 @@ async fn main() -> Result<()> {
         }
         Command::Review { task, policy, json } => {
             review_task(&socket_path, task, policy.into(), json).await
+        }
+        Command::Finish {
+            task,
+            policy,
+            max_corrections,
+            no_commit,
+            json,
+        } => {
+            finish_task(
+                &socket_path,
+                task,
+                policy.into(),
+                max_corrections,
+                !no_commit,
+                json,
+            )
+            .await
         }
         Command::Cancel { attempt, json } => {
             cancel_implementation(&socket_path, attempt, json).await
@@ -607,6 +640,67 @@ async fn review_task(
             policy,
         },
         Duration::from_mins(21),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+async fn finish_task(
+    socket_path: &PathBuf,
+    task_position: usize,
+    policy: ReviewPolicy,
+    max_corrections: u8,
+    create_commit: bool,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let plan = run
+        .plan
+        .as_ref()
+        .context("the active run has no approved plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task_position
+                .checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the approved plan")?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .rev()
+        .find(|worktree| {
+            worktree.task_id == task.id && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .context("the task has no ready worktree")?;
+    let implementation = run
+        .implementation_attempts
+        .iter()
+        .rev()
+        .find(|attempt| {
+            attempt.task_id == task.id
+                && attempt.worktree_id == worktree.id
+                && attempt.status == ImplementationStatus::Completed
+        })
+        .context("the task has no completed implementation in its ready worktree")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::FinishTask {
+            run_id: run.id.clone(),
+            plan_id: plan.id.clone(),
+            task_id: task.id.clone(),
+            worktree_id: worktree.id.clone(),
+            implementation_attempt_id: implementation.id.clone(),
+            policy,
+            max_corrections,
+            create_commit,
+        },
+        Duration::from_mins(91),
     )
     .await?;
     print_result(&snapshot, json)

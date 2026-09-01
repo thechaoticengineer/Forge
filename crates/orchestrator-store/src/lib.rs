@@ -15,7 +15,8 @@ use orchestrator_core::state::{
     ImplementationAttemptSummary, ImplementationContinuationKind, ImplementationStatus,
     ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary,
     ReviewAttemptSummary, ReviewIndependence, ReviewPolicy, ReviewResult, ReviewStatus,
-    ReviewVerdict, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
+    ReviewVerdict, RunStatus, TaskCommitStatus, TaskCommitSummary, TaskWorktreeStatus,
+    TaskWorktreeSummary, VerificationAttemptSummary, VerificationCommandResult, VerificationStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -26,7 +27,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -59,6 +60,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         7,
         "independent_reviews",
         include_str!("../migrations/0007_independent_reviews.sql"),
+    ),
+    (
+        8,
+        "completion_pipeline",
+        include_str!("../migrations/0008_completion_pipeline.sql"),
     ),
 ];
 
@@ -400,6 +406,50 @@ pub struct ReviewAttemptFailure {
     pub error_message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationAttemptInput {
+    pub run_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub status: VerificationStatus,
+    pub commands: Vec<VerificationCommandResult>,
+    pub error_message: Option<String>,
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedVerificationAttempt {
+    pub attempt_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCommitInput {
+    pub run_id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub implementation_attempt_id: String,
+    pub verification_attempt_id: String,
+    pub review_attempt_id: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedTaskCommit {
+    pub commit_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCommitSettlement {
+    pub commit_id: String,
+    pub status: TaskCommitStatus,
+    pub commit_hash: Option<String>,
+    pub error_message: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -497,6 +547,18 @@ enum Command {
     ),
     FailReviewAttempt(
         ReviewAttemptFailure,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    RecordVerificationAttempt(
+        VerificationAttemptInput,
+        oneshot::Sender<Result<RecordedVerificationAttempt, StorageError>>,
+    ),
+    RecordTaskCommit(
+        TaskCommitInput,
+        oneshot::Sender<Result<RecordedTaskCommit, StorageError>>,
+    ),
+    SettleTaskCommit(
+        TaskCommitSettlement,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -1040,6 +1102,63 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Persists one completed deterministic-verification attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the implementation identity is not completed,
+    /// command evidence cannot be serialized, or storage is unavailable.
+    pub async fn record_verification_attempt(
+        &self,
+        input: VerificationAttemptInput,
+    ) -> Result<RecordedVerificationAttempt, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::RecordVerificationAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists the outcome of the gated local task-commit operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence references are invalid or storage is
+    /// unavailable.
+    pub async fn record_task_commit(
+        &self,
+        input: TaskCommitInput,
+    ) -> Result<RecordedTaskCommit, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::RecordTaskCommit(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Settles a previously reserved local task commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reservation is no longer pending or storage
+    /// is unavailable.
+    pub async fn settle_task_commit(
+        &self,
+        input: TaskCommitSettlement,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SettleTaskCommit(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -1153,6 +1272,15 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             Command::FailReviewAttempt(input, reply) => {
                 let _ = reply.send(database.fail_review_attempt(&input));
             }
+            Command::RecordVerificationAttempt(input, reply) => {
+                let _ = reply.send(database.record_verification_attempt(&input));
+            }
+            Command::RecordTaskCommit(input, reply) => {
+                let _ = reply.send(database.record_task_commit(&input));
+            }
+            Command::SettleTaskCommit(input, reply) => {
+                let _ = reply.send(database.settle_task_commit(&input));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -1183,6 +1311,7 @@ impl Database {
         recover_interrupted_worktrees(&mut connection)?;
         recover_interrupted_implementations(&mut connection)?;
         recover_interrupted_reviews(&mut connection)?;
+        recover_interrupted_task_commits(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -1227,6 +1356,8 @@ impl Database {
             run.implementation_attempts = self.load_implementation_attempts(&run.id)?;
             run.implementation_activity = self.load_implementation_activity(&run.id)?;
             run.review_attempts = self.load_review_attempts(&run.id)?;
+            run.verification_attempts = self.load_verification_attempts(&run.id)?;
+            run.task_commits = self.load_task_commits(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -1303,6 +1434,8 @@ impl Database {
                 implementation_attempts: Vec::new(),
                 implementation_activity: Vec::new(),
                 review_attempts: Vec::new(),
+                verification_attempts: Vec::new(),
+                task_commits: Vec::new(),
                 last_error: None,
             }),
         })
@@ -2115,12 +2248,32 @@ impl Database {
         }
         let requested_at = unix_milliseconds()?;
         let transaction = self.connection.unchecked_transaction()?;
-        let (run_id, task_id, worktree_id, agent) =
-            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let (run_id, task_id, worktree_id, agent) = transaction
+            .query_row(
+                "SELECT run_id, task_id, worktree_id, agent FROM implementation_attempts \
+                 WHERE id = ?1 AND status IN ('running', 'completed')",
+                [&input.attempt_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(run_id, task_id, worktree_id, agent)| {
+                parse_agent_kind(&agent).map(|agent| (run_id, task_id, worktree_id, agent))
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                StorageError::ImplementationAttemptNotRunning(input.attempt_id.clone())
+            })?;
         let changed = transaction.execute(
             "UPDATE implementation_attempts SET \
                 pending_continuation_kind = ?2, pending_user_instruction = ?3 \
-             WHERE id = ?1 AND status = 'running' \
+             WHERE id = ?1 AND status IN ('running', 'completed') \
                AND pending_continuation_kind IS NULL AND pending_user_instruction IS NULL",
             (&input.attempt_id, input.kind.as_str(), instruction),
         )?;
@@ -2547,6 +2700,224 @@ impl Database {
         Ok(attempts)
     }
 
+    fn record_verification_attempt(
+        &self,
+        input: &VerificationAttemptInput,
+    ) -> Result<RecordedVerificationAttempt, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let attempt_id = uuid::Uuid::now_v7().to_string();
+        let commands_json = serde_json::to_string(&input.commands)
+            .map_err(|error| StorageError::Json(error.to_string()))?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO verification_attempts(\
+                id, run_id, plan_id, task_id, worktree_id, implementation_attempt_id, \
+                status, commands_json, error_message, started_at, completed_at\
+             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
+             WHERE EXISTS (SELECT 1 FROM implementation_attempts \
+               WHERE id = ?6 AND run_id = ?2 AND plan_id = ?3 AND task_id = ?4 \
+                 AND worktree_id = ?5 AND status = 'completed')",
+            (
+                &attempt_id,
+                &input.run_id,
+                &input.plan_id,
+                &input.task_id,
+                &input.worktree_id,
+                &input.implementation_attempt_id,
+                input.status.as_str(),
+                &commands_json,
+                &input.error_message,
+                input.started_at,
+                completed_at,
+            ),
+        )?;
+        if inserted != 1 {
+            return Err(StorageError::ImplementationNotReady(input.task_id.clone()));
+        }
+        let payload = json!({
+            "verification_attempt_id": attempt_id,
+            "task_id": input.task_id,
+            "implementation_attempt_id": input.implementation_attempt_id,
+            "status": input.status,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'verification_completed', 'engine', ?2, ?3)",
+            (&input.run_id, payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        Ok(RecordedVerificationAttempt {
+            attempt_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn record_task_commit(
+        &self,
+        input: &TaskCommitInput,
+    ) -> Result<RecordedTaskCommit, StorageError> {
+        let created_at = unix_milliseconds()?;
+        let commit_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO task_commits(\
+                id, run_id, task_id, worktree_id, implementation_attempt_id, \
+                verification_attempt_id, review_attempt_id, status, message, commit_hash, \
+                error_message, created_at, completed_at\
+             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL, ?9, NULL \
+             WHERE EXISTS (SELECT 1 FROM verification_attempts \
+               WHERE id = ?6 AND run_id = ?2 AND task_id = ?3 AND worktree_id = ?4 \
+                 AND implementation_attempt_id = ?5 AND status = 'passed') \
+               AND EXISTS (SELECT 1 FROM review_attempts \
+               WHERE id = ?7 AND run_id = ?2 AND task_id = ?3 AND worktree_id = ?4 \
+                 AND implementation_attempt_id = ?5 AND status = 'approved')",
+            (
+                &commit_id,
+                &input.run_id,
+                &input.task_id,
+                &input.worktree_id,
+                &input.implementation_attempt_id,
+                &input.verification_attempt_id,
+                &input.review_attempt_id,
+                &input.message,
+                created_at,
+            ),
+        )?;
+        if inserted != 1 {
+            return Err(StorageError::ImplementationNotReady(input.task_id.clone()));
+        }
+        let payload = json!({
+            "task_commit_id": commit_id,
+            "task_id": input.task_id,
+            "status": TaskCommitStatus::Reserved,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_commit_reserved', 'engine', ?2, ?3)",
+            (&input.run_id, payload.to_string(), created_at),
+        )?;
+        transaction.commit()?;
+        Ok(RecordedTaskCommit {
+            commit_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn settle_task_commit(
+        &self,
+        input: &TaskCommitSettlement,
+    ) -> Result<StoredSnapshot, StorageError> {
+        if input.status == TaskCommitStatus::Reserved {
+            return Err(StorageError::ImplementationNotReady(
+                input.commit_id.clone(),
+            ));
+        }
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let run_id = transaction
+            .query_row(
+                "SELECT run_id FROM task_commits WHERE id = ?1 AND status = 'reserved'",
+                [&input.commit_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::ImplementationNotReady(input.commit_id.clone()))?;
+        let changed = transaction.execute(
+            "UPDATE task_commits SET status = ?2, commit_hash = ?3, error_message = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'reserved'",
+            (&input.commit_id, input.status.as_str(), &input.commit_hash, &input.error_message, completed_at),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationNotReady(
+                input.commit_id.clone(),
+            ));
+        }
+        let payload = json!({ "task_commit_id": input.commit_id, "status": input.status, "commit_hash": input.commit_hash });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_commit_settled', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn load_verification_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<VerificationAttemptSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, worktree_id, implementation_attempt_id, status, commands_json, \
+                    error_message, started_at, completed_at \
+             FROM verification_attempts WHERE run_id = ?1 ORDER BY started_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                status,
+                commands_json,
+                error_message,
+                started_at,
+                completed_at,
+            ) = row?;
+            let commands = serde_json::from_str(&commands_json)
+                .map_err(|error| StorageError::Json(error.to_string()))?;
+            Ok(VerificationAttemptSummary {
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                status: parse_verification_status(&status)?,
+                commands,
+                error_message,
+                started_at,
+                completed_at,
+            })
+        })
+        .collect()
+    }
+
+    fn load_task_commits(&self, run_id: &str) -> Result<Vec<TaskCommitSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, worktree_id, implementation_attempt_id, verification_attempt_id, \
+                    review_attempt_id, status, message, commit_hash, error_message, created_at, completed_at \
+             FROM task_commits WHERE run_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(TaskCommitSummary {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                worktree_id: row.get(2)?,
+                implementation_attempt_id: row.get(3)?,
+                verification_attempt_id: row.get(4)?,
+                review_attempt_id: row.get(5)?,
+                status: parse_task_commit_status_sql(&row.get::<_, String>(6)?)?,
+                message: row.get(7)?,
+                commit_hash: row.get(8)?,
+                error_message: row.get(9)?,
+                created_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn load_task_worktrees(&self, run_id: &str) -> Result<Vec<TaskWorktreeSummary>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, task_id, status, branch, path, base_revision, \
@@ -2873,8 +3244,31 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         implementation_attempts: Vec::new(),
         implementation_activity: Vec::new(),
         review_attempts: Vec::new(),
+        verification_attempts: Vec::new(),
+        task_commits: Vec::new(),
         last_error: row.get(7)?,
     })
+}
+
+fn parse_verification_status(value: &str) -> Result<VerificationStatus, StorageError> {
+    match value {
+        "running" => Ok(VerificationStatus::Running),
+        "passed" => Ok(VerificationStatus::Passed),
+        "failed" => Ok(VerificationStatus::Failed),
+        "infrastructure_error" => Ok(VerificationStatus::InfrastructureError),
+        _ => Err(StorageError::Json(format!(
+            "invalid verification status: {value}"
+        ))),
+    }
+}
+
+fn parse_task_commit_status_sql(value: &str) -> rusqlite::Result<TaskCommitStatus> {
+    match value {
+        "reserved" => Ok(TaskCommitStatus::Reserved),
+        "created" => Ok(TaskCommitStatus::Created),
+        "failed" => Ok(TaskCommitStatus::Failed),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn parse_agent_kind(agent: &str) -> Result<AgentKind, StorageError> {
@@ -3312,6 +3706,17 @@ fn recover_interrupted_reviews(connection: &mut Connection) -> Result<(), Storag
     Ok(())
 }
 
+fn recover_interrupted_task_commits(connection: &mut Connection) -> Result<(), StorageError> {
+    let recovered_at = unix_milliseconds()?;
+    let error_message = "engine stopped while the local task commit was being created";
+    connection.execute(
+        "UPDATE task_commits SET status = 'failed', error_message = ?1, completed_at = ?2 \
+         WHERE status = 'reserved'",
+        (error_message, recovered_at),
+    )?;
+    Ok(())
+}
+
 fn retryable_continuation(
     transaction: &Transaction<'_>,
     attempt_id: &str,
@@ -3479,7 +3884,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -3616,8 +4021,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 8,
-                supported: 7
+                found: 9,
+                supported: 8
             }
         ));
     }

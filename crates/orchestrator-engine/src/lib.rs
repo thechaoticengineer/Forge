@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -27,21 +27,23 @@ use orchestrator_core::{
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, ImplementationContinuationKind,
         ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
-        PlanTaskSummary, ProposedTask, ReviewIndependence, ReviewPolicy, RunStatus,
-        TaskWorktreeStatus, TaskWorktreeSummary,
+        PlanTaskSummary, ProposedTask, ReviewIndependence, ReviewPolicy, ReviewStatus, RunStatus,
+        TaskCommitStatus, TaskWorktreeStatus, TaskWorktreeSummary, VerificationCommandResult,
+        VerificationStatus,
     },
 };
 use orchestrator_git::{
-    GitError, TaskWorktreeRequest, TaskWorktreeState, discover_repositories_until,
-    inspect_repository, prune_missing_worktrees, review_change_evidence, task_branch_name,
-    task_worktree_path, task_worktree_state,
+    GitError, TaskWorktreeRequest, TaskWorktreeState, create_task_commit,
+    discover_repositories_until, inspect_repository, prune_missing_worktrees,
+    review_change_evidence, task_branch_name, task_worktree_path, task_worktree_state,
 };
 use orchestrator_store::{
     DraftRunInput, ImplementationActivityInput, ImplementationAttemptCancellation,
     ImplementationAttemptFailure, ImplementationAttemptInput, ImplementationAttemptSuccess,
     ImplementationContinuationReservation, PlanAttemptFailure, PlanAttemptInput,
     PlanAttemptSuccess, PlanRevisionInput, ReviewAttemptFailure, ReviewAttemptInput,
-    ReviewAttemptSuccess, StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
+    ReviewAttemptSuccess, StatePaths, StorageWorker, StoredSnapshot, TaskCommitInput,
+    TaskCommitSettlement, TaskWorktreeReservation, VerificationAttemptInput,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -681,6 +683,39 @@ async fn handle_request(
             policy,
             storage,
             reviewer,
+            state_sender,
+            None,
+        )
+        .await
+        {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::FinishTask {
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            implementation_attempt_id,
+            policy,
+            max_corrections,
+            create_commit: should_commit,
+        } => match finish_task(
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            implementation_attempt_id,
+            policy,
+            max_corrections,
+            should_commit,
+            storage,
+            implementer,
+            reviewer,
+            implementation_controls,
             state_sender,
         )
         .await
@@ -2292,6 +2327,402 @@ async fn persist_implementation_activity(
     Ok(())
 }
 
+#[derive(Clone)]
+struct VerificationCommand {
+    label: &'static str,
+    program: &'static str,
+    arguments: &'static [&'static str],
+}
+
+fn detected_verification_commands(worktree: &Path) -> Vec<VerificationCommand> {
+    let mut commands = Vec::new();
+    if worktree.join("Cargo.toml").is_file() {
+        commands.extend([
+            VerificationCommand {
+                label: "Rust format",
+                program: "cargo",
+                arguments: &["fmt", "--all", "--", "--check"],
+            },
+            VerificationCommand {
+                label: "Rust tests",
+                program: "cargo",
+                arguments: &["test", "--workspace"],
+            },
+            VerificationCommand {
+                label: "Rust lint",
+                program: "cargo",
+                arguments: &[
+                    "clippy",
+                    "--workspace",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            },
+        ]);
+    }
+    if worktree.join("manifest.json").is_file() {
+        commands.push(VerificationCommand {
+            label: "Omarchy plugin",
+            program: "omarchy",
+            arguments: &["plugin", "validate", "."],
+        });
+    }
+    commands
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn verify_implementation(
+    run_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    worktree_id: &str,
+    implementation_attempt_id: &str,
+    worktree: &Path,
+    storage: &StorageWorker,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<(String, VerificationStatus, String, StoredSnapshot), RequestFailure> {
+    let started_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| RequestFailure {
+                code: "clock_error",
+                message: error.to_string(),
+            })?
+            .as_millis(),
+    )
+    .map_err(|_| RequestFailure {
+        code: "clock_error",
+        message: "system time is outside the supported range".to_owned(),
+    })?;
+    let commands = detected_verification_commands(worktree);
+    let mut results = Vec::new();
+    let mut infrastructure_error = None;
+    if commands.is_empty() {
+        infrastructure_error =
+            Some("no supported deterministic verification commands were detected".to_owned());
+    }
+    for specification in commands {
+        let began = Instant::now();
+        let mut command = AsyncCommand::new(specification.program);
+        command
+            .args(specification.arguments)
+            .current_dir(worktree)
+            .env("LC_ALL", "C");
+        match run_bounded_command(command, Duration::from_mins(15), 64 * 1024, 64 * 1024).await {
+            Ok(output) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                if output.stdout_truncated {
+                    stdout.push_str("\n[output truncated]");
+                }
+                results.push(VerificationCommandResult {
+                    label: specification.label.to_owned(),
+                    program: specification.program.to_owned(),
+                    arguments: specification
+                        .arguments
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    working_directory: worktree.to_string_lossy().into_owned(),
+                    status: if output.status.success() {
+                        VerificationStatus::Passed
+                    } else {
+                        VerificationStatus::Failed
+                    },
+                    exit_code: output.status.code(),
+                    stdout,
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    duration_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            Err(error) => {
+                infrastructure_error = Some(format!("{}: {error}", specification.label));
+                results.push(VerificationCommandResult {
+                    label: specification.label.to_owned(),
+                    program: specification.program.to_owned(),
+                    arguments: specification
+                        .arguments
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    working_directory: worktree.to_string_lossy().into_owned(),
+                    status: VerificationStatus::InfrastructureError,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: error,
+                    duration_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+                break;
+            }
+        }
+    }
+    let status = if infrastructure_error.is_some() {
+        VerificationStatus::InfrastructureError
+    } else if results
+        .iter()
+        .all(|result| result.status == VerificationStatus::Passed)
+    {
+        VerificationStatus::Passed
+    } else {
+        VerificationStatus::Failed
+    };
+    let evidence = results
+        .iter()
+        .map(|result| {
+            format!(
+                "{}: {} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+                result.label,
+                result.status.as_str(),
+                result.exit_code,
+                result.stdout,
+                result.stderr
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let recorded = storage
+        .record_verification_attempt(VerificationAttemptInput {
+            run_id: run_id.to_owned(),
+            plan_id: plan_id.to_owned(),
+            task_id: task_id.to_owned(),
+            worktree_id: worktree_id.to_owned(),
+            implementation_attempt_id: implementation_attempt_id.to_owned(),
+            status,
+            commands: results,
+            error_message: infrastructure_error,
+            started_at,
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot record verification", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(recorded.snapshot.clone()));
+    Ok((recorded.attempt_id, status, evidence, recorded.snapshot))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn finish_task(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    worktree_id: String,
+    mut implementation_attempt_id: String,
+    policy: ReviewPolicy,
+    max_corrections: u8,
+    should_commit: bool,
+    storage: &StorageWorker,
+    implementer: &ImplementerRunner,
+    reviewer: &ReviewerRunner,
+    implementation_controls: &ImplementationControls,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    if max_corrections > 3 {
+        return Err(RequestFailure {
+            code: "invalid_correction_limit",
+            message: "max_corrections must be between 0 and 3".to_owned(),
+        });
+    }
+    let initial =
+        load_implementation_context(storage, &run_id, &plan_id, &task_id, &worktree_id).await?;
+    let worktree = PathBuf::from(&initial.worktree.path);
+    let implementer_agent = initial
+        .run
+        .implementation_attempts
+        .iter()
+        .find(|attempt| {
+            attempt.id == implementation_attempt_id
+                && attempt.task_id == task_id
+                && attempt.worktree_id == worktree_id
+                && attempt.status == ImplementationStatus::Completed
+        })
+        .map(|attempt| attempt.agent)
+        .ok_or_else(|| RequestFailure {
+            code: "implementation_not_completed",
+            message: "finish requires a completed implementation attempt".to_owned(),
+        })?;
+    let mut correction = 0_u8;
+    loop {
+        let (verification_id, verification_status, evidence, mut snapshot) = verify_implementation(
+            &run_id,
+            &plan_id,
+            &task_id,
+            &worktree_id,
+            &implementation_attempt_id,
+            &worktree,
+            storage,
+            state_sender,
+        )
+        .await?;
+        let mut correction_reason = if verification_status == VerificationStatus::Passed {
+            None
+        } else {
+            Some(format!(
+                "Deterministic verification did not pass. Fix every failure and rerun the checks.\n\n{evidence}"
+            ))
+        };
+        let mut approved_review = None;
+        if verification_status == VerificationStatus::Passed {
+            snapshot = run_task_review(
+                run_id.clone(),
+                plan_id.clone(),
+                task_id.clone(),
+                worktree_id.clone(),
+                implementation_attempt_id.clone(),
+                policy,
+                storage,
+                reviewer,
+                state_sender,
+                Some(&evidence),
+            )
+            .await?;
+            let review = snapshot.active_run.as_ref().and_then(|run| {
+                run.review_attempts
+                    .iter()
+                    .rev()
+                    .find(|attempt| attempt.implementation_attempt_id == implementation_attempt_id)
+            });
+            match review {
+                Some(review) if review.status == ReviewStatus::Approved => {
+                    approved_review = Some(review.id.clone());
+                }
+                Some(review) if review.status == ReviewStatus::ChangesRequested => {
+                    let result = review.result.as_ref();
+                    correction_reason = Some(format!(
+                        "An independent reviewer requested changes. Address all findings.\n\n{}",
+                        result.map_or_else(
+                            || review.error_message.clone().unwrap_or_default(),
+                            |result| {
+                                let findings = result
+                                    .findings
+                                    .iter()
+                                    .map(|finding| {
+                                        format!(
+                                            "- {}: {} ({})",
+                                            finding.severity.as_str(),
+                                            finding.summary,
+                                            finding.evidence
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                format!("{}\n{findings}", result.summary)
+                            }
+                        )
+                    ));
+                }
+                _ => return Ok(snapshot),
+            }
+        }
+        if let Some(review_id) = approved_review {
+            if !should_commit {
+                return Ok(snapshot);
+            }
+            let message = conventional_task_commit_message(&initial.task.title);
+            let reserved = storage
+                .record_task_commit(TaskCommitInput {
+                    run_id: run_id.clone(),
+                    task_id: task_id.clone(),
+                    worktree_id: worktree_id.clone(),
+                    implementation_attempt_id: implementation_attempt_id.clone(),
+                    verification_attempt_id: verification_id,
+                    review_attempt_id: review_id,
+                    message: message.clone(),
+                })
+                .await
+                .map_err(|error| RequestFailure::storage("cannot reserve task commit", error))?;
+            publish_newer_snapshot(state_sender, engine_snapshot(reserved.snapshot));
+            let commit = tokio::task::spawn_blocking({
+                let worktree = worktree.clone();
+                let branch = initial.worktree.branch.clone();
+                let base = initial.worktree.base_revision.clone();
+                let message = message.clone();
+                move || create_task_commit(&worktree, &branch, &base, &message)
+            })
+            .await
+            .map_err(|error| format!("task commit worker failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let (status, commit_hash, error_message) = match commit {
+                Ok(hash) => (TaskCommitStatus::Created, Some(hash), None),
+                Err(error) => (TaskCommitStatus::Failed, None, Some(error)),
+            };
+            let stored = storage
+                .settle_task_commit(TaskCommitSettlement {
+                    commit_id: reserved.commit_id,
+                    status,
+                    commit_hash,
+                    error_message: error_message.clone(),
+                })
+                .await
+                .map_err(|error| RequestFailure::storage("cannot record task commit", error))?;
+            publish_newer_snapshot(state_sender, engine_snapshot(stored.clone()));
+            if let Some(message) = error_message {
+                return Err(RequestFailure {
+                    code: "commit_failed",
+                    message,
+                });
+            }
+            return Ok(stored);
+        }
+        if correction >= max_corrections {
+            return Ok(snapshot);
+        }
+        let instruction = correction_reason
+            .unwrap_or_else(|| "Recheck and correct the implementation.".to_owned());
+        let instruction = instruction.chars().take(19_000).collect::<String>();
+        storage
+            .reserve_implementation_continuation(ImplementationContinuationReservation {
+                attempt_id: implementation_attempt_id.clone(),
+                kind: ImplementationContinuationKind::AdditionalContext,
+                instruction: instruction.clone(),
+            })
+            .await
+            .map_err(|error| {
+                RequestFailure::storage("cannot reserve automated correction", error)
+            })?;
+        let corrected = run_task_implementation_attempt(
+            run_id.clone(),
+            plan_id.clone(),
+            task_id.clone(),
+            worktree_id.clone(),
+            implementer_agent,
+            Some(ImplementationContinuation {
+                parent_attempt_id: implementation_attempt_id,
+                kind: ImplementationContinuationKind::AdditionalContext,
+                instruction,
+            }),
+            storage,
+            implementer,
+            implementation_controls,
+            state_sender,
+        )
+        .await?;
+        implementation_attempt_id = corrected
+            .active_run
+            .as_ref()
+            .and_then(|run| run.implementation_attempts.last())
+            .map(|attempt| attempt.id.clone())
+            .ok_or_else(|| RequestFailure {
+                code: "implementation_failed",
+                message: "corrected implementation attempt was not persisted".to_owned(),
+            })?;
+        correction += 1;
+    }
+}
+
+fn conventional_task_commit_message(title: &str) -> String {
+    let title = title.trim().trim_end_matches(['.', '!', '?']);
+    let lowercase = title.to_ascii_lowercase();
+    let (prefix, subject) = if lowercase.starts_with("fix ") {
+        ("fix", lowercase.trim_start_matches("fix "))
+    } else {
+        ("feat", lowercase.as_str())
+    };
+    let mut message = format!("{prefix}: {subject}");
+    if message.chars().count() > 72 {
+        message = message.chars().take(72).collect();
+    }
+    message
+}
+
 fn normalize_implementation_activity(raw: &str) -> Vec<String> {
     let sanitized = strip_terminal_controls(raw);
     let mut messages = Vec::new();
@@ -2359,6 +2790,7 @@ async fn run_task_review(
     storage: &StorageWorker,
     reviewer_runner: &ReviewerRunner,
     state_sender: &watch::Sender<EngineSnapshot>,
+    verification_evidence: Option<&str>,
 ) -> Result<StoredSnapshot, RequestFailure> {
     let snapshot = storage
         .current_snapshot()
@@ -2437,7 +2869,10 @@ async fn run_task_review(
             }
         })?;
     let evidence = format!(
-        "Deterministic verification: not yet available in this Forge version. The reviewer must block when a required criterion cannot be established from repository evidence.\n\n{evidence}"
+        "Deterministic verification:\n{}\n\n{evidence}",
+        verification_evidence.unwrap_or(
+            "not run for this standalone review; block when a required criterion cannot be established"
+        )
     );
     let prompt = build_review_prompt(run, &task, &worktree, implementation.agent, &evidence);
     let primary_reviewer = implementation.agent.other();
@@ -2895,6 +3330,28 @@ fn remove_owned_socket(socket_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_fixed_rust_and_omarchy_verification_commands() {
+        let directory = TempDir::new().expect("temporary directory should exist");
+        fs::write(directory.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("Cargo marker should be written");
+        fs::write(directory.path().join("manifest.json"), "{}")
+            .expect("plugin marker should be written");
+        let commands = detected_verification_commands(directory.path());
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].arguments, &["fmt", "--all", "--", "--check"]);
+        assert_eq!(commands[3].arguments, &["plugin", "validate", "."]);
+    }
+
+    #[test]
+    fn creates_bounded_conventional_task_messages() {
+        assert_eq!(
+            conventional_task_commit_message("Fix broken review."),
+            "fix: broken review"
+        );
+        assert!(conventional_task_commit_message(&"Improve pipeline ".repeat(10)).len() <= 72);
+    }
 
     #[tokio::test]
     async fn first_stop_request_owns_the_implementation_transition() {
@@ -3674,6 +4131,7 @@ mod tests {
             &storage,
             &reviewer,
             &state_sender,
+            None,
         )
         .await
         .expect("review should settle");

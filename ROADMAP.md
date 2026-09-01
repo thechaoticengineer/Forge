@@ -12,7 +12,7 @@ The foundation and planning workflow are implemented. A developer can open the O
 
 Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; changed-file and retry evidence are the next implementation slice.
 
-The CLI can now run and persist a fresh independent review, preferring the provider that did not implement the task and recording an explicit same-provider fresh-session fallback when policy permits it. The **Changes**, **Verification**, and **Review** panel sections still communicate product direction and do not yet run those stages.
+The CLI and panel can now run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, failed gates can launch a fresh implementer correction, and a local isolated-worktree commit is created only after both gates pass. Configurable project checks, full raw-output drill-down, final diff approval, and integration actions remain open.
 
 ## Phase 0 — Foundation
 
@@ -68,20 +68,20 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 ## Phase 3 — Deterministic Verification
 
 - [ ] Define project verification commands and policy without asking an agent to infer success.
-- [ ] Run builds, tests, formatting, linting, and analyzers in the task worktree.
-- [ ] Capture exact commands, working directories, durations, output, and exit codes.
-- [ ] Persist verification attempts and distinguish pass, fail, cancellation, and infrastructure errors.
-- [ ] Present concise results in the **Verification** section with raw output available on demand.
-- [ ] Return actionable deterministic failures to the implementing agent only under user-visible policy.
+- [x] Run detected builds, tests, formatting, linting, and analyzers in the task worktree.
+- [x] Capture exact commands, working directories, durations, output, and exit codes.
+- [x] Persist verification attempts and distinguish pass, fail, and infrastructure errors. Cancellation remains planned.
+- [x] Present concise results in the **Verification** section. Raw-output drill-down remains planned.
+- [x] Return actionable deterministic failures to the implementing agent under an explicit bounded finish policy.
 
 ## Phase 4 — Independent Review and Correction
 
 - [x] Assign review to the agent that did not implement the change, with an explicit fresh-session fallback policy.
-- [ ] Give the reviewer the approved plan, acceptance criteria, diff, and verification evidence.
+- [x] Give the reviewer the approved plan, acceptance criteria, diff, and verification evidence.
 - [ ] Store findings with severity, evidence, status, and disposition. Verdicts, severity, and evidence are implemented; disposition remains.
-- [ ] Present findings in the **Review** section instead of hiding them in agent transcripts.
-- [ ] Return specific accepted findings to the implementer for correction.
-- [ ] Repeat verification and independent review after corrections.
+- [x] Present findings in the **Review** section instead of hiding them in agent transcripts.
+- [x] Return requested findings to the implementer for correction.
+- [x] Repeat verification and independent review after corrections.
 - [ ] Stop for human judgment on architecture, security, product intent, or conflicting agent opinions.
 
 ## Phase 5 — Final Inspection and Approval
@@ -91,7 +91,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [ ] Propose meaningful Conventional Commit boundaries and messages.
 - [ ] Show proposed commits before creating them.
 - [ ] Support keyboard-only final approval or rejection.
-- [ ] Create only user-approved commits without amending, rebasing, squashing, merging, or pushing implicitly.
+- [x] Create only explicitly requested local commits without amending, rebasing, squashing, merging, or pushing implicitly.
 - [ ] Preserve the final outcome and rejected result in durable history.
 
 ## Phase 6 — Omarchy Integration and Recovery Hardening
@@ -115,8 +115,8 @@ The first milestone is complete only when the whole workflow works through the r
 - [x] Describe a small engineering goal.
 - [x] Inspect, revise, approve, or reject a generated plan.
 - [x] Watch Codex CLI or Claude Code CLI implement the plan in an isolated worktree.
-- [ ] See deterministic build and test status update in the panel.
-- [ ] Receive independent review from the other agent.
+- [x] See deterministic build and test status update in the panel.
+- [x] Receive independent review from the other agent.
 - [ ] Inspect the final diff and proposed semantic commits.
 - [ ] Approve or reject the final result using only the keyboard.
 - [x] Reload the planning UI or restart the engine without losing the draft or plan.

@@ -2238,6 +2238,8 @@ mod tests {
             implementation_attempts: Vec::new(),
             implementation_activity: Vec::new(),
             review_attempts: Vec::new(),
+            verification_attempts: Vec::new(),
+            task_commits: Vec::new(),
             last_error: None,
         }
     }

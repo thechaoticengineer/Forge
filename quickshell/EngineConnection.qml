@@ -160,6 +160,20 @@ Item {
     })
   }
 
+  function finishTask(planId, taskId, worktreeId, implementationAttemptId) {
+    if (!activeRun) return false
+    return sendRequest("finish_task", {
+      run_id: activeRun.id,
+      plan_id: String(planId || ""),
+      task_id: String(taskId || ""),
+      worktree_id: String(worktreeId || ""),
+      implementation_attempt_id: String(implementationAttemptId || ""),
+      policy: "cross_provider_or_fresh_session",
+      max_corrections: 1,
+      create_commit: true
+    })
+  }
+
   function sendRequest(method, payload) {
     if (!socket.connected) {
       requestError = "The orchestration engine is not connected"

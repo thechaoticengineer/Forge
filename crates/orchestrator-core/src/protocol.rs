@@ -91,6 +91,16 @@ pub enum ClientRequest {
         implementation_attempt_id: String,
         policy: ReviewPolicy,
     },
+    FinishTask {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+        worktree_id: String,
+        implementation_attempt_id: String,
+        policy: ReviewPolicy,
+        max_corrections: u8,
+        create_commit: bool,
+    },
     GetSnapshot,
     Ping,
 }
@@ -240,6 +250,8 @@ mod tests {
         assert!(run.implementation_attempts.is_empty());
         assert!(run.implementation_activity.is_empty());
         assert!(run.review_attempts.is_empty());
+        assert!(run.verification_attempts.is_empty());
+        assert!(run.task_commits.is_empty());
     }
 
     #[test]
@@ -455,6 +467,27 @@ mod tests {
                 worktree_id: "worktree-1".to_owned(),
                 implementation_attempt_id: "implementation-1".to_owned(),
                 policy: ReviewPolicy::CrossProviderOrFreshSession,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_finish_task_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-finish","method":"finish_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session","max_corrections":1,"create_commit":true}"#,
+        )
+        .expect("finish request should parse");
+        assert_eq!(
+            message.request,
+            ClientRequest::FinishTask {
+                run_id: "run-1".to_owned(),
+                plan_id: "plan-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                worktree_id: "worktree-1".to_owned(),
+                implementation_attempt_id: "implementation-1".to_owned(),
+                policy: ReviewPolicy::CrossProviderOrFreshSession,
+                max_corrections: 1,
+                create_commit: true,
             }
         );
     }

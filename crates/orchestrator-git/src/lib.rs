@@ -48,6 +48,63 @@ const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_DISCOVERY_DIRECTORIES: usize = 4_000;
 const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
+/// Stages all task-worktree changes and creates one local commit.
+///
+/// The caller must supply the branch and base revision recorded when Forge
+/// created the worktree. This operation never merges or pushes.
+///
+/// # Errors
+///
+/// Returns an error when the worktree no longer matches its reservation, has
+/// no changes, Git cannot stage or commit the change, or the commit hash cannot
+/// be read.
+pub fn create_task_commit(
+    worktree: &Path,
+    expected_branch: &str,
+    expected_base: &str,
+    message: &str,
+) -> Result<String, GitError> {
+    let repository = inspect_repository(worktree)?;
+    if repository.branch.as_deref() != Some(expected_branch)
+        || repository.head_revision != expected_base
+    {
+        return Err(GitError::GitCommand {
+            operation: "validating the task worktree before commit",
+            status: None,
+            stderr: "task worktree branch or HEAD no longer matches its reservation".to_owned(),
+        });
+    }
+    checked_git(&repository.root, &["add", "--all"], "staging task changes")?;
+    let staged = run_git(
+        &repository.root,
+        &["diff", "--cached", "--quiet", "--exit-code"],
+        "checking staged task changes",
+    )?;
+    if staged.status.success() {
+        return Err(GitError::GitCommand {
+            operation: "creating the task commit",
+            status: Some(1),
+            stderr: "there are no task changes to commit".to_owned(),
+        });
+    }
+    if staged.status.code() != Some(1) {
+        return Err(command_error(&staged, "checking staged task changes"));
+    }
+    checked_git(
+        &repository.root,
+        &["commit", "-m", message],
+        "creating the task commit",
+    )?;
+    text_output(
+        checked_git(
+            &repository.root,
+            &["rev-parse", "HEAD"],
+            "reading task commit",
+        )?,
+        "reading task commit",
+    )
+}
+
 /// Captures bounded, read-only Git evidence for an independent reviewer.
 ///
 /// The status includes untracked paths, while the patch compares tracked
@@ -552,6 +609,32 @@ mod tests {
         assert!(evidence.contains("?? new.txt"));
         assert!(evidence.contains("-test"));
         assert!(evidence.contains("+changed"));
+    }
+
+    #[test]
+    fn creates_a_local_task_commit_only_from_the_expected_base() {
+        let repository = initialized_repository();
+        git(repository.path(), &["config", "user.name", "Test User"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        fs::write(repository.path().join("change.txt"), "verified")
+            .expect("task change should be written");
+        let hash = create_task_commit(
+            repository.path(),
+            state.branch.as_deref().expect("branch should exist"),
+            &state.head_revision,
+            "feat: record verified change",
+        )
+        .expect("task commit should be created");
+        assert_eq!(hash.len(), 40);
+        assert!(
+            !inspect_repository(repository.path())
+                .expect("repository should inspect")
+                .dirty
+        );
     }
 
     #[test]
