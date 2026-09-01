@@ -87,7 +87,7 @@ pub enum WorktreeError {
         path: PathBuf,
         cleanup: String,
         #[source]
-        source: GitError,
+        source: Box<GitError>,
     },
     #[error("created worktree does not match its request: {0}")]
     Unexpected(String),
@@ -424,7 +424,7 @@ fn roll_back_reservation(
         WorktreeError::CreateAndRollback {
             path: destination.to_path_buf(),
             cleanup: problems.join("; "),
-            source,
+            source: Box::new(source),
         }
     }
 }

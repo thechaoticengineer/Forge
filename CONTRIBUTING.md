@@ -93,6 +93,8 @@ cargo run -p orchestrator-cli -- finish --task 1
 # Create the inspected local commit, or preserve a rejection without committing.
 cargo run -p orchestrator-cli -- approve --task 1
 cargo run -p orchestrator-cli -- reject --task 1 --reason "Needs another pass"
+# After approval, explicitly fast-forward a checked-out clean local branch. This never pushes.
+cargo run -p orchestrator-cli -- integrate --task 1 --branch main
 # From another terminal while an implementation is running:
 cargo run -p orchestrator-cli -- pause
 cargo run -p orchestrator-cli -- resume
@@ -105,7 +107,13 @@ The worktree and its `orchestrator/`-prefixed branch are created below the engin
 
 The implementation command can also use `--agent claude`. The engine records the assignment before launching the agent, confines writes to the ready task worktree, supervises bounded output and process lifetime, and preserves success or failure evidence. A successful agent exit does not mean the task is verified or approved.
 
-The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can pause, resume, cancel, redirect, or add context while preserving partial worktree changes and linked attempt history. A paused process remains owned by the live engine and is recovered as interrupted if the engine exits. `finish` records detected Rust and Omarchy checks, sends their evidence to an independent reviewer, runs a bounded fresh correction session when needed, and prepares the exact final tree for inspection. The Changes section shows the complete patch, changed paths, gate status, and proposed one-task commit. A separate `approve` revalidates the tree and creates the local commit; `reject` preserves the result without committing. Configurable project checks, semantic multi-commit splitting, and merge or push actions remain to be implemented.
+The current run survives engine or shell restarts. The Overview section shows a bounded recent window of durable implementation activity and can pause, resume, cancel, redirect, or add context while preserving partial worktree changes and linked attempt history. A paused process remains owned by the live engine and is recovered as interrupted if the engine exits. `finish` records detected Rust and Omarchy checks, sends their evidence to an independent reviewer, runs a bounded fresh correction session when needed, and prepares the exact final tree for inspection. The Changes section shows the complete patch, changed paths, gate status, and proposed one-task commit. A separate `approve` revalidates that tree and creates the local task commit; `reject` preserves the result without committing. `integrate` is another explicit action that only fast-forwards an existing checked-out clean local branch to the approved commit. Configurable project checks, semantic multi-commit splitting, divergent merges, and push actions remain to be implemented.
+
+To exercise managed startup locally after installing both binaries, run
+`build-orchestrator engine install`. Inspect it with
+`build-orchestrator engine status`, and remove only the user service with
+`build-orchestrator engine uninstall`. Service removal preserves durable state
+and Git work. See [ADR-0014](docs/adr/0014-manage-the-engine-as-a-systemd-user-service.md).
 
 Documentation changes should also be checked for Markdown structure, broken internal references, trailing whitespace, and consistency with the README.
 

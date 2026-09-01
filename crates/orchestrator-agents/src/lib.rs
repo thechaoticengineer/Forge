@@ -2240,6 +2240,7 @@ mod tests {
             review_attempts: Vec::new(),
             verification_attempts: Vec::new(),
             task_commits: Vec::new(),
+            task_integrations: Vec::new(),
             last_error: None,
         }
     }

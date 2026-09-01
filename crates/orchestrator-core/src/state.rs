@@ -47,6 +47,8 @@ pub struct ActiveRunSummary {
     pub verification_attempts: Vec<VerificationAttemptSummary>,
     #[serde(default)]
     pub task_commits: Vec<TaskCommitSummary>,
+    #[serde(default)]
+    pub task_integrations: Vec<TaskIntegrationSummary>,
     pub last_error: Option<String>,
 }
 
@@ -178,6 +180,39 @@ pub struct TaskCommitSummary {
     pub error_message: Option<String>,
     #[serde(default)]
     pub decision_reason: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntegrationStatus {
+    Reserved,
+    Completed,
+    Failed,
+}
+
+impl TaskIntegrationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskIntegrationSummary {
+    pub id: String,
+    pub task_commit_id: String,
+    pub task_id: String,
+    pub target_branch: String,
+    pub expected_head: String,
+    pub status: TaskIntegrationStatus,
+    pub result_head: Option<String>,
+    pub error_message: Option<String>,
     pub created_at: i64,
     pub completed_at: Option<i64>,
 }

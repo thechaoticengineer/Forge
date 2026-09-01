@@ -109,6 +109,11 @@ pub enum ClientRequest {
         task_commit_id: String,
         reason: Option<String>,
     },
+    IntegrateTaskCommit {
+        run_id: String,
+        task_commit_id: String,
+        target_branch: String,
+    },
     GetSnapshot,
     Ping,
 }
@@ -523,6 +528,19 @@ mod tests {
                 run_id: "run-1".to_owned(),
                 task_commit_id: "commit-1".to_owned(),
                 reason: Some("Needs another pass".to_owned()),
+            }
+        );
+
+        let integration: ClientMessage = serde_json::from_str(
+            r#"{"version":2,"request_id":"request-integrate","method":"integrate_task_commit","run_id":"run-1","task_commit_id":"commit-1","target_branch":"main"}"#,
+        )
+        .expect("integration request should parse");
+        assert_eq!(
+            integration.request,
+            ClientRequest::IntegrateTaskCommit {
+                run_id: "run-1".to_owned(),
+                task_commit_id: "commit-1".to_owned(),
+                target_branch: "main".to_owned(),
             }
         );
     }

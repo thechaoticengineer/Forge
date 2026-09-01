@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** The first vertical workflow is implemented. The Omarchy panel can create an approved task's isolated worktree, launch a user-selected Codex or Claude implementer, show durable activity, and carry the task through deterministic checks, independent review, correction, and exact final-tree inspection. The CLI and panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. Managed engine startup, configurable project verification, semantic multi-commit splitting, merge, push, and deployment remain planned.
+> **Project status:** The first vertical workflow is implemented. The Omarchy panel can create an approved task's isolated worktree, launch a user-selected Codex or Claude implementer, show durable activity, and carry the task through deterministic checks, independent review, correction, and exact final-tree inspection. The CLI and panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. A second confirmed action can fast-forward a checked-out clean local branch to that commit, and the CLI can install the engine as a managed user service. Configurable project verification, semantic multi-commit splitting, divergent merges, push, and deployment remain planned.
 >
 > **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
@@ -209,7 +209,7 @@ The main panel should be a first-class product interface, not a transcript viewe
 
 The default screen should summarize progress and prioritize actionable information. Detailed prompts, responses, stdout, stderr, and internal events remain one level deeper for users who need to investigate.
 
-The implemented panel makes **Overview**, **Plan**, **Changes**, **Verification**, and **Review** functional. **Plan** shows each approved task's dependency declaration, worktree and branch, latest implementer attempt, failures, and next action; it can create the isolated worktree and launch Codex or Claude with keyboard-only controls. Because every task branch currently starts from the run's shared base revision, tasks with dependencies are visibly blocked until an explicit task-branch integration design exists rather than being launched without their prerequisite changes. **Changes** shows the exact final patch, changed-file summary, evidence status, proposed task commit, and explicit approval or rejection controls. Raw verification-output drill-down and semantic multi-commit splitting remain planned.
+The implemented panel makes **Overview**, **Plan**, **Changes**, **Verification**, and **Review** functional. **Plan** shows each approved task's dependency declaration, worktree and branch, latest implementer attempt, failures, and next action; it can create the isolated worktree and launch Codex or Claude with keyboard-only controls. Because every task branch currently starts from the run's shared base revision, tasks with dependencies are visibly blocked until task results can be composed without dropping prerequisite changes; root tasks remain executable. **Changes** shows the exact final patch, changed-file summary, evidence status, proposed task commit, explicit approval or rejection controls, and a separately confirmed fast-forward into a selected local branch after commit creation. Raw verification-output drill-down and semantic multi-commit splitting remain planned.
 
 ### Keyboard-first operation
 
@@ -322,6 +322,33 @@ Each implementation task of an approved plan can be given its own Git worktree a
 After recovery, the user should be able to understand what completed, what may have been interrupted, which operations are safe to retry, and what still requires attention. Recovery should favor explicit state reconciliation over replaying side effects blindly.
 
 Traceability is also a product feature. A run history should explain why a plan changed, why a finding was accepted or rejected, why a command was retried, and which evidence supported final approval.
+
+## Engine Installation and Lifecycle
+
+Install both Rust binaries, then let the CLI create and start the user-scoped
+systemd service:
+
+```text
+cargo install --locked --path crates/orchestrator-engine
+cargo install --locked --path crates/orchestrator-cli
+build-orchestrator engine install
+```
+
+The generated unit stores absolute paths for the engine and the authenticated
+Codex, Claude Code, and GitHub CLI installations, starts at the user's default
+target, and restarts only after failure. Reinstall the service after changing
+those executable locations or project roots. Rebuild or reinstall the binaries
+and run `systemctl --user restart omarchy-ai-build-orchestrator.service` after
+updating their code.
+
+```text
+build-orchestrator engine status
+build-orchestrator engine uninstall
+```
+
+Uninstalling the service stops it and removes only its user unit. It preserves
+the SQLite state, artifacts, task worktrees, task branches, and the independently
+managed Omarchy plugin. See [ADR-0014](docs/adr/0014-manage-the-engine-as-a-systemd-user-service.md).
 
 ## Initial Scope
 

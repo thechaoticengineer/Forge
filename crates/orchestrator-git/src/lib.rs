@@ -4,9 +4,9 @@ use std::{
     collections::{HashSet, VecDeque},
     ffi::OsStr,
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Output, Stdio},
     string::FromUtf8Error,
     time::Instant,
 };
@@ -55,6 +55,131 @@ pub struct TaskChangeSet {
     pub tree_hash: String,
     pub changed_files: Vec<ChangedFileSummary>,
     pub patch: String,
+}
+
+/// Read-only preflight evidence for integrating an approved task commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIntegrationTarget {
+    pub target_branch: String,
+    pub expected_head: String,
+    pub task_commit: String,
+}
+
+/// Validates that a local branch can be advanced to an approved task commit
+/// without synthesizing a merge or rewriting history.
+///
+/// # Errors
+///
+/// Returns an error when the branch or commit is missing, the branch name is
+/// invalid, or advancing the branch would not be a fast-forward.
+pub fn prepare_task_integration(
+    repository: &Path,
+    target_branch: &str,
+    task_commit: &str,
+) -> Result<TaskIntegrationTarget, GitError> {
+    let repository = inspect_repository(repository)?;
+    let target_ref = validate_local_branch(&repository.root, target_branch)?;
+    let expected_head = resolve_commit(
+        &repository.root,
+        &target_ref,
+        "resolving the integration target branch",
+    )?;
+    let task_commit = resolve_commit(
+        &repository.root,
+        task_commit,
+        "resolving the approved task commit",
+    )?;
+    if changes_gitlinks(&repository.root, &expected_head, &task_commit)? {
+        return Err(GitError::IntegrationChangesSubmodules);
+    }
+    if expected_head != task_commit
+        && !is_ancestor(&repository.root, &expected_head, &task_commit)?
+        && !is_ancestor(&repository.root, &task_commit, &expected_head)?
+    {
+        return Err(GitError::IntegrationNotFastForward {
+            branch: target_branch.to_owned(),
+            head: expected_head,
+            task_commit,
+        });
+    }
+    Ok(TaskIntegrationTarget {
+        target_branch: target_branch.to_owned(),
+        expected_head,
+        task_commit,
+    })
+}
+
+/// Advances a local branch to an approved task commit after rechecking the
+/// exact preflight head. The target must be checked out in a clean worktree so
+/// its branch, index, and files can be advanced coherently under Git's locks.
+///
+/// # Errors
+///
+/// Returns an error when the target changed after preflight, is dirty, no
+/// longer permits a fast-forward, or Git cannot update it safely.
+pub fn integrate_task_commit(
+    repository: &Path,
+    target: &TaskIntegrationTarget,
+) -> Result<String, GitError> {
+    let repository = inspect_repository(repository)?;
+    let target_ref = validate_local_branch(&repository.root, &target.target_branch)?;
+    let current_head = resolve_commit(
+        &repository.root,
+        &target_ref,
+        "rechecking the integration target branch",
+    )?;
+    let task_commit = resolve_commit(
+        &repository.root,
+        &target.task_commit,
+        "rechecking the approved task commit",
+    )?;
+    if current_head != target.expected_head {
+        return Err(GitError::IntegrationTargetChanged {
+            branch: target.target_branch.clone(),
+            expected: target.expected_head.clone(),
+            actual: current_head,
+        });
+    }
+    let worktree = branch_worktree(&repository.root, &target_ref)?
+        .ok_or_else(|| GitError::IntegrationBranchNotCheckedOut(target.target_branch.clone()))?;
+    let checked_out = inspect_repository(&worktree)?;
+    if checked_out.branch.as_deref() != Some(target.target_branch.as_str())
+        || checked_out.head_revision != target.expected_head
+    {
+        return Err(GitError::IntegrationTargetChanged {
+            branch: target.target_branch.clone(),
+            expected: target.expected_head.clone(),
+            actual: checked_out.head_revision,
+        });
+    }
+    if checked_out.dirty {
+        return Err(GitError::DirtyIntegrationWorktree(worktree));
+    }
+    if changes_gitlinks(&repository.root, &current_head, &task_commit)? {
+        return Err(GitError::IntegrationChangesSubmodules);
+    }
+    if current_head == task_commit || is_ancestor(&repository.root, &task_commit, &current_head)? {
+        return Ok(current_head);
+    }
+    if !is_ancestor(&repository.root, &current_head, &task_commit)? {
+        return Err(GitError::IntegrationNotFastForward {
+            branch: target.target_branch.clone(),
+            head: current_head,
+            task_commit,
+        });
+    }
+    guarded_fast_forward(
+        &checked_out.root,
+        &target_ref,
+        &target.expected_head,
+        &task_commit,
+    )?;
+
+    resolve_commit(
+        &repository.root,
+        &target_ref,
+        "reading the integrated branch",
+    )
 }
 
 /// Captures the exact tree, changed paths, and complete binary-safe Git patch
@@ -466,6 +591,356 @@ pub enum GitError {
     TemporaryIndex(std::io::Error),
     #[error("task worktree changed after inspection (expected tree {expected}, found {actual})")]
     WorktreeChanged { expected: String, actual: String },
+    #[error("invalid local integration branch: {0}")]
+    InvalidIntegrationBranch(String),
+    #[error("symbolic local refs cannot be integration targets: {0}")]
+    SymbolicIntegrationBranch(String),
+    #[error(
+        "integration target branch {branch} changed after confirmation (expected {expected}, found {actual})"
+    )]
+    IntegrationTargetChanged {
+        branch: String,
+        expected: String,
+        actual: String,
+    },
+    #[error(
+        "branch {branch} at {head} cannot be fast-forwarded to approved task commit {task_commit}"
+    )]
+    IntegrationNotFastForward {
+        branch: String,
+        head: String,
+        task_commit: String,
+    },
+    #[error("integration target worktree has uncommitted changes: {0}")]
+    DirtyIntegrationWorktree(PathBuf),
+    #[error("integration target branch must be checked out in a worktree: {0}")]
+    IntegrationBranchNotCheckedOut(String),
+    #[error("integration target branch is checked out in multiple worktrees: {0}")]
+    IntegrationBranchMultipleWorktrees(String),
+    #[error("integration target branch checkout changed while acquiring Git locks: {0}")]
+    IntegrationBranchOwnershipChanged(String),
+    #[error("integration changes submodule pointers, which is not supported safely yet")]
+    IntegrationChangesSubmodules,
+    #[error("cannot prepare the guarded integration transaction: {0}")]
+    IntegrationGuard(std::io::Error),
+    #[error(
+        "integration transaction failed after updating the worktree: {operation_error}; rollback failed: {rollback_error}"
+    )]
+    IntegrationWorktreeRollback {
+        operation_error: String,
+        rollback_error: String,
+    },
+}
+
+fn validate_local_branch(repository: &Path, branch: &str) -> Result<String, GitError> {
+    if branch.trim() != branch || branch.is_empty() || branch.starts_with('-') {
+        return Err(GitError::InvalidIntegrationBranch(branch.to_owned()));
+    }
+    let output = run_git(
+        repository,
+        &["check-ref-format", "--branch", branch],
+        "validating the integration branch",
+    )?;
+    if !output.status.success() {
+        return Err(GitError::InvalidIntegrationBranch(branch.to_owned()));
+    }
+    let target_ref = format!("refs/heads/{branch}");
+    let symbolic = run_git(
+        repository,
+        &["symbolic-ref", "--quiet", &target_ref],
+        "checking whether the integration branch is symbolic",
+    )?;
+    match symbolic.status.code() {
+        Some(0) => Err(GitError::SymbolicIntegrationBranch(branch.to_owned())),
+        Some(1) => Ok(target_ref),
+        _ => Err(command_error(
+            &symbolic,
+            "checking whether the integration branch is symbolic",
+        )),
+    }
+}
+
+fn resolve_commit(
+    repository: &Path,
+    revision: &str,
+    operation: &'static str,
+) -> Result<String, GitError> {
+    text_output(
+        checked_git(
+            repository,
+            &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+            operation,
+        )?,
+        operation,
+    )
+}
+
+fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+    let operation = "checking integration ancestry";
+    let output = run_git(
+        repository,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        operation,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(command_error(&output, operation)),
+    }
+}
+
+fn changes_gitlinks(repository: &Path, old: &str, new: &str) -> Result<bool, GitError> {
+    let operation = "checking integration submodule changes";
+    let output = checked_git(
+        repository,
+        &["diff-tree", "--no-commit-id", "-r", "--raw", old, new],
+        operation,
+    )?;
+    Ok(output.stdout.split(|byte| *byte == b'\n').any(|line| {
+        let mut fields = line.split(u8::is_ascii_whitespace);
+        let old_mode = fields.next().unwrap_or_default();
+        let new_mode = fields.next().unwrap_or_default();
+        old_mode.strip_prefix(b":") == Some(b"160000") || new_mode == b"160000"
+    }))
+}
+
+fn branch_worktree(repository: &Path, target_ref: &str) -> Result<Option<PathBuf>, GitError> {
+    let operation = "locating the integration branch worktree";
+    let output = checked_git(
+        repository,
+        &["worktree", "list", "--porcelain", "-z"],
+        operation,
+    )?;
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|source| GitError::NonUtf8 { operation, source })?;
+    let mut current_path = None;
+    let mut matched_path = None;
+    for field in listing.split('\0') {
+        if field.is_empty() {
+            current_path = None;
+        } else if let Some(path) = field.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path));
+        } else if field.strip_prefix("branch ") == Some(target_ref) {
+            if matched_path.is_some() {
+                return Err(GitError::IntegrationBranchMultipleWorktrees(
+                    target_ref
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(target_ref)
+                        .to_owned(),
+                ));
+            }
+            matched_path.clone_from(&current_path);
+        }
+    }
+    Ok(matched_path)
+}
+
+fn guarded_fast_forward(
+    worktree: &Path,
+    target_ref: &str,
+    expected_head: &str,
+    task_commit: &str,
+) -> Result<(), GitError> {
+    // Preparing the exact ref transaction takes Git's target-ref lock and,
+    // when that target is checked out here, its HEAD lock. This closes the
+    // branch-switch window before any index or worktree update begins.
+    let transaction =
+        PreparedRefTransaction::start(worktree, target_ref, expected_head, task_commit)?;
+    if let Err(error) = verify_locked_branch_worktree(worktree, target_ref) {
+        let _ = transaction.abort();
+        return Err(error);
+    }
+    let checked_out = inspect_repository(worktree)?;
+    let expected_branch = target_ref
+        .strip_prefix("refs/heads/")
+        .expect("validated local branch ref");
+    if checked_out.branch.as_deref() != Some(expected_branch)
+        || checked_out.head_revision != expected_head
+    {
+        let _ = transaction.abort();
+        return Err(GitError::IntegrationTargetChanged {
+            branch: expected_branch.to_owned(),
+            expected: expected_head.to_owned(),
+            actual: checked_out.head_revision,
+        });
+    }
+    if checked_out.dirty {
+        let _ = transaction.abort();
+        return Err(GitError::DirtyIntegrationWorktree(checked_out.root.clone()));
+    }
+    let worktree_update = checked_git(
+        worktree,
+        &["read-tree", "-u", "-m", expected_head, task_commit],
+        "updating the guarded integration worktree",
+    );
+    if let Err(error) = worktree_update {
+        let abort = transaction.abort();
+        return match abort {
+            Ok(()) => Err(error),
+            Err(abort_error) => Err(GitError::IntegrationWorktreeRollback {
+                operation_error: error.to_string(),
+                rollback_error: abort_error.to_string(),
+            }),
+        };
+    }
+    if let Err(error) = transaction.commit() {
+        let rollback = checked_git(
+            worktree,
+            &["read-tree", "-u", "-m", task_commit, expected_head],
+            "rolling back the guarded integration worktree",
+        );
+        return match rollback {
+            Ok(_) => Err(error),
+            Err(rollback_error) => Err(GitError::IntegrationWorktreeRollback {
+                operation_error: error.to_string(),
+                rollback_error: rollback_error.to_string(),
+            }),
+        };
+    }
+    let integrated = inspect_repository(worktree)?;
+    if integrated.branch.as_deref() != Some(expected_branch)
+        || integrated.head_revision != task_commit
+        || integrated.dirty
+    {
+        return Err(GitError::IntegrationWorktreeRollback {
+            operation_error:
+                "Git committed the reference transaction but the checkout is not coherent"
+                    .to_owned(),
+            rollback_error: "automatic rollback is unsafe after the target reference moved"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_locked_branch_worktree(worktree: &Path, target_ref: &str) -> Result<(), GitError> {
+    match branch_worktree(worktree, target_ref)? {
+        Some(locked_worktree) if locked_worktree == worktree => Ok(()),
+        _ => Err(GitError::IntegrationBranchOwnershipChanged(
+            target_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(target_ref)
+                .to_owned(),
+        )),
+    }
+}
+
+struct PreparedRefTransaction {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    error: ChildStderr,
+    finished: bool,
+}
+
+impl PreparedRefTransaction {
+    fn start(
+        worktree: &Path,
+        target_ref: &str,
+        expected_head: &str,
+        task_commit: &str,
+    ) -> Result<Self, GitError> {
+        let operation = "preparing the integration reference transaction";
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args([
+                "update-ref",
+                "-m",
+                "forge: integrate approved task commit",
+                "--stdin",
+            ])
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| GitError::StartGit { operation, source })?;
+        let input = child.stdin.take().ok_or_else(|| {
+            GitError::IntegrationGuard(std::io::Error::other("Git stdin was unavailable"))
+        })?;
+        let output = child.stdout.take().ok_or_else(|| {
+            GitError::IntegrationGuard(std::io::Error::other("Git stdout was unavailable"))
+        })?;
+        let error = child.stderr.take().ok_or_else(|| {
+            GitError::IntegrationGuard(std::io::Error::other("Git stderr was unavailable"))
+        })?;
+        let mut transaction = Self {
+            child,
+            input: Some(input),
+            output: BufReader::new(output),
+            error,
+            finished: false,
+        };
+        transaction.command("start", Some("start: ok"))?;
+        transaction.command(
+            &format!("update {target_ref} {task_commit} {expected_head}"),
+            None,
+        )?;
+        transaction.command("prepare", Some("prepare: ok"))?;
+        Ok(transaction)
+    }
+
+    fn commit(mut self) -> Result<(), GitError> {
+        self.command("commit", Some("commit: ok"))?;
+        self.finish()
+    }
+
+    fn abort(mut self) -> Result<(), GitError> {
+        self.command("abort", Some("abort: ok"))?;
+        self.finish()
+    }
+
+    fn command(&mut self, command: &str, expected: Option<&str>) -> Result<(), GitError> {
+        let input = self.input.as_mut().expect("live transaction input");
+        writeln!(input, "{command}").map_err(GitError::IntegrationGuard)?;
+        input.flush().map_err(GitError::IntegrationGuard)?;
+        if let Some(expected) = expected {
+            let mut response = String::new();
+            self.output
+                .read_line(&mut response)
+                .map_err(GitError::IntegrationGuard)?;
+            if response.trim_end() != expected {
+                return Err(GitError::GitCommand {
+                    operation: "running the integration reference transaction",
+                    status: None,
+                    stderr: format!(
+                        "expected Git response {expected:?}, received {:?}",
+                        response.trim_end()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), GitError> {
+        self.input.take();
+        let status = self.child.wait().map_err(GitError::IntegrationGuard)?;
+        let mut stderr = String::new();
+        self.error
+            .read_to_string(&mut stderr)
+            .map_err(GitError::IntegrationGuard)?;
+        self.finished = true;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(GitError::GitCommand {
+                operation: "running the integration reference transaction",
+                status: status.code(),
+                stderr: stderr.trim().to_owned(),
+            })
+        }
+    }
+}
+
+impl Drop for PreparedRefTransaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 fn validate_revision(worktree: &Path, revision: &str) -> Result<(), GitError> {
@@ -855,6 +1330,344 @@ mod tests {
     }
 
     #[test]
+    fn fast_forwards_a_clean_checked_out_target_branch() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let (task_worktree, task_commit) = committed_task(&repository, &worktrees);
+        let branch = inspect_repository(repository.path())
+            .expect("repository should inspect")
+            .branch
+            .expect("repository should have a branch");
+        let target = prepare_task_integration(repository.path(), &branch, &task_commit)
+            .expect("integration should preflight");
+
+        let integrated = integrate_task_commit(repository.path(), &target)
+            .expect("clean target should fast-forward");
+
+        assert_eq!(integrated, task_commit);
+        assert_eq!(
+            inspect_repository(repository.path())
+                .expect("repository should inspect")
+                .head_revision,
+            task_commit
+        );
+        assert!(repository.path().join("task.txt").exists());
+        assert!(!task_worktree.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn refuses_a_dirty_checked_out_target_branch() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        let branch = inspect_repository(repository.path())
+            .expect("repository should inspect")
+            .branch
+            .expect("repository should have a branch");
+        let target = prepare_task_integration(repository.path(), &branch, &task_commit)
+            .expect("integration should preflight");
+        fs::write(repository.path().join("local.txt"), "uncommitted")
+            .expect("target should become dirty");
+
+        let error = integrate_task_commit(repository.path(), &target)
+            .expect_err("dirty target must be refused");
+
+        assert!(matches!(error, GitError::DirtyIntegrationWorktree(_)));
+    }
+
+    #[test]
+    fn refuses_a_branch_that_is_not_checked_out() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        git(
+            repository.path(),
+            &["branch", "release", &state.head_revision],
+        );
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        let target = prepare_task_integration(repository.path(), "release", &task_commit)
+            .expect("integration should preflight");
+
+        let error = integrate_task_commit(repository.path(), &target)
+            .expect_err("unowned branch must be refused");
+
+        assert!(matches!(
+            error,
+            GitError::IntegrationBranchNotCheckedOut(branch) if branch == "release"
+        ));
+        let release = text_output(
+            checked_git(
+                repository.path(),
+                &["rev-parse", "release"],
+                "reading release branch",
+            )
+            .expect("release should resolve"),
+            "reading release branch",
+        )
+        .expect("release hash should be text");
+        assert_eq!(release, state.head_revision);
+    }
+
+    #[test]
+    fn refuses_a_branch_checked_out_in_multiple_worktrees() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let branch = state.branch.expect("branch should exist");
+        let duplicate = worktrees.path().join("duplicate");
+        git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--force",
+                duplicate.to_str().expect("worktree path should be UTF-8"),
+                &branch,
+            ],
+        );
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        let target = prepare_task_integration(repository.path(), &branch, &task_commit)
+            .expect("integration should preflight");
+
+        let error = integrate_task_commit(repository.path(), &target)
+            .expect_err("duplicate checked-out branch must be refused");
+
+        assert!(matches!(
+            error,
+            GitError::IntegrationBranchMultipleWorktrees(error_branch)
+                if error_branch == branch
+        ));
+        for checkout in [repository.path(), duplicate.as_path()] {
+            let unchanged = inspect_repository(checkout).expect("checkout should inspect");
+            assert_eq!(unchanged.head_revision, state.head_revision);
+            assert!(!unchanged.dirty);
+            assert!(!checkout.join("task.txt").exists());
+        }
+    }
+
+    #[test]
+    fn locked_ownership_recheck_detects_a_duplicate_checkout() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let branch = state.branch.expect("branch should exist");
+        let duplicate = worktrees.path().join("duplicate");
+        git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--force",
+                duplicate.to_str().expect("worktree path should be UTF-8"),
+                &branch,
+            ],
+        );
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        let transaction = PreparedRefTransaction::start(
+            repository.path(),
+            &format!("refs/heads/{branch}"),
+            &state.head_revision,
+            &task_commit,
+        )
+        .expect("reference transaction should prepare despite an earlier forced checkout");
+
+        let error =
+            verify_locked_branch_worktree(repository.path(), &format!("refs/heads/{branch}"))
+                .expect_err("locked ownership recheck must see both worktrees");
+
+        assert!(matches!(
+            error,
+            GitError::IntegrationBranchMultipleWorktrees(error_branch)
+                if error_branch == branch
+        ));
+        transaction.abort().expect("transaction should abort");
+        for checkout in [repository.path(), duplicate.as_path()] {
+            let unchanged = inspect_repository(checkout).expect("checkout should inspect");
+            assert_eq!(unchanged.head_revision, state.head_revision);
+            assert!(!unchanged.dirty);
+            assert!(!checkout.join("task.txt").exists());
+        }
+    }
+
+    #[test]
+    fn rejects_a_symbolic_local_integration_branch() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        git(
+            repository.path(),
+            &[
+                "symbolic-ref",
+                "refs/heads/alias",
+                &format!("refs/heads/{}", state.branch.expect("branch should exist")),
+            ],
+        );
+
+        let error = prepare_task_integration(repository.path(), "alias", &task_commit)
+            .expect_err("symbolic target must be refused");
+
+        assert!(matches!(error, GitError::SymbolicIntegrationBranch(branch) if branch == "alias"));
+    }
+
+    #[test]
+    fn refuses_an_integration_that_changes_a_submodule_pointer() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let (task_worktree, _) = committed_task(&repository, &worktrees);
+        git(
+            &task_worktree,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},module", state.head_revision),
+            ],
+        );
+        git(
+            &task_worktree,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "test: add submodule pointer",
+            ],
+        );
+        let task_commit = inspect_repository(&task_worktree)
+            .expect("task worktree should inspect")
+            .head_revision;
+
+        let error = prepare_task_integration(
+            repository.path(),
+            state.branch.as_deref().expect("branch should exist"),
+            &task_commit,
+        )
+        .expect_err("submodule pointer change must be refused");
+
+        assert!(matches!(error, GitError::IntegrationChangesSubmodules));
+        let unchanged = inspect_repository(repository.path()).expect("repository should inspect");
+        assert_eq!(unchanged.head_revision, state.head_revision);
+        assert!(!unchanged.dirty);
+        assert!(!repository.path().join("module").exists());
+    }
+
+    #[test]
+    fn guarded_fast_forward_refuses_to_advance_a_different_checked_out_branch() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let target_branch = state.branch.expect("branch should exist");
+        let base = state.head_revision;
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        git(repository.path(), &["checkout", "--quiet", "-b", "other"]);
+
+        let error = guarded_fast_forward(
+            repository.path(),
+            &format!("refs/heads/{target_branch}"),
+            &base,
+            &task_commit,
+        )
+        .expect_err("guard must reject a branch ownership race");
+
+        assert!(matches!(
+            error,
+            GitError::IntegrationBranchOwnershipChanged(error_branch)
+                if error_branch == target_branch
+        ));
+        for branch in [target_branch.as_str(), "other"] {
+            assert_eq!(
+                resolve_commit(repository.path(), branch, "checking guarded branch")
+                    .expect("branch should resolve"),
+                base
+            );
+        }
+        assert!(
+            !inspect_repository(repository.path())
+                .expect("rejected checkout should inspect")
+                .dirty
+        );
+        assert!(!repository.path().join("task.txt").exists());
+    }
+
+    #[test]
+    fn prepared_ref_transaction_blocks_a_concurrent_branch_switch() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        let target_branch = state.branch.expect("branch should exist");
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        git(
+            repository.path(),
+            &["branch", "other", &state.head_revision],
+        );
+        let transaction = PreparedRefTransaction::start(
+            repository.path(),
+            &format!("refs/heads/{target_branch}"),
+            &state.head_revision,
+            &task_commit,
+        )
+        .expect("reference transaction should prepare");
+
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args(["checkout", "--quiet", "other"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("concurrent Git should start");
+
+        assert!(!checkout.status.success());
+        assert!(String::from_utf8_lossy(&checkout.stderr).contains("HEAD.lock"));
+        transaction.abort().expect("transaction should abort");
+        let unchanged = inspect_repository(repository.path()).expect("repository should inspect");
+        assert_eq!(unchanged.branch.as_deref(), Some(target_branch.as_str()));
+        assert_eq!(unchanged.head_revision, state.head_revision);
+        assert!(!unchanged.dirty);
+        assert!(!repository.path().join("task.txt").exists());
+    }
+
+    #[test]
+    fn refuses_integration_after_the_target_branch_changes() {
+        let repository = initialized_repository();
+        let worktrees = TempDir::new().expect("worktree root should exist");
+        let (_, task_commit) = committed_task(&repository, &worktrees);
+        let branch = inspect_repository(repository.path())
+            .expect("repository should inspect")
+            .branch
+            .expect("repository should have a branch");
+        let target = prepare_task_integration(repository.path(), &branch, &task_commit)
+            .expect("integration should preflight");
+        fs::write(repository.path().join("main.txt"), "advanced")
+            .expect("main change should be written");
+        git(repository.path(), &["add", "main.txt"]);
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "test: advance main",
+            ],
+        );
+
+        let error = integrate_task_commit(repository.path(), &target)
+            .expect_err("changed target must be refused");
+
+        assert!(matches!(error, GitError::IntegrationTargetChanged { .. }));
+    }
+
+    #[test]
     fn discovers_nested_repositories_and_github_origins() {
         let projects = TempDir::new().expect("projects root should exist");
         let first = projects.path().join("Forge");
@@ -931,6 +1744,43 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory should exist");
         initialize_repository(directory.path());
         directory
+    }
+
+    fn committed_task(repository: &TempDir, worktrees: &TempDir) -> (PathBuf, String) {
+        let task_worktree = worktrees.path().join("task");
+        git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "orchestrator/test/task",
+                task_worktree
+                    .to_str()
+                    .expect("worktree path should be UTF-8"),
+            ],
+        );
+        fs::write(task_worktree.join("task.txt"), "approved")
+            .expect("task change should be written");
+        git(&task_worktree, &["add", "task.txt"]);
+        git(
+            &task_worktree,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "feat: approved task",
+            ],
+        );
+        let commit = inspect_repository(&task_worktree)
+            .expect("task worktree should inspect")
+            .head_revision;
+        (task_worktree, commit)
     }
 
     fn initialize_repository(directory: &Path) {

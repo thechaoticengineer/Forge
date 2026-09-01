@@ -21,6 +21,7 @@ Item {
   property string taskActionTaskId: ""
   property bool confirmingImplementationCancel: false
   property string completionDecisionMode: ""
+  property string integrationMode: ""
   property string implementationInterventionMode: ""
   property string localDraftError: ""
   property var repositoryPathCandidates: []
@@ -74,6 +75,11 @@ Item {
       completionDecisionMode = ""
       return
     }
+    if (integrationMode !== "") {
+      integrationMode = ""
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+      return
+    }
     if (implementationInterventionMode !== "") {
       cancelImplementationIntervention()
       return
@@ -104,6 +110,7 @@ Item {
 
   function moveNavigation(dx, dy) {
     if (confirmingImplementationCancel || completionDecisionMode !== ""
+        || integrationMode !== ""
         || implementationInterventionMode !== "" || taskActionMode !== "") return
     if (editingDraft && draftStep === "repository") {
       if (dx !== 0) {
@@ -156,6 +163,10 @@ Item {
     if (taskActionMode === "choose_agent") return
     if (completionDecisionMode !== "") {
       confirmCompletionDecision()
+      return
+    }
+    if (integrationMode === "confirm") {
+      confirmTaskIntegration()
       return
     }
     if (confirmingImplementationCancel) {
@@ -439,7 +450,7 @@ Item {
     if (code === "running") return "Implementation running"
     if (code === "busy") return "Waiting for the active implementation"
     if (code === "dependencies_blocked")
-      return "Blocked until task-branch integration is implemented"
+      return "Blocked until prerequisite task results can be composed"
     if (code === "finish") return "Ready for verification and review"
     if (code === "inspect") return "Ready for final inspection"
     if (code === "complete") return "Local task commit created"
@@ -604,10 +615,10 @@ Item {
   }
 
   function latestTaskRecord(records) {
-    var context = finishContext()
-    if (!context || !records) return null
+    var task = selectedTask()
+    if (!task || !records) return null
     for (var i = records.length - 1; i >= 0; i--)
-      if (records[i].task_id === context.task.id) return records[i]
+      if (records[i].task_id === task.id) return records[i]
     return null
   }
 
@@ -642,6 +653,43 @@ Item {
     completionDecisionMode = ""
     if (mode === "approve") engine.approveTaskCommit(proposal.id)
     else engine.rejectTaskCommit(proposal.id, "Rejected during final inspection")
+  }
+
+  function createdTaskCommit() {
+    var commit = latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
+    return commit && commit.status === "created" ? commit : null
+  }
+
+  function latestTaskIntegration() {
+    var commit = createdTaskCommit()
+    var integrations = engine.activeRun ? engine.activeRun.task_integrations || [] : []
+    if (!commit) return null
+    for (var i = integrations.length - 1; i >= 0; i--)
+      if (integrations[i].task_commit_id === commit.id) return integrations[i]
+    return null
+  }
+
+  function beginTaskIntegration() {
+    var commit = createdTaskCommit()
+    if (!commit || engine.requestPending) return
+    integrationTargetField.text = engine.activeRun && engine.activeRun.branch
+      ? engine.activeRun.branch : ""
+    integrationMode = "edit"
+    Qt.callLater(function() { integrationTargetField.forceActiveFocus() })
+  }
+
+  function reviewTaskIntegration() {
+    if (integrationTargetField.text.trim() === "") return
+    integrationMode = "confirm"
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function confirmTaskIntegration() {
+    var commit = createdTaskCommit()
+    var branch = integrationTargetField.text.trim()
+    if (!commit || branch === "" || engine.requestPending) return
+    integrationMode = ""
+    engine.integrateTaskCommit(commit.id, branch)
   }
 
   function runningImplementationAttempt() {
@@ -764,6 +812,10 @@ Item {
       return "Enter  Create inspected local commit    Esc  Keep inspecting"
     if (completionDecisionMode === "reject")
       return "Enter  Preserve rejection    Esc  Keep inspecting"
+    if (integrationMode === "edit")
+      return "Enter  Review branch integration    Esc  Cancel"
+    if (integrationMode === "confirm")
+      return "Enter  Fast-forward local branch    Esc  Cancel"
     if (implementationInterventionMode !== "")
       return "Enter  Submit instruction    Esc  Keep current attempt"
     if (focusArea === "sections")
@@ -776,6 +828,8 @@ Item {
       return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
     if (selectedSection === 2 && proposedTaskCommit())
       return "h/←  Sections    j/k or ↑/↓  Scroll diff    a  Approve    x  Reject    Esc  Close"
+    if (selectedSection === 2 && createdTaskCommit())
+      return "h/←  Sections    j/k or ↑/↓  Scroll diff    i  Integrate local branch    Esc  Close"
     if (selectedSection === 2)
       return "h/←  Sections    p  Prepare inspected result    Esc  Close"
     if (selectedSection === 0 && runningImplementationAttempt())
@@ -825,6 +879,7 @@ Item {
       if (method === "reject_plan") root.rejectingPlan = false
       if (method === "approve_task_commit" || method === "reject_task_commit")
         root.completionDecisionMode = ""
+      if (method === "integrate_task_commit") root.integrationMode = ""
       root.selectedTaskIndex = Math.max(0, root.selectedTaskIndex)
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
@@ -943,6 +998,7 @@ Item {
           || taskTitleField.activeFocus || taskDescriptionField.activeFocus
           || taskCriteriaField.activeFocus || rejectionReasonField.activeFocus
           || implementationInstructionField.activeFocus
+          || integrationTargetField.activeFocus
         onMoveRequested: function(dx, dy) {
           root.moveNavigation(dx, dy)
         }
@@ -992,6 +1048,7 @@ Item {
           else if (root.selectedSection === 2 && text === "p") root.finishSelectedTask()
           else if (root.selectedSection === 2 && text === "a") root.beginCompletionDecision("approve")
           else if (root.selectedSection === 2 && text === "x") root.beginCompletionDecision("reject")
+          else if (root.selectedSection === 2 && text === "i") root.beginTaskIntegration()
         }
 
         Item {
@@ -2172,7 +2229,7 @@ Item {
                               text: (taskDelegate.modelData.depends_on || []).length > 0
                                 ? ("Dependencies: tasks "
                                    + (taskDelegate.modelData.depends_on || []).join(", ")
-                                   + " • blocked until branch integration is implemented")
+                                   + " • blocked until prerequisite results can be composed")
                                 : "Dependencies: none"
                               color: root.mutedForeground
                               font.family: root.fontFamily
@@ -2687,6 +2744,138 @@ Item {
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.bodySmall
                           wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                          visible: root.latestTaskIntegration() !== null
+                          width: parent.width
+                          text: {
+                            var integration = root.latestTaskIntegration()
+                            if (!integration) return ""
+                            return "Integration: " + integration.status + " · "
+                              + integration.target_branch
+                              + (integration.result_head
+                                ? " · " + integration.result_head.slice(0, 12) : "")
+                              + (integration.error_message
+                                ? " — " + integration.error_message : "")
+                          }
+                          color: root.latestTaskIntegration()
+                            && root.latestTaskIntegration().status === "completed"
+                            ? root.accent : root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                          visible: changesSection.proposal
+                            && changesSection.proposal.status === "created"
+                            && root.integrationMode === ""
+                          text: "Integrate local branch"
+                          bordered: true
+                          enabled: !engine.requestPending
+                          foreground: root.foreground
+                          accent: root.accent
+                          onClicked: root.beginTaskIntegration()
+                        }
+
+                        Column {
+                          visible: root.integrationMode === "edit"
+                          width: parent.width
+                          spacing: Style.space(7)
+                          Text {
+                            width: parent.width
+                            text: "Select a local branch that is checked out in a clean worktree. Forge will only fast-forward it; unowned branches, divergent history, and dirty worktrees are refused."
+                            color: root.mutedForeground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                          }
+                          TextField {
+                            id: integrationTargetField
+                            width: parent.width
+                            placeholderText: "Local branch (for example, main)"
+                            Keys.onPressed: function(event) {
+                              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                root.reviewTaskIntegration()
+                                event.accepted = true
+                              } else if (event.key === Qt.Key_Escape) {
+                                root.integrationMode = ""
+                                keyCatcher.forceActiveFocus()
+                                event.accepted = true
+                              }
+                            }
+                          }
+                          Row {
+                            spacing: Style.space(8)
+                            Button {
+                              text: "Review integration"
+                              bordered: true
+                              enabled: integrationTargetField.text.trim() !== ""
+                                && !engine.requestPending
+                              foreground: root.foreground
+                              accent: root.accent
+                              onClicked: root.reviewTaskIntegration()
+                            }
+                            Button {
+                              text: "Cancel"
+                              enabled: !engine.requestPending
+                              foreground: root.foreground
+                              accent: root.accent
+                              onClicked: {
+                                root.integrationMode = ""
+                                keyCatcher.forceActiveFocus()
+                              }
+                            }
+                          }
+                        }
+
+                        Rectangle {
+                          visible: root.integrationMode === "confirm"
+                          width: parent.width
+                          height: integrationDecisionColumn.implicitHeight + Style.space(20)
+                          radius: Style.cornerRadius
+                          color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+                          border.width: 1
+                          border.color: root.urgent
+
+                          Column {
+                            id: integrationDecisionColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: Style.space(10)
+                            spacing: Style.space(7)
+                            Text {
+                              width: parent.width
+                              text: "Fast-forward local branch “" + integrationTargetField.text.trim()
+                                + "” to commit " + (root.createdTaskCommit()
+                                  ? root.createdTaskCommit().commit_hash.slice(0, 12) : "")
+                                + "? This updates that local branch and its clean checked-out files. It will not merge divergent history, push, deploy, or delete the task worktree."
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+                            Row {
+                              spacing: Style.space(8)
+                              Button {
+                                text: "Confirm fast-forward"
+                                bordered: true
+                                enabled: !engine.requestPending
+                                foreground: root.foreground
+                                accent: root.accent
+                                onClicked: root.confirmTaskIntegration()
+                              }
+                              Button {
+                                text: "Cancel"
+                                enabled: !engine.requestPending
+                                foreground: root.foreground
+                                accent: root.accent
+                                onClicked: root.integrationMode = ""
+                              }
+                            }
+                          }
                         }
 
                         Text {

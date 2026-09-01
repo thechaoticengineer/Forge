@@ -51,3 +51,5 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0010](0010-run-independent-reviews-in-fresh-agent-sessions.md) | Accepted | Route independent reviews through fresh cross-provider or explicit fallback sessions |
 | [ADR-0011](0011-gate-local-task-commits-on-verification-and-independent-review.md) | Accepted; commit authorization superseded by ADR-0012 | Gate isolated local task commits on deterministic verification and independent review |
 | [ADR-0012](0012-separate-final-inspection-from-commit-approval.md) | Accepted | Prepare an exact final-inspection record before separate user commit approval |
+| [ADR-0013](0013-fast-forward-approved-task-commits.md) | Accepted | Integrate approved task commits only through an explicit conflict-checked fast-forward |
+| [ADR-0014](0014-manage-the-engine-as-a-systemd-user-service.md) | Accepted | Install and run the engine as a managed systemd user service |

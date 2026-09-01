@@ -10,9 +10,9 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Each task of an approved plan is actionable in the Omarchy panel with its dependency declaration, worktree, branch, latest implementer attempt, failures, and next action visible in context. The panel can confirm creation of the recorded isolated worktree and launch a user-selected Codex or Claude implementer through the existing engine requests. Because task branches currently share the run's original base, dependent tasks are explicitly blocked in both the panel and engine until task-branch integration is designed; root tasks remain executable. The engine refuses conflicting worktree operations, supervises the bounded process, and preserves its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Opening and retiring exact worktrees and richer prompt history remain open.
+Each task of an approved plan is actionable in the Omarchy panel with its dependency declaration, worktree, branch, latest implementer attempt, failures, and next action visible in context. The panel can confirm creation of the recorded isolated worktree and launch a user-selected Codex or Claude implementer through the existing engine requests. Because task branches currently share the run's original base, dependent tasks are explicitly blocked in both the panel and engine until prerequisite task results can be composed without dropping changes; root tasks remain executable. The engine refuses conflicting worktree operations, supervises the bounded process, and preserves its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Opening and retiring exact worktrees and richer prompt history remain open.
 
-The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and integration actions remain open.
+The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. After commit creation, another confirmed action can fast-forward a selected checked-out clean local branch, with exact-head comparison and durable outcome. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and divergent merge flows remain open.
 
 ## Next Delivery Slice — UI-First Self-Hosting
 
@@ -25,7 +25,7 @@ The immediate priority is to let a developer use the Omarchy panel to start the 
 - [x] Show actionable worktree and launch failures in the task context without losing the approved plan or creating duplicate side effects.
 - [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
 
-The next operational step is managed engine installation and startup so opening the panel does not require manually launching the Rust process. Integrating an approved task commit into another local branch remains a separate consequential action: it requires a dedicated design decision, conflict checks, and explicit user approval, and must never be implied by final task approval.
+The remaining operational proof is to install and start the managed engine, refresh the installed plugin, and exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Composing multiple dependent task branches remains open because all task worktrees currently start from the run's shared base.
 
 ## Phase 0 — Foundation
 
@@ -106,12 +106,12 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [x] Support keyboard-only final approval or rejection.
 - [x] Create only explicitly requested local commits without amending, rebasing, squashing, merging, or pushing implicitly.
 - [x] Preserve the final outcome and rejected result in durable history.
-- [ ] Define a separate explicit, conflict-checked action for integrating an approved task commit into a selected local branch.
+- [x] Define a separate explicit, conflict-checked action for integrating an approved task commit into a selected local branch.
 
 ## Phase 6 — Omarchy Integration and Recovery Hardening
 
-- [ ] Define installation and lifecycle management for the Rust engine alongside the shell plugin.
-- [ ] Shut the engine down cleanly on `SIGTERM` as well as `SIGINT`.
+- [x] Define installation and lifecycle management for the Rust engine alongside the shell plugin.
+- [x] Shut the engine down cleanly on `SIGTERM` as well as `SIGINT`.
 - [ ] Add a conflict-checked Omarchy key binding for summoning or hiding the panel.
 - [ ] Send Omarchy notifications for blocked, failed, completed, and waiting-for-user events.
 - [ ] Verify live theme changes, light and dark themes, display scaling, and varied monitor sizes.

@@ -28,14 +28,15 @@ use orchestrator_core::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, ImplementationContinuationKind,
         ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
         PlanTaskSummary, ProposedTask, ReviewIndependence, ReviewPolicy, ReviewStatus, RunStatus,
-        TaskCommitStatus, TaskCommitSummary, TaskWorktreeStatus, TaskWorktreeSummary,
-        VerificationCommandResult, VerificationStatus,
+        TaskCommitStatus, TaskCommitSummary, TaskIntegrationStatus, TaskWorktreeStatus,
+        TaskWorktreeSummary, VerificationCommandResult, VerificationStatus,
     },
 };
 use orchestrator_git::{
     GitError, TaskWorktreeRequest, TaskWorktreeState, capture_task_changes, create_task_commit,
-    discover_repositories_until, inspect_repository, prune_missing_worktrees,
-    review_change_evidence, task_branch_name, task_worktree_path, task_worktree_state,
+    discover_repositories_until, inspect_repository, integrate_task_commit,
+    prepare_task_integration, prune_missing_worktrees, review_change_evidence, task_branch_name,
+    task_worktree_path, task_worktree_state,
 };
 use orchestrator_store::{
     DraftRunInput, ImplementationActivityInput, ImplementationAttemptCancellation,
@@ -43,7 +44,8 @@ use orchestrator_store::{
     ImplementationContinuationReservation, PlanAttemptFailure, PlanAttemptInput,
     PlanAttemptSuccess, PlanRevisionInput, ReviewAttemptFailure, ReviewAttemptInput,
     ReviewAttemptSuccess, StatePaths, StorageWorker, StoredSnapshot, TaskCommitInput,
-    TaskCommitSettlement, TaskWorktreeReservation, VerificationAttemptInput,
+    TaskCommitSettlement, TaskIntegrationReservation, TaskIntegrationSettlement,
+    TaskWorktreeReservation, VerificationAttemptInput,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -292,10 +294,18 @@ async fn run_listener(
     implementation_controls: Arc<ImplementationControls>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("cannot listen for SIGTERM")?;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.context("cannot listen for shutdown signal")?;
+                return Ok(());
+            }
+            signal = terminate.recv() => {
+                if signal.is_none() {
+                    anyhow::bail!("SIGTERM listener stopped unexpectedly");
+                }
                 return Ok(());
             }
             accepted = listener.accept() => {
@@ -739,6 +749,25 @@ async fn handle_request(
             task_commit_id,
             reason,
         } => match reject_task_commit(run_id, task_commit_id, reason, storage).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::IntegrateTaskCommit {
+            run_id,
+            task_commit_id,
+            target_branch,
+        } => match integrate_approved_task_commit(
+            run_id,
+            task_commit_id,
+            target_branch,
+            storage,
+            state_sender,
+        )
+        .await
+        {
             Ok(stored_snapshot) => {
                 publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
                 ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
@@ -2916,6 +2945,87 @@ async fn reject_task_commit(
         })
         .await
         .map_err(|error| RequestFailure::storage("cannot reject task commit", error))
+}
+
+async fn integrate_approved_task_commit(
+    run_id: String,
+    task_commit_id: String,
+    target_branch: String,
+    storage: &StorageWorker,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let run = load_active_run(storage, &run_id).await?;
+    let commit = run
+        .task_commits
+        .iter()
+        .find(|commit| commit.id == task_commit_id && commit.status == TaskCommitStatus::Created)
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "task_commit_not_created",
+            message: "the selected task commit has not been created and approved".to_owned(),
+        })?;
+    let commit_hash = commit.commit_hash.clone().ok_or_else(|| RequestFailure {
+        code: "task_commit_not_created",
+        message: "the selected task commit has no recorded Git commit".to_owned(),
+    })?;
+    let repository = PathBuf::from(&run.repository);
+    let target = tokio::task::spawn_blocking({
+        let repository = repository.clone();
+        let target_branch = target_branch.clone();
+        let commit_hash = commit_hash.clone();
+        move || prepare_task_integration(&repository, &target_branch, &commit_hash)
+    })
+    .await
+    .map_err(|error| RequestFailure {
+        code: "integration_preflight_failed",
+        message: format!("task integration worker failed: {error}"),
+    })?
+    .map_err(|error| RequestFailure {
+        code: "integration_refused",
+        message: error.to_string(),
+    })?;
+
+    let reserved = storage
+        .reserve_task_integration(TaskIntegrationReservation {
+            run_id,
+            task_commit_id,
+            target_branch: target.target_branch.clone(),
+            expected_head: target.expected_head.clone(),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot reserve task integration", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(reserved.snapshot));
+
+    let result = tokio::task::spawn_blocking(move || integrate_task_commit(&repository, &target))
+        .await
+        .map_err(|error| GitError::GitCommand {
+            operation: "running the task integration worker",
+            status: None,
+            stderr: error.to_string(),
+        });
+    let (status, result_head, error_message) = match result {
+        Ok(Ok(head)) => (TaskIntegrationStatus::Completed, Some(head), None),
+        Ok(Err(error)) | Err(error) => {
+            (TaskIntegrationStatus::Failed, None, Some(error.to_string()))
+        }
+    };
+    let stored = storage
+        .settle_task_integration(TaskIntegrationSettlement {
+            integration_id: reserved.integration_id,
+            status,
+            result_head,
+            error_message: error_message.clone(),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot record task integration", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(stored.clone()));
+    if let Some(message) = error_message {
+        return Err(RequestFailure {
+            code: "integration_failed",
+            message,
+        });
+    }
+    Ok(stored)
 }
 
 fn conventional_task_commit_message(title: &str) -> String {

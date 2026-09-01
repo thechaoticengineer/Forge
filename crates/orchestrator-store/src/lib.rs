@@ -16,8 +16,8 @@ use orchestrator_core::state::{
     ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
     PlanTaskSummary, ReviewAttemptSummary, ReviewIndependence, ReviewPolicy, ReviewResult,
     ReviewStatus, ReviewVerdict, RunStatus, TaskCommitStatus, TaskCommitSummary,
-    TaskWorktreeStatus, TaskWorktreeSummary, VerificationAttemptSummary, VerificationCommandResult,
-    VerificationStatus,
+    TaskIntegrationStatus, TaskIntegrationSummary, TaskWorktreeStatus, TaskWorktreeSummary,
+    VerificationAttemptSummary, VerificationCommandResult, VerificationStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -28,7 +28,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -71,6 +71,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         9,
         "task_commit_approval",
         include_str!("../migrations/0009_task_commit_approval.sql"),
+    ),
+    (
+        10,
+        "task_integrations",
+        include_str!("../migrations/0010_task_integrations.sql"),
     ),
 ];
 
@@ -127,6 +132,8 @@ pub enum StorageError {
     InvalidReviewIndependence(String),
     #[error("database returned an invalid review status: {0}")]
     InvalidReviewStatus(String),
+    #[error("database returned an invalid task integration status: {0}")]
+    InvalidTaskIntegrationStatus(String),
     #[error("run does not exist: {0}")]
     RunNotFound(String),
     #[error("run is not ready for planning: {0}")]
@@ -137,7 +144,7 @@ pub enum StorageError {
     PlanNotCurrent(String),
     #[error("task is not ready for isolated implementation: {0}")]
     TaskNotImplementable(String),
-    #[error("task dependencies cannot run until task-branch integration is implemented: {0}")]
+    #[error("task dependencies cannot run until prerequisite results are composed: {0}")]
     TaskDependenciesNotIntegrated(String),
     #[error("task worktree does not exist or is no longer reserved: {0}")]
     WorktreeNotReserved(String),
@@ -155,6 +162,8 @@ pub enum StorageError {
     ReviewNotReady(String),
     #[error("review attempt does not exist or is no longer running: {0}")]
     ReviewAttemptNotRunning(String),
+    #[error("task commit is not ready for integration: {0}")]
+    TaskCommitNotIntegratable(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -462,6 +471,28 @@ pub struct TaskCommitSettlement {
     pub decision_reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIntegrationReservation {
+    pub run_id: String,
+    pub task_commit_id: String,
+    pub target_branch: String,
+    pub expected_head: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservedTaskIntegration {
+    pub integration_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskIntegrationSettlement {
+    pub integration_id: String,
+    pub status: TaskIntegrationStatus,
+    pub result_head: Option<String>,
+    pub error_message: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -575,6 +606,14 @@ enum Command {
     },
     SettleTaskCommit(
         TaskCommitSettlement,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    ReserveTaskIntegration(
+        TaskIntegrationReservation,
+        oneshot::Sender<Result<ReservedTaskIntegration, StorageError>>,
+    ),
+    SettleTaskIntegration(
+        TaskIntegrationSettlement,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
@@ -1197,6 +1236,45 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Records the exact target head before an approved task commit is
+    /// integrated into a local branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the commit is not created, the reservation cannot
+    /// be persisted, or storage is unavailable.
+    pub async fn reserve_task_integration(
+        &self,
+        input: TaskIntegrationReservation,
+    ) -> Result<ReservedTaskIntegration, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ReserveTaskIntegration(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists the outcome of a previously reserved task integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the integration is not reserved, the settlement
+    /// is invalid, or storage is unavailable.
+    pub async fn settle_task_integration(
+        &self,
+        input: TaskIntegrationSettlement,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SettleTaskIntegration(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -1322,6 +1400,12 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             Command::SettleTaskCommit(input, reply) => {
                 let _ = reply.send(database.settle_task_commit(&input));
             }
+            Command::ReserveTaskIntegration(input, reply) => {
+                let _ = reply.send(database.reserve_task_integration(&input));
+            }
+            Command::SettleTaskIntegration(input, reply) => {
+                let _ = reply.send(database.settle_task_integration(&input));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -1353,6 +1437,7 @@ impl Database {
         recover_interrupted_implementations(&mut connection)?;
         recover_interrupted_reviews(&mut connection)?;
         recover_interrupted_task_commits(&mut connection)?;
+        recover_interrupted_task_integrations(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -1399,6 +1484,7 @@ impl Database {
             run.review_attempts = self.load_review_attempts(&run.id)?;
             run.verification_attempts = self.load_verification_attempts(&run.id)?;
             run.task_commits = self.load_task_commits(&run.id)?;
+            run.task_integrations = self.load_task_integrations(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -1477,6 +1563,7 @@ impl Database {
                 review_attempts: Vec::new(),
                 verification_attempts: Vec::new(),
                 task_commits: Vec::new(),
+                task_integrations: Vec::new(),
                 last_error: None,
             }),
         })
@@ -2986,6 +3073,107 @@ impl Database {
         self.current_snapshot()
     }
 
+    fn reserve_task_integration(
+        &self,
+        input: &TaskIntegrationReservation,
+    ) -> Result<ReservedTaskIntegration, StorageError> {
+        let created_at = unix_milliseconds()?;
+        let integration_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        let task_id = transaction
+            .query_row(
+                "SELECT task_id FROM task_commits \
+                 WHERE id = ?2 AND run_id = ?1 AND status = 'created' \
+                   AND commit_hash IS NOT NULL",
+                (&input.run_id, &input.task_commit_id),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::TaskCommitNotIntegratable(input.task_commit_id.clone()))?;
+        transaction.execute(
+            "INSERT INTO task_integrations(\
+                id, run_id, task_commit_id, task_id, target_branch, expected_head, \
+                status, result_head, error_message, created_at, completed_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'reserved', NULL, NULL, ?7, NULL)",
+            (
+                &integration_id,
+                &input.run_id,
+                &input.task_commit_id,
+                &task_id,
+                &input.target_branch,
+                &input.expected_head,
+                created_at,
+            ),
+        )?;
+        let payload = json!({
+            "task_integration_id": integration_id,
+            "task_commit_id": input.task_commit_id,
+            "target_branch": input.target_branch,
+            "expected_head": input.expected_head,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_integration_reserved', 'user', ?2, ?3)",
+            (&input.run_id, payload.to_string(), created_at),
+        )?;
+        transaction.commit()?;
+        Ok(ReservedTaskIntegration {
+            integration_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn settle_task_integration(
+        &self,
+        input: &TaskIntegrationSettlement,
+    ) -> Result<StoredSnapshot, StorageError> {
+        if input.status == TaskIntegrationStatus::Reserved {
+            return Err(StorageError::TaskCommitNotIntegratable(
+                input.integration_id.clone(),
+            ));
+        }
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let run_id = transaction
+            .query_row(
+                "SELECT run_id FROM task_integrations WHERE id = ?1 AND status = 'reserved'",
+                [&input.integration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::TaskCommitNotIntegratable(input.integration_id.clone()))?;
+        let changed = transaction.execute(
+            "UPDATE task_integrations SET status = ?2, result_head = ?3, \
+                error_message = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'reserved'",
+            (
+                &input.integration_id,
+                input.status.as_str(),
+                &input.result_head,
+                &input.error_message,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::TaskCommitNotIntegratable(
+                input.integration_id.clone(),
+            ));
+        }
+        let payload = json!({
+            "task_integration_id": input.integration_id,
+            "status": input.status,
+            "result_head": input.result_head,
+            "error": input.error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_integration_settled', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
     fn load_verification_attempts(
         &self,
         run_id: &str,
@@ -3111,6 +3299,33 @@ impl Database {
             });
         }
         Ok(commits)
+    }
+
+    fn load_task_integrations(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TaskIntegrationSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_commit_id, task_id, target_branch, expected_head, status, \
+                    result_head, error_message, created_at, completed_at \
+             FROM task_integrations WHERE run_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok(TaskIntegrationSummary {
+                id: row.get(0)?,
+                task_commit_id: row.get(1)?,
+                task_id: row.get(2)?,
+                target_branch: row.get(3)?,
+                expected_head: row.get(4)?,
+                status: parse_task_integration_status_sql(&row.get::<_, String>(5)?)?,
+                result_head: row.get(6)?,
+                error_message: row.get(7)?,
+                created_at: row.get(8)?,
+                completed_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     fn load_task_worktrees(&self, run_id: &str) -> Result<Vec<TaskWorktreeSummary>, StorageError> {
@@ -3441,6 +3656,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         review_attempts: Vec::new(),
         verification_attempts: Vec::new(),
         task_commits: Vec::new(),
+        task_integrations: Vec::new(),
         last_error: row.get(7)?,
     })
 }
@@ -3465,6 +3681,15 @@ fn parse_task_commit_status_sql(value: &str) -> rusqlite::Result<TaskCommitStatu
         "rejected" => Ok(TaskCommitStatus::Rejected),
         "stale" => Ok(TaskCommitStatus::Stale),
         "failed" => Ok(TaskCommitStatus::Failed),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn parse_task_integration_status_sql(value: &str) -> rusqlite::Result<TaskIntegrationStatus> {
+    match value {
+        "reserved" => Ok(TaskIntegrationStatus::Reserved),
+        "completed" => Ok(TaskIntegrationStatus::Completed),
+        "failed" => Ok(TaskIntegrationStatus::Failed),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -3915,6 +4140,50 @@ fn recover_interrupted_task_commits(connection: &mut Connection) -> Result<(), S
     Ok(())
 }
 
+fn recover_interrupted_task_integrations(connection: &mut Connection) -> Result<(), StorageError> {
+    let interrupted = {
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, target_branch FROM task_integrations WHERE status = 'reserved'",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+    let recovered_at = unix_milliseconds()?;
+    let transaction = connection.transaction()?;
+    for (integration_id, run_id, target_branch) in interrupted {
+        let error_message = format!(
+            "engine stopped while integrating into {target_branch}; inspect the branch before retrying"
+        );
+        transaction.execute(
+            "UPDATE task_integrations SET status = 'failed', error_message = ?2, \
+                completed_at = ?3 WHERE id = ?1 AND status = 'reserved'",
+            (&integration_id, &error_message, recovered_at),
+        )?;
+        let payload = json!({
+            "task_integration_id": integration_id,
+            "target_branch": target_branch,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_integration_interrupted', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), recovered_at),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn retryable_continuation(
     transaction: &Transaction<'_>,
     attempt_id: &str,
@@ -4219,8 +4488,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 10,
-                supported: 9
+                found: 11,
+                supported: 10
             }
         ));
     }
@@ -4794,7 +5063,7 @@ mod tests {
             .expect("user approval should reserve the commit");
         let created = worker
             .settle_task_commit(TaskCommitSettlement {
-                commit_id: proposal.commit_id,
+                commit_id: proposal.commit_id.clone(),
                 status: TaskCommitStatus::Created,
                 commit_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
                 error_message: None,
@@ -4811,19 +5080,63 @@ mod tests {
             TaskCommitStatus::Created
         );
 
+        let integration = worker
+            .reserve_task_integration(TaskIntegrationReservation {
+                run_id: run_id.clone(),
+                task_commit_id: proposal.commit_id.clone(),
+                target_branch: "main".to_owned(),
+                expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            })
+            .await
+            .expect("integration should reserve");
+        worker
+            .settle_task_integration(TaskIntegrationSettlement {
+                integration_id: integration.integration_id,
+                status: TaskIntegrationStatus::Completed,
+                result_head: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+                error_message: None,
+            })
+            .await
+            .expect("integration should settle");
+        worker
+            .reserve_task_integration(TaskIntegrationReservation {
+                run_id,
+                task_commit_id: proposal.commit_id,
+                target_branch: "release".to_owned(),
+                expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            })
+            .await
+            .expect("interrupted integration should reserve");
+
         drop(worker);
         let reopened = StorageWorker::start(paths).expect("storage should reopen");
-        let commit = reopened
+        let mut run = reopened
             .current_snapshot()
             .await
             .expect("snapshot should load")
             .active_run
-            .expect("run should stay active")
+            .expect("run should stay active");
+        let commit = run
             .task_commits
             .pop()
             .expect("commit should survive restart");
         assert_eq!(commit.status, TaskCommitStatus::Created);
         assert_eq!(commit.changed_files.len(), 1);
+        assert_eq!(run.task_integrations.len(), 2);
+        assert_eq!(
+            run.task_integrations[0].status,
+            TaskIntegrationStatus::Completed
+        );
+        assert_eq!(
+            run.task_integrations[1].status,
+            TaskIntegrationStatus::Failed
+        );
+        assert!(
+            run.task_integrations[1]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("inspect the branch"))
+        );
     }
 
     #[tokio::test]

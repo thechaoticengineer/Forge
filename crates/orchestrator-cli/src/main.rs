@@ -19,6 +19,8 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+mod service;
+
 #[derive(Debug, Parser)]
 #[command(about = "Inspect and control the local software build orchestrator")]
 struct Arguments {
@@ -31,6 +33,11 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Install, inspect, or remove the managed user engine service.
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
     /// Create a durable draft run for a local Git repository.
     Draft {
         /// Path to a local Git repository.
@@ -105,6 +112,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Fast-forward a selected local branch to an approved task commit.
+    Integrate {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        /// Local target branch; defaults to the run's recorded branch.
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Cancel the active supervised implementation and preserve partial work.
     Cancel {
         /// Running attempt ID; defaults to the active run's running attempt.
@@ -158,6 +176,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCommand {
+    /// Install and immediately start the systemd user service.
+    Install {
+        /// Engine executable; defaults to `orchestrator-engine` on PATH.
+        #[arg(long, default_value = "orchestrator-engine")]
+        engine_binary: PathBuf,
+        #[arg(long, default_value = "codex")]
+        codex_binary: PathBuf,
+        #[arg(long, default_value = "claude")]
+        claude_binary: PathBuf,
+        #[arg(long, default_value = "gh")]
+        gh_binary: PathBuf,
+        /// Project root to scan and use for cloning (repeatable).
+        #[arg(long = "projects-root")]
+        project_roots: Vec<PathBuf>,
+    },
+    /// Show the systemd user service status.
+    Status,
+    /// Stop, disable, and remove the systemd user service unit.
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -286,12 +327,17 @@ impl From<DirectionArgument> for MoveDirection {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    let command = match arguments.command {
+        Command::Engine { command } => return engine_command(command),
+        command => command,
+    };
     let socket_path = match arguments.socket {
         Some(path) => path,
         None => default_socket_path().context("cannot determine the engine socket path")?,
     };
 
-    match arguments.command {
+    match command {
+        Command::Engine { .. } => unreachable!("engine command returned before socket discovery"),
         Command::Draft {
             repository,
             goal,
@@ -316,6 +362,9 @@ async fn main() -> Result<()> {
         }
         Command::Reject { task, reason, json } => {
             decide_task_commit(&socket_path, task, false, reason, json).await
+        }
+        Command::Integrate { task, branch, json } => {
+            integrate_task(&socket_path, task, branch, json).await
         }
         Command::Cancel { attempt, json } => {
             cancel_implementation(&socket_path, attempt, json).await
@@ -357,6 +406,34 @@ async fn main() -> Result<()> {
         Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
         Command::Status { json } => status(&socket_path, json).await,
+    }
+}
+
+fn engine_command(command: EngineCommand) -> Result<()> {
+    match command {
+        EngineCommand::Install {
+            engine_binary,
+            codex_binary,
+            claude_binary,
+            gh_binary,
+            project_roots,
+        } => {
+            let path = service::install(service::InstallOptions {
+                engine_binary,
+                codex_binary,
+                claude_binary,
+                gh_binary,
+                project_roots,
+            })?;
+            println!("Installed and started {}", path.display());
+            Ok(())
+        }
+        EngineCommand::Status => service::status(),
+        EngineCommand::Uninstall => {
+            let path = service::uninstall()?;
+            println!("Stopped and removed {}", path.display());
+            Ok(())
+        }
     }
 }
 
@@ -760,6 +837,51 @@ async fn decide_task_commit(
     print_result(&snapshot, json)
 }
 
+async fn integrate_task(
+    socket_path: &PathBuf,
+    task_position: usize,
+    branch: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let plan = run.plan.as_ref().context("the active run has no plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task_position
+                .checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the plan")?;
+    let commit = run
+        .task_commits
+        .iter()
+        .rev()
+        .find(|commit| {
+            commit.task_id == task.id
+                && commit.status == orchestrator_core::state::TaskCommitStatus::Created
+        })
+        .context("the task has no approved local commit")?;
+    let target_branch = branch
+        .or_else(|| run.branch.clone())
+        .context("the run started from detached HEAD; select --branch explicitly")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::IntegrateTaskCommit {
+            run_id: run.id.clone(),
+            task_commit_id: commit.id.clone(),
+            target_branch,
+        },
+        Duration::from_secs(120),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
 async fn cancel_implementation(
     socket_path: &PathBuf,
     attempt_id: Option<String>,
@@ -1122,20 +1244,7 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
             }
             print_implementation(run);
             print_reviews(run);
-            if let Some(commit) = run.task_commits.last() {
-                println!(
-                    "Task commit: {} · {} · {} changed file(s)",
-                    commit.status.as_str(),
-                    commit.message,
-                    commit.changed_files.len()
-                );
-                if let Some(hash) = &commit.commit_hash {
-                    println!("  Commit: {hash}");
-                }
-                if let Some(reason) = &commit.decision_reason {
-                    println!("  Decision: {reason}");
-                }
-            }
+            print_task_results(run);
             if let Some(plan) = &run.plan {
                 println!(
                     "Plan: revision {} · {} · {}",
@@ -1172,6 +1281,36 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
             "not required"
         }
     );
+}
+
+fn print_task_results(run: &ActiveRunSummary) {
+    if let Some(commit) = run.task_commits.last() {
+        println!(
+            "Task commit: {} · {} · {} changed file(s)",
+            commit.status.as_str(),
+            commit.message,
+            commit.changed_files.len()
+        );
+        if let Some(hash) = &commit.commit_hash {
+            println!("  Commit: {hash}");
+        }
+        if let Some(reason) = &commit.decision_reason {
+            println!("  Decision: {reason}");
+        }
+    }
+    if let Some(integration) = run.task_integrations.last() {
+        println!(
+            "Task integration: {} · {}",
+            integration.status.as_str(),
+            integration.target_branch
+        );
+        if let Some(head) = &integration.result_head {
+            println!("  Result: {head}");
+        }
+        if let Some(error) = &integration.error_message {
+            println!("  {error}");
+        }
+    }
 }
 
 fn print_implementation(run: &ActiveRunSummary) {

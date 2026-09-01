@@ -208,6 +208,15 @@ Item {
     })
   }
 
+  function integrateTaskCommit(taskCommitId, targetBranch) {
+    if (!activeRun) return false
+    return sendRequest("integrate_task_commit", {
+      run_id: activeRun.id,
+      task_commit_id: String(taskCommitId || ""),
+      target_branch: String(targetBranch || "")
+    })
+  }
+
   function sendRequest(method, payload) {
     if (!socket.connected) {
       requestError = "The orchestration engine is not connected"
