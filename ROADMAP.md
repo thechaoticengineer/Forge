@@ -10,7 +10,7 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. Assigning an implementing agent to that worktree and supervising it is the next slice; the worktree lifecycle is currently reachable from the CLI only.
+Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. Worktree and implementation controls are currently CLI-only, and structured activity streaming is the next slice.
 
 The **Changes**, **Verification**, and **Review** panel sections currently communicate product direction but do not yet run those stages.
 
@@ -50,13 +50,13 @@ Planned usability follow-ups:
 
 ## Phase 2 — Isolated Implementation
 
-This phase is partly implemented. A task can be given an isolated worktree; running an implementing agent inside one cannot.
+This phase is partly implemented. A task can be given an isolated worktree and a user-selected implementing agent can run inside it under engine supervision. Live activity and interactive controls are not implemented.
 
 - [x] Define worktree and task-branch lifecycle rules, including recovery and cleanup boundaries.
 - [x] Refuse to overwrite or absorb existing user changes.
 - [x] Create and record an isolated Git worktree for each implementation task.
-- [ ] Let the user assign Codex CLI or Claude Code CLI as implementer.
-- [ ] Run the implementer under explicit process supervision owned by the Rust engine.
+- [x] Let the user assign Codex CLI or Claude Code CLI as implementer.
+- [x] Run the implementer under explicit process supervision owned by the Rust engine.
 - [ ] Stream structured activity and progress to the Omarchy panel.
 - [ ] Let the user pause, cancel, redirect, or add context without losing run history.
 - [ ] Preserve prompts, responses, changed files, failed approaches, and retries.

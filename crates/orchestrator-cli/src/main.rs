@@ -8,7 +8,7 @@ use orchestrator_core::{
         ClientMessage, ClientRequest, MoveDirection, PROTOCOL_VERSION, RepositoryCatalog,
         ServerMessage,
     },
-    state::{AgentKind, EngineSnapshot},
+    state::{AgentKind, EngineSnapshot, TaskWorktreeStatus},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -49,6 +49,16 @@ enum Command {
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
+    },
+    /// Assign an agent to implement one approved task in its ready worktree.
+    Implement {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long, value_enum)]
+        agent: AgentArgument,
+        #[arg(long)]
+        json: bool,
     },
     /// List local and GitHub repositories or clone a missing repository.
     Repositories {
@@ -189,6 +199,9 @@ async fn main() -> Result<()> {
         } => create_draft(&socket_path, repository, goal, json).await,
         Command::Plan { command } => plan_command(&socket_path, command).await,
         Command::Worktree { command } => worktree_command(&socket_path, command).await,
+        Command::Implement { task, agent, json } => {
+            implement_task(&socket_path, task, agent.into(), json).await
+        }
         Command::Repositories { command } => repository_command(&socket_path, command).await,
         Command::Ping => ping(&socket_path).await,
         Command::Status { json } => status(&socket_path, json).await,
@@ -382,6 +395,52 @@ async fn worktree_command(socket_path: &PathBuf, command: WorktreeCommand) -> Re
             task_id: task.id.clone(),
         },
         Duration::from_secs(120),
+    )
+    .await?;
+    print_result(&snapshot, json)
+}
+
+async fn implement_task(
+    socket_path: &PathBuf,
+    task_position: usize,
+    agent: AgentKind,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let plan = run
+        .plan
+        .as_ref()
+        .context("the active run has no approved plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task_position
+                .checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the approved plan")?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .rev()
+        .find(|worktree| {
+            worktree.task_id == task.id && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .context("the task has no ready worktree; create it first")?;
+    let snapshot = send_workflow_request(
+        socket_path,
+        ClientRequest::RunTaskImplementation {
+            run_id: run.id.clone(),
+            plan_id: plan.id.clone(),
+            task_id: task.id.clone(),
+            worktree_id: worktree.id.clone(),
+            agent,
+        },
+        Duration::from_mins(61),
     )
     .await?;
     print_result(&snapshot, json)
@@ -640,6 +699,26 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
                         );
                     }
                     if let Some(error) = &worktree.last_error {
+                        println!("     {error}");
+                    }
+                }
+            }
+            if !run.implementation_attempts.is_empty() {
+                println!(
+                    "Implementation attempts: {}",
+                    run.implementation_attempts.len()
+                );
+                for attempt in &run.implementation_attempts {
+                    println!(
+                        "  {}  {}  task {}",
+                        attempt.status.as_str(),
+                        attempt.agent.as_str(),
+                        attempt.task_id
+                    );
+                    if let Some(exit_code) = attempt.exit_code {
+                        println!("     exit code: {exit_code}");
+                    }
+                    if let Some(error) = &attempt.error_message {
                         println!("     {error}");
                     }
                 }

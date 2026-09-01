@@ -8,7 +8,13 @@ use std::{
     time::Duration,
 };
 
-use orchestrator_core::state::{ActiveRunSummary, AgentKind, PlanProposal};
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+use orchestrator_core::state::{
+    ActiveRunSummary, AgentKind, PlanProposal, PlanTaskSummary, TaskWorktreeSummary,
+};
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -17,6 +23,7 @@ use tokio::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(10);
+const DEFAULT_IMPLEMENTATION_TIMEOUT: Duration = Duration::from_mins(60);
 const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
 const MAX_TASKS: usize = 20;
@@ -71,6 +78,15 @@ impl Default for AgentCommands {
     }
 }
 
+impl AgentCommands {
+    fn command_path(&self, agent: AgentKind) -> &Path {
+        match agent {
+            AgentKind::Codex => &self.codex,
+            AgentKind::Claude => &self.claude,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlannerRunner {
     commands: AgentCommands,
@@ -98,6 +114,11 @@ impl PlannerRunner {
         self
     }
 
+    #[must_use]
+    pub const fn commands(&self) -> &AgentCommands {
+        &self.commands
+    }
+
     /// Runs the selected planner and returns a validated structured proposal.
     ///
     /// # Errors
@@ -115,6 +136,7 @@ impl PlannerRunner {
             command,
             self.command_path(agent),
             agent,
+            "planner",
             prompt,
             self.timeout,
         )
@@ -218,9 +240,150 @@ impl PlannerRunner {
     }
 
     fn command_path(&self, agent: AgentKind) -> &Path {
+        self.commands.command_path(agent)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ImplementerRunner {
+    commands: AgentCommands,
+    timeout: Duration,
+}
+
+impl Default for ImplementerRunner {
+    fn default() -> Self {
+        Self::new(AgentCommands::default())
+    }
+}
+
+impl ImplementerRunner {
+    #[must_use]
+    pub const fn new(commands: AgentCommands) -> Self {
+        Self {
+            commands,
+            timeout: DEFAULT_IMPLEMENTATION_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Runs one write-capable agent inside an existing task worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded failure evidence when the CLI cannot start, times out,
+    /// exits unsuccessfully, or exceeds the configured capture limits.
+    pub async fn implement(
+        &self,
+        agent: AgentKind,
+        worktree: &Path,
+        prompt: &str,
+    ) -> Result<ImplementerOutput, ImplementerFailure> {
+        let command = self.prepare_command(agent, worktree);
+        let output = run_command(
+            command,
+            self.commands.command_path(agent),
+            agent,
+            "implementer",
+            prompt,
+            self.timeout,
+        )
+        .await
+        .map_err(ImplementerFailure::from)?;
+        let exit_code = output.status.code();
+
+        if output.stdout.truncated || output.stderr.truncated {
+            return Err(ImplementerFailure {
+                message: "implementer output exceeded the configured capture limit".to_owned(),
+                final_output: output.stdout.text,
+                diagnostic_output: output.stderr.text,
+                exit_code,
+            });
+        }
+        if !output.status.success() {
+            return Err(ImplementerFailure {
+                message: format!(
+                    "{} CLI exited unsuccessfully{}",
+                    agent.as_str(),
+                    exit_code.map_or_else(String::new, |code| format!(" with status {code}"))
+                ),
+                final_output: output.stdout.text,
+                diagnostic_output: output.stderr.text,
+                exit_code,
+            });
+        }
+
+        Ok(ImplementerOutput {
+            final_output: output.stdout.text,
+            diagnostic_output: output.stderr.text,
+            exit_code: exit_code.unwrap_or(0),
+        })
+    }
+
+    fn prepare_command(&self, agent: AgentKind, worktree: &Path) -> Command {
         match agent {
-            AgentKind::Codex => &self.commands.codex,
-            AgentKind::Claude => &self.commands.claude,
+            AgentKind::Codex => {
+                let mut command = Command::new(&self.commands.codex);
+                command.args([
+                    "exec",
+                    "--ephemeral",
+                    "--sandbox",
+                    "workspace-write",
+                    "--color",
+                    "never",
+                ]);
+                command.arg("-C").arg(worktree).arg("-");
+                command.current_dir(worktree);
+                command
+            }
+            AgentKind::Claude => {
+                let mut command = Command::new(&self.commands.claude);
+                command.args([
+                    "--print",
+                    "--safe-mode",
+                    "--restricted",
+                    "--disable-slash-commands",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--tools",
+                    "Read,Glob,Grep,Edit,Write",
+                    "--output-format",
+                    "text",
+                    "--no-session-persistence",
+                ]);
+                command.current_dir(worktree);
+                command
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementerOutput {
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementerFailure {
+    pub message: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: Option<i32>,
+}
+
+impl From<PlannerFailure> for ImplementerFailure {
+    fn from(failure: PlannerFailure) -> Self {
+        Self {
+            message: failure.message,
+            final_output: failure.final_output,
+            diagnostic_output: failure.diagnostic_output,
+            exit_code: failure.exit_code,
         }
     }
 }
@@ -235,6 +398,7 @@ async fn run_command(
     mut command: Command,
     command_path: &Path,
     agent: AgentKind,
+    role: &str,
     prompt: &str,
     duration: Duration,
 ) -> Result<ProcessOutput, PlannerFailure> {
@@ -242,6 +406,7 @@ async fn run_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|error| {
         PlannerFailure::new(format!(
@@ -250,21 +415,31 @@ async fn run_command(
             command_path.display()
         ))
     })?;
+    let process_group = child
+        .id()
+        .ok_or_else(|| PlannerFailure::new(format!("{role} process ID is unavailable")))?;
+    let mut process_guard = ProcessGroupGuard::new(process_group)?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| PlannerFailure::new("planner stdout is unavailable".to_owned()))?;
+        .ok_or_else(|| PlannerFailure::new(format!("{role} stdout is unavailable")))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| PlannerFailure::new("planner stderr is unavailable".to_owned()))?;
+        .ok_or_else(|| PlannerFailure::new(format!("{role} stderr is unavailable")))?;
     let stdout_task = tokio::spawn(read_bounded(stdout, MAX_STDOUT_BYTES));
     let stderr_task = tokio::spawn(read_bounded(stderr, MAX_STDERR_BYTES));
-    send_prompt(&mut child, agent, prompt).await?;
-
-    let status_result = wait_for_child(&mut child, duration, agent).await;
-    let stdout = join_output(stdout_task, "stdout").await?;
-    let stderr = join_output(stderr_task, "stderr").await?;
+    let status_result = wait_for_child(
+        &mut child,
+        duration,
+        agent,
+        role,
+        prompt,
+        &mut process_guard,
+    )
+    .await;
+    let stdout = join_output(stdout_task, role, "stdout").await?;
+    let stderr = join_output(stderr_task, role, "stderr").await?;
     let status = status_result.map_err(|message| PlannerFailure {
         message,
         final_output: stdout.text.clone(),
@@ -281,12 +456,13 @@ async fn run_command(
 async fn send_prompt(
     child: &mut Child,
     agent: AgentKind,
+    role: &str,
     prompt: &str,
 ) -> Result<(), PlannerFailure> {
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| PlannerFailure::new("planner stdin is unavailable".to_owned()))?;
+        .ok_or_else(|| PlannerFailure::new(format!("{role} stdin is unavailable")))?;
     if let Err(error) = stdin.write_all(prompt.as_bytes()).await {
         let _ = child.kill().await;
         return Err(PlannerFailure::new(format!(
@@ -346,6 +522,52 @@ pub fn build_planning_prompt(run: &ActiveRunSummary) -> String {
          Branch: {}\n\
          Working tree: {}\n",
         run.goal, run.repository, run.base_revision, branch, working_tree
+    )
+}
+
+#[must_use]
+pub fn build_implementation_prompt(
+    run: &ActiveRunSummary,
+    task: &PlanTaskSummary,
+    worktree: &TaskWorktreeSummary,
+) -> String {
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dependencies = if task.depends_on.is_empty() {
+        "none".to_owned()
+    } else {
+        task.depends_on
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        "You are the implementation worker in a local software workshop.\n\
+         Work only inside the current task worktree. Read the repository's applicable contributor instructions before editing. Implement only the assigned task and keep existing unrelated changes intact.\n\
+         Do not commit, merge, push, rebase, reset, rewrite Git history, delete branches or worktrees, modify another checkout, or change external systems. Do not claim that tests or verification passed; deterministic verification is a separate engine stage.\n\
+         Inspect the current worktree first because a retry may contain a previous partial attempt. Make the smallest coherent code and test changes required by the task. End with a concise summary of changed files, remaining concerns, and checks you recommend the engine run.\n\n\
+         Overall goal:\n{}\n\n\
+         Assigned task {}: {}\n{}\n\n\
+         Acceptance criteria:\n{}\n\n\
+         Dependencies by plan position: {}\n\
+         Base revision: {}\n\
+         Task branch: {}\n\
+         Task worktree: {}\n",
+        run.goal,
+        task.position,
+        task.title,
+        task.description,
+        criteria,
+        dependencies,
+        worktree.base_revision,
+        worktree.branch,
+        worktree.path
     )
 }
 
@@ -444,16 +666,85 @@ async fn wait_for_child(
     child: &mut Child,
     duration: Duration,
     agent: AgentKind,
+    role: &str,
+    prompt: &str,
+    process_guard: &mut ProcessGroupGuard,
 ) -> Result<std::process::ExitStatus, String> {
-    if let Ok(result) = timeout(duration, child.wait()).await {
-        result.map_err(|error| format!("cannot wait for {} CLI: {error}", agent.as_str()))
-    } else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        Err(format!(
-            "{} CLI exceeded the planning timeout",
-            agent.as_str()
-        ))
+    let invocation = async {
+        send_prompt(child, agent, role, prompt)
+            .await
+            .map_err(|failure| failure.message)?;
+        child
+            .wait()
+            .await
+            .map_err(|error| format!("cannot wait for {} CLI: {error}", agent.as_str()))
+    };
+    match timeout(duration, invocation).await {
+        Ok(Ok(status)) => {
+            process_guard.kill_remaining();
+            Ok(status)
+        }
+        Ok(Err(message)) => {
+            process_guard.terminate(child).await;
+            Err(message)
+        }
+        Err(_) => {
+            process_guard.terminate(child).await;
+            Err(format!(
+                "{} CLI exceeded the {role} timeout",
+                agent.as_str()
+            ))
+        }
+    }
+}
+
+struct ProcessGroupGuard {
+    process_group: Option<Pid>,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_id: u32) -> Result<Self, PlannerFailure> {
+        let process_group = i32::try_from(process_id)
+            .map(Pid::from_raw)
+            .map_err(|_| PlannerFailure::new("agent process ID is out of range".to_owned()))?;
+        Ok(Self {
+            process_group: Some(process_group),
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.process_group = None;
+    }
+
+    fn kill_remaining(&mut self) {
+        if let Some(process_group) = self.process_group {
+            let _ = killpg(process_group, Signal::SIGKILL);
+        }
+        self.disarm();
+    }
+
+    async fn terminate(&mut self, child: &mut Child) {
+        let Some(process_group) = self.process_group else {
+            return;
+        };
+        let _ = killpg(process_group, Signal::SIGTERM);
+        let exited = matches!(
+            timeout(Duration::from_secs(5), child.wait()).await,
+            Ok(Ok(_))
+        );
+        let _ = killpg(process_group, Signal::SIGKILL);
+        if !exited {
+            let _ = child.wait().await;
+        }
+        self.disarm();
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.process_group {
+            let _ = killpg(process_group, Signal::SIGKILL);
+        }
     }
 }
 
@@ -484,11 +775,12 @@ where
 
 async fn join_output(
     task: tokio::task::JoinHandle<std::io::Result<BoundedOutput>>,
+    role: &str,
     stream: &str,
 ) -> Result<BoundedOutput, PlannerFailure> {
     task.await
-        .map_err(|error| PlannerFailure::new(format!("cannot join planner {stream}: {error}")))?
-        .map_err(|error| PlannerFailure::new(format!("cannot read planner {stream}: {error}")))
+        .map_err(|error| PlannerFailure::new(format!("cannot join {role} {stream}: {error}")))?
+        .map_err(|error| PlannerFailure::new(format!("cannot read {role} {stream}: {error}")))
 }
 
 #[cfg(test)]
@@ -508,6 +800,36 @@ mod tests {
         assert!(prompt.contains("0123456789"));
         assert!(prompt.contains("Working tree: dirty"));
         assert!(prompt.contains("without modifying"));
+    }
+
+    #[test]
+    fn builds_an_implementation_prompt_with_task_boundaries() {
+        let run = sample_run();
+        let task = PlanTaskSummary {
+            id: "task-1".to_owned(),
+            position: 1,
+            title: "Implement the change".to_owned(),
+            description: "Make the focused edit.".to_owned(),
+            acceptance_criteria: vec!["The behavior is covered.".to_owned()],
+            depends_on: Vec::new(),
+        };
+        let worktree = TaskWorktreeSummary {
+            id: "worktree-1".to_owned(),
+            task_id: task.id.clone(),
+            status: orchestrator_core::state::TaskWorktreeStatus::Ready,
+            branch: "orchestrator/run/1-implement".to_owned(),
+            path: "/tmp/worktree".to_owned(),
+            base_revision: "0123456789".to_owned(),
+            repository_dirty: false,
+            last_error: None,
+        };
+
+        let prompt = build_implementation_prompt(&run, &task, &worktree);
+        assert!(prompt.contains("Implement the change"));
+        assert!(prompt.contains("The behavior is covered"));
+        assert!(prompt.contains("/tmp/worktree"));
+        assert!(prompt.contains("Do not commit"));
+        assert!(prompt.contains("verification is a separate engine stage"));
     }
 
     #[test]
@@ -615,6 +937,51 @@ mod tests {
         assert_eq!(failure.diagnostic_output, "not authenticated");
     }
 
+    #[tokio::test]
+    async fn runs_implementers_inside_the_selected_worktree() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let codex = temporary.path().join("codex");
+        let claude = temporary.path().join("claude");
+        let marker = temporary.path().join("implemented");
+        let script = format!(
+            "#!/bin/sh\nread prompt\nprintf done > '{}'\nprintf 'implemented'\n",
+            marker.display()
+        );
+        write_executable(&codex, &script);
+        write_executable(&claude, &script);
+        let runner = ImplementerRunner::new(AgentCommands { codex, claude });
+
+        for agent in [AgentKind::Codex, AgentKind::Claude] {
+            let output = runner
+                .implement(agent, temporary.path(), "Implement the task")
+                .await
+                .expect("implementation should complete");
+            assert_eq!(output.final_output, "implemented");
+            assert_eq!(output.exit_code, 0);
+        }
+        assert!(marker.is_file());
+    }
+
+    #[tokio::test]
+    async fn bounds_prompt_delivery_by_the_implementation_timeout() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let stalled = temporary.path().join("stalled");
+        write_executable(&stalled, "#!/bin/sh\nsleep 60\n");
+        let runner = ImplementerRunner::new(AgentCommands {
+            codex: stalled.clone(),
+            claude: stalled,
+        })
+        .with_timeout(Duration::from_millis(50));
+        let prompt = "x".repeat(1024 * 1024);
+
+        let failure = runner
+            .implement(AgentKind::Codex, temporary.path(), &prompt)
+            .await
+            .expect_err("stalled prompt delivery should time out");
+
+        assert!(failure.message.contains("implementer timeout"));
+    }
+
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).expect("fake CLI should be written");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -653,6 +1020,7 @@ mod tests {
             run_status: RunStatus::Draft,
             plan: None,
             worktrees: Vec::new(),
+            implementation_attempts: Vec::new(),
             last_error: None,
         }
     }

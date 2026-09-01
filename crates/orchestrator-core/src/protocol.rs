@@ -58,6 +58,13 @@ pub enum ClientRequest {
         plan_id: String,
         task_id: String,
     },
+    RunTaskImplementation {
+        run_id: String,
+        plan_id: String,
+        task_id: String,
+        worktree_id: String,
+        agent: AgentKind,
+    },
     GetSnapshot,
     Ping,
 }
@@ -179,6 +186,37 @@ mod tests {
         assert_eq!(json["type"], "snapshot");
         assert_eq!(json["snapshot"]["status"], "idle");
         assert!(json.get("request_id").is_none());
+    }
+
+    #[test]
+    fn defaults_implementation_attempts_from_an_older_version_one_snapshot() {
+        let run = serde_json::json!({
+            "id": "run-1",
+            "goal": "Implement safely",
+            "repository": "/tmp/project",
+            "base_revision": "0123456789012345678901234567890123456789",
+            "branch": "main",
+            "worktree_dirty": false,
+            "run_status": "waiting_for_user",
+            "plan": null,
+            "worktrees": [],
+            "last_error": null
+        });
+        let snapshot: EngineSnapshot = serde_json::from_value(serde_json::json!({
+            "sequence": 1,
+            "status": "idle",
+            "active_run": run,
+            "requires_attention": false
+        }))
+        .expect("an older version-one snapshot should remain readable");
+
+        assert!(
+            snapshot
+                .active_run
+                .expect("run should decode")
+                .implementation_attempts
+                .is_empty()
+        );
     }
 
     #[test]
@@ -326,6 +364,25 @@ mod tests {
                 run_id: "run-1".to_owned(),
                 plan_id: "plan-1".to_owned(),
                 task_id: "task-1".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_run_task_implementation_request() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"version":1,"request_id":"request-implement","method":"run_task_implementation","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","agent":"claude"}"#,
+        )
+        .expect("implementation request should parse");
+
+        assert_eq!(
+            message.request,
+            ClientRequest::RunTaskImplementation {
+                run_id: "run-1".to_owned(),
+                plan_id: "plan-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                worktree_id: "worktree-1".to_owned(),
+                agent: AgentKind::Claude,
             }
         );
     }

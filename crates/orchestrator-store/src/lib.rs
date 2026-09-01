@@ -11,8 +11,8 @@ use std::{
 };
 
 use orchestrator_core::state::{
-    ActiveRunSummary, AgentKind, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary, RunStatus,
-    TaskWorktreeStatus, TaskWorktreeSummary,
+    ActiveRunSummary, AgentKind, ImplementationAttemptSummary, ImplementationStatus, PlanProposal,
+    PlanStatus, PlanSummary, PlanTaskSummary, RunStatus, TaskWorktreeStatus, TaskWorktreeSummary,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -23,7 +23,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
     (
@@ -35,6 +35,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         3,
         "worktrees",
         include_str!("../migrations/0003_worktrees.sql"),
+    ),
+    (
+        4,
+        "implementation_attempts",
+        include_str!("../migrations/0004_implementation_attempts.sql"),
     ),
 ];
 
@@ -77,6 +82,8 @@ pub enum StorageError {
     InvalidWorktreeStatus(String),
     #[error("database returned an invalid agent kind: {0}")]
     InvalidAgentKind(String),
+    #[error("database returned an invalid implementation status: {0}")]
+    InvalidImplementationStatus(String),
     #[error("run does not exist: {0}")]
     RunNotFound(String),
     #[error("run is not ready for planning: {0}")]
@@ -91,6 +98,10 @@ pub enum StorageError {
     WorktreeNotReserved(String),
     #[error("this task already has a live worktree; retire it before creating another")]
     WorktreeAlreadyLive,
+    #[error("task implementation is not ready to run: {0}")]
+    ImplementationNotReady(String),
+    #[error("implementation attempt does not exist or is no longer running: {0}")]
+    ImplementationAttemptNotRunning(String),
     #[error("database sequence is negative: {0}")]
     NegativeSequence(i64),
     #[error("database position is outside the supported range: {0}")]
@@ -253,6 +264,39 @@ pub struct ReservedTaskWorktree {
     pub snapshot: StoredSnapshot,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationAttemptInput {
+    pub run_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub agent: AgentKind,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedImplementationAttempt {
+    pub attempt_id: String,
+    pub snapshot: StoredSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationAttemptSuccess {
+    pub attempt_id: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImplementationAttemptFailure {
+    pub attempt_id: String,
+    pub final_output: String,
+    pub diagnostic_output: String,
+    pub exit_code: Option<i32>,
+    pub error_message: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoredSnapshot {
     pub sequence: u64,
@@ -311,6 +355,18 @@ enum Command {
         detail: Option<String>,
         reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
     },
+    BeginImplementationAttempt(
+        ImplementationAttemptInput,
+        oneshot::Sender<Result<StartedImplementationAttempt, StorageError>>,
+    ),
+    CompleteImplementationAttempt(
+        ImplementationAttemptSuccess,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
+    FailImplementationAttempt(
+        ImplementationAttemptFailure,
+        oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    ),
     CurrentSnapshot(oneshot::Sender<Result<StoredSnapshot, StorageError>>),
     Health(oneshot::Sender<Result<StorageHealth, StorageError>>),
     Shutdown,
@@ -654,6 +710,61 @@ impl StorageWorker {
             .await
             .map_err(|_| StorageError::WorkerStopped)?
     }
+
+    /// Records a user-selected implementation assignment before the agent starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approved task, ready worktree, or run state no
+    /// longer matches the request, or when storage is unavailable.
+    pub async fn begin_implementation_attempt(
+        &self,
+        input: ImplementationAttemptInput,
+    ) -> Result<StartedImplementationAttempt, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::BeginImplementationAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists a successfully exited implementation process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running or storage fails.
+    pub async fn complete_implementation_attempt(
+        &self,
+        input: ImplementationAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::CompleteImplementationAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
+    /// Persists a failed, timed-out, or refused implementation process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is no longer running or storage fails.
+    pub async fn fail_implementation_attempt(
+        &self,
+        input: ImplementationAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::FailImplementationAttempt(input, reply_sender))
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
 }
 
 impl Drop for StorageWorker {
@@ -732,6 +843,15 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
                     detail.as_deref(),
                 ));
             }
+            Command::BeginImplementationAttempt(input, reply) => {
+                let _ = reply.send(database.begin_implementation_attempt(&input));
+            }
+            Command::CompleteImplementationAttempt(input, reply) => {
+                let _ = reply.send(database.complete_implementation_attempt(&input));
+            }
+            Command::FailImplementationAttempt(input, reply) => {
+                let _ = reply.send(database.fail_implementation_attempt(&input));
+            }
             Command::CurrentSnapshot(reply) => {
                 let _ = reply.send(database.current_snapshot());
             }
@@ -760,6 +880,7 @@ impl Database {
         apply_migrations(&mut connection)?;
         recover_interrupted_planning(&mut connection)?;
         recover_interrupted_worktrees(&mut connection)?;
+        recover_interrupted_implementations(&mut connection)?;
 
         Ok(Self {
             connection,
@@ -801,6 +922,7 @@ impl Database {
         if let Some(run) = &mut active_run {
             run.plan = self.load_latest_plan(&run.id)?;
             run.worktrees = self.load_task_worktrees(&run.id)?;
+            run.implementation_attempts = self.load_implementation_attempts(&run.id)?;
         }
 
         Ok(StoredSnapshot {
@@ -874,6 +996,7 @@ impl Database {
                 run_status: RunStatus::Draft,
                 plan: None,
                 worktrees: Vec::new(),
+                implementation_attempts: Vec::new(),
                 last_error: None,
             }),
         })
@@ -1279,6 +1402,233 @@ impl Database {
         self.current_snapshot()
     }
 
+    fn begin_implementation_attempt(
+        &self,
+        input: &ImplementationAttemptInput,
+    ) -> Result<StartedImplementationAttempt, StorageError> {
+        let started_at = unix_milliseconds()?;
+        let attempt_id = uuid::Uuid::now_v7().to_string();
+        let transaction = self.connection.unchecked_transaction()?;
+        let ready = transaction
+            .query_row(
+                "SELECT 1 FROM task_worktrees w \
+                 JOIN plans p ON p.id = w.plan_id \
+                 JOIN runs r ON r.id = w.run_id \
+                 WHERE w.id = ?4 AND w.run_id = ?1 AND w.plan_id = ?2 AND w.task_id = ?3 \
+                   AND w.status = 'ready' AND p.status = 'approved' \
+                   AND p.revision = (SELECT max(revision) FROM plans WHERE run_id = ?1) \
+                   AND r.status IN ('waiting_for_user', 'failed')",
+                (
+                    &input.run_id,
+                    &input.plan_id,
+                    &input.task_id,
+                    &input.worktree_id,
+                ),
+                |_| Ok(true),
+            )
+            .optional()?;
+        if ready.is_none() {
+            return Err(if run_exists(&transaction, &input.run_id)? {
+                StorageError::ImplementationNotReady(input.task_id.clone())
+            } else {
+                StorageError::RunNotFound(input.run_id.clone())
+            });
+        }
+
+        let changed = transaction.execute(
+            "UPDATE runs SET status = 'running', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status IN ('waiting_for_user', 'failed')",
+            (&input.run_id, started_at),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationNotReady(input.task_id.clone()));
+        }
+        transaction.execute(
+            "INSERT INTO implementation_attempts(\
+                id, run_id, plan_id, task_id, worktree_id, agent, status, prompt, started_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+            (
+                &attempt_id,
+                &input.run_id,
+                &input.plan_id,
+                &input.task_id,
+                &input.worktree_id,
+                input.agent.as_str(),
+                &input.prompt,
+                started_at,
+            ),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "task_id": input.task_id,
+            "worktree_id": input.worktree_id,
+            "agent": input.agent,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_started', ?2, ?3, ?4)",
+            (
+                &input.run_id,
+                input.agent.as_str(),
+                payload.to_string(),
+                started_at,
+            ),
+        )?;
+        transaction.commit()?;
+
+        Ok(StartedImplementationAttempt {
+            attempt_id,
+            snapshot: self.current_snapshot()?,
+        })
+    }
+
+    fn complete_implementation_attempt(
+        &self,
+        input: &ImplementationAttemptSuccess,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, worktree_id, agent) =
+            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE implementation_attempts SET \
+                status = 'completed', final_output = ?2, diagnostic_output = ?3, \
+                exit_code = ?4, completed_at = ?5 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationAttemptNotRunning(
+                input.attempt_id.clone(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'waiting_for_user', last_error = NULL, updated_at = ?2 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+            "exit_code": input.exit_code,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_completed', ?2, ?3, ?4)",
+            (&run_id, agent.as_str(), payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn fail_implementation_attempt(
+        &self,
+        input: &ImplementationAttemptFailure,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let completed_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let (run_id, task_id, worktree_id, agent) =
+            running_implementation_attempt(&transaction, &input.attempt_id)?;
+        let changed = transaction.execute(
+            "UPDATE implementation_attempts SET \
+                status = 'failed', final_output = ?2, diagnostic_output = ?3, \
+                exit_code = ?4, error_message = ?5, completed_at = ?6 \
+             WHERE id = ?1 AND status = 'running'",
+            (
+                &input.attempt_id,
+                &input.final_output,
+                &input.diagnostic_output,
+                input.exit_code,
+                &input.error_message,
+                completed_at,
+            ),
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationAttemptNotRunning(
+                input.attempt_id.clone(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, &input.error_message, completed_at),
+        )?;
+        let payload = json!({
+            "attempt_id": input.attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+            "exit_code": input.exit_code,
+            "error": input.error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_failed', ?2, ?3, ?4)",
+            (&run_id, agent.as_str(), payload.to_string(), completed_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
+    fn load_implementation_attempts(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ImplementationAttemptSummary>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, worktree_id, agent, status, exit_code, error_message, \
+                    started_at, completed_at \
+             FROM implementation_attempts WHERE run_id = ?1 ORDER BY started_at, rowid",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i32>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (
+                id,
+                task_id,
+                worktree_id,
+                agent,
+                status,
+                exit_code,
+                error_message,
+                started_at,
+                completed_at,
+            ) = row?;
+            attempts.push(ImplementationAttemptSummary {
+                id,
+                task_id,
+                worktree_id,
+                agent: parse_agent_kind(&agent)?,
+                status: parse_implementation_status(&status)?,
+                exit_code,
+                error_message,
+                started_at,
+                completed_at,
+            });
+        }
+        Ok(attempts)
+    }
+
     fn load_task_worktrees(&self, run_id: &str) -> Result<Vec<TaskWorktreeSummary>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, task_id, status, branch, path, base_revision, \
@@ -1423,6 +1773,33 @@ fn running_attempt(
     Ok((run_id, parse_agent_kind(&agent)?))
 }
 
+fn running_implementation_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+) -> Result<(String, String, String, AgentKind), StorageError> {
+    let attempt = transaction
+        .query_row(
+            "SELECT run_id, task_id, worktree_id, agent FROM implementation_attempts \
+             WHERE id = ?1 AND status = 'running'",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((run_id, task_id, worktree_id, agent)) = attempt else {
+        return Err(StorageError::ImplementationAttemptNotRunning(
+            attempt_id.to_owned(),
+        ));
+    };
+    Ok((run_id, task_id, worktree_id, parse_agent_kind(&agent)?))
+}
+
 fn current_proposed_plan_agent(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1551,6 +1928,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActiveRunSummary> {
         run_status,
         plan: None,
         worktrees: Vec::new(),
+        implementation_attempts: Vec::new(),
         last_error: row.get(7)?,
     })
 }
@@ -1560,6 +1938,16 @@ fn parse_agent_kind(agent: &str) -> Result<AgentKind, StorageError> {
         "codex" => Ok(AgentKind::Codex),
         "claude" => Ok(AgentKind::Claude),
         _ => Err(StorageError::InvalidAgentKind(agent.to_owned())),
+    }
+}
+
+fn parse_implementation_status(status: &str) -> Result<ImplementationStatus, StorageError> {
+    match status {
+        "running" => Ok(ImplementationStatus::Running),
+        "completed" => Ok(ImplementationStatus::Completed),
+        "failed" => Ok(ImplementationStatus::Failed),
+        "cancelled" => Ok(ImplementationStatus::Cancelled),
+        _ => Err(StorageError::InvalidImplementationStatus(status.to_owned())),
     }
 }
 
@@ -1783,6 +2171,59 @@ fn recover_interrupted_worktrees(connection: &mut Connection) -> Result<(), Stor
     Ok(())
 }
 
+fn recover_interrupted_implementations(connection: &mut Connection) -> Result<(), StorageError> {
+    let interrupted = {
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, task_id, worktree_id, agent \
+             FROM implementation_attempts WHERE status = 'running'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if interrupted.is_empty() {
+        return Ok(());
+    }
+
+    let recovered_at = unix_milliseconds()?;
+    let error_message = "engine stopped before the implementer completed";
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (attempt_id, run_id, task_id, worktree_id, agent) in interrupted {
+        transaction.execute(
+            "UPDATE implementation_attempts SET \
+                status = 'failed', error_message = ?2, completed_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&attempt_id, error_message, recovered_at),
+        )?;
+        transaction.execute(
+            "UPDATE runs SET status = 'failed', last_error = ?2, updated_at = ?3 \
+             WHERE id = ?1 AND status = 'running'",
+            (&run_id, error_message, recovered_at),
+        )?;
+        let payload = json!({
+            "attempt_id": attempt_id,
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "agent": agent,
+            "error": error_message,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'implementation_interrupted', 'engine', ?2, ?3)",
+            (&run_id, payload.to_string(), recovered_at),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
     let created = match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1906,7 +2347,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 3);
+        assert_eq!(migration_count, 4);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -2043,8 +2484,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             }
         ));
     }
@@ -2348,6 +2789,122 @@ mod tests {
         assert_eq!(
             worktrees[0].last_error.as_deref(),
             Some("engine stopped before the task worktree was created")
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_a_supervised_implementation_attempt() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        let worktree_id = reserved.worktree_id;
+        worker
+            .confirm_task_worktree(worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+
+        let started = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id,
+                task_id: task_id.clone(),
+                worktree_id: worktree_id.clone(),
+                agent: AgentKind::Claude,
+                prompt: "Implement the approved task".to_owned(),
+            })
+            .await
+            .expect("implementation should start");
+        let running = started
+            .snapshot
+            .active_run
+            .as_ref()
+            .expect("run should stay active");
+        assert_eq!(running.run_status, RunStatus::Running);
+        assert_eq!(
+            running.implementation_attempts[0].status,
+            ImplementationStatus::Running
+        );
+
+        let completed = worker
+            .complete_implementation_attempt(ImplementationAttemptSuccess {
+                attempt_id: started.attempt_id,
+                final_output: "Changed the requested files".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("implementation should complete");
+        let run = completed.active_run.expect("run should stay active");
+        assert_eq!(run.run_status, RunStatus::WaitingForUser);
+        assert_eq!(
+            run.implementation_attempts[0].status,
+            ImplementationStatus::Completed
+        );
+        assert_eq!(run.implementation_attempts[0].task_id, task_id);
+        assert_eq!(run.implementation_attempts[0].worktree_id, worktree_id);
+
+        drop(worker);
+        let reopened = StorageWorker::start(paths).expect("storage should reopen");
+        assert_eq!(
+            reopened
+                .current_snapshot()
+                .await
+                .expect("snapshot should load")
+                .active_run
+                .expect("run should stay active")
+                .implementation_attempts[0]
+                .status,
+            ImplementationStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_an_interrupted_implementation_as_failed() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let reserved = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        worker
+            .confirm_task_worktree(reserved.worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id,
+                plan_id,
+                task_id,
+                worktree_id: reserved.worktree_id,
+                agent: AgentKind::Codex,
+                prompt: "Implement the approved task".to_owned(),
+            })
+            .await
+            .expect("implementation should start");
+        drop(worker);
+
+        let reopened = StorageWorker::start(paths).expect("storage should recover");
+        let run = reopened
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should remain active");
+        assert_eq!(run.run_status, RunStatus::Failed);
+        assert_eq!(
+            run.implementation_attempts[0].status,
+            ImplementationStatus::Failed
+        );
+        assert_eq!(
+            run.last_error.as_deref(),
+            Some("engine stopped before the implementer completed")
         );
     }
 

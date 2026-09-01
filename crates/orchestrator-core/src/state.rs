@@ -37,7 +37,44 @@ pub struct ActiveRunSummary {
     pub run_status: RunStatus,
     pub plan: Option<PlanSummary>,
     pub worktrees: Vec<TaskWorktreeSummary>,
+    #[serde(default)]
+    pub implementation_attempts: Vec<ImplementationAttemptSummary>,
     pub last_error: Option<String>,
+}
+
+/// Durable state of one supervised implementation-agent invocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl ImplementationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImplementationAttemptSummary {
+    pub id: String,
+    pub task_id: String,
+    pub worktree_id: String,
+    pub agent: AgentKind,
+    pub status: ImplementationStatus,
+    pub exit_code: Option<i32>,
+    pub error_message: Option<String>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
 }
 
 /// Lifecycle of one engine-owned task worktree. See ADR-0006.

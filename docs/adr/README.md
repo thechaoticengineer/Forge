@@ -45,3 +45,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0004](0004-run-planners-as-constrained-cli-processes.md) | Accepted | Run Codex and Claude planners as bounded, read-only CLI subprocesses |
 | [ADR-0005](0005-browse-local-and-github-repositories.md) | Accepted | Discover local projects and clone GitHub repositories through the Rust engine |
 | [ADR-0006](0006-isolate-task-implementation-in-git-worktrees.md) | Accepted | Give each implementation task an isolated Git worktree and reserved task branch |
+| [ADR-0007](0007-supervise-implementation-agents-in-task-worktrees.md) | Accepted | Run explicitly assigned implementation agents under engine supervision in task worktrees |

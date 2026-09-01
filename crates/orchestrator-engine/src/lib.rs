@@ -13,7 +13,10 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
-use orchestrator_agents::{PlannerRunner, build_planning_prompt, validate_proposal};
+use orchestrator_agents::{
+    ImplementerRunner, PlannerRunner, build_implementation_prompt, build_planning_prompt,
+    validate_proposal,
+};
 use orchestrator_core::{
     protocol::{
         ClientMessage, ClientRequest, GithubRepository, LocalRepository, MoveDirection,
@@ -21,7 +24,8 @@ use orchestrator_core::{
     },
     state::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, PlanProposal, PlanStatus,
-        PlanSummary, ProposedTask, RunStatus, TaskWorktreeStatus,
+        PlanSummary, PlanTaskSummary, ProposedTask, RunStatus, TaskWorktreeStatus,
+        TaskWorktreeSummary,
     },
 };
 use orchestrator_git::{
@@ -30,8 +34,9 @@ use orchestrator_git::{
     task_worktree_state,
 };
 use orchestrator_store::{
-    DraftRunInput, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess, PlanRevisionInput,
-    StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
+    DraftRunInput, ImplementationAttemptFailure, ImplementationAttemptInput,
+    ImplementationAttemptSuccess, PlanAttemptFailure, PlanAttemptInput, PlanAttemptSuccess,
+    PlanRevisionInput, StatePaths, StorageWorker, StoredSnapshot, TaskWorktreeReservation,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -117,6 +122,7 @@ pub async fn serve_with_settings(
     planner: PlannerRunner,
     repositories: RepositorySettings,
 ) -> Result<()> {
+    let implementer = ImplementerRunner::new(planner.commands().clone());
     let storage = Arc::new(
         StorageWorker::start(state_paths).context("cannot initialize durable state storage")?,
     );
@@ -140,6 +146,7 @@ pub async fn serve_with_settings(
         state_sender,
         storage,
         Arc::new(planner),
+        Arc::new(implementer),
         Arc::new(repositories),
     )
     .await;
@@ -153,6 +160,7 @@ async fn run_listener(
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
+    implementer: Arc<ImplementerRunner>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     loop {
@@ -166,6 +174,7 @@ async fn run_listener(
                 let client_state = state_sender.clone();
                 let client_storage = Arc::clone(&storage);
                 let client_planner = Arc::clone(&planner);
+                let client_implementer = Arc::clone(&implementer);
                 let client_repositories = Arc::clone(&repositories);
                 tokio::spawn(async move {
                     if let Err(error) = handle_client(
@@ -173,6 +182,7 @@ async fn run_listener(
                         client_state,
                         client_storage,
                         client_planner,
+                        client_implementer,
                         client_repositories,
                     ).await {
                         eprintln!("IPC client disconnected after error: {error:#}");
@@ -188,6 +198,7 @@ async fn handle_client(
     state_sender: watch::Sender<EngineSnapshot>,
     storage: Arc<StorageWorker>,
     planner: Arc<PlannerRunner>,
+    implementer: Arc<ImplementerRunner>,
     repositories: Arc<RepositorySettings>,
 ) -> Result<()> {
     let mut state_receiver = state_sender.subscribe();
@@ -212,6 +223,7 @@ async fn handle_client(
                     &state_sender,
                     &storage,
                     &planner,
+                    &implementer,
                     &repositories,
                     &mut write_half,
                 ).await?;
@@ -236,6 +248,7 @@ async fn handle_request(
     state_sender: &watch::Sender<EngineSnapshot>,
     storage: &StorageWorker,
     planner: &PlannerRunner,
+    implementer: &ImplementerRunner,
     repositories: &RepositorySettings,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
@@ -404,6 +417,30 @@ async fn handle_request(
             plan_id,
             task_id,
         } => match prepare_task_worktree(run_id, plan_id, task_id, storage, state_sender).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::RunTaskImplementation {
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            agent,
+        } => match run_task_implementation(
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            agent,
+            storage,
+            implementer,
+            state_sender,
+        )
+        .await
+        {
             Ok(stored_snapshot) => {
                 publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
                 ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
@@ -1546,6 +1583,158 @@ async fn prepare_task_worktree(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_task_implementation(
+    run_id: String,
+    plan_id: String,
+    task_id: String,
+    worktree_id: String,
+    agent: AgentKind,
+    storage: &StorageWorker,
+    implementer: &ImplementerRunner,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let context =
+        load_implementation_context(storage, &run_id, &plan_id, &task_id, &worktree_id).await?;
+    let prompt = build_implementation_prompt(&context.run, &context.task, &context.worktree);
+    let worktree_path = context.worktree.path.clone();
+    let started = storage
+        .begin_implementation_attempt(ImplementationAttemptInput {
+            run_id,
+            plan_id,
+            task_id,
+            worktree_id,
+            agent,
+            prompt: prompt.clone(),
+        })
+        .await
+        .map_err(|error| match error {
+            orchestrator_store::StorageError::ImplementationNotReady(_) => RequestFailure {
+                code: "implementation_not_ready",
+                message: error.to_string(),
+            },
+            other => RequestFailure::storage("cannot start implementation", other),
+        })?;
+    publish_newer_snapshot(state_sender, engine_snapshot(started.snapshot));
+
+    match implementer
+        .implement(agent, Path::new(&worktree_path), &prompt)
+        .await
+    {
+        Ok(output) => storage
+            .complete_implementation_attempt(ImplementationAttemptSuccess {
+                attempt_id: started.attempt_id,
+                final_output: output.final_output,
+                diagnostic_output: output.diagnostic_output,
+                exit_code: output.exit_code,
+            })
+            .await
+            .map_err(|error| {
+                RequestFailure::storage("cannot persist implementation result", error)
+            }),
+        Err(failure) => {
+            let message = failure.message.clone();
+            let failed = storage
+                .fail_implementation_attempt(ImplementationAttemptFailure {
+                    attempt_id: started.attempt_id,
+                    final_output: failure.final_output,
+                    diagnostic_output: failure.diagnostic_output,
+                    exit_code: failure.exit_code,
+                    error_message: failure.message,
+                })
+                .await
+                .map_err(|error| {
+                    RequestFailure::storage("cannot persist implementation failure", error)
+                })?;
+            publish_newer_snapshot(state_sender, engine_snapshot(failed));
+            Err(RequestFailure {
+                code: "implementation_failed",
+                message,
+            })
+        }
+    }
+}
+
+struct ImplementationContext {
+    run: ActiveRunSummary,
+    task: PlanTaskSummary,
+    worktree: TaskWorktreeSummary,
+}
+
+async fn load_implementation_context(
+    storage: &StorageWorker,
+    run_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    worktree_id: &str,
+) -> Result<ImplementationContext, RequestFailure> {
+    let run = load_active_run(storage, run_id).await?;
+    let plan = run
+        .plan
+        .as_ref()
+        .filter(|plan| plan.id == plan_id && plan.status == PlanStatus::Approved)
+        .ok_or_else(|| RequestFailure {
+            code: "plan_not_approved",
+            message: "implementation requires the run's approved plan".to_owned(),
+        })?;
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "task_not_found",
+            message: "the selected task is not part of the approved plan".to_owned(),
+        })?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .find(|worktree| {
+            worktree.id == worktree_id
+                && worktree.task_id == task_id
+                && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "worktree_not_ready",
+            message: "the selected task does not have that ready worktree".to_owned(),
+        })?;
+
+    let repository = PathBuf::from(&run.repository);
+    let worktree_path = PathBuf::from(&worktree.path);
+    let branch = worktree.branch.clone();
+    let state = tokio::task::spawn_blocking(move || {
+        task_worktree_state(&repository, &worktree_path, &branch)
+    })
+    .await
+    .map_err(|error| RequestFailure {
+        code: "worktree_not_ready",
+        message: format!("cannot inspect the task worktree: {error}"),
+    })?
+    .map_err(|error| RequestFailure {
+        code: "worktree_not_ready",
+        message: error.to_string(),
+    })?;
+    if !matches!(state, TaskWorktreeState::Ready { .. }) {
+        return Err(RequestFailure {
+            code: "worktree_not_ready",
+            message: match state {
+                TaskWorktreeState::Missing => "the task worktree is missing".to_owned(),
+                TaskWorktreeState::Diverged(detail) => {
+                    format!("the task worktree diverged from its record: {detail}")
+                }
+                TaskWorktreeState::Ready { .. } => unreachable!(),
+            },
+        });
+    }
+
+    Ok(ImplementationContext {
+        run,
+        task,
+        worktree,
+    })
+}
+
 /// Compares recorded worktrees with the filesystem at startup and records what
 /// diverged instead of repairing it. See ADR-0006.
 async fn reconcile_task_worktrees(
@@ -2381,6 +2570,70 @@ mod tests {
                 .expect("user work should survive"),
             "user work"
         );
+    }
+
+    #[tokio::test]
+    async fn supervises_an_implementer_in_the_task_worktree() {
+        let repository = initialized_repository();
+        let state = TempDir::new().expect("state directory should exist");
+        let storage = StorageWorker::start(StatePaths::new(state.path().join("store")))
+            .expect("storage should start");
+        let (run_id, plan) = approved_plan(repository.path(), &storage, &state).await;
+        let (state_sender, _receiver) = watch::channel(EngineSnapshot::default());
+        let created = prepare_task_worktree(
+            run_id.clone(),
+            plan.id.clone(),
+            plan.tasks[0].id.clone(),
+            &storage,
+            &state_sender,
+        )
+        .await
+        .expect("worktree should be created");
+        let worktree = created
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .worktrees[0]
+            .clone();
+        let fake_codex = state.path().join("implementer-codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\ninput=$(cat)\nprintf implemented > implemented.txt\nprintf 'changed implemented.txt'\n",
+        )
+        .expect("fake implementer should be written");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("fake implementer should be executable");
+        let implementer = ImplementerRunner::new(orchestrator_agents::AgentCommands {
+            codex: fake_codex,
+            claude: state.path().join("unused-claude"),
+        });
+
+        let completed = run_task_implementation(
+            run_id,
+            plan.id,
+            plan.tasks[0].id.clone(),
+            worktree.id.clone(),
+            AgentKind::Codex,
+            &storage,
+            &implementer,
+            &state_sender,
+        )
+        .await
+        .expect("implementation should complete");
+        let run = completed.active_run.expect("run should stay active");
+
+        assert_eq!(run.run_status, RunStatus::WaitingForUser);
+        assert_eq!(run.implementation_attempts.len(), 1);
+        assert_eq!(
+            run.implementation_attempts[0].status,
+            orchestrator_core::state::ImplementationStatus::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree.path).join("implemented.txt"))
+                .expect("implementer should edit its worktree"),
+            "implemented"
+        );
+        assert!(!repository.path().join("implemented.txt").exists());
     }
 
     #[tokio::test]
