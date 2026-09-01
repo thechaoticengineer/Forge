@@ -10,9 +10,9 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Isolated implementation has begun. Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; changed-file and retry evidence are the next implementation slice.
+Each task of an approved plan can be given a recorded Git worktree on its own reserved branch, created from the engine and refused rather than forced when it would touch existing user work. From the CLI, the user can assign Codex or Claude to a ready task worktree; the engine supervises the bounded process and preserves the attempt and its outcome. The Omarchy Overview shows bounded durable activity and lets the user pause, resume, cancel, redirect, or add context while retaining partial work and linked attempt history. Worktree creation and assignment remain CLI-only; richer prompt, retry, and worktree lifecycle presentation remains open.
 
-The CLI and panel can now run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, failed gates can launch a fresh implementer correction, and a local isolated-worktree commit is created only after both gates pass. Configurable project checks, full raw-output drill-down, final diff approval, and integration actions remain open.
+The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and integration actions remain open.
 
 ## Phase 0 — Foundation
 
@@ -86,13 +86,13 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 
 ## Phase 5 — Final Inspection and Approval
 
-- [ ] Present the complete diff and changed-file summary.
-- [ ] Present verification evidence and unresolved review findings together.
-- [ ] Propose meaningful Conventional Commit boundaries and messages.
-- [ ] Show proposed commits before creating them.
-- [ ] Support keyboard-only final approval or rejection.
+- [x] Present the complete diff and changed-file summary.
+- [x] Present verification evidence and unresolved review findings together.
+- [x] Propose a meaningful one-task Conventional Commit boundary and message. Semantic multi-commit splitting remains planned.
+- [x] Show proposed commits before creating them.
+- [x] Support keyboard-only final approval or rejection.
 - [x] Create only explicitly requested local commits without amending, rebasing, squashing, merging, or pushing implicitly.
-- [ ] Preserve the final outcome and rejected result in durable history.
+- [x] Preserve the final outcome and rejected result in durable history.
 
 ## Phase 6 — Omarchy Integration and Recovery Hardening
 
@@ -117,8 +117,8 @@ The first milestone is complete only when the whole workflow works through the r
 - [x] Watch Codex CLI or Claude Code CLI implement the plan in an isolated worktree.
 - [x] See deterministic build and test status update in the panel.
 - [x] Receive independent review from the other agent.
-- [ ] Inspect the final diff and proposed semantic commits.
-- [ ] Approve or reject the final result using only the keyboard.
+- [x] Inspect the final diff and proposed semantic commit.
+- [x] Approve or reject the final result using only the keyboard.
 - [x] Reload the planning UI or restart the engine without losing the draft or plan.
 - [x] See current engine and attention state in the bar widget.
 

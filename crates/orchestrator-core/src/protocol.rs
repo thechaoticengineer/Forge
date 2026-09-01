@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{AgentKind, EngineSnapshot, ImplementationContinuationKind, ReviewPolicy};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientMessage {
@@ -99,7 +99,15 @@ pub enum ClientRequest {
         implementation_attempt_id: String,
         policy: ReviewPolicy,
         max_corrections: u8,
-        create_commit: bool,
+    },
+    ApproveTaskCommit {
+        run_id: String,
+        task_commit_id: String,
+    },
+    RejectTaskCommit {
+        run_id: String,
+        task_commit_id: String,
+        reason: Option<String>,
     },
     GetSnapshot,
     Ping,
@@ -257,7 +265,7 @@ mod tests {
     #[test]
     fn parses_snapshot_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-1","method":"get_snapshot"}"#,
+            r#"{"version":2,"request_id":"request-1","method":"get_snapshot"}"#,
         )
         .expect("request should parse");
 
@@ -269,7 +277,7 @@ mod tests {
     #[test]
     fn parses_create_draft_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-2","method":"create_draft_run","repository":"/tmp/project","goal":"Add a test"}"#,
+            r#"{"version":2,"request_id":"request-2","method":"create_draft_run","repository":"/tmp/project","goal":"Add a test"}"#,
         )
         .expect("request should parse");
 
@@ -285,7 +293,7 @@ mod tests {
     #[test]
     fn parses_implementation_control_and_continuation_requests() {
         let pause: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-pause","method":"pause_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
+            r#"{"version":2,"request_id":"request-pause","method":"pause_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
         )
         .expect("pause request should parse");
         assert_eq!(
@@ -297,7 +305,7 @@ mod tests {
         );
 
         let continuation: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-continue","method":"continue_task_implementation","run_id":"run-1","attempt_id":"attempt-1","kind":"additional_context","instruction":"Preserve the compatibility path"}"#,
+            r#"{"version":2,"request_id":"request-continue","method":"continue_task_implementation","run_id":"run-1","attempt_id":"attempt-1","kind":"additional_context","instruction":"Preserve the compatibility path"}"#,
         )
         .expect("continuation request should parse");
         assert_eq!(
@@ -314,7 +322,7 @@ mod tests {
     #[test]
     fn parses_repository_path_completion_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-path","method":"complete_repository_path","path":"/home/dev/Pro"}"#,
+            r#"{"version":2,"request_id":"request-path","method":"complete_repository_path","path":"/home/dev/Pro"}"#,
         )
         .expect("path completion request should parse");
 
@@ -329,13 +337,13 @@ mod tests {
     #[test]
     fn parses_repository_catalog_and_clone_requests() {
         let list: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-list","method":"list_repositories"}"#,
+            r#"{"version":2,"request_id":"request-list","method":"list_repositories"}"#,
         )
         .expect("catalog request should parse");
         assert_eq!(list.request, ClientRequest::ListRepositories);
 
         let clone: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-clone","method":"clone_repository","name_with_owner":"owner/project"}"#,
+            r#"{"version":2,"request_id":"request-clone","method":"clone_repository","name_with_owner":"owner/project"}"#,
         )
         .expect("clone request should parse");
         assert_eq!(
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn parses_create_task_worktree_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-worktree","method":"create_task_worktree","run_id":"run-1","plan_id":"plan-1","task_id":"task-1"}"#,
+            r#"{"version":2,"request_id":"request-worktree","method":"create_task_worktree","run_id":"run-1","plan_id":"plan-1","task_id":"task-1"}"#,
         )
         .expect("worktree request should parse");
 
@@ -435,7 +443,7 @@ mod tests {
     #[test]
     fn parses_run_task_implementation_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-implement","method":"run_task_implementation","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","agent":"claude"}"#,
+            r#"{"version":2,"request_id":"request-implement","method":"run_task_implementation","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","agent":"claude"}"#,
         )
         .expect("implementation request should parse");
 
@@ -454,7 +462,7 @@ mod tests {
     #[test]
     fn parses_independent_review_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-review","method":"run_task_review","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session"}"#,
+            r#"{"version":2,"request_id":"request-review","method":"run_task_review","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session"}"#,
         )
         .expect("review request should parse");
 
@@ -474,7 +482,7 @@ mod tests {
     #[test]
     fn parses_finish_task_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-finish","method":"finish_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session","max_corrections":1,"create_commit":true}"#,
+            r#"{"version":2,"request_id":"request-finish","method":"finish_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-1","worktree_id":"worktree-1","implementation_attempt_id":"implementation-1","policy":"cross_provider_or_fresh_session","max_corrections":1}"#,
         )
         .expect("finish request should parse");
         assert_eq!(
@@ -487,7 +495,34 @@ mod tests {
                 implementation_attempt_id: "implementation-1".to_owned(),
                 policy: ReviewPolicy::CrossProviderOrFreshSession,
                 max_corrections: 1,
-                create_commit: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_commit_decisions() {
+        let approval: ClientMessage = serde_json::from_str(
+            r#"{"version":2,"request_id":"request-approve","method":"approve_task_commit","run_id":"run-1","task_commit_id":"commit-1"}"#,
+        )
+        .expect("approval request should parse");
+        assert_eq!(
+            approval.request,
+            ClientRequest::ApproveTaskCommit {
+                run_id: "run-1".to_owned(),
+                task_commit_id: "commit-1".to_owned(),
+            }
+        );
+
+        let rejection: ClientMessage = serde_json::from_str(
+            r#"{"version":2,"request_id":"request-reject","method":"reject_task_commit","run_id":"run-1","task_commit_id":"commit-1","reason":"Needs another pass"}"#,
+        )
+        .expect("rejection request should parse");
+        assert_eq!(
+            rejection.request,
+            ClientRequest::RejectTaskCommit {
+                run_id: "run-1".to_owned(),
+                task_commit_id: "commit-1".to_owned(),
+                reason: Some("Needs another pass".to_owned()),
             }
         );
     }
@@ -495,7 +530,7 @@ mod tests {
     #[test]
     fn parses_cancel_task_implementation_request() {
         let message: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-cancel","method":"cancel_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
+            r#"{"version":2,"request_id":"request-cancel","method":"cancel_task_implementation","run_id":"run-1","attempt_id":"attempt-1"}"#,
         )
         .expect("cancellation request should parse");
 
@@ -511,7 +546,7 @@ mod tests {
     #[test]
     fn parses_plan_workflow_requests() {
         let generate: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-3","method":"generate_plan","run_id":"run-1","agent":"claude"}"#,
+            r#"{"version":2,"request_id":"request-3","method":"generate_plan","run_id":"run-1","agent":"claude"}"#,
         )
         .expect("generate request should parse");
         assert_eq!(
@@ -523,7 +558,7 @@ mod tests {
         );
 
         let move_task: ClientMessage = serde_json::from_str(
-            r#"{"version":1,"request_id":"request-4","method":"move_plan_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-2","direction":"up"}"#,
+            r#"{"version":2,"request_id":"request-4","method":"move_plan_task","run_id":"run-1","plan_id":"plan-1","task_id":"task-2","direction":"up"}"#,
         )
         .expect("move request should parse");
         assert_eq!(

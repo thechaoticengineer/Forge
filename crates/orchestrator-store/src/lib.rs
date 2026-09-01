@@ -11,12 +11,13 @@ use std::{
 };
 
 use orchestrator_core::state::{
-    ActiveRunSummary, AgentKind, ImplementationActivityKind, ImplementationActivitySummary,
-    ImplementationAttemptSummary, ImplementationContinuationKind, ImplementationStatus,
-    ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary, PlanTaskSummary,
-    ReviewAttemptSummary, ReviewIndependence, ReviewPolicy, ReviewResult, ReviewStatus,
-    ReviewVerdict, RunStatus, TaskCommitStatus, TaskCommitSummary, TaskWorktreeStatus,
-    TaskWorktreeSummary, VerificationAttemptSummary, VerificationCommandResult, VerificationStatus,
+    ActiveRunSummary, AgentKind, ChangedFileSummary, ImplementationActivityKind,
+    ImplementationActivitySummary, ImplementationAttemptSummary, ImplementationContinuationKind,
+    ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
+    PlanTaskSummary, ReviewAttemptSummary, ReviewIndependence, ReviewPolicy, ReviewResult,
+    ReviewStatus, ReviewVerdict, RunStatus, TaskCommitStatus, TaskCommitSummary,
+    TaskWorktreeStatus, TaskWorktreeSummary, VerificationAttemptSummary, VerificationCommandResult,
+    VerificationStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
@@ -27,7 +28,7 @@ const APPLICATION_DIRECTORY: &str = "omarchy-ai-build-orchestrator";
 const DATABASE_FILE: &str = "state.db";
 const ARTIFACTS_DIRECTORY: &str = "artifacts";
 const WORKTREES_DIRECTORY: &str = "worktrees";
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 const RECENT_IMPLEMENTATION_ACTIVITY_LIMIT: i64 = 50;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "initial", include_str!("../migrations/0001_initial.sql")),
@@ -65,6 +66,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         8,
         "completion_pipeline",
         include_str!("../migrations/0008_completion_pipeline.sql"),
+    ),
+    (
+        9,
+        "task_commit_approval",
+        include_str!("../migrations/0009_task_commit_approval.sql"),
     ),
 ];
 
@@ -434,6 +440,9 @@ pub struct TaskCommitInput {
     pub verification_attempt_id: String,
     pub review_attempt_id: String,
     pub message: String,
+    pub tree_hash: String,
+    pub changed_files: Vec<ChangedFileSummary>,
+    pub patch: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,6 +457,7 @@ pub struct TaskCommitSettlement {
     pub status: TaskCommitStatus,
     pub commit_hash: Option<String>,
     pub error_message: Option<String>,
+    pub decision_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -557,6 +567,10 @@ enum Command {
         TaskCommitInput,
         oneshot::Sender<Result<RecordedTaskCommit, StorageError>>,
     ),
+    ReserveTaskCommit {
+        commit_id: String,
+        reply: oneshot::Sender<Result<StoredSnapshot, StorageError>>,
+    },
     SettleTaskCommit(
         TaskCommitSettlement,
         oneshot::Sender<Result<StoredSnapshot, StorageError>>,
@@ -1141,6 +1155,28 @@ impl StorageWorker {
             .map_err(|_| StorageError::WorkerStopped)?
     }
 
+    /// Records the user's approval before the proposed task commit is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the proposal is no longer awaiting a decision or
+    /// storage is unavailable.
+    pub async fn reserve_task_commit(
+        &self,
+        commit_id: String,
+    ) -> Result<StoredSnapshot, StorageError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ReserveTaskCommit {
+                commit_id,
+                reply: reply_sender,
+            })
+            .map_err(|_| StorageError::WorkerStopped)?;
+        reply_receiver
+            .await
+            .map_err(|_| StorageError::WorkerStopped)?
+    }
+
     /// Settles a previously reserved local task commit.
     ///
     /// # Errors
@@ -1277,6 +1313,9 @@ fn run_worker(database: &Database, receiver: &mpsc::Receiver<Command>) {
             }
             Command::RecordTaskCommit(input, reply) => {
                 let _ = reply.send(database.record_task_commit(&input));
+            }
+            Command::ReserveTaskCommit { commit_id, reply } => {
+                let _ = reply.send(database.reserve_task_commit(&commit_id));
             }
             Command::SettleTaskCommit(input, reply) => {
                 let _ = reply.send(database.settle_task_commit(&input));
@@ -2758,19 +2797,26 @@ impl Database {
     ) -> Result<RecordedTaskCommit, StorageError> {
         let created_at = unix_milliseconds()?;
         let commit_id = uuid::Uuid::now_v7().to_string();
+        let changed_files_json = serde_json::to_string(&input.changed_files)
+            .map_err(|error| StorageError::Json(error.to_string()))?;
         let transaction = self.connection.unchecked_transaction()?;
         let inserted = transaction.execute(
             "INSERT INTO task_commits(\
                 id, run_id, task_id, worktree_id, implementation_attempt_id, \
-                verification_attempt_id, review_attempt_id, status, message, commit_hash, \
-                error_message, created_at, completed_at\
-             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL, ?9, NULL \
+                verification_attempt_id, review_attempt_id, status, message, tree_hash, \
+                changed_files_json, patch, commit_hash, error_message, decision_reason, \
+                created_at, completed_at\
+             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'proposed', ?8, ?9, ?10, ?11, \
+                NULL, NULL, NULL, ?12, NULL \
              WHERE EXISTS (SELECT 1 FROM verification_attempts \
                WHERE id = ?6 AND run_id = ?2 AND task_id = ?3 AND worktree_id = ?4 \
                  AND implementation_attempt_id = ?5 AND status = 'passed') \
                AND EXISTS (SELECT 1 FROM review_attempts \
                WHERE id = ?7 AND run_id = ?2 AND task_id = ?3 AND worktree_id = ?4 \
-                 AND implementation_attempt_id = ?5 AND status = 'approved')",
+                 AND implementation_attempt_id = ?5 AND status = 'approved') \
+               AND NOT EXISTS (SELECT 1 FROM task_commits \
+               WHERE run_id = ?2 AND task_id = ?3 \
+                 AND status IN ('proposed', 'reserved', 'created'))",
             (
                 &commit_id,
                 &input.run_id,
@@ -2780,6 +2826,9 @@ impl Database {
                 &input.verification_attempt_id,
                 &input.review_attempt_id,
                 &input.message,
+                &input.tree_hash,
+                &changed_files_json,
+                &input.patch,
                 created_at,
             ),
         )?;
@@ -2789,11 +2838,11 @@ impl Database {
         let payload = json!({
             "task_commit_id": commit_id,
             "task_id": input.task_id,
-            "status": TaskCommitStatus::Reserved,
+            "status": TaskCommitStatus::Proposed,
         });
         transaction.execute(
             "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
-             VALUES (?1, 'task_commit_reserved', 'engine', ?2, ?3)",
+             VALUES (?1, 'task_commit_proposed', 'engine', ?2, ?3)",
             (&input.run_id, payload.to_string(), created_at),
         )?;
         transaction.commit()?;
@@ -2803,40 +2852,107 @@ impl Database {
         })
     }
 
+    fn reserve_task_commit(&self, commit_id: &str) -> Result<StoredSnapshot, StorageError> {
+        let approved_at = unix_milliseconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let run_id = transaction
+            .query_row(
+                "SELECT run_id FROM task_commits WHERE id = ?1 AND status = 'proposed'",
+                [commit_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::ImplementationNotReady(commit_id.to_owned()))?;
+        let changed = transaction.execute(
+            "UPDATE task_commits SET status = 'reserved', decision_reason = 'approved by user' \
+             WHERE id = ?1 AND status = 'proposed'",
+            [commit_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ImplementationNotReady(commit_id.to_owned()));
+        }
+        let payload = json!({
+            "task_commit_id": commit_id,
+            "status": TaskCommitStatus::Reserved,
+        });
+        transaction.execute(
+            "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
+             VALUES (?1, 'task_commit_approved', 'user', ?2, ?3)",
+            (&run_id, payload.to_string(), approved_at),
+        )?;
+        transaction.commit()?;
+        self.current_snapshot()
+    }
+
     fn settle_task_commit(
         &self,
         input: &TaskCommitSettlement,
     ) -> Result<StoredSnapshot, StorageError> {
-        if input.status == TaskCommitStatus::Reserved {
+        if matches!(
+            input.status,
+            TaskCommitStatus::Proposed | TaskCommitStatus::Reserved
+        ) {
             return Err(StorageError::ImplementationNotReady(
                 input.commit_id.clone(),
             ));
         }
         let completed_at = unix_milliseconds()?;
         let transaction = self.connection.unchecked_transaction()?;
+        let expected_status = match input.status {
+            TaskCommitStatus::Rejected => "proposed",
+            TaskCommitStatus::Created | TaskCommitStatus::Failed => "reserved",
+            TaskCommitStatus::Stale => "proposed_or_reserved",
+            TaskCommitStatus::Proposed | TaskCommitStatus::Reserved => unreachable!(),
+        };
         let run_id = transaction
             .query_row(
-                "SELECT run_id FROM task_commits WHERE id = ?1 AND status = 'reserved'",
-                [&input.commit_id],
+                "SELECT run_id FROM task_commits WHERE id = ?1 \
+                   AND (?2 = 'proposed_or_reserved' AND status IN ('proposed', 'reserved') \
+                     OR status = ?2)",
+                (&input.commit_id, expected_status),
                 |row| row.get::<_, String>(0),
             )
             .optional()?
             .ok_or_else(|| StorageError::ImplementationNotReady(input.commit_id.clone()))?;
         let changed = transaction.execute(
-            "UPDATE task_commits SET status = ?2, commit_hash = ?3, error_message = ?4, completed_at = ?5 \
-             WHERE id = ?1 AND status = 'reserved'",
-            (&input.commit_id, input.status.as_str(), &input.commit_hash, &input.error_message, completed_at),
+            "UPDATE task_commits SET status = ?2, commit_hash = ?3, error_message = ?4, \
+                decision_reason = coalesce(?5, decision_reason), completed_at = ?6 \
+             WHERE id = ?1 AND (?7 = 'proposed_or_reserved' AND status IN ('proposed', 'reserved') \
+                OR status = ?7)",
+            (
+                &input.commit_id,
+                input.status.as_str(),
+                &input.commit_hash,
+                &input.error_message,
+                &input.decision_reason,
+                completed_at,
+                expected_status,
+            ),
         )?;
         if changed != 1 {
             return Err(StorageError::ImplementationNotReady(
                 input.commit_id.clone(),
             ));
         }
-        let payload = json!({ "task_commit_id": input.commit_id, "status": input.status, "commit_hash": input.commit_hash });
+        let payload = json!({
+            "task_commit_id": input.commit_id,
+            "status": input.status,
+            "commit_hash": input.commit_hash,
+            "reason": input.decision_reason,
+        });
         transaction.execute(
             "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
-             VALUES (?1, 'task_commit_settled', 'engine', ?2, ?3)",
-            (&run_id, payload.to_string(), completed_at),
+             VALUES (?1, 'task_commit_settled', ?2, ?3, ?4)",
+            (
+                &run_id,
+                if input.status == TaskCommitStatus::Rejected {
+                    "user"
+                } else {
+                    "engine"
+                },
+                payload.to_string(),
+                completed_at,
+            ),
         )?;
         transaction.commit()?;
         self.current_snapshot()
@@ -2896,26 +3012,77 @@ impl Database {
     fn load_task_commits(&self, run_id: &str) -> Result<Vec<TaskCommitSummary>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, task_id, worktree_id, implementation_attempt_id, verification_attempt_id, \
-                    review_attempt_id, status, message, commit_hash, error_message, created_at, completed_at \
+                    review_attempt_id, status, message, tree_hash, changed_files_json, patch, \
+                    commit_hash, error_message, decision_reason, created_at, completed_at \
              FROM task_commits WHERE run_id = ?1 ORDER BY created_at, rowid",
         )?;
         let rows = statement.query_map([run_id], |row| {
-            Ok(TaskCommitSummary {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                worktree_id: row.get(2)?,
-                implementation_attempt_id: row.get(3)?,
-                verification_attempt_id: row.get(4)?,
-                review_attempt_id: row.get(5)?,
-                status: parse_task_commit_status_sql(&row.get::<_, String>(6)?)?,
-                message: row.get(7)?,
-                commit_hash: row.get(8)?,
-                error_message: row.get(9)?,
-                created_at: row.get(10)?,
-                completed_at: row.get(11)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+            ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let mut commits = Vec::new();
+        for row in rows {
+            let (
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                verification_attempt_id,
+                review_attempt_id,
+                status,
+                message,
+                tree_hash,
+                changed_files_json,
+                patch,
+                commit_hash,
+                error_message,
+                decision_reason,
+                created_at,
+                completed_at,
+            ) = row?;
+            let changed_files = changed_files_json
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|error| StorageError::Json(error.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            commits.push(TaskCommitSummary {
+                id,
+                task_id,
+                worktree_id,
+                implementation_attempt_id,
+                verification_attempt_id,
+                review_attempt_id,
+                status: parse_task_commit_status_sql(&status)?,
+                message,
+                tree_hash,
+                changed_files,
+                patch,
+                commit_hash,
+                error_message,
+                decision_reason,
+                created_at,
+                completed_at,
+            });
+        }
+        Ok(commits)
     }
 
     fn load_task_worktrees(&self, run_id: &str) -> Result<Vec<TaskWorktreeSummary>, StorageError> {
@@ -3264,8 +3431,11 @@ fn parse_verification_status(value: &str) -> Result<VerificationStatus, StorageE
 
 fn parse_task_commit_status_sql(value: &str) -> rusqlite::Result<TaskCommitStatus> {
     match value {
+        "proposed" => Ok(TaskCommitStatus::Proposed),
         "reserved" => Ok(TaskCommitStatus::Reserved),
         "created" => Ok(TaskCommitStatus::Created),
+        "rejected" => Ok(TaskCommitStatus::Rejected),
+        "stale" => Ok(TaskCommitStatus::Stale),
         "failed" => Ok(TaskCommitStatus::Failed),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -3884,7 +4054,7 @@ mod tests {
                 row.get(0)
             })
             .expect("migration table should be readable");
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, LATEST_SCHEMA_VERSION);
         let project_table: i64 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
@@ -4021,8 +4191,8 @@ mod tests {
         assert!(matches!(
             error,
             StorageError::FutureSchema {
-                found: 9,
-                supported: 8
+                found: 10,
+                supported: 9
             }
         ));
     }
@@ -4418,6 +4588,186 @@ mod tests {
                 .status,
             ImplementationStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn persists_task_commit_proposal_approval_and_restart() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths.clone()).expect("storage should start");
+        let (run_id, plan_id, task_id) = approved_plan(&worker).await;
+        let worktree = worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &task_id, 1))
+            .await
+            .expect("worktree should be reserved");
+        worker
+            .confirm_task_worktree(worktree.worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        let implementation = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id: plan_id.clone(),
+                task_id: task_id.clone(),
+                worktree_id: worktree.worktree_id.clone(),
+                agent: AgentKind::Codex,
+                prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
+            })
+            .await
+            .expect("implementation should start");
+        worker
+            .complete_implementation_attempt(ImplementationAttemptSuccess {
+                attempt_id: implementation.attempt_id.clone(),
+                final_output: "Implemented".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("implementation should complete");
+        let review = worker
+            .begin_review_attempt(ReviewAttemptInput {
+                run_id: run_id.clone(),
+                plan_id: plan_id.clone(),
+                task_id: task_id.clone(),
+                worktree_id: worktree.worktree_id.clone(),
+                implementation_attempt_id: implementation.attempt_id.clone(),
+                implementer: AgentKind::Codex,
+                reviewer: AgentKind::Claude,
+                policy: ReviewPolicy::CrossProviderRequired,
+                independence: ReviewIndependence::CrossProvider,
+                prompt: "Review the exact task diff".to_owned(),
+            })
+            .await
+            .expect("review should start");
+        worker
+            .complete_review_attempt(ReviewAttemptSuccess {
+                attempt_id: review.attempt_id.clone(),
+                result: ReviewResult {
+                    verdict: ReviewVerdict::Approved,
+                    summary: "The task is ready".to_owned(),
+                    findings: Vec::new(),
+                },
+                final_output: "approved".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("review should complete");
+        let verification = worker
+            .record_verification_attempt(VerificationAttemptInput {
+                run_id: run_id.clone(),
+                plan_id,
+                task_id: task_id.clone(),
+                worktree_id: worktree.worktree_id.clone(),
+                implementation_attempt_id: implementation.attempt_id.clone(),
+                status: VerificationStatus::Passed,
+                commands: Vec::new(),
+                error_message: None,
+                started_at: 1,
+            })
+            .await
+            .expect("verification should persist");
+        let input = TaskCommitInput {
+            run_id: run_id.clone(),
+            task_id: task_id.clone(),
+            worktree_id: worktree.worktree_id.clone(),
+            implementation_attempt_id: implementation.attempt_id,
+            verification_attempt_id: verification.attempt_id,
+            review_attempt_id: review.attempt_id,
+            message: "feat: implement the change".to_owned(),
+            tree_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            changed_files: vec![ChangedFileSummary {
+                path: "src/lib.rs".to_owned(),
+                previous_path: None,
+                status: orchestrator_core::state::ChangedFileStatus::Modified,
+            }],
+            patch: "diff --git a/src/lib.rs b/src/lib.rs".to_owned(),
+        };
+        let rejected = worker
+            .record_task_commit(input.clone())
+            .await
+            .expect("proposal should persist");
+        let proposed = rejected
+            .snapshot
+            .active_run
+            .as_ref()
+            .expect("run should stay active")
+            .task_commits
+            .last()
+            .expect("proposal should be visible");
+        assert_eq!(proposed.status, TaskCommitStatus::Proposed);
+        assert_eq!(proposed.changed_files[0].path, "src/lib.rs");
+        assert!(
+            proposed
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("diff --git"))
+        );
+        let rejected = worker
+            .settle_task_commit(TaskCommitSettlement {
+                commit_id: rejected.commit_id,
+                status: TaskCommitStatus::Rejected,
+                commit_hash: None,
+                error_message: None,
+                decision_reason: Some("Needs another pass".to_owned()),
+            })
+            .await
+            .expect("rejection should persist");
+        assert_eq!(
+            rejected
+                .active_run
+                .as_ref()
+                .expect("run should stay active")
+                .task_commits[0]
+                .status,
+            TaskCommitStatus::Rejected
+        );
+
+        let proposal = worker
+            .record_task_commit(input)
+            .await
+            .expect("a new proposal should persist after rejection");
+
+        worker
+            .reserve_task_commit(proposal.commit_id.clone())
+            .await
+            .expect("user approval should reserve the commit");
+        let created = worker
+            .settle_task_commit(TaskCommitSettlement {
+                commit_id: proposal.commit_id,
+                status: TaskCommitStatus::Created,
+                commit_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+                error_message: None,
+                decision_reason: None,
+            })
+            .await
+            .expect("created commit should settle");
+        assert_eq!(
+            created
+                .active_run
+                .expect("run should stay active")
+                .task_commits[1]
+                .status,
+            TaskCommitStatus::Created
+        );
+
+        drop(worker);
+        let reopened = StorageWorker::start(paths).expect("storage should reopen");
+        let commit = reopened
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should stay active")
+            .task_commits
+            .pop()
+            .expect("commit should survive restart");
+        assert_eq!(commit.status, TaskCommitStatus::Created);
+        assert_eq!(commit.changed_files.len(), 1);
     }
 
     #[tokio::test]

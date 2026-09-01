@@ -99,9 +99,48 @@ pub struct VerificationAttemptSummary {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ChangedFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+    Unknown,
+}
+
+impl ChangedFileStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+            Self::Copied => "copied",
+            Self::TypeChanged => "type_changed",
+            Self::Unmerged => "unmerged",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChangedFileSummary {
+    pub path: String,
+    pub previous_path: Option<String>,
+    pub status: ChangedFileStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskCommitStatus {
+    Proposed,
     Reserved,
     Created,
+    Rejected,
+    Stale,
     Failed,
 }
 
@@ -109,8 +148,11 @@ impl TaskCommitStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Proposed => "proposed",
             Self::Reserved => "reserved",
             Self::Created => "created",
+            Self::Rejected => "rejected",
+            Self::Stale => "stale",
             Self::Failed => "failed",
         }
     }
@@ -126,8 +168,16 @@ pub struct TaskCommitSummary {
     pub review_attempt_id: String,
     pub status: TaskCommitStatus,
     pub message: String,
+    #[serde(default)]
+    pub tree_hash: Option<String>,
+    #[serde(default)]
+    pub changed_files: Vec<ChangedFileSummary>,
+    #[serde(default)]
+    pub patch: Option<String>,
     pub commit_hash: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub decision_reason: Option<String>,
     pub created_at: i64,
     pub completed_at: Option<i64>,
 }

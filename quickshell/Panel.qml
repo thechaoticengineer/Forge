@@ -18,6 +18,7 @@ Item {
   property bool editingPlanTask: false
   property bool rejectingPlan: false
   property bool confirmingImplementationCancel: false
+  property string completionDecisionMode: ""
   property string implementationInterventionMode: ""
   property string localDraftError: ""
   property var repositoryPathCandidates: []
@@ -63,6 +64,10 @@ Item {
   }
 
   function requestClose() {
+    if (completionDecisionMode !== "") {
+      completionDecisionMode = ""
+      return
+    }
     if (implementationInterventionMode !== "") {
       cancelImplementationIntervention()
       return
@@ -92,7 +97,8 @@ Item {
   }
 
   function moveNavigation(dx, dy) {
-    if (confirmingImplementationCancel || implementationInterventionMode !== "") return
+    if (confirmingImplementationCancel || completionDecisionMode !== ""
+        || implementationInterventionMode !== "") return
     if (editingDraft && draftStep === "repository") {
       if (dx !== 0) {
         repositorySourceIndex = Math.max(0, Math.min(1, repositorySourceIndex + dx))
@@ -125,10 +131,22 @@ Item {
     if (selectedSection === 1 && plan && plan.tasks && plan.tasks.length > 0) {
       selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex + dy))
       planTaskList.positionViewAtIndex(selectedTaskIndex, ListView.Contain)
+    } else if (selectedSection === 2 && changesFlickable.visible) {
+      changesFlickable.contentY = Math.max(
+        0,
+        Math.min(
+          Math.max(0, changesFlickable.contentHeight - changesFlickable.height),
+          changesFlickable.contentY + dy * Style.space(36)
+        )
+      )
     }
   }
 
   function activateNavigation() {
+    if (completionDecisionMode !== "") {
+      confirmCompletionDecision()
+      return
+    }
     if (confirmingImplementationCancel) {
       confirmImplementationCancel()
       return
@@ -424,10 +442,37 @@ Item {
     return null
   }
 
+  function recordById(records, id) {
+    if (!records || !id) return null
+    for (var i = records.length - 1; i >= 0; i--)
+      if (records[i].id === id) return records[i]
+    return null
+  }
+
   function finishSelectedTask() {
     var context = finishContext()
     if (!context || engine.requestPending) return
     engine.finishTask(context.plan.id, context.task.id, context.worktree.id, context.implementation.id)
+  }
+
+  function proposedTaskCommit() {
+    var proposal = latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
+    return proposal && proposal.status === "proposed" ? proposal : null
+  }
+
+  function beginCompletionDecision(mode) {
+    if (!proposedTaskCommit() || engine.requestPending) return
+    completionDecisionMode = mode
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function confirmCompletionDecision() {
+    var proposal = proposedTaskCommit()
+    if (!proposal || engine.requestPending || completionDecisionMode === "") return
+    var mode = completionDecisionMode
+    completionDecisionMode = ""
+    if (mode === "approve") engine.approveTaskCommit(proposal.id)
+    else engine.rejectTaskCommit(proposal.id, "Rejected during final inspection")
   }
 
   function runningImplementationAttempt() {
@@ -542,6 +587,10 @@ Item {
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
     if (confirmingImplementationCancel)
       return "Enter  Confirm cancellation    Esc  Keep running"
+    if (completionDecisionMode === "approve")
+      return "Enter  Create inspected local commit    Esc  Keep inspecting"
+    if (completionDecisionMode === "reject")
+      return "Enter  Preserve rejection    Esc  Keep inspecting"
     if (implementationInterventionMode !== "")
       return "Enter  Submit instruction    Esc  Keep current attempt"
     if (focusArea === "sections")
@@ -550,6 +599,10 @@ Item {
       return "h/←  Sections    j/k or ↑/↓  Tasks    Enter/e  Edit    J/K  Reorder    a  Approve    x  Reject"
     if (selectedSection === 1)
       return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
+    if (selectedSection === 2 && proposedTaskCommit())
+      return "h/←  Sections    j/k or ↑/↓  Scroll diff    a  Approve    x  Reject    Esc  Close"
+    if (selectedSection === 2)
+      return "h/←  Sections    p  Prepare inspected result    Esc  Close"
     if (selectedSection === 0 && runningImplementationAttempt())
       return "h/←  Sections    p  Pause/resume    i  Redirect    a  Add context    x  Cancel"
     if (selectedSection === 0 && engine.activeRun)
@@ -595,6 +648,8 @@ Item {
       if (method === "complete_repository_path") return
       if (method === "update_plan_task") root.editingPlanTask = false
       if (method === "reject_plan") root.rejectingPlan = false
+      if (method === "approve_task_commit" || method === "reject_task_commit")
+        root.completionDecisionMode = ""
       root.selectedTaskIndex = Math.max(0, root.selectedTaskIndex)
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
@@ -606,6 +661,7 @@ Item {
         root.selectedTaskIndex = 0
       if (!root.runningImplementationAttempt())
         root.confirmingImplementationCancel = false
+      if (!root.proposedTaskCommit()) root.completionDecisionMode = ""
       if (!root.runningImplementationAttempt() && !continuationEngine.requestPending)
         root.implementationInterventionMode = ""
       var latestAttempt = root.latestImplementationAttempt()
@@ -666,7 +722,7 @@ Item {
     }
     ListElement {
       title: "Changes"
-      description: "Changed files, worktrees, diffs, and proposed semantic commits will appear here."
+      description: "Inspect the exact changed files, complete patch, and proposed local task commit."
     }
     ListElement {
       title: "Verification"
@@ -729,6 +785,9 @@ Item {
           else if (root.selectedSection === 1 && text === "K") root.moveCurrentTask("up")
           else if (root.selectedSection === 1 && text === "a" && root.currentPlan() && root.currentPlan().status === "proposed") engine.approvePlan()
           else if (root.selectedSection === 1 && text === "x") root.beginRejectPlan()
+          else if (root.selectedSection === 2 && text === "p") root.finishSelectedTask()
+          else if (root.selectedSection === 2 && text === "a") root.beginCompletionDecision("approve")
+          else if (root.selectedSection === 2 && text === "x") root.beginCompletionDecision("reject")
         }
 
         Item {
@@ -923,6 +982,12 @@ Item {
                         if (plan.status === "approved") return "Plan approved"
                         return "Plan revision " + plan.revision
                       }
+                      if (root.selectedSection === 2) {
+                        var proposal = root.latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
+                        return proposal ? "Final result " + proposal.status : "Prepare final inspection"
+                      }
+                      if (root.selectedSection === 3) return "Deterministic verification"
+                      if (root.selectedSection === 4) return "Independent review"
                       if (root.selectedSection !== 0) return "Planned capability"
                       if (!engine.connected) return "Start the Rust engine to connect"
                       if (root.editingDraft) return "Create a durable draft run"
@@ -2120,13 +2185,277 @@ Item {
                   }
 
                   Column {
+                    id: changesSection
+                    visible: root.selectedSection === 2
+                    width: parent.width
+                    height: Math.max(0, contentBody.height - contentHeading.height
+                      - Style.space(56))
+                    spacing: Style.space(8)
+                    property var proposal: root.latestTaskRecord(
+                      engine.activeRun ? engine.activeRun.task_commits : [])
+                    property var verification: root.recordById(
+                      engine.activeRun ? engine.activeRun.verification_attempts : [],
+                      proposal ? proposal.verification_attempt_id : "")
+                    property var review: root.recordById(
+                      engine.activeRun ? engine.activeRun.review_attempts : [],
+                      proposal ? proposal.review_attempt_id : "")
+
+                    Button {
+                      id: prepareTaskButton
+                      visible: !changesSection.proposal
+                        || changesSection.proposal.status === "rejected"
+                        || changesSection.proposal.status === "stale"
+                        || changesSection.proposal.status === "failed"
+                      text: engine.requestPending && engine.pendingMethod === "finish_task"
+                        ? "Preparing…" : "Prepare selected task"
+                      bordered: true
+                      enabled: root.finishContext() !== null && !engine.requestPending
+                      foreground: root.foreground
+                      accent: root.accent
+                      onClicked: root.finishSelectedTask()
+                    }
+
+                    Flickable {
+                      id: changesFlickable
+                      width: parent.width
+                      height: Math.max(0, parent.height - (prepareTaskButton.visible
+                        ? prepareTaskButton.height + parent.spacing : 0))
+                      contentWidth: width
+                      contentHeight: changesDocument.height
+                      boundsBehavior: Flickable.StopAtBounds
+                      clip: true
+
+                      Column {
+                        id: changesDocument
+                        width: changesFlickable.width
+                        spacing: Style.space(9)
+
+                        Text {
+                          width: parent.width
+                          text: changesSection.proposal
+                            ? "Status: " + changesSection.proposal.status
+                            : "No inspected result is ready. Prepare the selected completed task to run verification, independent review, and final change capture."
+                          color: changesSection.proposal
+                            && (changesSection.proposal.status === "proposed"
+                              || changesSection.proposal.status === "created")
+                            ? root.accent : root.mutedForeground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: changesSection.proposal !== null
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                          visible: changesSection.proposal !== null
+                          width: parent.width
+                          text: changesSection.proposal
+                            ? "Proposed commit: " + changesSection.proposal.message : ""
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                          visible: changesSection.proposal !== null
+                          width: parent.width
+                          text: {
+                            if (!changesSection.proposal) return ""
+                            return "Evidence: verification "
+                              + (changesSection.verification
+                                ? changesSection.verification.status : "missing")
+                              + " · review " + (changesSection.review
+                                ? changesSection.review.status : "missing")
+                          }
+                          color: root.mutedForeground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Repeater {
+                          model: changesSection.review && changesSection.review.result
+                            ? changesSection.review.result.findings || [] : []
+                          Text {
+                            required property var modelData
+                            width: changesDocument.width
+                            text: "Review " + modelData.severity + ": "
+                              + modelData.summary + " — " + modelData.evidence
+                            color: modelData.severity === "minor"
+                              ? root.mutedForeground : root.urgent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                          }
+                        }
+
+                        Text {
+                          visible: changesSection.proposal
+                            && changesSection.proposal.commit_hash
+                          width: parent.width
+                          text: changesSection.proposal && changesSection.proposal.commit_hash
+                            ? "Local commit: " + changesSection.proposal.commit_hash : ""
+                          color: root.accent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WrapAnywhere
+                        }
+
+                        Text {
+                          visible: changesSection.proposal
+                            && changesSection.proposal.decision_reason
+                          width: parent.width
+                          text: changesSection.proposal && changesSection.proposal.decision_reason
+                            ? "Decision: " + changesSection.proposal.decision_reason : ""
+                          color: root.mutedForeground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Text {
+                          visible: changesSection.proposal !== null
+                          text: changesSection.proposal
+                            ? "Changed files (" + (changesSection.proposal.changed_files || []).length + ")"
+                            : ""
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                        }
+
+                        Repeater {
+                          model: changesSection.proposal
+                            ? changesSection.proposal.changed_files || [] : []
+                          Text {
+                            required property var modelData
+                            width: changesDocument.width
+                            text: modelData.status + " · "
+                              + (modelData.previous_path
+                                ? modelData.previous_path + " → " : "")
+                              + modelData.path
+                            color: root.mutedForeground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WrapAnywhere
+                          }
+                        }
+
+                        Row {
+                          visible: changesSection.proposal
+                            && changesSection.proposal.status === "proposed"
+                            && root.completionDecisionMode === ""
+                          spacing: Style.space(8)
+                          Button {
+                            text: "Approve local commit"
+                            bordered: true
+                            enabled: !engine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.beginCompletionDecision("approve")
+                          }
+                          Button {
+                            text: "Reject result"
+                            enabled: !engine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.beginCompletionDecision("reject")
+                          }
+                        }
+
+                        Rectangle {
+                          visible: root.completionDecisionMode !== ""
+                          width: parent.width
+                          height: decisionColumn.implicitHeight + Style.space(20)
+                          radius: Style.cornerRadius
+                          color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+                          border.width: 1
+                          border.color: root.completionDecisionMode === "approve"
+                            ? root.accent : root.urgent
+
+                          Column {
+                            id: decisionColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.margins: Style.space(10)
+                            spacing: Style.space(7)
+                            Text {
+                              width: parent.width
+                              text: root.completionDecisionMode === "approve"
+                                ? "Create exactly this inspected local commit in the reserved task branch? This will not merge, push, retire the worktree, or touch the primary checkout."
+                                : "Reject this inspected result? The proposal, worktree, branch, and changes will remain available in durable history."
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              wrapMode: Text.WordWrap
+                            }
+                            Row {
+                              spacing: Style.space(8)
+                              Button {
+                                text: root.completionDecisionMode === "approve"
+                                  ? "Confirm commit" : "Confirm rejection"
+                                bordered: true
+                                enabled: !engine.requestPending
+                                foreground: root.foreground
+                                accent: root.accent
+                                onClicked: root.confirmCompletionDecision()
+                              }
+                              Button {
+                                text: "Cancel"
+                                enabled: !engine.requestPending
+                                foreground: root.foreground
+                                accent: root.accent
+                                onClicked: root.completionDecisionMode = ""
+                              }
+                            }
+                          }
+                        }
+
+                        Text {
+                          visible: changesSection.proposal !== null
+                          width: parent.width
+                          text: "Complete patch"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                        }
+
+                        Rectangle {
+                          visible: changesSection.proposal !== null
+                          width: parent.width
+                          height: patchText.implicitHeight + Style.space(16)
+                          radius: Style.cornerRadius
+                          color: root.background
+
+                          Text {
+                            id: patchText
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: Style.space(8)
+                            text: changesSection.proposal
+                              ? changesSection.proposal.patch || "(empty patch)" : ""
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WrapAnywhere
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  Column {
                     visible: root.selectedSection === 3
                     width: parent.width
                     spacing: Style.space(10)
                     property var verification: root.latestTaskRecord(engine.activeRun ? engine.activeRun.verification_attempts : [])
 
                     Button {
-                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Finishing…" : "Finish selected task"
+                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Preparing…" : "Prepare selected task"
                       bordered: true
                       enabled: root.finishContext() !== null && !engine.requestPending
                       foreground: root.foreground
@@ -2164,7 +2493,7 @@ Item {
                     property var taskCommit: root.latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
 
                     Button {
-                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Reviewing…" : "Finish selected task"
+                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Reviewing…" : "Prepare selected task"
                       bordered: true
                       enabled: root.finishContext() !== null && !engine.requestPending
                       foreground: root.foreground

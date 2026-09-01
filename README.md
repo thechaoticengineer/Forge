@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** The foundation, planning, isolated implementation, and first completion-pipeline slices are implemented. The Rust engine can run detected Rust and Omarchy checks, persist command evidence, obtain a fresh independent review, return failed gates to a bounded fresh implementer correction session, and create a local commit in its isolated task worktree only after verification and review pass. The CLI exposes this as `finish --task N`; the Omarchy Verification and Review sections show durable summaries and expose the same explicit action. Configurable project verification, complete diff inspection, semantic multi-commit proposals, merge, push, and deployment remain planned.
+> **Project status:** The first vertical workflow is implemented. The Rust engine can run detected Rust and Omarchy checks, persist command evidence, obtain a fresh independent review, return failed gates to a bounded fresh implementer correction session, and prepare an exact final tree for inspection. The CLI and Omarchy panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. Configurable project verification, semantic multi-commit splitting, merge, push, and deployment remain planned.
 >
 > **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
@@ -91,7 +91,7 @@ An agent must never be the sole reviewer of its own implementation. Independent 
 
 The first workflow should keep routing simple and visible: the user or a small deterministic policy chooses the planner, implementer, and reviewer. Smarter routing is a later capability. It may eventually consider task type, agent availability, retained context, previous results, and available usage limits, but none of that is required for the first complete workflow.
 
-The implemented planning slice keeps that choice explicit. The engine launches the selected authenticated CLI non-interactively with read-only planning permissions, sends its prompt over standard input, requires a shared structured plan schema, and validates the result before storing it. It does not select a model or use a direct model API. Implementation agents receive writes only inside an existing task worktree and remain engine-supervised. Pause, cancellation, redirects, and added context preserve durable evidence and partial work. The explicit finish operation runs detected deterministic checks, supplies their evidence to a fresh independent reviewer, and can launch a bounded fresh implementer correction. Only a passing verification and approving review for the same attempt permit one local task-worktree commit; finish never merges or pushes. See [ADR-0010](docs/adr/0010-run-independent-reviews-in-fresh-agent-sessions.md) and [ADR-0011](docs/adr/0011-gate-local-task-commits-on-verification-and-independent-review.md).
+The implemented planning slice keeps that choice explicit. The engine launches the selected authenticated CLI non-interactively with read-only planning permissions, sends its prompt over standard input, requires a shared structured plan schema, and validates the result before storing it. It does not select a model or use a direct model API. Implementation agents receive writes only inside an existing task worktree and remain engine-supervised. Pause, cancellation, redirects, and added context preserve durable evidence and partial work. The explicit finish operation runs detected deterministic checks, supplies their evidence to a fresh independent reviewer, can launch a bounded fresh implementer correction, and then prepares an exact final inspection record. A separate approval revalidates the inspected tree before creating one local task-worktree commit; rejection preserves the result without committing it. Neither action merges or pushes. See [ADR-0010](docs/adr/0010-run-independent-reviews-in-fresh-agent-sessions.md), [ADR-0011](docs/adr/0011-gate-local-task-commits-on-verification-and-independent-review.md), and [ADR-0012](docs/adr/0012-separate-final-inspection-from-commit-approval.md).
 
 ## Omarchy and Quickshell Integration
 
@@ -209,7 +209,7 @@ The main panel should be a first-class product interface, not a transcript viewe
 
 The default screen should summarize progress and prioritize actionable information. Detailed prompts, responses, stdout, stderr, and internal events remain one level deeper for users who need to investigate.
 
-The implemented panel currently makes the **Overview** and **Plan** sections functional. **Changes**, **Verification**, and **Review** are visible placeholders for later workflow stages; they must not be mistaken for completed capabilities.
+The implemented panel makes **Overview**, **Plan**, **Changes**, **Verification**, and **Review** functional. **Changes** shows the exact final patch, changed-file summary, evidence status, proposed task commit, and explicit approval or rejection controls. Raw verification-output drill-down and semantic multi-commit splitting remain planned.
 
 ### Keyboard-first operation
 

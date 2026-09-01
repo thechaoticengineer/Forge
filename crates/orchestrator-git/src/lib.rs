@@ -11,6 +11,8 @@ use std::{
     time::Instant,
 };
 
+use orchestrator_core::state::{ChangedFileStatus, ChangedFileSummary};
+use tempfile::TempDir;
 use thiserror::Error;
 
 mod worktree;
@@ -48,6 +50,93 @@ const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_DISCOVERY_DIRECTORIES: usize = 4_000;
 const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskChangeSet {
+    pub tree_hash: String,
+    pub changed_files: Vec<ChangedFileSummary>,
+    pub patch: String,
+}
+
+/// Captures the exact tree, changed paths, and complete binary-safe Git patch
+/// that a task commit would contain without modifying the worktree index or a
+/// reference.
+///
+/// Git writes any new blob and tree objects into the shared object database,
+/// but the temporary index is removed and no reference makes those objects
+/// reachable until the user approves the commit.
+///
+/// # Errors
+///
+/// Returns an error when the worktree or base revision is invalid, a temporary
+/// index cannot be created, Git fails, or Git returns invalid UTF-8 metadata.
+pub fn capture_task_changes(
+    worktree: &Path,
+    base_revision: &str,
+) -> Result<TaskChangeSet, GitError> {
+    validate_revision(worktree, base_revision)?;
+    let repository = inspect_repository(worktree)?;
+    let temporary_index = TempDir::new().map_err(GitError::TemporaryIndex)?;
+    let index = temporary_index.path().join("index");
+    checked_git_with_index(
+        &repository.root,
+        &index,
+        &["read-tree", base_revision],
+        "initializing the inspection index",
+    )?;
+    checked_git_with_index(
+        &repository.root,
+        &index,
+        &["add", "--all"],
+        "capturing task changes",
+    )?;
+    let tree_hash = text_output(
+        checked_git_with_index(
+            &repository.root,
+            &index,
+            &["write-tree"],
+            "fingerprinting task changes",
+        )?,
+        "fingerprinting task changes",
+    )?;
+    let patch = String::from_utf8_lossy(
+        &checked_git_with_index(
+            &repository.root,
+            &index,
+            &[
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--no-color",
+                base_revision,
+                "--",
+            ],
+            "capturing the task patch",
+        )?
+        .stdout,
+    )
+    .into_owned();
+    let names = checked_git_with_index(
+        &repository.root,
+        &index,
+        &[
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+            base_revision,
+            "--",
+        ],
+        "capturing changed paths",
+    )?
+    .stdout;
+    Ok(TaskChangeSet {
+        tree_hash,
+        changed_files: parse_changed_files(&names),
+        patch,
+    })
+}
+
 /// Stages all task-worktree changes and creates one local commit.
 ///
 /// The caller must supply the branch and base revision recorded when Forge
@@ -62,6 +151,7 @@ pub fn create_task_commit(
     worktree: &Path,
     expected_branch: &str,
     expected_base: &str,
+    expected_tree: &str,
     message: &str,
 ) -> Result<String, GitError> {
     let repository = inspect_repository(worktree)?;
@@ -74,7 +164,28 @@ pub fn create_task_commit(
             stderr: "task worktree branch or HEAD no longer matches its reservation".to_owned(),
         });
     }
+    let current = capture_task_changes(&repository.root, expected_base)?;
+    if current.tree_hash != expected_tree {
+        return Err(GitError::WorktreeChanged {
+            expected: expected_tree.to_owned(),
+            actual: current.tree_hash,
+        });
+    }
     checked_git(&repository.root, &["add", "--all"], "staging task changes")?;
+    let staged_tree = text_output(
+        checked_git(
+            &repository.root,
+            &["write-tree"],
+            "validating staged task changes",
+        )?,
+        "validating staged task changes",
+    )?;
+    if staged_tree != expected_tree {
+        return Err(GitError::WorktreeChanged {
+            expected: expected_tree.to_owned(),
+            actual: staged_tree,
+        });
+    }
     let staged = run_git(
         &repository.root,
         &["diff", "--cached", "--quiet", "--exit-code"],
@@ -116,11 +227,7 @@ pub fn create_task_commit(
 /// Returns an error when the path is not a repository, the base revision is
 /// invalid, Git fails, or its output is not UTF-8.
 pub fn review_change_evidence(worktree: &Path, base_revision: &str) -> Result<String, GitError> {
-    if !(4..=64).contains(&base_revision.len())
-        || !base_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(GitError::MissingHead(worktree.to_path_buf()));
-    }
+    validate_revision(worktree, base_revision)?;
     let repository = inspect_repository(worktree)?;
     let status = review_text_output(
         checked_git(
@@ -355,6 +462,59 @@ pub enum GitError {
     BareRepository(PathBuf),
     #[error("repository has no committed HEAD revision: {0}")]
     MissingHead(PathBuf),
+    #[error("cannot create a temporary Git index: {0}")]
+    TemporaryIndex(std::io::Error),
+    #[error("task worktree changed after inspection (expected tree {expected}, found {actual})")]
+    WorktreeChanged { expected: String, actual: String },
+}
+
+fn validate_revision(worktree: &Path, revision: &str) -> Result<(), GitError> {
+    if !(4..=64).contains(&revision.len()) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitError::MissingHead(worktree.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn parse_changed_files(output: &[u8]) -> Vec<ChangedFileSummary> {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let status_code = fields[index].first().copied().unwrap_or(b'?');
+        index += 1;
+        if index >= fields.len() {
+            break;
+        }
+        let first_path = String::from_utf8_lossy(fields[index]).into_owned();
+        index += 1;
+        let (previous_path, path) = if matches!(status_code, b'R' | b'C') && index < fields.len() {
+            let path = String::from_utf8_lossy(fields[index]).into_owned();
+            index += 1;
+            (Some(first_path), path)
+        } else {
+            (None, first_path)
+        };
+        let status = match status_code {
+            b'A' => ChangedFileStatus::Added,
+            b'M' => ChangedFileStatus::Modified,
+            b'D' => ChangedFileStatus::Deleted,
+            b'R' => ChangedFileStatus::Renamed,
+            b'C' => ChangedFileStatus::Copied,
+            b'T' => ChangedFileStatus::TypeChanged,
+            b'U' => ChangedFileStatus::Unmerged,
+            _ => ChangedFileStatus::Unknown,
+        };
+        files.push(ChangedFileSummary {
+            path,
+            previous_path,
+            status,
+        });
+    }
+    files
 }
 
 /// Inspects a local Git worktree without modifying it.
@@ -500,6 +660,27 @@ pub(crate) fn run_git<S: AsRef<OsStr>>(
         .map_err(|source| GitError::StartGit { operation, source })
 }
 
+fn checked_git_with_index<S: AsRef<OsStr>>(
+    repository: &Path,
+    index: &Path,
+    arguments: &[S],
+    operation: &'static str,
+) -> Result<Output, GitError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .env("GIT_INDEX_FILE", index)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|source| GitError::StartGit { operation, source })?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(command_error(&output, operation))
+    }
+}
+
 pub(crate) fn command_error(output: &Output, operation: &'static str) -> GitError {
     GitError::GitCommand {
         operation,
@@ -622,10 +803,17 @@ mod tests {
         let state = inspect_repository(repository.path()).expect("repository should inspect");
         fs::write(repository.path().join("change.txt"), "verified")
             .expect("task change should be written");
+        let inspected = capture_task_changes(repository.path(), &state.head_revision)
+            .expect("task changes should be inspectable");
+        assert_eq!(inspected.changed_files.len(), 1);
+        assert_eq!(inspected.changed_files[0].path, "change.txt");
+        assert_eq!(inspected.changed_files[0].status, ChangedFileStatus::Added);
+        assert!(inspected.patch.contains("+verified"));
         let hash = create_task_commit(
             repository.path(),
             state.branch.as_deref().expect("branch should exist"),
             &state.head_revision,
+            &inspected.tree_hash,
             "feat: record verified change",
         )
         .expect("task commit should be created");
@@ -634,6 +822,35 @@ mod tests {
             !inspect_repository(repository.path())
                 .expect("repository should inspect")
                 .dirty
+        );
+    }
+
+    #[test]
+    fn refuses_to_commit_a_tree_that_changed_after_inspection() {
+        let repository = initialized_repository();
+        let state = inspect_repository(repository.path()).expect("repository should inspect");
+        fs::write(repository.path().join("change.txt"), "inspected")
+            .expect("task change should be written");
+        let inspected = capture_task_changes(repository.path(), &state.head_revision)
+            .expect("task changes should be inspectable");
+        fs::write(repository.path().join("change.txt"), "changed afterward")
+            .expect("task change should mutate");
+
+        let error = create_task_commit(
+            repository.path(),
+            state.branch.as_deref().expect("branch should exist"),
+            &state.head_revision,
+            &inspected.tree_hash,
+            "feat: unsafe stale change",
+        )
+        .expect_err("stale inspection must not be committed");
+
+        assert!(matches!(error, GitError::WorktreeChanged { .. }));
+        assert_eq!(
+            inspect_repository(repository.path())
+                .expect("repository should inspect")
+                .head_revision,
+            state.head_revision
         );
     }
 

@@ -169,8 +169,24 @@ Item {
       worktree_id: String(worktreeId || ""),
       implementation_attempt_id: String(implementationAttemptId || ""),
       policy: "cross_provider_or_fresh_session",
-      max_corrections: 1,
-      create_commit: true
+      max_corrections: 1
+    })
+  }
+
+  function approveTaskCommit(taskCommitId) {
+    if (!activeRun) return false
+    return sendRequest("approve_task_commit", {
+      run_id: activeRun.id,
+      task_commit_id: String(taskCommitId || "")
+    })
+  }
+
+  function rejectTaskCommit(taskCommitId, reason) {
+    if (!activeRun) return false
+    return sendRequest("reject_task_commit", {
+      run_id: activeRun.id,
+      task_commit_id: String(taskCommitId || ""),
+      reason: String(reason || "")
     })
   }
 
@@ -187,7 +203,7 @@ Item {
     requestPending = true
     requestError = ""
     var message = {
-      version: 1,
+      version: 2,
       request_id: pendingRequestId,
       method: method
     }
@@ -206,7 +222,7 @@ Item {
       return
     }
 
-    if (!message || message.version !== 1) {
+    if (!message || message.version !== 2) {
       lastError = "The engine uses an unsupported protocol version"
       return
     }

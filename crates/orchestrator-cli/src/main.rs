@@ -74,7 +74,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Verify, independently review, correct, and optionally commit one task.
+    /// Verify, independently review, correct, and prepare one task for approval.
     Finish {
         /// One-based task position shown by `status`.
         #[arg(long)]
@@ -84,9 +84,24 @@ enum Command {
         /// Maximum fresh correction sessions after failed gates.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
         max_corrections: u8,
-        /// Run the gates without creating the final local commit.
         #[arg(long)]
-        no_commit: bool,
+        json: bool,
+    },
+    /// Approve the inspected result and create its local task commit.
+    Approve {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reject the inspected result while preserving its worktree and history.
+    Reject {
+        /// One-based task position shown by `status`.
+        #[arg(long)]
+        task: usize,
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -294,18 +309,13 @@ async fn main() -> Result<()> {
             task,
             policy,
             max_corrections,
-            no_commit,
             json,
-        } => {
-            finish_task(
-                &socket_path,
-                task,
-                policy.into(),
-                max_corrections,
-                !no_commit,
-                json,
-            )
-            .await
+        } => finish_task(&socket_path, task, policy.into(), max_corrections, json).await,
+        Command::Approve { task, json } => {
+            decide_task_commit(&socket_path, task, true, None, json).await
+        }
+        Command::Reject { task, reason, json } => {
+            decide_task_commit(&socket_path, task, false, reason, json).await
         }
         Command::Cancel { attempt, json } => {
             cancel_implementation(&socket_path, attempt, json).await
@@ -650,7 +660,6 @@ async fn finish_task(
     task_position: usize,
     policy: ReviewPolicy,
     max_corrections: u8,
-    create_commit: bool,
     json: bool,
 ) -> Result<()> {
     let snapshot = fetch_snapshot(socket_path).await?;
@@ -698,11 +707,56 @@ async fn finish_task(
             implementation_attempt_id: implementation.id.clone(),
             policy,
             max_corrections,
-            create_commit,
         },
         Duration::from_mins(91),
     )
     .await?;
+    print_result(&snapshot, json)
+}
+
+async fn decide_task_commit(
+    socket_path: &PathBuf,
+    task_position: usize,
+    approve: bool,
+    reason: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let snapshot = fetch_snapshot(socket_path).await?;
+    let run = snapshot
+        .active_run
+        .as_ref()
+        .context("there is no active run")?;
+    let plan = run.plan.as_ref().context("the active run has no plan")?;
+    let task = plan
+        .tasks
+        .get(
+            task_position
+                .checked_sub(1)
+                .context("task position must be at least 1")?,
+        )
+        .context("task position is outside the plan")?;
+    let proposal = run
+        .task_commits
+        .iter()
+        .rev()
+        .find(|proposal| {
+            proposal.task_id == task.id
+                && proposal.status == orchestrator_core::state::TaskCommitStatus::Proposed
+        })
+        .context("the task has no inspected commit awaiting approval")?;
+    let request = if approve {
+        ClientRequest::ApproveTaskCommit {
+            run_id: run.id.clone(),
+            task_commit_id: proposal.id.clone(),
+        }
+    } else {
+        ClientRequest::RejectTaskCommit {
+            run_id: run.id.clone(),
+            task_commit_id: proposal.id.clone(),
+            reason,
+        }
+    };
+    let snapshot = send_workflow_request(socket_path, request, Duration::from_secs(120)).await?;
     print_result(&snapshot, json)
 }
 
@@ -1068,6 +1122,20 @@ fn print_snapshot(snapshot: &EngineSnapshot) {
             }
             print_implementation(run);
             print_reviews(run);
+            if let Some(commit) = run.task_commits.last() {
+                println!(
+                    "Task commit: {} · {} · {} changed file(s)",
+                    commit.status.as_str(),
+                    commit.message,
+                    commit.changed_files.len()
+                );
+                if let Some(hash) = &commit.commit_hash {
+                    println!("  Commit: {hash}");
+                }
+                if let Some(reason) = &commit.decision_reason {
+                    println!("  Decision: {reason}");
+                }
+            }
             if let Some(plan) = &run.plan {
                 println!(
                     "Plan: revision {} · {} · {}",

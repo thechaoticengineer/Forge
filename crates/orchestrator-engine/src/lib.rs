@@ -28,12 +28,12 @@ use orchestrator_core::{
         ActiveRunSummary, AgentKind, EngineSnapshot, EngineStatus, ImplementationContinuationKind,
         ImplementationStatus, ImplementationStopReason, PlanProposal, PlanStatus, PlanSummary,
         PlanTaskSummary, ProposedTask, ReviewIndependence, ReviewPolicy, ReviewStatus, RunStatus,
-        TaskCommitStatus, TaskWorktreeStatus, TaskWorktreeSummary, VerificationCommandResult,
-        VerificationStatus,
+        TaskCommitStatus, TaskCommitSummary, TaskWorktreeStatus, TaskWorktreeSummary,
+        VerificationCommandResult, VerificationStatus,
     },
 };
 use orchestrator_git::{
-    GitError, TaskWorktreeRequest, TaskWorktreeState, create_task_commit,
+    GitError, TaskWorktreeRequest, TaskWorktreeState, capture_task_changes, create_task_commit,
     discover_repositories_until, inspect_repository, prune_missing_worktrees,
     review_change_evidence, task_branch_name, task_worktree_path, task_worktree_state,
 };
@@ -702,7 +702,6 @@ async fn handle_request(
             implementation_attempt_id,
             policy,
             max_corrections,
-            create_commit: should_commit,
         } => match finish_task(
             run_id,
             plan_id,
@@ -711,7 +710,6 @@ async fn handle_request(
             implementation_attempt_id,
             policy,
             max_corrections,
-            should_commit,
             storage,
             implementer,
             reviewer,
@@ -720,6 +718,27 @@ async fn handle_request(
         )
         .await
         {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::ApproveTaskCommit {
+            run_id,
+            task_commit_id,
+        } => match approve_task_commit(run_id, task_commit_id, storage, state_sender).await {
+            Ok(stored_snapshot) => {
+                publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
+                ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
+            }
+            Err(error) => ServerMessage::error(Some(request.request_id), error.code, error.message),
+        },
+        ClientRequest::RejectTaskCommit {
+            run_id,
+            task_commit_id,
+            reason,
+        } => match reject_task_commit(run_id, task_commit_id, reason, storage).await {
             Ok(stored_snapshot) => {
                 publish_newer_snapshot(state_sender, engine_snapshot(stored_snapshot));
                 ServerMessage::snapshot(state_sender.borrow().clone(), Some(request.request_id))
@@ -2508,7 +2527,6 @@ async fn finish_task(
     mut implementation_attempt_id: String,
     policy: ReviewPolicy,
     max_corrections: u8,
-    should_commit: bool,
     storage: &StorageWorker,
     implementer: &ImplementerRunner,
     reviewer: &ReviewerRunner,
@@ -2523,6 +2541,30 @@ async fn finish_task(
     }
     let initial =
         load_implementation_context(storage, &run_id, &plan_id, &task_id, &worktree_id).await?;
+    if let Some(commit) = initial
+        .run
+        .task_commits
+        .iter()
+        .rev()
+        .find(|commit| commit.task_id == task_id)
+    {
+        match commit.status {
+            TaskCommitStatus::Proposed | TaskCommitStatus::Reserved => {
+                return Err(RequestFailure {
+                    code: "task_commit_awaiting_decision",
+                    message: "the task already has an inspected commit awaiting a final decision"
+                        .to_owned(),
+                });
+            }
+            TaskCommitStatus::Created => {
+                return Err(RequestFailure {
+                    code: "task_already_committed",
+                    message: "the task already has its approved local commit".to_owned(),
+                });
+            }
+            TaskCommitStatus::Rejected | TaskCommitStatus::Stale | TaskCommitStatus::Failed => {}
+        }
+    }
     let worktree = PathBuf::from(&initial.worktree.path);
     let implementer_agent = initial
         .run
@@ -2613,10 +2655,27 @@ async fn finish_task(
             }
         }
         if let Some(review_id) = approved_review {
-            if !should_commit {
-                return Ok(snapshot);
-            }
             let message = conventional_task_commit_message(&initial.task.title);
+            let change_set = tokio::task::spawn_blocking({
+                let worktree = worktree.clone();
+                let base = initial.worktree.base_revision.clone();
+                move || capture_task_changes(&worktree, &base)
+            })
+            .await
+            .map_err(|error| RequestFailure {
+                code: "inspection_failed",
+                message: format!("task inspection worker failed: {error}"),
+            })?
+            .map_err(|error| RequestFailure {
+                code: "inspection_failed",
+                message: error.to_string(),
+            })?;
+            if change_set.changed_files.is_empty() {
+                return Err(RequestFailure {
+                    code: "no_task_changes",
+                    message: "the inspected task worktree has no changes to approve".to_owned(),
+                });
+            }
             let reserved = storage
                 .record_task_commit(TaskCommitInput {
                     run_id: run_id.clone(),
@@ -2626,41 +2685,13 @@ async fn finish_task(
                     verification_attempt_id: verification_id,
                     review_attempt_id: review_id,
                     message: message.clone(),
+                    tree_hash: change_set.tree_hash,
+                    changed_files: change_set.changed_files,
+                    patch: change_set.patch,
                 })
                 .await
-                .map_err(|error| RequestFailure::storage("cannot reserve task commit", error))?;
-            publish_newer_snapshot(state_sender, engine_snapshot(reserved.snapshot));
-            let commit = tokio::task::spawn_blocking({
-                let worktree = worktree.clone();
-                let branch = initial.worktree.branch.clone();
-                let base = initial.worktree.base_revision.clone();
-                let message = message.clone();
-                move || create_task_commit(&worktree, &branch, &base, &message)
-            })
-            .await
-            .map_err(|error| format!("task commit worker failed: {error}"))
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            let (status, commit_hash, error_message) = match commit {
-                Ok(hash) => (TaskCommitStatus::Created, Some(hash), None),
-                Err(error) => (TaskCommitStatus::Failed, None, Some(error)),
-            };
-            let stored = storage
-                .settle_task_commit(TaskCommitSettlement {
-                    commit_id: reserved.commit_id,
-                    status,
-                    commit_hash,
-                    error_message: error_message.clone(),
-                })
-                .await
-                .map_err(|error| RequestFailure::storage("cannot record task commit", error))?;
-            publish_newer_snapshot(state_sender, engine_snapshot(stored.clone()));
-            if let Some(message) = error_message {
-                return Err(RequestFailure {
-                    code: "commit_failed",
-                    message,
-                });
-            }
-            return Ok(stored);
+                .map_err(|error| RequestFailure::storage("cannot propose task commit", error))?;
+            return Ok(reserved.snapshot);
         }
         if correction >= max_corrections {
             return Ok(snapshot);
@@ -2706,6 +2737,171 @@ async fn finish_task(
             })?;
         correction += 1;
     }
+}
+
+struct TaskCommitContext {
+    proposal: TaskCommitSummary,
+    worktree: TaskWorktreeSummary,
+}
+
+async fn load_task_commit_context(
+    storage: &StorageWorker,
+    run_id: &str,
+    task_commit_id: &str,
+) -> Result<TaskCommitContext, RequestFailure> {
+    let run = load_active_run(storage, run_id).await?;
+    let proposal = run
+        .task_commits
+        .iter()
+        .find(|proposal| {
+            proposal.id == task_commit_id && proposal.status == TaskCommitStatus::Proposed
+        })
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "task_commit_not_proposed",
+            message: "the selected task commit is no longer awaiting approval".to_owned(),
+        })?;
+    let worktree = run
+        .worktrees
+        .iter()
+        .find(|worktree| {
+            worktree.id == proposal.worktree_id
+                && worktree.task_id == proposal.task_id
+                && worktree.status == TaskWorktreeStatus::Ready
+        })
+        .cloned()
+        .ok_or_else(|| RequestFailure {
+            code: "worktree_not_ready",
+            message: "the proposed commit's task worktree is no longer ready".to_owned(),
+        })?;
+    Ok(TaskCommitContext { proposal, worktree })
+}
+
+async fn approve_task_commit(
+    run_id: String,
+    task_commit_id: String,
+    storage: &StorageWorker,
+    state_sender: &watch::Sender<EngineSnapshot>,
+) -> Result<StoredSnapshot, RequestFailure> {
+    let context = load_task_commit_context(storage, &run_id, &task_commit_id).await?;
+    let expected_tree = context
+        .proposal
+        .tree_hash
+        .clone()
+        .ok_or_else(|| RequestFailure {
+            code: "task_commit_not_inspectable",
+            message: "this older task commit has no recorded inspection fingerprint".to_owned(),
+        })?;
+    let current = tokio::task::spawn_blocking({
+        let worktree = PathBuf::from(&context.worktree.path);
+        let base = context.worktree.base_revision.clone();
+        move || capture_task_changes(&worktree, &base)
+    })
+    .await
+    .map_err(|error| RequestFailure {
+        code: "inspection_failed",
+        message: format!("task inspection worker failed: {error}"),
+    })?
+    .map_err(|error| RequestFailure {
+        code: "inspection_failed",
+        message: error.to_string(),
+    })?;
+    if current.tree_hash != expected_tree {
+        let message = "the task worktree changed after inspection; prepare a new result".to_owned();
+        let stale = storage
+            .settle_task_commit(TaskCommitSettlement {
+                commit_id: task_commit_id,
+                status: TaskCommitStatus::Stale,
+                commit_hash: None,
+                error_message: None,
+                decision_reason: Some(message.clone()),
+            })
+            .await
+            .map_err(|error| RequestFailure::storage("cannot mark stale task commit", error))?;
+        publish_newer_snapshot(state_sender, engine_snapshot(stale));
+        return Err(RequestFailure {
+            code: "task_commit_stale",
+            message,
+        });
+    }
+
+    let reserved = storage
+        .reserve_task_commit(context.proposal.id.clone())
+        .await
+        .map_err(|error| RequestFailure::storage("cannot approve task commit", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(reserved));
+    let result = tokio::task::spawn_blocking({
+        let worktree = PathBuf::from(&context.worktree.path);
+        let branch = context.worktree.branch;
+        let base = context.worktree.base_revision;
+        let message = context.proposal.message;
+        let expected_tree = expected_tree.clone();
+        move || create_task_commit(&worktree, &branch, &base, &expected_tree, &message)
+    })
+    .await
+    .map_err(|error| GitError::GitCommand {
+        operation: "running the task commit worker",
+        status: None,
+        stderr: error.to_string(),
+    });
+    let (status, commit_hash, error_message, decision_reason) = match result {
+        Ok(Ok(hash)) => (TaskCommitStatus::Created, Some(hash), None, None),
+        Ok(Err(error @ GitError::WorktreeChanged { .. })) => {
+            let message = error.to_string();
+            (TaskCommitStatus::Stale, None, None, Some(message))
+        }
+        Ok(Err(error)) | Err(error) => (
+            TaskCommitStatus::Failed,
+            None,
+            Some(error.to_string()),
+            None,
+        ),
+    };
+    let stored = storage
+        .settle_task_commit(TaskCommitSettlement {
+            commit_id: context.proposal.id,
+            status,
+            commit_hash,
+            error_message: error_message.clone(),
+            decision_reason: decision_reason.clone(),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot record task commit", error))?;
+    publish_newer_snapshot(state_sender, engine_snapshot(stored.clone()));
+    if let Some(message) = error_message.or(decision_reason) {
+        return Err(RequestFailure {
+            code: if status == TaskCommitStatus::Stale {
+                "task_commit_stale"
+            } else {
+                "commit_failed"
+            },
+            message,
+        });
+    }
+    Ok(stored)
+}
+
+async fn reject_task_commit(
+    run_id: String,
+    task_commit_id: String,
+    reason: Option<String>,
+    storage: &StorageWorker,
+) -> Result<StoredSnapshot, RequestFailure> {
+    load_task_commit_context(storage, &run_id, &task_commit_id).await?;
+    storage
+        .settle_task_commit(TaskCommitSettlement {
+            commit_id: task_commit_id,
+            status: TaskCommitStatus::Rejected,
+            commit_hash: None,
+            error_message: None,
+            decision_reason: Some(
+                reason
+                    .filter(|reason| !reason.trim().is_empty())
+                    .unwrap_or_else(|| "rejected by user".to_owned()),
+            ),
+        })
+        .await
+        .map_err(|error| RequestFailure::storage("cannot reject task commit", error))
 }
 
 fn conventional_task_commit_message(title: &str) -> String {
@@ -3196,10 +3392,15 @@ fn engine_snapshot(stored: StoredSnapshot) -> EngineSnapshot {
                 }
                 RunStatus::Planning | RunStatus::Running => (EngineStatus::Running, false),
                 RunStatus::WaitingForUser => {
+                    let commit_needs_attention = run
+                        .task_commits
+                        .iter()
+                        .any(|commit| commit.status == TaskCommitStatus::Proposed);
                     let review_needs_attention = run.review_attempts.last().is_some_and(|review| {
                         review.status == orchestrator_core::state::ReviewStatus::ChangesRequested
                     });
-                    if !review_needs_attention
+                    if !commit_needs_attention
+                        && !review_needs_attention
                         && run
                             .plan
                             .as_ref()

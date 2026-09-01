@@ -1,6 +1,6 @@
 # ADR-0011: Gate Local Task Commits on Verification and Independent Review
 
-- Status: Accepted
+- Status: Accepted; commit authorization superseded by ADR-0012
 - Date: 2026-09-01
 - Decision owners: Project maintainers
 

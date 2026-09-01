@@ -389,6 +389,7 @@ dependencies = [
 name = "orchestrator-git"
 version = "0.1.0"
 dependencies = [
+ "orchestrator-core",
  "tempfile",
  "thiserror",
 ]

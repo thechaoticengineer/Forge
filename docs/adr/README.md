@@ -49,4 +49,5 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0008](0008-persist-bounded-implementation-activity-and-cancel-process-groups.md) | Accepted | Persist bounded implementation activity and let the engine cancel supervised process groups |
 | [ADR-0009](0009-control-and-continue-running-implementations.md) | Accepted | Pause supervised process groups and continue implementations with durable user instructions |
 | [ADR-0010](0010-run-independent-reviews-in-fresh-agent-sessions.md) | Accepted | Route independent reviews through fresh cross-provider or explicit fallback sessions |
-| [ADR-0011](0011-gate-local-task-commits-on-verification-and-independent-review.md) | Accepted | Gate isolated local task commits on deterministic verification and independent review |
+| [ADR-0011](0011-gate-local-task-commits-on-verification-and-independent-review.md) | Accepted; commit authorization superseded by ADR-0012 | Gate isolated local task commits on deterministic verification and independent review |
+| [ADR-0012](0012-separate-final-inspection-from-commit-approval.md) | Accepted | Prepare an exact final-inspection record before separate user commit approval |
