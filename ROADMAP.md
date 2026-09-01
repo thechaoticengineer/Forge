@@ -25,7 +25,7 @@ The immediate priority is to let a developer use the Omarchy panel to start the 
 - [x] Show actionable worktree and launch failures in the task context without losing the approved plan or creating duplicate side effects.
 - [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
 
-The remaining operational proof is to install and start the managed engine, refresh the installed plugin, and exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Composing multiple dependent task branches remains open because all task worktrees currently start from the run's shared base.
+The managed engine is installed and running for the current development environment, and the installed plugin has been refreshed and rescanned successfully. The remaining operational proof is to exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Composing multiple dependent task branches remains open because all task worktrees currently start from the run's shared base.
 
 ## Phase 0 — Foundation
 
