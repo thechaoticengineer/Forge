@@ -14,9 +14,11 @@ Each task of an approved plan is actionable in the Omarchy panel with its depend
 
 The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. After commit creation, another confirmed action can fast-forward a selected checked-out clean local branch, with exact-head comparison and durable outcome. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and divergent merge flows remain open.
 
-## Next Delivery Slice — UI-First Self-Hosting
+This is a complete single-task vertical slice, not yet a whole-project operating loop. A run still plans against one recorded repository base, dependent tasks cannot inherit integrated prerequisite work, and the engine does not select and continue through a durable backlog. Forge can safely complete one result; it cannot yet own a broad engineering campaign and keep working until every reachable problem is resolved.
 
-The immediate priority is to let a developer use the Omarchy panel to start the implementation workflow, not merely observe and control a process launched from the CLI. After the engine is available, an approved plan should be executable through final local task-commit approval without requiring a terminal command.
+## Immediate Validation — First Self-Hosted Run
+
+The UI-first implementation slice is present. Before campaign orchestration builds on it, the complete path must be exercised as one uninterrupted self-hosted run against this repository without substituting terminal commands for panel decisions.
 
 - [x] Present every approved task with its implementation readiness, dependency state, worktree, branch, assigned agent, latest attempt, and next available action.
 - [x] Create a task worktree from the panel through the existing engine request, with a confirmation that explains the isolated branch and committed-base behavior.
@@ -26,6 +28,31 @@ The immediate priority is to let a developer use the Omarchy panel to start the 
 - [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
 
 The managed engine is installed and running for the current development environment, and the installed plugin has been refreshed and rescanned successfully. The remaining operational proof is to exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Composing multiple dependent task branches remains open because all task worktrees currently start from the run's shared base.
+
+## Next Major Milestone — Durable Whole-Project Campaigns
+
+The next milestone is not another isolated feature task. Forge should accept a broad project objective, turn repository evidence and an editable backlog into ordered work, and continue through that work across many independently reviewed changes. A **campaign** is the durable owner of that objective, backlog, evolving integration base, policies, decisions, and history.
+
+The first campaign implementation should be deliberately sequential. It should prove correct dependency composition and recovery before parallel execution is considered. Human approval remains required for consequential Git operations, architecture or product decisions, policy changes, pushes, and deployment.
+
+The milestone is complete when Forge can use the repository's full roadmap as a campaign, finish and integrate multiple dependent tasks onto an evolving local base, re-evaluate the remaining work after each integration, survive restarts, and continue until the campaign is complete or has an explicit evidence-backed blocker.
+
+### Delivery order
+
+1. **Campaign state and backlog:** persist a broad objective, ordered work items, dependencies, priorities, acceptance criteria, policies, and lifecycle independently from a single agent plan attempt.
+2. **Evolving integration base:** dispatch each new task from the campaign's current accepted base, advance that base only after explicit integration, and invalidate or re-plan stale work safely.
+3. **Dependency composition:** make an integrated prerequisite available to dependent tasks without cherry-picking, silently merging divergent work, or dropping sibling changes.
+4. **Durable coordinator:** deterministically select the next unblocked item, run the existing implementation/verification/review/approval pipeline, and continue under visible user-controlled policy.
+5. **Campaign interface:** show the whole backlog, progress, current work, blockers, decisions, evidence, and next action in the Omarchy panel.
+6. **Self-hosting proof:** run a real Forge campaign through multiple dependent improvements, including restart recovery and a human-decision stop, entirely through the managed engine and panel.
+
+### Non-goals for the first campaign milestone
+
+- Parallel implementation of sibling tasks.
+- Automatic push, pull-request creation, deployment, release, or destructive cleanup.
+- Automatic acceptance of architecture, security, product-scope, or conflicting-review decisions.
+- Rebase, history rewriting, force-push, or silent conflict resolution.
+- Treating agent claims, elapsed time, or token usage as proof that work is complete.
 
 ## Phase 0 — Foundation
 
@@ -75,7 +102,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [x] Let the user pause, redirect, or add context without losing run history.
 - [ ] Preserve prompts, responses, changed files, failed approaches, and retries.
 - [ ] Open the exact task worktree from the interface.
-- [ ] Show recorded task worktrees, their branches, and their status in the panel.
+- [ ] Add a dedicated inventory for all recorded task worktrees, branches, and lifecycle states across current and previous runs.
 - [ ] Retire a task worktree and its branch through an explicit confirmed action.
 
 ## Phase 3 — Deterministic Verification
@@ -119,14 +146,65 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [ ] Add end-to-end recovery tests across engine, shell, and terminal restarts.
 - [ ] Document supported installation, update, removal, state backup, and recovery procedures.
 
-## First Milestone Checklist
+## Phase 7 — Campaign State and Backlog
 
-The completed first milestone established the full engine workflow with real Omarchy visibility and decision controls. The panel now starts task worktrees and implementers as well; the remaining proof for the UI-first self-hosting slice is exercising that complete path against this repository.
+- [ ] Record a campaign separately from a single run, with repository identity, broad objective, current integration base, status, and timestamps.
+- [ ] Persist an editable backlog with stable work-item identities, acceptance criteria, dependencies, priority, and source or rationale.
+- [ ] Represent queued, ready, running, waiting-for-user, blocked, integrated, superseded, failed, and completed states explicitly.
+- [ ] Preserve campaign revisions and the decision that added, changed, reordered, split, superseded, or removed each work item.
+- [ ] Import an approved multi-task plan into a campaign without treating that first plan as permanently correct.
+- [ ] Reconcile roadmap, repository, review, and verification evidence into proposed backlog changes that require visible approval.
+- [ ] Add campaign creation, selection, pause, resume, stop, and archive operations to the shared engine protocol and CLI.
+- [ ] Show current and previous campaigns without losing existing run history.
+
+## Phase 8 — Evolving Base and Dependency Composition
+
+- [ ] Record the exact accepted campaign base and update it only after a separately approved integration succeeds.
+- [ ] Create each task worktree from the campaign base current at dispatch time rather than the campaign's original base.
+- [ ] Mark planned or running work stale when its assumed base no longer matches the accepted campaign base.
+- [ ] Re-plan or recreate stale, not-yet-approved work without rewriting user history or discarding useful evidence.
+- [ ] Unblock a dependent item only when every prerequisite result is present in its dispatch base.
+- [ ] Compose sequential task results through exact fast-forward integration before considering divergent merge support.
+- [ ] Detect sibling overlap and require re-planning or explicit human resolution instead of guessing conflict intent.
+- [ ] Retire integrated task worktrees and branches through a separate confirmed, recoverable cleanup action.
+- [ ] Preserve the rule that integration never implies push or deployment.
+
+## Phase 9 — Durable Campaign Coordinator
+
+- [ ] Deterministically choose the next ready work item by approved dependency and priority order.
+- [ ] Reuse the existing supervised implementation, deterministic verification, independent review, final inspection, and integration pipeline for every item.
+- [ ] Expose the minimum campaign execution policy and **Continue**, **Pause**, and **Stop** controls through the shared protocol, CLI, and panel before enabling coordinator continuation.
+- [ ] Continue to the next ready item only under the campaign execution policy explicitly selected by the user.
+- [ ] Define stop boundaries for human judgment, failed or contradictory review, repeated correction failure, stale plans, unavailable agents, and unsafe Git state.
+- [ ] Distinguish retryable infrastructure failure, work-item failure, campaign blocker, and campaign completion.
+- [ ] Re-evaluate readiness and proposed backlog changes after every accepted integration.
+- [ ] Recover a campaign after engine or shell restart without replaying consequential side effects or losing which action owned the transition.
+- [ ] Support a user redirect that changes campaign priority or scope while preserving the previous plan and partial evidence.
+- [ ] Explain why the coordinator selected, skipped, blocked, retried, superseded, or stopped on each work item.
+
+## Phase 10 — Campaign Interface and Self-Hosting Proof
+
+- [ ] Add a campaign dashboard with objective, accepted base, overall progress, active item, queued work, blockers, and waiting decisions.
+- [ ] Let the user inspect and edit backlog ordering, dependencies, acceptance criteria, and priority with keyboard-first controls.
+- [ ] Present the next proposed coordinator action before it launches work or changes Git state.
+- [ ] Provide explicit **Continue campaign**, **Pause**, **Redirect**, **Stop**, and **Resolve blocker** controls.
+- [ ] Link every campaign item to its worktree, attempts, verification evidence, reviews, commit, integration, and decision history.
+- [ ] Show stale or superseded work without presenting it as part of the accepted base.
+- [ ] Notify the user only for failures, blockers, completed campaign work, or decisions that actually need attention.
+- [ ] Create a Forge campaign from the complete remaining roadmap rather than a demonstration-only goal.
+- [ ] Complete and integrate multiple dependent Forge tasks through the live panel against an evolving `main`.
+- [ ] Restart the engine and reload the Omarchy plugin during that campaign, then continue from durable state.
+- [ ] Demonstrate a safe stop at a real human-decision boundary and a later explicit continuation.
+- [ ] Finish with every campaign item completed, superseded with rationale, or blocked with concrete evidence.
+
+## First Vertical Milestone Checklist
+
+The completed first vertical milestone established each part of the single-task engine workflow with real Omarchy visibility and decision controls. The remaining validation is exercising those parts as one uninterrupted self-hosted run against this repository.
 
 - [x] Install or enable the validated Quickshell plugin.
 - [x] Summon the orchestrator panel from Omarchy.
 - [x] Open a local Git repository or clone one from GitHub through the panel.
-- [x] Describe a small engineering goal.
+- [x] Describe a bounded engineering goal.
 - [x] Inspect, revise, approve, or reject a generated plan.
 - [x] Watch Codex CLI or Claude Code CLI implement the plan in an isolated worktree.
 - [x] See deterministic build and test status update in the panel.
@@ -136,6 +214,6 @@ The completed first milestone established the full engine workflow with real Oma
 - [x] Reload the planning UI or restart the engine without losing the draft or plan.
 - [x] See current engine and attention state in the bar widget.
 
-## After the First Milestone
+## After the Campaign Milestone
 
-Only after the UI-first self-hosting slice and its engine lifecycle are dependable should the project consider parallel task execution, smarter agent routing, usage-limit awareness, pull-request workflows, configurable policies, security and prompt-injection checks, automated low-risk decisions, richer historical learning, additional Omarchy surfaces, or remote workers.
+Only after sequential campaign execution and recovery are dependable should the project consider parallel task execution, smarter agent routing, usage-limit awareness, pull-request workflows, automated low-risk decisions, richer historical learning, additional Omarchy surfaces, or remote workers. Configurable verification policy and security or prompt-injection hardening may move earlier when campaign work exposes a concrete safety need.
