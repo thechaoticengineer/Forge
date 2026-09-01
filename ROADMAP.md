@@ -14,6 +14,19 @@ Each task of an approved plan can be given a recorded Git worktree on its own re
 
 The CLI and panel can run a bounded completion pipeline: detected Rust and Omarchy checks are persisted, their evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. Configurable project checks, full raw-output drill-down, semantic multi-commit splitting, and integration actions remain open.
 
+## Next Delivery Slice — UI-First Self-Hosting
+
+The immediate priority is to let a developer use the Omarchy panel to start the implementation workflow, not merely observe and control a process launched from the CLI. After the engine is available, an approved plan should be executable through final local task-commit approval without requiring a terminal command.
+
+- [ ] Present every approved task with its implementation readiness, dependency state, worktree, branch, assigned agent, latest attempt, and next available action.
+- [ ] Create a task worktree from the panel through the existing engine request, with a confirmation that explains the isolated branch and committed-base behavior.
+- [ ] Let the user choose Codex CLI or Claude Code CLI and start the implementation from the panel through the existing supervised engine request.
+- [ ] Keep worktree creation, agent selection, implementation launch, failure recovery, and retry usable with keyboard-only navigation.
+- [ ] Show actionable worktree and launch failures in the task context without losing the approved plan or creating duplicate side effects.
+- [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
+
+The next operational step is managed engine installation and startup so opening the panel does not require manually launching the Rust process. Integrating an approved task commit into another local branch remains a separate consequential action: it requires a dedicated design decision, conflict checks, and explicit user approval, and must never be implied by final task approval.
+
 ## Phase 0 — Foundation
 
 - [x] Establish the Rust workspace, orchestration engine, and CLI.
@@ -40,7 +53,7 @@ The CLI and panel can run a bounded completion pipeline: detected Rust and Omarc
 - [x] Browse bounded local project roots and remote-only GitHub repositories from the panel.
 - [x] Explicitly clone a selected GitHub repository into a collision-safe local destination.
 
-Planned usability follow-ups:
+Planned usability follow-ups after the UI-first self-hosting slice:
 
 - [x] Add a richer keyboard-driven repository chooser with shared search and manual-path fallback.
 - [x] Keep the repository chooser usable in constrained-height and narrow panel layouts.
@@ -93,6 +106,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 - [x] Support keyboard-only final approval or rejection.
 - [x] Create only explicitly requested local commits without amending, rebasing, squashing, merging, or pushing implicitly.
 - [x] Preserve the final outcome and rejected result in durable history.
+- [ ] Define a separate explicit, conflict-checked action for integrating an approved task commit into a selected local branch.
 
 ## Phase 6 — Omarchy Integration and Recovery Hardening
 
@@ -107,7 +121,7 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 
 ## First Milestone Checklist
 
-The first milestone is complete only when the whole workflow works through the real Omarchy UI:
+The completed first milestone established the full engine workflow with real Omarchy visibility and decision controls. Starting a task worktree and its initial implementer remained CLI-only and is the UI-first self-hosting follow-up above.
 
 - [x] Install or enable the validated Quickshell plugin.
 - [x] Summon the orchestrator panel from Omarchy.
@@ -124,4 +138,4 @@ The first milestone is complete only when the whole workflow works through the r
 
 ## After the First Milestone
 
-Only after the vertical slice is dependable should the project consider parallel task execution, smarter agent routing, usage-limit awareness, pull-request workflows, configurable policies, security and prompt-injection checks, automated low-risk decisions, richer historical learning, additional Omarchy surfaces, or remote workers.
+Only after the UI-first self-hosting slice and its engine lifecycle are dependable should the project consider parallel task execution, smarter agent routing, usage-limit awareness, pull-request workflows, configurable policies, security and prompt-injection checks, automated low-risk decisions, richer historical learning, additional Omarchy surfaces, or remote workers.
