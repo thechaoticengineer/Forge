@@ -522,11 +522,11 @@ Item {
     if (engine.activeRun.run_status === "planning") return "Planning"
     if (engine.activeRun.run_status === "running") return "Running"
     var plan = currentPlan()
-    if (!plan || plan.status === "rejected") return "To plan"
+    if (!plan || plan.status === "rejected") return "Plan"
     if (plan.status === "proposed") return "Planned"
     if (plan.status === "approved")
       return selectedTask() ? taskStateLabel(selectedTask()) : "Ready to run"
-    return "To plan"
+    return "Plan"
   }
 
   function workflowStageColor() {
@@ -1520,7 +1520,7 @@ Item {
                         if (!engine.activeRun) return "Choose a project first"
                         if (engine.activeRun.run_status === "planning") return "Planner is inspecting the repository"
                         if (engine.activeRun.run_status === "failed") return "Planning failed"
-                        if (!plan || plan.status === "rejected") return "To plan"
+                        if (!plan || plan.status === "rejected") return "Plan"
                         if (plan.status === "approved")
                           return root.taskStateLabel(root.selectedTask())
                         return "Plan revision " + plan.revision
