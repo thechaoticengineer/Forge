@@ -16,6 +16,27 @@ The CLI and panel can run a bounded completion pipeline: detected Rust and Omarc
 
 This is a complete single-task vertical slice, not yet a whole-project operating loop. A run still plans against one recorded repository base, dependent tasks cannot inherit integrated prerequisite work, and the engine does not select and continue through a durable backlog. Forge can safely complete one result; it cannot yet own a broad engineering campaign and keep working until every reachable problem is resolved.
 
+## Proposed Workflow Simplification
+
+The first live self-hosted task exposed too much internal Git machinery and
+required too many confirmations. The next iteration should simplify the
+single-task experience to:
+
+> **Plan → Accept and choose agent → Automatic work → Review changes / Merge & push**
+
+After plan acceptance and implementer selection, implementation,
+deterministic verification, independent review, bounded correction, and final
+verification should proceed automatically. Forge should stop only for a real
+human decision or an unrecoverable failure. The final result should offer a
+detailed review and one explicit merge-and-push action.
+
+The proposed path removes linked worktrees from the initial single-task
+workflow. Forge may use a hidden temporary branch in the selected clean
+checkout, but branch creation, switching, integration, push reporting, and
+cleanup must not become user-managed steps. Only one task may modify a project
+at a time. Exact safety and recovery behavior remains to be decided before
+implementation. See [ADR-0016](docs/adr/0016-simplify-the-single-task-workflow.md).
+
 ## Immediate Validation — First Self-Hosted Run
 
 The UI-first implementation slice is present. Before campaign orchestration builds on it, the complete path must be exercised as one uninterrupted self-hosted run against this repository without substituting terminal commands for panel decisions.
