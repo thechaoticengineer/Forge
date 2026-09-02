@@ -53,3 +53,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0012](0012-separate-final-inspection-from-commit-approval.md) | Accepted | Prepare an exact final-inspection record before separate user commit approval |
 | [ADR-0013](0013-fast-forward-approved-task-commits.md) | Accepted | Integrate approved task commits only through an explicit conflict-checked fast-forward |
 | [ADR-0014](0014-manage-the-engine-as-a-systemd-user-service.md) | Accepted | Install and run the engine as a managed systemd user service |
+| [ADR-0015](0015-center-the-panel-on-tasks.md) | Accepted | Make the task queue and selected task workspace the panel's primary interaction model |
