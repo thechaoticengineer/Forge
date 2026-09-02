@@ -11,9 +11,10 @@ Item {
   property var shell: null
   property var manifest: null
   property bool closingFromHost: false
+  // Internal workspace mode: 0 = setup, 1 = selected task, 2 = final inspection.
   property int selectedSection: 0
   property int selectedTaskIndex: 0
-  property string focusArea: "sections"
+  property string focusArea: "tasks"
   property bool editingDraft: false
   property bool editingPlanTask: false
   property bool rejectingPlan: false
@@ -54,7 +55,7 @@ Item {
 
   function open(payloadJson) {
     closingFromHost = false
-    focusArea = "sections"
+    focusArea = "tasks"
     window.visible = true
     engine.reconnect()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -96,16 +97,13 @@ Item {
       cancelPlanInput()
       return
     }
+    if (selectedSection === 2) {
+      selectedSection = 1
+      focusArea = "content"
+      return
+    }
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else window.visible = false
-  }
-
-  function moveSection(delta) {
-    if (editingDraft || editingPlanTask || rejectingPlan) return
-    var count = sectionModel.count
-    selectedSection = ((selectedSection + delta) % count + count) % count
-    selectedTaskIndex = 0
-    sectionList.positionViewAtIndex(selectedSection, ListView.Contain)
   }
 
   function moveNavigation(dx, dy) {
@@ -129,21 +127,33 @@ Item {
     if (editingDraft || editingPlanTask || rejectingPlan) return
 
     if (dx !== 0) {
-      if (dx > 0 && focusArea === "sections") focusArea = "content"
-      else if (dx < 0 && focusArea === "content") focusArea = "sections"
+      if (dx > 0 && focusArea === "tasks") focusArea = "content"
+      else if (dx < 0 && focusArea === "content" && selectedSection === 2)
+        selectedSection = 1
+      else if (dx < 0 && focusArea === "content") focusArea = "tasks"
       return
     }
 
     if (dy === 0) return
-    if (focusArea === "sections") {
-      moveSection(dy)
+    if (focusArea === "tasks") {
+      var queuedPlan = currentPlan()
+      var queuedTasks = queuedPlan && queuedPlan.tasks ? queuedPlan.tasks : []
+      if (queuedTasks.length === 0) return
+      selectedTaskIndex = Math.max(
+        0, Math.min(queuedTasks.length - 1, selectedTaskIndex + dy))
+      taskQueue.positionViewAtIndex(selectedTaskIndex, ListView.Contain)
+      selectedSection = 1
       return
     }
 
-    var plan = currentPlan()
-    if (selectedSection === 1 && plan && plan.tasks && plan.tasks.length > 0) {
-      selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, selectedTaskIndex + dy))
-      planTaskList.positionViewAtIndex(selectedTaskIndex, ListView.Contain)
+    if (selectedSection === 1 && selectedTaskWorkspace.visible) {
+      selectedTaskWorkspace.contentY = Math.max(
+        0,
+        Math.min(
+          Math.max(0, selectedTaskWorkspace.contentHeight - selectedTaskWorkspace.height),
+          selectedTaskWorkspace.contentY + dy * Style.space(28)
+        )
+      )
     } else if (selectedSection === 2 && changesFlickable.visible) {
       changesFlickable.contentY = Math.max(
         0,
@@ -177,7 +187,14 @@ Item {
       activateRepository()
       return
     }
-    if (focusArea === "sections") {
+    if (focusArea === "tasks") {
+      if (!currentPlan() || !currentPlan().tasks
+          || currentPlan().tasks.length === 0) {
+        if (!engine.activeRun) beginDraftEntry()
+        else focusArea = "content"
+        return
+      }
+      selectedSection = 1
       focusArea = "content"
       return
     }
@@ -224,6 +241,9 @@ Item {
     repositorySearchField.focus = false
     repositorySearchField.text = ""
     goalField.focus = false
+    selectedSection = engine.activeRun ? 1 : 0
+    focusArea = currentPlan() && currentPlan().tasks
+      && currentPlan().tasks.length > 0 ? "tasks" : "content"
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -459,6 +479,63 @@ Item {
     return "Awaiting an approved plan"
   }
 
+  function taskStateLabel(task) {
+    var plan = currentPlan()
+    if (!task || !plan) return "Unavailable"
+    if (plan.status === "proposed") return "Proposed"
+    var code = taskActionCode(task)
+    if (code === "running") {
+      var attempt = latestImplementationForTask(task.id)
+      return attempt && attempt.paused ? "Paused" : "Active"
+    }
+    if (code === "dependencies_blocked" || code === "worktree_unavailable")
+      return "Blocked"
+    if (code === "complete") return "Done"
+    if (code === "rejected") return "Rejected"
+    if (["create_worktree", "choose_agent", "retry_implementation", "finish",
+         "inspect"].indexOf(code) !== -1) return "Needs attention"
+    return "Waiting"
+  }
+
+  function taskStateColor(task) {
+    var state = taskStateLabel(task)
+    if (state === "Active" || state === "Done") return accent
+    if (state === "Needs attention" || state === "Blocked"
+        || state === "Rejected") return urgent
+    return mutedForeground
+  }
+
+  function selectedImplementationAttempt() {
+    var task = selectedTask()
+    return task ? latestImplementationForTask(task.id) : null
+  }
+
+  function selectedImplementationActivity() {
+    var attempt = selectedImplementationAttempt()
+    var activity = engine.activeRun && engine.activeRun.implementation_activity
+      ? engine.activeRun.implementation_activity : []
+    var result = []
+    if (!attempt) return result
+    for (var i = 0; i < activity.length; i++)
+      if (activity[i].attempt_id === attempt.id) result.push(activity[i])
+    return result
+  }
+
+  function selectedRunningImplementationAttempt() {
+    var attempt = selectedImplementationAttempt()
+    return attempt && attempt.status === "running" ? attempt : null
+  }
+
+  function selectedVerification() {
+    return latestTaskRecord(
+      engine.activeRun ? engine.activeRun.verification_attempts : [])
+  }
+
+  function selectedReview() {
+    return latestTaskRecord(
+      engine.activeRun ? engine.activeRun.review_attempts : [])
+  }
+
   function taskActionTask() {
     return taskById(taskActionTaskId)
   }
@@ -476,7 +553,7 @@ Item {
       taskActionEngine.requestError = ""
       taskActionMode = "choose_agent"
     } else if (code === "running") {
-      selectedSection = 0
+      selectedSection = 1
     } else if (code === "finish" || code === "inspect") {
       selectedSection = 2
     }
@@ -729,20 +806,20 @@ Item {
   }
 
   function beginImplementationCancel() {
-    if (!runningImplementationAttempt() || controlEngine.requestPending
+    if (!selectedRunningImplementationAttempt() || controlEngine.requestPending
         || continuationEngine.requestPending
         || implementationInterventionMode !== "") return
     confirmingImplementationCancel = true
   }
 
   function confirmImplementationCancel() {
-    var attempt = runningImplementationAttempt()
+    var attempt = selectedRunningImplementationAttempt()
     if (!attempt || !engine.activeRun || controlEngine.requestPending) return
     controlEngine.cancelImplementation(engine.activeRun.id, attempt.id)
   }
 
   function toggleImplementationPause() {
-    var attempt = runningImplementationAttempt()
+    var attempt = selectedRunningImplementationAttempt()
     if (!attempt || !engine.activeRun || controlEngine.requestPending
         || continuationEngine.requestPending || confirmingImplementationCancel
         || implementationInterventionMode !== "") return
@@ -753,24 +830,24 @@ Item {
   }
 
   function beginImplementationIntervention(mode) {
-    if (!runningImplementationAttempt() || continuationEngine.requestPending
+    if (!selectedRunningImplementationAttempt() || continuationEngine.requestPending
         || controlEngine.requestPending || confirmingImplementationCancel) return
     implementationInterventionMode = mode
-    implementationInstructionField.text = ""
-    Qt.callLater(function() { implementationInstructionField.forceActiveFocus() })
+    selectedTaskInstructionField.text = ""
+    Qt.callLater(function() { selectedTaskInstructionField.forceActiveFocus() })
   }
 
   function cancelImplementationIntervention() {
     implementationInterventionMode = ""
-    implementationInstructionField.text = ""
-    implementationInstructionField.focus = false
+    selectedTaskInstructionField.text = ""
+    selectedTaskInstructionField.focus = false
     continuationEngine.requestError = ""
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function submitImplementationIntervention() {
-    var attempt = runningImplementationAttempt()
-    var instruction = implementationInstructionField.text.trim()
+    var attempt = selectedRunningImplementationAttempt()
+    var instruction = selectedTaskInstructionField.text.trim()
     if (!attempt || !engine.activeRun || instruction === ""
         || continuationEngine.requestPending) return
     var kind = implementationInterventionMode === "redirect"
@@ -778,7 +855,7 @@ Item {
     if (continuationEngine.continueImplementation(
           engine.activeRun.id, attempt.id, kind, instruction)) {
       implementationInterventionMode = ""
-      implementationInstructionField.focus = false
+      selectedTaskInstructionField.focus = false
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
@@ -818,27 +895,25 @@ Item {
       return "Enter  Fast-forward local branch    Esc  Cancel"
     if (implementationInterventionMode !== "")
       return "Enter  Submit instruction    Esc  Keep current attempt"
-    if (focusArea === "sections")
-      return "j/k or ↑/↓  Sections    l/→ or Enter  Open    r  Reconnect    Esc  Close"
+    if (focusArea === "tasks")
+      return "j/k or ↑/↓  Tasks    l/→ or Enter  Open task    n  New run    r  Reconnect    Esc  Close"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "proposed")
-      return "h/←  Sections    j/k or ↑/↓  Tasks    Enter/e  Edit    J/K  Reorder    a  Approve    x  Reject"
+      return "h/←  Task queue    Enter/e  Edit task    J/K  Reorder    a  Approve backlog    x  Reject"
     if (selectedSection === 1 && currentPlan() && currentPlan().status === "approved")
-      return "h/←  Sections    j/k or ↑/↓  Tasks    Enter  Next action    c/d  Choose agent"
+      return "h/←  Task queue    j/k or ↑/↓  Scroll task    Enter  Next action    p  Prepare result"
     if (selectedSection === 1)
-      return "h/←  Sections    c  Plan with Codex    d  Plan with Claude    Esc  Close"
+      return "h/←  Task queue    c  Plan with Codex    d  Plan with Claude    Esc  Close"
     if (selectedSection === 2 && proposedTaskCommit())
-      return "h/←  Sections    j/k or ↑/↓  Scroll diff    a  Approve    x  Reject    Esc  Close"
+      return "h/←  Task workspace    j/k or ↑/↓  Scroll    a  Approve    x  Reject    Esc  Close"
     if (selectedSection === 2 && createdTaskCommit())
-      return "h/←  Sections    j/k or ↑/↓  Scroll diff    i  Integrate local branch    Esc  Close"
+      return "h/←  Task workspace    j/k or ↑/↓  Scroll    i  Integrate local branch    Esc  Close"
     if (selectedSection === 2)
-      return "h/←  Sections    p  Prepare inspected result    Esc  Close"
-    if (selectedSection === 0 && runningImplementationAttempt())
-      return "h/←  Sections    p  Pause/resume    i  Redirect    a  Add context    x  Cancel"
+      return "h/←  Task workspace    p  Prepare inspected result    Esc  Close"
     if (selectedSection === 0 && engine.activeRun)
-      return "h/←  Sections    Enter/n  New draft    r  Reconnect    Esc  Close"
+      return "h/←  Task queue    Enter/n  New draft    r  Reconnect    Esc  Close"
     if (selectedSection === 0)
-      return "h/←  Sections    Enter  Create draft    r  Reconnect    Esc  Close"
-    return "h/←  Sections    r  Reconnect    Esc  Close"
+      return "h/←  Task queue    Enter  Create draft    r  Reconnect    Esc  Close"
+    return "h/←  Task queue    r  Reconnect    Esc  Close"
   }
 
   function statusLabel() {
@@ -889,6 +964,8 @@ Item {
         root.selectedTaskIndex = Math.max(0, Math.min(plan.tasks.length - 1, root.selectedTaskIndex))
       else
         root.selectedTaskIndex = 0
+      if (!root.editingDraft && root.selectedSection !== 2)
+        root.selectedSection = engine.activeRun ? 1 : 0
       if (!root.runningImplementationAttempt())
         root.confirmingImplementationCancel = false
       if (!root.proposedTaskCommit()) root.completionDecisionMode = ""
@@ -948,30 +1025,6 @@ Item {
     }
   }
 
-  ListModel {
-    id: sectionModel
-    ListElement {
-      title: "Overview"
-      description: "Current run, ownership, queue, and the next required decision."
-    }
-    ListElement {
-      title: "Plan"
-      description: "Generate, inspect, revise, reorder, approve, or reject the explicit task plan."
-    }
-    ListElement {
-      title: "Changes"
-      description: "Inspect the exact changed files, complete patch, and proposed local task commit."
-    }
-    ListElement {
-      title: "Verification"
-      description: "Deterministic build, test, format, lint, and analyzer results will appear here."
-    }
-    ListElement {
-      title: "Review"
-      description: "Independent review findings and correction loops will appear here."
-    }
-  }
-
   FloatingWindow {
     id: window
     visible: false
@@ -998,6 +1051,7 @@ Item {
           || taskTitleField.activeFocus || taskDescriptionField.activeFocus
           || taskCriteriaField.activeFocus || rejectionReasonField.activeFocus
           || implementationInstructionField.activeFocus
+          || selectedTaskInstructionField.activeFocus
           || integrationTargetField.activeFocus
         onMoveRequested: function(dx, dy) {
           root.moveNavigation(dx, dy)
@@ -1007,8 +1061,9 @@ Item {
         onDeleteRequested: {
           if (root.taskActionMode !== "" || root.editingDraft
               || root.editingPlanTask || root.rejectingPlan) return
-          if (root.selectedSection === 0) root.beginImplementationCancel()
-          else if (root.selectedSection === 1) root.beginRejectPlan()
+          if (root.selectedRunningImplementationAttempt()) root.beginImplementationCancel()
+          else if (root.currentPlan() && root.currentPlan().status === "proposed")
+            root.beginRejectPlan()
           else if (root.selectedSection === 2) root.beginCompletionDecision("reject")
         }
         onTextKey: function(text) {
@@ -1026,10 +1081,6 @@ Item {
           }
           if (text === "r") engine.reconnect()
           else if (text === "n") root.beginDraftEntry()
-          else if (root.selectedSection === 0 && text === "x") root.beginImplementationCancel()
-          else if (root.selectedSection === 0 && text === "p") root.toggleImplementationPause()
-          else if (root.selectedSection === 0 && text === "i") root.beginImplementationIntervention("redirect")
-          else if (root.selectedSection === 0 && text === "a") root.beginImplementationIntervention("additional_context")
           else if (root.selectedSection === 1 && text === "c"
               && root.currentPlan() && root.currentPlan().status === "approved") {
             root.launchSelectedTaskImplementation("codex")
@@ -1044,7 +1095,16 @@ Item {
           else if (root.selectedSection === 1 && text === "J") root.moveCurrentTask("down")
           else if (root.selectedSection === 1 && text === "K") root.moveCurrentTask("up")
           else if (root.selectedSection === 1 && text === "a" && root.currentPlan() && root.currentPlan().status === "proposed") engine.approvePlan()
+          else if (root.selectedSection === 1 && text === "x"
+              && root.selectedRunningImplementationAttempt()) root.beginImplementationCancel()
           else if (root.selectedSection === 1 && text === "x") root.beginRejectPlan()
+          else if (root.selectedSection === 1 && text === "p"
+              && root.selectedRunningImplementationAttempt()) root.toggleImplementationPause()
+          else if (root.selectedSection === 1 && text === "i"
+              && root.selectedRunningImplementationAttempt()) root.beginImplementationIntervention("redirect")
+          else if (root.selectedSection === 1 && text === "a"
+              && root.selectedRunningImplementationAttempt()) root.beginImplementationIntervention("additional_context")
+          else if (root.selectedSection === 1 && text === "p") root.finishSelectedTask()
           else if (root.selectedSection === 2 && text === "p") root.finishSelectedTask()
           else if (root.selectedSection === 2 && text === "a") root.beginCompletionDecision("approve")
           else if (root.selectedSection === 2 && text === "x") root.beginCompletionDecision("reject")
@@ -1124,53 +1184,120 @@ Item {
             anchors.bottomMargin: Style.space(18)
             spacing: Style.space(18)
 
-            ListView {
-              id: sectionList
+            Column {
+              id: taskRail
               width: root.compactWidthLayout
                 ? Math.min(Style.space(150), parent.width * 0.26)
                 : Math.min(Style.space(220), parent.width * 0.32)
               height: parent.height
-              model: sectionModel
-              interactive: contentHeight > height
-              clip: true
-              spacing: Style.space(6)
+              spacing: Style.space(8)
 
-              delegate: Rectangle {
-                id: sectionDelegate
-                required property int index
-                required property string title
-                width: ListView.view.width
-                height: Style.space(42)
-                radius: Style.cornerRadius
-                color: index === root.selectedSection
-                  ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b,
-                            root.focusArea === "sections" ? 0.18 : 0.08)
-                  : "transparent"
-                border.width: index === root.selectedSection && root.focusArea === "sections" ? 1 : 0
-                border.color: root.accent
+              Row {
+                width: parent.width
+
+                Text {
+                  width: parent.width - taskCountText.width
+                  text: "TASKS"
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Text {
+                  id: taskCountText
+                  text: {
+                    var plan = root.currentPlan()
+                    return plan && plan.tasks ? String(plan.tasks.length) : "0"
+                  }
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              ListView {
+                id: taskQueue
+                width: parent.width
+                height: parent.height - parent.spacing - Style.space(22)
+                model: root.currentPlan() && root.currentPlan().tasks
+                  ? root.currentPlan().tasks : []
+                interactive: contentHeight > height
+                clip: true
+                spacing: Style.space(6)
+                currentIndex: root.selectedTaskIndex
 
                 Text {
                   anchors.left: parent.left
-                  anchors.leftMargin: Style.space(12)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: sectionDelegate.title
-                  color: root.foreground
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  visible: taskQueue.count === 0
+                  text: engine.activeRun
+                    ? "No tasks yet. Open the workspace to generate a task proposal."
+                    : "Create a run to begin a task backlog."
+                  color: root.mutedForeground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: sectionDelegate.index === root.selectedSection
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
                 }
 
-                MouseArea {
-                  anchors.fill: parent
-                  onClicked: {
-                    root.selectedSection = sectionDelegate.index
-                    root.selectedTaskIndex = 0
-                    root.focusArea = "sections"
+                delegate: Rectangle {
+                  id: queuedTask
+                  required property int index
+                  required property var modelData
+                  width: ListView.view.width
+                  height: queuedTaskContent.implicitHeight + Style.space(16)
+                  radius: Style.cornerRadius
+                  color: index === root.selectedTaskIndex
+                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b,
+                              root.focusArea === "tasks" ? 0.18 : 0.08)
+                    : "transparent"
+                  border.width: index === root.selectedTaskIndex
+                    && root.focusArea === "tasks" ? 1 : 0
+                  border.color: root.accent
+
+                  Column {
+                    id: queuedTaskContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
+
+                    Text {
+                      width: parent.width
+                      text: queuedTask.modelData.position + ". " + queuedTask.modelData.title
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: queuedTask.index === root.selectedTaskIndex
+                      wrapMode: Text.WordWrap
+                      maximumLineCount: 2
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      width: parent.width
+                      text: root.taskStateLabel(queuedTask.modelData)
+                      color: root.taskStateColor(queuedTask.modelData)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
                   }
-                  onDoubleClicked: {
-                    root.selectedSection = sectionDelegate.index
-                    root.selectedTaskIndex = 0
-                    root.focusArea = "content"
+
+                  MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                      root.selectedTaskIndex = queuedTask.index
+                      root.selectedSection = 1
+                      root.focusArea = "tasks"
+                    }
+                    onDoubleClicked: {
+                      root.selectedTaskIndex = queuedTask.index
+                      root.selectedSection = 1
+                      root.focusArea = "content"
+                    }
                   }
                 }
               }
@@ -1184,14 +1311,22 @@ Item {
 
             Column {
               id: contentPane
-              width: parent.width - sectionList.width - Style.space(19)
+              width: parent.width - taskRail.width - Style.space(19)
               height: parent.height
               spacing: Style.space(14)
 
               Text {
                 id: contentTitle
                 visible: !root.compactDraftLayout
-                text: sectionModel.get(root.selectedSection).title
+                text: {
+                  if (root.editingDraft) return "Start a run"
+                  if (!engine.activeRun) return "Task workspace"
+                  if (root.selectedSection === 2 && root.selectedTask())
+                    return root.selectedTask().title
+                  if (root.currentPlan() && root.selectedTask())
+                    return root.selectedTask().title
+                  return "Build the task backlog"
+                }
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -1202,7 +1337,15 @@ Item {
                 id: contentDescription
                 visible: !root.compactDraftLayout
                 width: parent.width
-                text: sectionModel.get(root.selectedSection).description
+                text: {
+                  if (root.selectedSection === 2)
+                    return "Final inspection and decisions for the selected task."
+                  if (root.currentPlan() && root.currentPlan().status === "approved")
+                    return "Status, activity, evidence, and next action stay with this task."
+                  if (root.currentPlan() && root.currentPlan().status === "proposed")
+                    return "Review and shape the proposed tasks before approval."
+                  return "Create a run and generate explicit tasks with acceptance criteria."
+                }
                 color: root.mutedForeground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1240,16 +1383,14 @@ Item {
                         if (engine.activeRun.run_status === "planning") return "Planner is inspecting the repository"
                         if (engine.activeRun.run_status === "failed") return "Planning failed"
                         if (!plan || plan.status === "rejected") return "Choose a planning agent"
-                        if (plan.status === "approved") return "Plan approved"
+                        if (plan.status === "approved")
+                          return root.taskStateLabel(root.selectedTask())
                         return "Plan revision " + plan.revision
                       }
                       if (root.selectedSection === 2) {
                         var proposal = root.latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
                         return proposal ? "Final result " + proposal.status : "Prepare final inspection"
                       }
-                      if (root.selectedSection === 3) return "Deterministic verification"
-                      if (root.selectedSection === 4) return "Independent review"
-                      if (root.selectedSection !== 0) return "Planned capability"
                       if (!engine.connected) return "Start the Rust engine to connect"
                       if (root.editingDraft) return "Create a durable draft run"
                       if (engine.activeRun) {
@@ -1272,7 +1413,7 @@ Item {
                   Text {
                     visible: root.selectedSection > 1
                     width: parent.width
-                    text: sectionModel.get(root.selectedSection).description
+                    text: "Changes, deterministic checks, independent review, and commit decisions belong to the selected task."
                     color: root.mutedForeground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -1774,8 +1915,8 @@ Item {
                       width: parent.width
                       visible: !root.latestImplementationAttempt()
                       text: engine.activeRun && engine.activeRun.plan
-                        ? "The plan is durable. Open the Plan section to inspect its tasks and decision state."
-                        : "This draft survives engine and shell restarts. Open the Plan section to choose Codex or Claude as the read-only planner."
+                        ? "The task backlog is durable. Select a task to inspect its state and next action."
+                        : "This draft survives engine and shell restarts. Choose Codex or Claude to propose explicit tasks."
                       color: root.mutedForeground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -2068,7 +2209,7 @@ Item {
                     Text {
                       visible: !engine.activeRun
                       width: parent.width
-                      text: "Create a durable draft in Overview before asking an agent to inspect the repository."
+                      text: "Create a durable run before asking an agent to inspect the repository."
                       color: root.mutedForeground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -2156,21 +2297,19 @@ Item {
                       }
 
                       ListView {
-                        id: planTaskList
+                        id: selectedTaskWorkspace
                         width: parent.width
                         height: {
                           var reserved = root.taskActionMode === ""
                             ? Style.space(115) : Style.space(205)
                           return Math.max(Style.space(90), Math.min(
-                            Style.space(270), contentBody.height
+                            Style.space(360), contentBody.height
                               - contentHeading.height - reserved))
                         }
                         clip: true
                         spacing: Style.space(6)
-                        model: root.currentPlan() && root.currentPlan().tasks
-                          ? root.currentPlan().tasks
-                          : []
-                        currentIndex: root.selectedTaskIndex
+                        model: root.selectedTask() ? [root.selectedTask()] : []
+                        currentIndex: 0
 
                         delegate: Rectangle {
                           id: taskDelegate
@@ -2179,10 +2318,8 @@ Item {
                           width: ListView.view.width
                           height: taskContent.implicitHeight + Style.space(16)
                           radius: Style.cornerRadius
-                          color: index === root.selectedTaskIndex
-                            ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14)
-                            : "transparent"
-                          border.width: index === root.selectedTaskIndex ? 1 : 0
+                          color: "transparent"
+                          border.width: 0
                           border.color: root.accent
 
                           Column {
@@ -2313,21 +2450,183 @@ Item {
                               font.pixelSize: Style.font.bodySmall
                               wrapMode: Text.WordWrap
                             }
+
+                            Column {
+                              visible: root.currentPlan()
+                                && root.currentPlan().status === "approved"
+                                && root.selectedImplementationAttempt() !== null
+                              width: parent.width
+                              spacing: Style.space(5)
+
+                              Text {
+                                width: parent.width
+                                text: "Activity"
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                font.bold: true
+                              }
+
+                              Text {
+                                visible: root.selectedImplementationActivity().length === 0
+                                width: parent.width
+                                text: root.selectedImplementationAttempt()
+                                  && root.selectedImplementationAttempt().status === "running"
+                                  ? "Waiting for the agent's first activity update…"
+                                  : "No activity output was recorded for this attempt."
+                                color: root.mutedForeground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.bodySmall
+                                wrapMode: Text.WordWrap
+                              }
+
+                              Repeater {
+                                model: root.selectedImplementationActivity()
+
+                                Rectangle {
+                                  required property var modelData
+                                  width: taskContent.width
+                                  height: selectedActivityText.implicitHeight + Style.space(10)
+                                  radius: Style.cornerRadius
+                                  color: Qt.rgba(root.foreground.r, root.foreground.g,
+                                    root.foreground.b, 0.05)
+
+                                  Text {
+                                    id: selectedActivityText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.margins: Style.space(5)
+                                    text: modelData.message || ""
+                                    color: modelData.kind === "diagnostic"
+                                      ? root.mutedForeground : root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    wrapMode: Text.WordWrap
+                                  }
+                                }
+                              }
+
+                              Flow {
+                                visible: root.selectedRunningImplementationAttempt()
+                                  && !root.confirmingImplementationCancel
+                                  && root.implementationInterventionMode === ""
+                                width: parent.width
+                                spacing: Style.space(8)
+
+                                Button {
+                                  text: root.selectedRunningImplementationAttempt()
+                                    && root.selectedRunningImplementationAttempt().paused
+                                    ? "Resume" : "Pause"
+                                  enabled: !controlEngine.requestPending
+                                  foreground: root.foreground
+                                  accent: root.accent
+                                  onClicked: root.toggleImplementationPause()
+                                }
+                                Button {
+                                  text: "Redirect"
+                                  enabled: !controlEngine.requestPending
+                                    && !continuationEngine.requestPending
+                                  foreground: root.foreground
+                                  accent: root.accent
+                                  onClicked: root.beginImplementationIntervention("redirect")
+                                }
+                                Button {
+                                  text: "Add context"
+                                  enabled: !controlEngine.requestPending
+                                    && !continuationEngine.requestPending
+                                  foreground: root.foreground
+                                  accent: root.accent
+                                  onClicked: root.beginImplementationIntervention("additional_context")
+                                }
+                                Button {
+                                  text: "Cancel"
+                                  enabled: !controlEngine.requestPending
+                                  foreground: root.foreground
+                                  accent: root.urgent
+                                  onClicked: root.beginImplementationCancel()
+                                }
+                              }
+                            }
+
+                            Rectangle {
+                              visible: root.currentPlan()
+                                && root.currentPlan().status === "approved"
+                              width: parent.width
+                              height: taskEvidence.implicitHeight + Style.space(16)
+                              radius: Style.cornerRadius
+                              color: Qt.rgba(root.foreground.r, root.foreground.g,
+                                root.foreground.b, 0.04)
+
+                              Column {
+                                id: taskEvidence
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.margins: Style.space(8)
+                                spacing: Style.space(5)
+                                property var taskCommit: root.latestTaskRecord(
+                                  engine.activeRun ? engine.activeRun.task_commits : [])
+                                property var verification: root.selectedVerification()
+                                property var review: root.selectedReview()
+
+                                Text {
+                                  width: parent.width
+                                  text: "Evidence"
+                                  color: root.foreground
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.bodySmall
+                                  font.bold: true
+                                }
+                                Text {
+                                  width: parent.width
+                                  text: "Changes  ·  " + (taskEvidence.taskCommit
+                                    ? taskEvidence.taskCommit.status + "  ·  "
+                                      + (taskEvidence.taskCommit.changed_files || []).length
+                                      + " files"
+                                    : "not prepared")
+                                  color: taskEvidence.taskCommit
+                                    ? root.accent : root.mutedForeground
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.bodySmall
+                                  wrapMode: Text.WordWrap
+                                }
+                                Text {
+                                  width: parent.width
+                                  text: "Verification  ·  " + (taskEvidence.verification
+                                    ? taskEvidence.verification.status + "  ·  "
+                                      + (taskEvidence.verification.commands || []).length
+                                      + " checks"
+                                    : "not run")
+                                  color: taskEvidence.verification
+                                    && taskEvidence.verification.status === "passed"
+                                    ? root.accent : root.mutedForeground
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.bodySmall
+                                  wrapMode: Text.WordWrap
+                                }
+                                Text {
+                                  width: parent.width
+                                  text: "Independent review  ·  " + (taskEvidence.review
+                                    ? taskEvidence.review.status + "  ·  "
+                                      + (taskEvidence.review.result
+                                        ? (taskEvidence.review.result.findings || []).length : 0)
+                                      + " findings"
+                                    : "not run")
+                                  color: taskEvidence.review
+                                    && taskEvidence.review.status === "approved"
+                                    ? root.accent : root.mutedForeground
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.bodySmall
+                                  wrapMode: Text.WordWrap
+                                }
+                              }
+                            }
                           }
 
                           MouseArea {
                             anchors.fill: parent
-                            onClicked: {
-                              root.selectedTaskIndex = taskDelegate.index
-                              root.focusArea = "content"
-                            }
-                            onDoubleClicked: {
-                              root.selectedTaskIndex = taskDelegate.index
-                              if (root.currentPlan() && root.currentPlan().status === "approved")
-                                root.beginSelectedTaskAction()
-                              else
-                                root.beginPlanTaskEdit()
-                            }
+                            enabled: false
                           }
                         }
                       }
@@ -2400,6 +2699,95 @@ Item {
                           foreground: root.foreground
                           accent: root.accent
                           onClicked: root.beginSelectedTaskAction()
+                        }
+                      }
+
+                      Column {
+                        visible: root.implementationInterventionMode !== ""
+                        width: parent.width
+                        spacing: Style.space(7)
+
+                        Text {
+                          width: parent.width
+                          text: root.implementationInterventionMode === "redirect"
+                            ? "Redirect this task. The current process will stop and a linked continuation will inspect its partial changes."
+                            : "Add context to this task. The current process will stop and a linked continuation will inspect its partial changes."
+                          color: root.mutedForeground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        TextField {
+                          id: selectedTaskInstructionField
+                          width: parent.width
+                          enabled: !continuationEngine.requestPending
+                          placeholderText: root.implementationInterventionMode === "redirect"
+                            ? "Describe the corrected approach" : "Provide the additional context"
+                          foreground: root.foreground
+                          accent: root.accent
+                          Keys.onPressed: function(event) {
+                            if (event.key === Qt.Key_Escape) {
+                              root.cancelImplementationIntervention(); event.accepted = true
+                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                              root.submitImplementationIntervention(); event.accepted = true
+                            }
+                          }
+                        }
+
+                        Row {
+                          spacing: Style.space(8)
+                          Button {
+                            text: "Submit"
+                            bordered: true
+                            enabled: !continuationEngine.requestPending
+                              && selectedTaskInstructionField.text.trim() !== ""
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.submitImplementationIntervention()
+                          }
+                          Button {
+                            text: "Keep current attempt"
+                            enabled: !continuationEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.cancelImplementationIntervention()
+                          }
+                        }
+                      }
+
+                      Column {
+                        visible: root.confirmingImplementationCancel
+                          && root.selectedRunningImplementationAttempt()
+                        width: parent.width
+                        spacing: Style.space(7)
+
+                        Text {
+                          width: parent.width
+                          text: "Stop the implementation for this task? Partial changes remain in its worktree for inspection or retry."
+                          color: root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          wrapMode: Text.WordWrap
+                        }
+
+                        Row {
+                          spacing: Style.space(8)
+                          Button {
+                            text: controlEngine.requestPending ? "Cancelling…" : "Confirm cancel"
+                            bordered: true
+                            enabled: !controlEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.urgent
+                            onClicked: root.confirmImplementationCancel()
+                          }
+                          Button {
+                            text: "Keep running"
+                            enabled: !controlEngine.requestPending
+                            foreground: root.foreground
+                            accent: root.accent
+                            onClicked: root.confirmingImplementationCancel = false
+                          }
                         }
                       }
 
@@ -2718,6 +3106,48 @@ Item {
                           wrapMode: Text.WordWrap
                         }
 
+                        Text {
+                          visible: changesSection.verification !== null
+                          width: parent.width
+                          text: "Deterministic verification"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                        }
+
+                        Repeater {
+                          model: changesSection.verification
+                            ? changesSection.verification.commands || [] : []
+                          Text {
+                            required property var modelData
+                            width: changesDocument.width
+                            text: modelData.label + " — " + modelData.status
+                              + (modelData.exit_code === null
+                                ? "" : " (exit " + modelData.exit_code + ")")
+                            color: modelData.status === "passed"
+                              ? root.accent : root.urgent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.bodySmall
+                            wrapMode: Text.WordWrap
+                          }
+                        }
+
+                        Text {
+                          visible: changesSection.review !== null
+                          width: parent.width
+                          text: changesSection.review
+                            ? "Independent review · " + changesSection.review.reviewer
+                              + " · " + changesSection.review.status : ""
+                          color: changesSection.review
+                            && changesSection.review.status === "approved"
+                            ? root.accent : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.bodySmall
+                          font.bold: true
+                          wrapMode: Text.WordWrap
+                        }
+
                         Repeater {
                           model: changesSection.review && changesSection.review.result
                             ? changesSection.review.result.findings || [] : []
@@ -3024,90 +3454,6 @@ Item {
                     }
                   }
 
-                  Column {
-                    visible: root.selectedSection === 3
-                    width: parent.width
-                    spacing: Style.space(10)
-                    property var verification: root.latestTaskRecord(engine.activeRun ? engine.activeRun.verification_attempts : [])
-
-                    Button {
-                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Preparing…" : "Prepare selected task"
-                      bordered: true
-                      enabled: root.finishContext() !== null && !engine.requestPending
-                      foreground: root.foreground
-                      accent: root.accent
-                      onClicked: root.finishSelectedTask()
-                    }
-                    Text {
-                      width: parent.width
-                      text: parent.verification ? "Latest verification: " + parent.verification.status : "No verification recorded for this task"
-                      color: parent.verification && parent.verification.status === "passed" ? root.accent : root.mutedForeground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      wrapMode: Text.WordWrap
-                    }
-                    Repeater {
-                      model: parent.verification ? parent.verification.commands : []
-                      Text {
-                        required property var modelData
-                        width: parent.width
-                        text: modelData.label + " — " + modelData.status
-                          + (modelData.exit_code === null ? "" : " (exit " + modelData.exit_code + ")")
-                        color: modelData.status === "passed" ? root.accent : root.urgent
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        wrapMode: Text.WordWrap
-                      }
-                    }
-                  }
-
-                  Column {
-                    visible: root.selectedSection === 4
-                    width: parent.width
-                    spacing: Style.space(10)
-                    property var review: root.latestTaskRecord(engine.activeRun ? engine.activeRun.review_attempts : [])
-                    property var taskCommit: root.latestTaskRecord(engine.activeRun ? engine.activeRun.task_commits : [])
-
-                    Button {
-                      text: engine.requestPending && engine.pendingMethod === "finish_task" ? "Reviewing…" : "Prepare selected task"
-                      bordered: true
-                      enabled: root.finishContext() !== null && !engine.requestPending
-                      foreground: root.foreground
-                      accent: root.accent
-                      onClicked: root.finishSelectedTask()
-                    }
-                    Text {
-                      width: parent.width
-                      text: parent.review ? "Reviewer: " + parent.review.reviewer + " · "
-                        + parent.review.independence + " · " + parent.review.status
-                        : "No independent review recorded for this task"
-                      color: parent.review && parent.review.status === "approved" ? root.accent : root.mutedForeground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      wrapMode: Text.WordWrap
-                    }
-                    Repeater {
-                      model: parent.review && parent.review.result ? parent.review.result.findings : []
-                      Text {
-                        required property var modelData
-                        width: parent.width
-                        text: modelData.severity + ": " + modelData.summary + " — " + modelData.evidence
-                        color: root.urgent
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.bodySmall
-                        wrapMode: Text.WordWrap
-                      }
-                    }
-                    Text {
-                      width: parent.width
-                      visible: parent.taskCommit !== null
-                      text: parent.taskCommit ? "Local commit: " + parent.taskCommit.status
-                        + (parent.taskCommit.commit_hash ? " · " + parent.taskCommit.commit_hash.slice(0, 12) : "") : ""
-                      color: parent.taskCommit && parent.taskCommit.status === "created" ? root.accent : root.urgent
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                    }
-                  }
                 }
               }
             }
