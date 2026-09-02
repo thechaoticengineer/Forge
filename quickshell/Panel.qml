@@ -41,6 +41,8 @@ Item {
   readonly property bool compactDraftLayout: root.editingDraft
     && root.panelDesignHeight < 620
   readonly property bool compactWidthLayout: root.panelDesignWidth < 800
+  readonly property bool compactTaskRailLayout: root.compactWidthLayout
+    || root.panelDesignHeight < 560
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id
@@ -208,7 +210,7 @@ Item {
 
   function beginDraftEntry() {
     if (!engine.connected || engine.requestPending
-        || (engine.activeRun && engine.activeRun.run_status === "running")) return
+        || root.projectChangeBlocked()) return
     selectedSection = 0
     focusArea = "content"
     editingDraft = true
@@ -482,26 +484,57 @@ Item {
   function taskStateLabel(task) {
     var plan = currentPlan()
     if (!task || !plan) return "Unavailable"
-    if (plan.status === "proposed") return "Proposed"
+    if (plan.status === "proposed") return "Planned"
+    var worktree = latestWorktreeForTask(task.id)
+    var attempt = latestImplementationForTask(task.id)
+    if ((worktree && worktree.status === "failed")
+        || (attempt && attempt.status === "failed")) return "Failed"
     var code = taskActionCode(task)
     if (code === "running") {
-      var attempt = latestImplementationForTask(task.id)
       return attempt && attempt.paused ? "Paused" : "Active"
     }
     if (code === "dependencies_blocked" || code === "worktree_unavailable")
       return "Blocked"
     if (code === "complete") return "Done"
     if (code === "rejected") return "Rejected"
-    if (["create_worktree", "choose_agent", "retry_implementation", "finish",
-         "inspect"].indexOf(code) !== -1) return "Needs attention"
+    if (["create_worktree", "choose_agent", "retry_implementation"].indexOf(code) !== -1)
+      return "Ready to run"
+    if (["finish", "inspect"].indexOf(code) !== -1) return "Needs attention"
     return "Waiting"
   }
 
   function taskStateColor(task) {
     var state = taskStateLabel(task)
-    if (state === "Active" || state === "Done") return accent
-    if (state === "Needs attention" || state === "Blocked"
+    if (["Planned", "Ready to run", "Active", "Done"].indexOf(state) !== -1)
+      return accent
+    if (state === "Needs attention" || state === "Blocked" || state === "Failed"
         || state === "Rejected") return urgent
+    return mutedForeground
+  }
+
+  function projectChangeBlocked() {
+    return !!engine.activeRun
+      && ["planning", "running"].indexOf(engine.activeRun.run_status) !== -1
+  }
+
+  function workflowStageLabel() {
+    if (!engine.activeRun) return "Choose project"
+    if (engine.activeRun.run_status === "planning") return "Planning"
+    if (engine.activeRun.run_status === "running") return "Running"
+    var plan = currentPlan()
+    if (!plan || plan.status === "rejected") return "To plan"
+    if (plan.status === "proposed") return "Planned"
+    if (plan.status === "approved")
+      return selectedTask() ? taskStateLabel(selectedTask()) : "Ready to run"
+    return "To plan"
+  }
+
+  function workflowStageColor() {
+    var stage = workflowStageLabel()
+    if (["Planning", "Planned", "Ready to run", "Running", "Active", "Done"].indexOf(stage) !== -1)
+      return accent
+    if (["Blocked", "Rejected", "Failed", "Needs attention"].indexOf(stage) !== -1)
+      return urgent
     return mutedForeground
   }
 
@@ -880,7 +913,7 @@ Item {
       return "h/l or ←/→  Source    j/k or ↑/↓  Repository    Enter  Open or clone    /  Search    p  Path    Esc  Cancel"
     if (editingDraft && draftStep === "path")
       return "Tab  Complete path    Enter  Continue    Esc  Repository browser"
-    if (editingDraft) return "Enter  Create draft    Shift+Tab  Repositories    Esc  Cancel"
+    if (editingDraft) return "Enter  Save task    Shift+Tab  Projects    Esc  Cancel"
     if (editingPlanTask) return "Tab  Next field    Enter  Continue or save    Esc  Cancel"
     if (rejectingPlan) return "Enter  Reject plan    Esc  Cancel"
     if (confirmingImplementationCancel)
@@ -912,7 +945,7 @@ Item {
     if (selectedSection === 0 && engine.activeRun)
       return "h/←  Task queue    Enter/n  New draft    r  Reconnect    Esc  Close"
     if (selectedSection === 0)
-      return "h/←  Task queue    Enter  Create draft    r  Reconnect    Esc  Close"
+      return "h/←  Task queue    Enter  Choose project    r  Reconnect    Esc  Close"
     return "h/←  Task queue    r  Reconnect    Esc  Close"
   }
 
@@ -1190,14 +1223,111 @@ Item {
                 ? Math.min(Style.space(150), parent.width * 0.26)
                 : Math.min(Style.space(220), parent.width * 0.32)
               height: parent.height
+              clip: true
               spacing: Style.space(8)
 
+              Column {
+                id: projectChooser
+                width: parent.width
+                spacing: Style.space(5)
+
+                Text {
+                  visible: !root.compactTaskRailLayout
+                  text: "PROJECT"
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Text {
+                  visible: !root.compactTaskRailLayout
+                  width: parent.width
+                  text: engine.activeRun
+                    ? engine.activeRun.repository
+                    : "No project selected"
+                  color: engine.activeRun ? root.foreground : root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: !!engine.activeRun
+                  elide: Text.ElideMiddle
+                }
+
+                Button {
+                  width: parent.width
+                  text: root.compactTaskRailLayout
+                    ? (engine.activeRun ? "Project" : "Choose")
+                    : (engine.activeRun ? "Change project" : "Choose project")
+                  tooltipText: engine.activeRun ? engine.activeRun.repository : "Choose project"
+                  bordered: true
+                  fontSize: root.compactTaskRailLayout
+                    ? Style.font.bodySmall : Style.font.body
+                  verticalPadding: root.compactTaskRailLayout
+                    ? Style.space(2) : Style.spacing.controlPaddingY
+                  enabled: engine.connected && !engine.requestPending
+                    && !root.editingDraft
+                    && !root.projectChangeBlocked()
+                  foreground: root.foreground
+                  accent: root.accent
+                  onClicked: root.beginDraftEntry()
+                }
+
+                Text {
+                  visible: root.projectChangeBlocked() && !root.compactTaskRailLayout
+                  width: parent.width
+                  text: "Finish or stop active work before changing projects."
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Column {
+                id: taskBrief
+                width: parent.width
+                spacing: Style.space(4)
+
+                Text {
+                  visible: !root.compactTaskRailLayout
+                  text: "TASK"
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Text {
+                  width: parent.width
+                  text: engine.activeRun
+                    ? engine.activeRun.goal
+                    : "Choose a project, then describe the task."
+                  color: engine.activeRun ? root.foreground : root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                  maximumLineCount: root.compactTaskRailLayout ? 1 : 2
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: "STAGE  ·  " + root.workflowStageLabel()
+                  color: root.workflowStageColor()
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+              }
+
               Row {
+                id: taskRailHeading
+                visible: !root.compactTaskRailLayout
                 width: parent.width
 
                 Text {
                   width: parent.width - taskCountText.width
-                  text: "TASKS"
+                  text: "PLAN TASKS"
                   color: root.mutedForeground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -1219,7 +1349,11 @@ Item {
               ListView {
                 id: taskQueue
                 width: parent.width
-                height: parent.height - parent.spacing - Style.space(22)
+                height: Math.max(Style.space(48), parent.height - projectChooser.height
+                  - (taskBrief.visible ? taskBrief.height : 0)
+                  - (taskRailHeading.visible ? taskRailHeading.height : 0)
+                  - parent.spacing * (1 + (taskBrief.visible ? 1 : 0)
+                    + (taskRailHeading.visible ? 1 : 0)))
                 model: root.currentPlan() && root.currentPlan().tasks
                   ? root.currentPlan().tasks : []
                 interactive: contentHeight > height
@@ -1319,7 +1453,11 @@ Item {
                 id: contentTitle
                 visible: !root.compactDraftLayout
                 text: {
-                  if (root.editingDraft) return "Start a run"
+                  if (root.editingDraft) {
+                    if (root.draftStep === "repository") return "Choose a project"
+                    if (root.draftStep === "path") return "Enter a project path"
+                    return "Describe the task"
+                  }
                   if (!engine.activeRun) return "Task workspace"
                   if (root.selectedSection === 2 && root.selectedTask())
                     return root.selectedTask().title
@@ -1344,7 +1482,7 @@ Item {
                     return "Status, activity, evidence, and next action stay with this task."
                   if (root.currentPlan() && root.currentPlan().status === "proposed")
                     return "Review and shape the proposed tasks before approval."
-                  return "Create a run and generate explicit tasks with acceptance criteria."
+                  return "Choose a project, describe the task, then plan it into work that is ready to run."
                 }
                 color: root.mutedForeground
                 font.family: root.fontFamily
@@ -1379,10 +1517,10 @@ Item {
                     text: {
                       if (root.selectedSection === 1) {
                         var plan = root.currentPlan()
-                        if (!engine.activeRun) return "Create a draft first"
+                        if (!engine.activeRun) return "Choose a project first"
                         if (engine.activeRun.run_status === "planning") return "Planner is inspecting the repository"
                         if (engine.activeRun.run_status === "failed") return "Planning failed"
-                        if (!plan || plan.status === "rejected") return "Choose a planning agent"
+                        if (!plan || plan.status === "rejected") return "To plan"
                         if (plan.status === "approved")
                           return root.taskStateLabel(root.selectedTask())
                         return "Plan revision " + plan.revision
@@ -1392,7 +1530,7 @@ Item {
                         return proposal ? "Final result " + proposal.status : "Prepare final inspection"
                       }
                       if (!engine.connected) return "Start the Rust engine to connect"
-                      if (root.editingDraft) return "Create a durable draft run"
+                      if (root.editingDraft) return "Create a task for this project"
                       if (engine.activeRun) {
                         var implementation = root.latestImplementationAttempt()
                         if (implementation && implementation.status === "running")
@@ -1437,7 +1575,7 @@ Item {
 
                     Text {
                       width: parent.width
-                      text: "Open a local Git repository and preserve an engineering goal. The engine will record its canonical path, current revision, branch, and working-tree condition without modifying it."
+                      text: "Choose a local Git project, then describe the task you want to plan. The engine records the repository without modifying it."
                       color: root.mutedForeground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -1445,7 +1583,7 @@ Item {
                     }
 
                     Button {
-                      text: "Create draft"
+                      text: "Choose project"
                       bordered: true
                       foreground: root.foreground
                       accent: root.accent
@@ -1465,7 +1603,9 @@ Item {
 
                     Text {
                       id: draftStepTitle
-                      text: root.draftStep === "goal" ? "Engineering goal" : "Choose a repository"
+                      text: root.draftStep === "goal"
+                        ? "Task to plan"
+                        : (root.draftStep === "path" ? "Project path" : "Choose a project")
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -1825,7 +1965,7 @@ Item {
                         id: goalField
                         width: parent.width
                         enabled: !engine.requestPending
-                        placeholderText: "Describe a small engineering goal"
+                        placeholderText: "Describe the task to plan"
                         foreground: root.foreground
                         accent: root.accent
 
@@ -1844,7 +1984,7 @@ Item {
                         spacing: Style.space(8)
 
                         Button {
-                          text: engine.requestPending ? "Creating…" : "Create draft"
+                          text: engine.requestPending ? "Saving…" : "Save task"
                           bordered: true
                           enabled: !engine.requestPending
                           foreground: root.foreground
