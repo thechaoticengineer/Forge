@@ -2,7 +2,7 @@
 
 > **Working title:** “Omarchy AI Build Orchestrator” is descriptive and temporary. A final product name has not been chosen.
 >
-> **Project status:** The first vertical workflow is implemented. The Omarchy panel can create an approved task's isolated worktree, launch a user-selected Codex or Claude implementer, show durable activity, and carry the task through deterministic checks, independent review, correction, and exact final-tree inspection. The CLI and panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. A second confirmed action can fast-forward a checked-out clean local branch to that commit, and the CLI can install the engine as a managed user service. Configurable project verification, semantic multi-commit splitting, divergent merges, push, and deployment remain planned.
+> **Project status:** The first vertical workflow is implemented. The Omarchy panel can create an approved task's isolated worktree, launch a user-selected Codex or Claude implementer, show durable activity, and carry the task through deterministic checks, independent review, correction, and exact final-tree inspection. The CLI and panel show the complete patch, changed files, gate evidence, and proposed one-task Conventional Commit before a separate keyboard-accessible approval or rejection. Approval refuses a worktree that changed after inspection and creates only a local isolated-worktree commit. A second confirmed action can fast-forward a checked-out clean local branch to that commit, and the CLI can install the engine as a managed user service. A project can declare its own deterministic checks and policy in a committed `.orchestrator/verification.json`. Semantic multi-commit splitting, divergent merges, push, and deployment remain planned.
 >
 > **Implementation progress:** See [ROADMAP.md](ROADMAP.md) for the ordered delivery plan and first-milestone checklist.
 
@@ -186,6 +186,32 @@ The intended end-to-end workflow is:
 14. The user approves or rejects the result.
 
 Compilation, tests, formatting, linters, analyzers, and Git commands are deterministic operations. The engine should record the exact invocation, working directory, relevant environment, output, duration, and exit code. It should not ask an AI agent to guess whether a command succeeded when the operating system already provides an authoritative result.
+
+### Project verification policy
+
+A project defines which deterministic checks decide whether a task passes. The engine reads them from `.orchestrator/verification.json` in the repository root:
+
+```json
+{
+  "schemaVersion": 1,
+  "commands": [
+    {
+      "label": "Rust tests",
+      "program": "cargo",
+      "arguments": ["test", "--workspace"],
+      "workingDirectory": ".",
+      "timeoutSeconds": 900,
+      "required": true
+    }
+  ]
+}
+```
+
+`label` names the evidence and must be unique. `program` and `arguments` run directly without a shell. `workingDirectory` defaults to the repository root and must stay inside the worktree. `timeoutSeconds` defaults to 900 and is capped at 3600. `required` defaults to true; an advisory check declared `required: false` still runs and is still shown, but its failure does not fail the task. At least one check must be required, so a policy can never be entirely advisory.
+
+The engine reads this file as it was **committed at the task's base revision**, not as it exists in the task worktree. An implementing agent may propose a change to the policy, and a human reviews that change like any other, but an agent cannot widen or weaken the gates that judge its own work in the same run.
+
+A repository without this file keeps the previous behavior: the engine detects `Cargo.toml` and `manifest.json` and runs the corresponding Cargo and Omarchy commands. A repository whose committed policy cannot be used is an explicit infrastructure error naming the field and the reason — never a silent fall back to detection. See [ADR-0017](docs/adr/0017-read-project-verification-policy-from-the-task-base-revision.md).
 
 ## UI and Keyboard Interaction
 
@@ -462,7 +488,7 @@ After the first workflow is dependable, later capabilities may include:
 - agent availability, usage, and limit awareness;
 - pull-request creation and monitoring;
 - security, dependency, permission, and prompt-injection checks;
-- configurable project policies and quality gates;
+- campaign-level policies and quality gates layered over project verification;
 - automated decisions for explicitly defined low-risk review findings;
 - richer project history and learning from previous runs;
 - additional Omarchy widgets, panels, and notification actions;

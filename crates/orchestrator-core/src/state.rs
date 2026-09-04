@@ -79,11 +79,19 @@ pub struct VerificationCommandResult {
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: String,
+    /// Whether a failure of this command fails the whole verification attempt.
+    /// Older attempts recorded before advisory checks existed load as required.
+    #[serde(default = "required_check")]
+    pub required: bool,
     pub status: VerificationStatus,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
+}
+
+const fn required_check() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

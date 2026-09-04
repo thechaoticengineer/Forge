@@ -3262,11 +3262,15 @@ Item {
                           Text {
                             required property var modelData
                             width: changesDocument.width
-                            text: modelData.label + " — " + modelData.status
+                            text: modelData.label
+                              + (modelData.required === false ? " (advisory)" : "")
+                              + " — " + modelData.status
                               + (modelData.exit_code === null
                                 ? "" : " (exit " + modelData.exit_code + ")")
                             color: modelData.status === "passed"
-                              ? root.accent : root.urgent
+                              ? root.accent
+                              : (modelData.required === false
+                                ? root.mutedForeground : root.urgent)
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.bodySmall
                             wrapMode: Text.WordWrap

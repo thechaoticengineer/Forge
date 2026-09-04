@@ -55,3 +55,4 @@ Keep ADRs concise enough to review, but include enough reasoning that a future c
 | [ADR-0014](0014-manage-the-engine-as-a-systemd-user-service.md) | Accepted | Install and run the engine as a managed systemd user service |
 | [ADR-0015](0015-center-the-panel-on-tasks.md) | Accepted | Make the task queue and selected task workspace the panel's primary interaction model |
 | [ADR-0016](0016-simplify-the-single-task-workflow.md) | Proposed | Remove linked worktrees from the initial single-task path and automate routine stages after implementer selection |
+| [ADR-0017](0017-read-project-verification-policy-from-the-task-base-revision.md) | Accepted | Read project-defined verification commands and policy from the task's committed base revision |

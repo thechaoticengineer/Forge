@@ -380,6 +380,7 @@ dependencies = [
  "orchestrator-core",
  "orchestrator-git",
  "orchestrator-store",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

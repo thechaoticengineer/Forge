@@ -49,6 +49,7 @@ pub struct RepositoryDiscovery {
 const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_DISCOVERY_DIRECTORIES: usize = 4_000;
 const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COMMITTED_FILE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskChangeSet {
@@ -378,6 +379,73 @@ pub fn review_change_evidence(worktree: &Path, base_revision: &str) -> Result<St
     Ok(evidence)
 }
 
+/// Reads one repository-relative file exactly as it was committed at
+/// `base_revision`, ignoring uncommitted worktree edits.
+///
+/// Verification policy is read this way so that an implementing agent cannot
+/// widen or weaken its own quality gates from inside the task worktree.
+/// Returns `Ok(None)` when the revision does not contain the path.
+///
+/// # Errors
+///
+/// Returns an error when the revision or path is unusable, when Git fails, or
+/// when the committed file is larger than 64 KiB.
+pub fn committed_file(
+    worktree: &Path,
+    base_revision: &str,
+    relative_path: &str,
+) -> Result<Option<String>, GitError> {
+    validate_revision(worktree, base_revision)?;
+    validate_committed_path(relative_path)?;
+    let repository = inspect_repository(worktree)?;
+    let located = run_git(
+        &repository.root,
+        &[
+            "rev-parse".to_owned(),
+            "--verify".to_owned(),
+            "--quiet".to_owned(),
+            format!("{base_revision}:{relative_path}"),
+        ],
+        "locating a committed file",
+    )?;
+    if !located.status.success() {
+        return Ok(None);
+    }
+    let object = text_output(located, "locating a committed file")?;
+    let contents = checked_git(
+        &repository.root,
+        &["cat-file", "blob", &object],
+        "reading a committed file",
+    )?;
+    if contents.stdout.len() > MAX_COMMITTED_FILE_BYTES {
+        return Err(GitError::CommittedFileTooLarge {
+            path: relative_path.to_owned(),
+            limit: MAX_COMMITTED_FILE_BYTES,
+        });
+    }
+    String::from_utf8(contents.stdout)
+        .map(Some)
+        .map_err(|source| GitError::NonUtf8 {
+            operation: "reading a committed file",
+            source,
+        })
+}
+
+fn validate_committed_path(relative_path: &str) -> Result<(), GitError> {
+    let usable = !relative_path.is_empty()
+        && !relative_path.starts_with('/')
+        && !relative_path.starts_with('-')
+        && !relative_path.contains('\0')
+        && relative_path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if usable {
+        Ok(())
+    } else {
+        Err(GitError::InvalidCommittedPath(relative_path.to_owned()))
+    }
+}
+
 fn floor_char_boundary(value: &str, maximum: usize) -> usize {
     let mut boundary = maximum.min(value.len());
     while !value.is_char_boundary(boundary) {
@@ -589,6 +657,10 @@ pub enum GitError {
     MissingHead(PathBuf),
     #[error("cannot create a temporary Git index: {0}")]
     TemporaryIndex(std::io::Error),
+    #[error("repository-relative path is not usable: {0}")]
+    InvalidCommittedPath(String),
+    #[error("committed file {path} is larger than {limit} bytes")]
+    CommittedFileTooLarge { path: String, limit: usize },
     #[error("task worktree changed after inspection (expected tree {expected}, found {actual})")]
     WorktreeChanged { expected: String, actual: String },
     #[error("invalid local integration branch: {0}")]
@@ -1738,6 +1810,32 @@ mod tests {
 
         assert!(report.truncated);
         assert!(report.repositories.is_empty());
+    }
+
+    #[test]
+    fn reads_committed_files_and_ignores_worktree_edits() {
+        let repository = initialized_repository();
+        let head = inspect_repository(repository.path())
+            .expect("repository should inspect")
+            .head_revision;
+
+        fs::write(repository.path().join("README.md"), "uncommitted")
+            .expect("worktree edit should be written");
+
+        assert_eq!(
+            committed_file(repository.path(), &head, "README.md")
+                .expect("committed file should be readable"),
+            Some("test".to_owned())
+        );
+        assert_eq!(
+            committed_file(repository.path(), &head, "missing.json")
+                .expect("absent file should not be an error"),
+            None
+        );
+        assert!(matches!(
+            committed_file(repository.path(), &head, "../escape.json"),
+            Err(GitError::InvalidCommittedPath(_))
+        ));
     }
 
     fn initialized_repository() -> TempDir {

@@ -55,6 +55,10 @@ use tokio::{
     time::timeout,
 };
 
+mod verification;
+
+use verification::{VerificationSource, resolve_verification_commands};
+
 const GITHUB_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_CLONE_TIMEOUT: Duration = Duration::from_mins(15);
 const LOCAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2389,51 +2393,6 @@ async fn persist_implementation_activity(
     Ok(())
 }
 
-#[derive(Clone)]
-struct VerificationCommand {
-    label: &'static str,
-    program: &'static str,
-    arguments: &'static [&'static str],
-}
-
-fn detected_verification_commands(worktree: &Path) -> Vec<VerificationCommand> {
-    let mut commands = Vec::new();
-    if worktree.join("Cargo.toml").is_file() {
-        commands.extend([
-            VerificationCommand {
-                label: "Rust format",
-                program: "cargo",
-                arguments: &["fmt", "--all", "--", "--check"],
-            },
-            VerificationCommand {
-                label: "Rust tests",
-                program: "cargo",
-                arguments: &["test", "--workspace"],
-            },
-            VerificationCommand {
-                label: "Rust lint",
-                program: "cargo",
-                arguments: &[
-                    "clippy",
-                    "--workspace",
-                    "--all-targets",
-                    "--",
-                    "-D",
-                    "warnings",
-                ],
-            },
-        ]);
-    }
-    if worktree.join("manifest.json").is_file() {
-        commands.push(VerificationCommand {
-            label: "Omarchy plugin",
-            program: "omarchy",
-            arguments: &["plugin", "validate", "."],
-        });
-    }
-    commands
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn verify_implementation(
     run_id: &str,
@@ -2442,6 +2401,7 @@ async fn verify_implementation(
     worktree_id: &str,
     implementation_attempt_id: &str,
     worktree: &Path,
+    base_revision: &str,
     storage: &StorageWorker,
     state_sender: &watch::Sender<EngineSnapshot>,
 ) -> Result<(String, VerificationStatus, String, StoredSnapshot), RequestFailure> {
@@ -2458,63 +2418,69 @@ async fn verify_implementation(
         code: "clock_error",
         message: "system time is outside the supported range".to_owned(),
     })?;
-    let commands = detected_verification_commands(worktree);
     let mut results = Vec::new();
     let mut infrastructure_error = None;
-    if commands.is_empty() {
-        infrastructure_error =
-            Some("no supported deterministic verification commands were detected".to_owned());
-    }
+    let mut source = VerificationSource::Detected;
+    let commands = match resolve_verification_commands(worktree, base_revision) {
+        Ok((commands, resolved)) => {
+            source = resolved;
+            if commands.is_empty() {
+                infrastructure_error = Some(format!(
+                    "no deterministic checks are available: the project has no {} and no {}",
+                    VerificationSource::Project.describe(),
+                    VerificationSource::Detected.describe()
+                ));
+            }
+            commands
+        }
+        Err(error) => {
+            infrastructure_error = Some(error);
+            Vec::new()
+        }
+    };
     for specification in commands {
         let began = Instant::now();
-        let mut command = AsyncCommand::new(specification.program);
+        let working_directory = worktree.join(&specification.working_directory);
+        let mut command = AsyncCommand::new(&specification.program);
         command
-            .args(specification.arguments)
-            .current_dir(worktree)
+            .args(&specification.arguments)
+            .current_dir(&working_directory)
             .env("LC_ALL", "C");
-        match run_bounded_command(command, Duration::from_mins(15), 64 * 1024, 64 * 1024).await {
+        let outcome =
+            run_bounded_command(command, specification.timeout, 64 * 1024, 64 * 1024).await;
+        let mut result = VerificationCommandResult {
+            label: specification.label.clone(),
+            program: specification.program.clone(),
+            arguments: specification.arguments.clone(),
+            working_directory: working_directory.to_string_lossy().into_owned(),
+            required: specification.required,
+            status: VerificationStatus::Running,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        match outcome {
             Ok(output) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 if output.stdout_truncated {
                     stdout.push_str("\n[output truncated]");
                 }
-                results.push(VerificationCommandResult {
-                    label: specification.label.to_owned(),
-                    program: specification.program.to_owned(),
-                    arguments: specification
-                        .arguments
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
-                    working_directory: worktree.to_string_lossy().into_owned(),
-                    status: if output.status.success() {
-                        VerificationStatus::Passed
-                    } else {
-                        VerificationStatus::Failed
-                    },
-                    exit_code: output.status.code(),
-                    stdout,
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    duration_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
-                });
+                result.status = if output.status.success() {
+                    VerificationStatus::Passed
+                } else {
+                    VerificationStatus::Failed
+                };
+                result.exit_code = output.status.code();
+                result.stdout = stdout;
+                result.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                results.push(result);
             }
             Err(error) => {
                 infrastructure_error = Some(format!("{}: {error}", specification.label));
-                results.push(VerificationCommandResult {
-                    label: specification.label.to_owned(),
-                    program: specification.program.to_owned(),
-                    arguments: specification
-                        .arguments
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
-                    working_directory: worktree.to_string_lossy().into_owned(),
-                    status: VerificationStatus::InfrastructureError,
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: error,
-                    duration_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
-                });
+                result.status = VerificationStatus::InfrastructureError;
+                result.stderr = error;
+                results.push(result);
                 break;
             }
         }
@@ -2523,7 +2489,7 @@ async fn verify_implementation(
         VerificationStatus::InfrastructureError
     } else if results
         .iter()
-        .all(|result| result.status == VerificationStatus::Passed)
+        .all(|result| result.status == VerificationStatus::Passed || !result.required)
     {
         VerificationStatus::Passed
     } else {
@@ -2533,8 +2499,9 @@ async fn verify_implementation(
         .iter()
         .map(|result| {
             format!(
-                "{}: {} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+                "{}{}: {} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
                 result.label,
+                if result.required { "" } else { " (advisory)" },
                 result.status.as_str(),
                 result.exit_code,
                 result.stdout,
@@ -2543,6 +2510,11 @@ async fn verify_implementation(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
+    let evidence = if evidence.is_empty() {
+        evidence
+    } else {
+        format!("Checks from the {}:\n\n{evidence}", source.describe())
+    };
     let recorded = storage
         .record_verification_attempt(VerificationAttemptInput {
             run_id: run_id.to_owned(),
@@ -2633,10 +2605,17 @@ async fn finish_task(
             &worktree_id,
             &implementation_attempt_id,
             &worktree,
+            &initial.worktree.base_revision,
             storage,
             state_sender,
         )
         .await?;
+        if verification_status == VerificationStatus::InfrastructureError {
+            // An unusable policy or an unavailable tool is not something the
+            // implementing agent can correct, and asking it to try invites it
+            // to weaken the gates instead. Stop for the user.
+            return Ok(snapshot);
+        }
         let mut correction_reason = if verification_status == VerificationStatus::Passed {
             None
         } else {
@@ -3661,19 +3640,6 @@ fn remove_owned_socket(socket_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_fixed_rust_and_omarchy_verification_commands() {
-        let directory = TempDir::new().expect("temporary directory should exist");
-        fs::write(directory.path().join("Cargo.toml"), "[workspace]\n")
-            .expect("Cargo marker should be written");
-        fs::write(directory.path().join("manifest.json"), "{}")
-            .expect("plugin marker should be written");
-        let commands = detected_verification_commands(directory.path());
-        assert_eq!(commands.len(), 4);
-        assert_eq!(commands[0].arguments, &["fmt", "--all", "--", "--check"]);
-        assert_eq!(commands[3].arguments, &["plugin", "validate", "."]);
-    }
 
     #[test]
     fn creates_bounded_conventional_task_messages() {
