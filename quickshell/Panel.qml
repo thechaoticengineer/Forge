@@ -442,7 +442,7 @@ Item {
 
     var attempt = latestImplementationForTask(task.id)
     if (attempt && attempt.status === "running") return "running"
-    if ((task.depends_on || []).length > 0) return "dependencies_blocked"
+    if (pendingPrerequisites(task).length > 0) return "dependencies_blocked"
 
     var readyWorktree = readyWorktreeForTask(task.id)
     if (attempt && attempt.status === "completed" && readyWorktree
@@ -472,7 +472,8 @@ Item {
     if (code === "running") return "Implementation running"
     if (code === "busy") return "Waiting for the active implementation"
     if (code === "dependencies_blocked")
-      return "Blocked until prerequisite task results can be composed"
+      return "Waiting for task " + pendingPrerequisites(task).join(", ")
+        + " to be integrated"
     if (code === "finish") return "Ready for verification and review"
     if (code === "inspect") return "Ready for final inspection"
     if (code === "complete") return "Local task commit created"
@@ -567,6 +568,46 @@ Item {
   function selectedReview() {
     return latestTaskRecord(
       engine.activeRun ? engine.activeRun.review_attempts : [])
+  }
+
+  function taskByPosition(position) {
+    var plan = currentPlan()
+    if (!plan) return null
+    var tasks = plan.tasks || []
+    for (var index = 0; index < tasks.length; index++)
+      if (tasks[index].position === position) return tasks[index]
+    return null
+  }
+
+  function taskIsIntegrated(taskId) {
+    if (!taskId || !engine.activeRun) return false
+    var integrations = engine.activeRun.task_integrations || []
+    for (var index = 0; index < integrations.length; index++)
+      if (integrations[index].task_id === taskId
+          && integrations[index].status === "completed") return true
+    return false
+  }
+
+  function pendingPrerequisites(task) {
+    if (!task) return []
+    var positions = task.depends_on || []
+    var pending = []
+    for (var index = 0; index < positions.length; index++) {
+      var prerequisite = taskByPosition(positions[index])
+      if (!prerequisite || !taskIsIntegrated(prerequisite.id))
+        pending.push(positions[index])
+    }
+    return pending
+  }
+
+  function prerequisiteSummary(task) {
+    var positions = task ? (task.depends_on || []) : []
+    if (positions.length === 0) return "Dependencies: none"
+    var pending = pendingPrerequisites(task)
+    if (pending.length === 0)
+      return "Dependencies: tasks " + positions.join(", ") + " • integrated"
+    return "Dependencies: tasks " + positions.join(", ")
+      + " • waiting for task " + pending.join(", ") + " to be integrated"
   }
 
   function reviewIndependenceLabel(review) {
@@ -2551,11 +2592,7 @@ Item {
                                 || (taskDelegate.modelData.depends_on
                                     && taskDelegate.modelData.depends_on.length > 0))
                               width: parent.width
-                              text: (taskDelegate.modelData.depends_on || []).length > 0
-                                ? ("Dependencies: tasks "
-                                   + (taskDelegate.modelData.depends_on || []).join(", ")
-                                   + " • blocked until prerequisite results can be composed")
-                                : "Dependencies: none"
+                              text: root.prerequisiteSummary(taskDelegate.modelData)
                               color: root.mutedForeground
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.bodySmall

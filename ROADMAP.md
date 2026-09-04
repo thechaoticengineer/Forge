@@ -10,7 +10,7 @@ No phase below is a promise of a release date. Safety, recovery, and a coherent 
 
 The foundation and planning workflow are implemented. A developer can open the Omarchy panel, browse repositories below configured local project roots, discover accessible GitHub repositories through an authenticated `gh` CLI, explicitly clone a missing repository, preserve a goal, ask Codex CLI or Claude Code CLI for a constrained structured plan, revise that plan, and approve or reject it.
 
-Each task of an approved plan is actionable in the Omarchy panel through a persistent task queue and selected task workspace. Dependency declarations, acceptance criteria, worktree and branch, latest implementer attempt, durable activity, failures, evidence, and the next action remain attached to the task instead of being split across pipeline sections. The panel can confirm creation of the recorded isolated worktree, launch a user-selected Codex or Claude implementer, and pause, resume, cancel, redirect, or add context through the existing engine requests. Because task branches currently share the run's original base, dependent tasks are explicitly blocked in both the panel and engine until prerequisite task results can be composed without dropping changes; root tasks remain executable. The engine refuses conflicting worktree operations, supervises the bounded process, and preserves its outcome. Opening and retiring exact worktrees and richer prompt history remain open.
+Each task of an approved plan is actionable in the Omarchy panel through a persistent task queue and selected task workspace. Dependency declarations, acceptance criteria, worktree and branch, latest implementer attempt, durable activity, failures, evidence, and the next action remain attached to the task instead of being split across pipeline sections. The panel can confirm creation of the recorded isolated worktree, launch a user-selected Codex or Claude implementer, and pause, resume, cancel, redirect, or add context through the existing engine requests. A task with declared dependencies is blocked only while a prerequisite's approved commit has not been integrated. A completed integration advances the run's accepted base, and the dependent task's worktree is then created from that base, so a plan can be worked through in order. The engine refuses conflicting worktree operations, supervises the bounded process, and preserves its outcome. Opening and retiring exact worktrees and richer prompt history remain open.
 
 The CLI and panel can run a bounded completion pipeline: a project's own committed verification policy, or detected Rust and Omarchy checks when it has none, is persisted, its evidence is sent to a fresh independent reviewer, and failed gates can launch a fresh implementer correction. Passing gates prepare an exact final tree, complete patch, changed-file summary, and proposed one-task commit. A separate user approval revalidates that tree before creating the local isolated-worktree commit; rejection is durable and preserves the worktree. After commit creation, another confirmed action can fast-forward a selected checked-out clean local branch, with exact-head comparison and durable outcome. Full raw-output drill-down, verification cancellation, semantic multi-commit splitting, and divergent merge flows remain open.
 
@@ -49,7 +49,7 @@ The UI-first implementation slice is present. Before campaign orchestration buil
 - [x] Replace pipeline-oriented top-level sections with a task queue and unified selected-task workspace.
 - [ ] Exercise the self-hosting path against this repository: approve a plan, create its worktree, launch its implementer, inspect activity and gates, and approve or reject the resulting local commit entirely through the panel.
 
-The managed engine is installed and running for the current development environment, and the installed plugin has been refreshed and rescanned successfully. The remaining operational proof is to exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Composing multiple dependent task branches remains open because all task worktrees currently start from the run's shared base.
+The managed engine is installed and running for the current development environment, and the installed plugin has been refreshed and rescanned successfully. The remaining operational proof is to exercise the complete self-hosting path through the live panel. Task integration remains separate from final approval and never pushes. Sequential dependent tasks now compose through the run's advancing base; divergent merges and sibling overlap remain open.
 
 ## Next Major Milestone — Durable Whole-Project Campaigns
 
@@ -181,11 +181,11 @@ This phase is partly implemented. A task can be given an isolated worktree and a
 
 ## Phase 8 — Evolving Base and Dependency Composition
 
-- [ ] Record the exact accepted campaign base and update it only after a separately approved integration succeeds.
-- [ ] Create each task worktree from the campaign base current at dispatch time rather than the campaign's original base.
+- [x] Record the exact accepted campaign base and update it only after a separately approved integration succeeds. A run's base advances on completed integration; campaign-level ownership remains planned.
+- [x] Create each task worktree from the campaign base current at dispatch time rather than the campaign's original base.
 - [ ] Mark planned or running work stale when its assumed base no longer matches the accepted campaign base.
 - [ ] Re-plan or recreate stale, not-yet-approved work without rewriting user history or discarding useful evidence.
-- [ ] Unblock a dependent item only when every prerequisite result is present in its dispatch base.
+- [x] Unblock a dependent item only when every prerequisite result is present in its dispatch base.
 - [ ] Compose sequential task results through exact fast-forward integration before considering divergent merge support.
 - [ ] Detect sibling overlap and require re-planning or explicit human resolution instead of guessing conflict intent.
 - [ ] Retire integrated task worktrees and branches through a separate confirmed, recoverable cleanup action.

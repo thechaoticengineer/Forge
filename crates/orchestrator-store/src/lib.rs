@@ -144,7 +144,9 @@ pub enum StorageError {
     PlanNotCurrent(String),
     #[error("task is not ready for isolated implementation: {0}")]
     TaskNotImplementable(String),
-    #[error("task dependencies cannot run until prerequisite results are composed: {0}")]
+    #[error(
+        "this task waits on a prerequisite task whose approved commit has not been integrated yet: {0}"
+    )]
     TaskDependenciesNotIntegrated(String),
     #[error("task worktree does not exist or is no longer reserved: {0}")]
     WorktreeNotReserved(String),
@@ -1841,15 +1843,12 @@ impl Database {
                 StorageError::RunNotFound(input.run_id.clone())
             });
         }
-        let has_dependencies = transaction
-            .query_row(
-                "SELECT 1 FROM plan_task_dependencies \
-                 WHERE plan_id = ?1 AND task_id = ?2 LIMIT 1",
-                (&input.plan_id, &input.task_id),
-                |_| Ok(true),
-            )
-            .optional()?;
-        if has_dependencies.is_some() {
+        if has_unintegrated_dependencies(
+            &transaction,
+            &input.run_id,
+            &input.plan_id,
+            &input.task_id,
+        )? {
             return Err(StorageError::TaskDependenciesNotIntegrated(
                 input.task_id.clone(),
             ));
@@ -2015,15 +2014,12 @@ impl Database {
                 StorageError::RunNotFound(input.run_id.clone())
             });
         }
-        let has_dependencies = transaction
-            .query_row(
-                "SELECT 1 FROM plan_task_dependencies \
-                 WHERE plan_id = ?1 AND task_id = ?2 LIMIT 1",
-                (&input.plan_id, &input.task_id),
-                |_| Ok(true),
-            )
-            .optional()?;
-        if has_dependencies.is_some() {
+        if has_unintegrated_dependencies(
+            &transaction,
+            &input.run_id,
+            &input.plan_id,
+            &input.task_id,
+        )? {
             return Err(StorageError::TaskDependenciesNotIntegrated(
                 input.task_id.clone(),
             ));
@@ -3159,11 +3155,26 @@ impl Database {
                 input.integration_id.clone(),
             ));
         }
+        // A completed integration is a fast-forward, so its result head always
+        // contains the previous base. Advancing the run's accepted base here is
+        // what lets a dependent task be dispatched from work that has actually
+        // landed instead of from the run's original revision.
+        let advanced_base = match (input.status, input.result_head.as_deref()) {
+            (TaskIntegrationStatus::Completed, Some(head)) if is_object_name(head) => {
+                transaction.execute(
+                    "UPDATE runs SET base_revision = ?2, updated_at = ?3 WHERE id = ?1",
+                    (&run_id, head, completed_at),
+                )?;
+                Some(head)
+            }
+            _ => None,
+        };
         let payload = json!({
             "task_integration_id": input.integration_id,
             "status": input.status,
             "result_head": input.result_head,
             "error": input.error_message,
+            "advanced_base_revision": advanced_base,
         });
         transaction.execute(
             "INSERT INTO run_events(run_id, kind, actor, payload_json, created_at) \
@@ -3444,6 +3455,44 @@ impl Database {
         let rows = statement.query_map((plan_id, task_id), |row| row.get::<_, i64>(0))?;
         rows.map(|row| position_to_u32(row?)).collect()
     }
+}
+
+/// Reports whether the task still waits on a prerequisite whose approved
+/// commit has not been integrated into the run's accepted base.
+///
+/// A dependency is satisfied only by a completed integration of the
+/// prerequisite task in the same run. Declaring a dependency is therefore no
+/// longer a permanent block: it becomes runnable as soon as the work it needs
+/// is actually part of the base its worktree will be created from.
+fn has_unintegrated_dependencies(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    plan_id: &str,
+    task_id: &str,
+) -> Result<bool, StorageError> {
+    transaction
+        .query_row(
+            "SELECT 1 FROM plan_task_dependencies link \
+             WHERE link.plan_id = ?2 AND link.task_id = ?3 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM task_integrations integration \
+                 WHERE integration.run_id = ?1 \
+                   AND integration.task_id = link.depends_on_task_id \
+                   AND integration.status = 'completed' \
+               ) \
+             LIMIT 1",
+            (run_id, plan_id, task_id),
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+}
+
+/// Accepts only a full-length Git object name, so a malformed result head can
+/// never become a run's accepted base.
+fn is_object_name(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn run_exists(transaction: &Transaction<'_>, run_id: &str) -> Result<bool, StorageError> {
@@ -4798,6 +4847,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn releases_a_dependent_task_once_its_prerequisite_is_integrated() {
+        const INTEGRATED_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, first_task_id) = approved_plan(&worker).await;
+        let dependent_task_id = worker
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .and_then(|run| run.plan)
+            .and_then(|plan| plan.tasks.get(1).cloned())
+            .expect("the sample plan should have a dependent task")
+            .id;
+
+        worker
+            .reserve_task_worktree(reservation(&run_id, &plan_id, &dependent_task_id, 2))
+            .await
+            .expect_err("a dependent task waits until its prerequisite is integrated");
+
+        let integrated =
+            integrate_task(&worker, &run_id, &plan_id, &first_task_id, INTEGRATED_HEAD).await;
+        assert_eq!(
+            integrated
+                .active_run
+                .as_ref()
+                .expect("run should stay active")
+                .base_revision,
+            INTEGRATED_HEAD,
+            "a completed integration should advance the run's accepted base"
+        );
+
+        let released = worker
+            .reserve_task_worktree(TaskWorktreeReservation {
+                base_revision: INTEGRATED_HEAD.to_owned(),
+                ..reservation(&run_id, &plan_id, &dependent_task_id, 2)
+            })
+            .await
+            .expect("the dependent task should start once its prerequisite is integrated");
+        let worktree = released
+            .snapshot
+            .active_run
+            .expect("run should stay active")
+            .worktrees
+            .into_iter()
+            .find(|worktree| worktree.id == released.worktree_id)
+            .expect("the released worktree should be recorded");
+        assert_eq!(worktree.base_revision, INTEGRATED_HEAD);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_accepted_base_when_an_integration_fails() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let paths = StatePaths::new(temporary.path().join("state"));
+        let worker = StorageWorker::start(paths).expect("storage should start");
+        let (run_id, plan_id, first_task_id) = approved_plan(&worker).await;
+        let original_base = worker
+            .current_snapshot()
+            .await
+            .expect("snapshot should load")
+            .active_run
+            .expect("run should stay active")
+            .base_revision;
+
+        let commit_id = approved_task_commit(&worker, &run_id, &plan_id, &first_task_id, 1).await;
+        let integration = worker
+            .reserve_task_integration(TaskIntegrationReservation {
+                run_id: run_id.clone(),
+                task_commit_id: commit_id,
+                target_branch: "main".to_owned(),
+                expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            })
+            .await
+            .expect("integration should reserve");
+        let settled = worker
+            .settle_task_integration(TaskIntegrationSettlement {
+                integration_id: integration.integration_id,
+                status: TaskIntegrationStatus::Failed,
+                result_head: None,
+                error_message: Some("the branch was not fast-forwardable".to_owned()),
+            })
+            .await
+            .expect("failed integration should settle");
+
+        assert_eq!(
+            settled
+                .active_run
+                .expect("run should stay active")
+                .base_revision,
+            original_base,
+            "a failed integration must not advance the accepted base"
+        );
+    }
+
+    #[tokio::test]
     async fn recovers_an_interrupted_reservation_as_failed() {
         let temporary = TempDir::new().expect("temporary directory should exist");
         let paths = StatePaths::new(temporary.path().join("state"));
@@ -5559,6 +5705,155 @@ mod tests {
             path: format!("/tmp/state/worktrees/run/{attempt}-inspect-behavior"),
             base_revision: "0123456789012345678901234567890123456789".to_owned(),
         }
+    }
+
+    /// Drives one task from a reserved worktree to an approved local commit and
+    /// returns that commit's identifier.
+    #[allow(clippy::too_many_lines)]
+    async fn approved_task_commit(
+        worker: &StorageWorker,
+        run_id: &str,
+        plan_id: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> String {
+        let worktree = worker
+            .reserve_task_worktree(reservation(run_id, plan_id, task_id, attempt))
+            .await
+            .expect("worktree should be reserved");
+        worker
+            .confirm_task_worktree(worktree.worktree_id.clone(), false)
+            .await
+            .expect("worktree should be ready");
+        let implementation = worker
+            .begin_implementation_attempt(ImplementationAttemptInput {
+                run_id: run_id.to_owned(),
+                plan_id: plan_id.to_owned(),
+                task_id: task_id.to_owned(),
+                worktree_id: worktree.worktree_id.clone(),
+                agent: AgentKind::Codex,
+                prompt: "Implement the approved task".to_owned(),
+                parent_attempt_id: None,
+                continuation_kind: None,
+                user_instruction: None,
+            })
+            .await
+            .expect("implementation should start");
+        worker
+            .complete_implementation_attempt(ImplementationAttemptSuccess {
+                attempt_id: implementation.attempt_id.clone(),
+                final_output: "Implemented".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("implementation should complete");
+        let review = worker
+            .begin_review_attempt(ReviewAttemptInput {
+                run_id: run_id.to_owned(),
+                plan_id: plan_id.to_owned(),
+                task_id: task_id.to_owned(),
+                worktree_id: worktree.worktree_id.clone(),
+                implementation_attempt_id: implementation.attempt_id.clone(),
+                implementer: AgentKind::Codex,
+                reviewer: AgentKind::Claude,
+                policy: ReviewPolicy::CrossProviderRequired,
+                independence: ReviewIndependence::CrossProvider,
+                prompt: "Review the exact task diff".to_owned(),
+            })
+            .await
+            .expect("review should start");
+        worker
+            .complete_review_attempt(ReviewAttemptSuccess {
+                attempt_id: review.attempt_id.clone(),
+                result: ReviewResult {
+                    verdict: ReviewVerdict::Approved,
+                    summary: "The task is ready".to_owned(),
+                    findings: Vec::new(),
+                },
+                final_output: "approved".to_owned(),
+                diagnostic_output: String::new(),
+                exit_code: 0,
+            })
+            .await
+            .expect("review should complete");
+        let verification = worker
+            .record_verification_attempt(VerificationAttemptInput {
+                run_id: run_id.to_owned(),
+                plan_id: plan_id.to_owned(),
+                task_id: task_id.to_owned(),
+                worktree_id: worktree.worktree_id.clone(),
+                implementation_attempt_id: implementation.attempt_id.clone(),
+                status: VerificationStatus::Passed,
+                commands: Vec::new(),
+                error_message: None,
+                started_at: 1,
+            })
+            .await
+            .expect("verification should persist");
+        let proposal = worker
+            .record_task_commit(TaskCommitInput {
+                run_id: run_id.to_owned(),
+                task_id: task_id.to_owned(),
+                worktree_id: worktree.worktree_id,
+                implementation_attempt_id: implementation.attempt_id,
+                verification_attempt_id: verification.attempt_id,
+                review_attempt_id: review.attempt_id,
+                message: "feat: implement the change".to_owned(),
+                tree_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                changed_files: vec![ChangedFileSummary {
+                    path: "src/lib.rs".to_owned(),
+                    previous_path: None,
+                    status: orchestrator_core::state::ChangedFileStatus::Modified,
+                }],
+                patch: "diff --git a/src/lib.rs b/src/lib.rs".to_owned(),
+            })
+            .await
+            .expect("proposal should persist");
+        worker
+            .reserve_task_commit(proposal.commit_id.clone())
+            .await
+            .expect("user approval should reserve the commit");
+        worker
+            .settle_task_commit(TaskCommitSettlement {
+                commit_id: proposal.commit_id.clone(),
+                status: TaskCommitStatus::Created,
+                commit_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+                error_message: None,
+                decision_reason: None,
+            })
+            .await
+            .expect("created commit should settle");
+        proposal.commit_id
+    }
+
+    /// Carries one task through approval and a completed integration.
+    async fn integrate_task(
+        worker: &StorageWorker,
+        run_id: &str,
+        plan_id: &str,
+        task_id: &str,
+        result_head: &str,
+    ) -> StoredSnapshot {
+        let commit_id = approved_task_commit(worker, run_id, plan_id, task_id, 1).await;
+        let integration = worker
+            .reserve_task_integration(TaskIntegrationReservation {
+                run_id: run_id.to_owned(),
+                task_commit_id: commit_id,
+                target_branch: "main".to_owned(),
+                expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            })
+            .await
+            .expect("integration should reserve");
+        worker
+            .settle_task_integration(TaskIntegrationSettlement {
+                integration_id: integration.integration_id,
+                status: TaskIntegrationStatus::Completed,
+                result_head: Some(result_head.to_owned()),
+                error_message: None,
+            })
+            .await
+            .expect("integration should settle")
     }
 
     /// Drives a run to a proposed plan and returns its run, plan, and first task.

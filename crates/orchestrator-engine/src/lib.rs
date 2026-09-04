@@ -1931,13 +1931,6 @@ async fn prepare_task_worktree(
             code: "task_not_found",
             message: "the selected task is not part of the approved plan".to_owned(),
         })?;
-    if !task.depends_on.is_empty() {
-        return Err(RequestFailure {
-            code: "task_dependencies_not_integrated",
-            message: "this task depends on earlier task branches; integration is not implemented, so the engine will not create an incomplete worktree".to_owned(),
-        });
-    }
-
     let branch = task_branch_name(&run.id, task.position, &task.title);
     let path = task_worktree_path(
         storage.paths().worktrees(),
@@ -3313,12 +3306,6 @@ async fn load_implementation_context(
             code: "task_not_found",
             message: "the selected task is not part of the approved plan".to_owned(),
         })?;
-    if !task.depends_on.is_empty() {
-        return Err(RequestFailure {
-            code: "task_dependencies_not_integrated",
-            message: "this task depends on earlier task branches; integration is not implemented, so the engine will not launch it against the run base".to_owned(),
-        });
-    }
     let worktree = run
         .worktrees
         .iter()
