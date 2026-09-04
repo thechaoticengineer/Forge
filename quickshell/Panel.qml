@@ -569,6 +569,54 @@ Item {
       engine.activeRun ? engine.activeRun.review_attempts : [])
   }
 
+  function reviewIndependenceLabel(review) {
+    if (!review) return ""
+    var independence = String(review.independence || "")
+    if (independence === "cross_provider") return "different provider"
+    if (independence === "fresh_session_fallback") return "same provider, fresh session"
+    return independence
+  }
+
+  function reviewFindingCount(review) {
+    if (!review || !review.result || !review.result.findings) return 0
+    return review.result.findings.length
+  }
+
+  function reviewPairing(review) {
+    if (!review) return ""
+    var reviewer = String(review.reviewer || "another agent")
+    var implementer = String(review.implementer || "the implementer")
+    return reviewer + (review.status === "running" ? " is reviewing " : " reviewed ")
+      + implementer + "'s work"
+  }
+
+  function reviewHeadline(review) {
+    if (!review) return "Independent review  ·  not run"
+    if (review.status === "running")
+      return "Independent review  ·  " + reviewPairing(review) + " now"
+    var findings = reviewFindingCount(review)
+    return "Independent review  ·  " + reviewPairing(review)
+      + "  ·  " + String(review.status || "unknown")
+      + "  ·  " + reviewIndependenceLabel(review)
+      + "  ·  " + findings + (findings === 1 ? " finding" : " findings")
+  }
+
+  function reviewHeadlineColor(review) {
+    if (!review) return mutedForeground
+    if (review.status === "running") return foreground
+    if (review.status === "approved")
+      return review.independence === "fresh_session_fallback" ? foreground : accent
+    return urgent
+  }
+
+  function reviewDetail(review) {
+    if (!review) return ""
+    if (review.status === "running") return ""
+    if (review.error_message) return String(review.error_message)
+    if (review.result && review.result.summary) return String(review.result.summary)
+    return ""
+  }
+
   function taskActionTask() {
     return taskById(taskActionTaskId)
   }
@@ -2747,15 +2795,17 @@ Item {
                                 }
                                 Text {
                                   width: parent.width
-                                  text: "Independent review  ·  " + (taskEvidence.review
-                                    ? taskEvidence.review.status + "  ·  "
-                                      + (taskEvidence.review.result
-                                        ? (taskEvidence.review.result.findings || []).length : 0)
-                                      + " findings"
-                                    : "not run")
-                                  color: taskEvidence.review
-                                    && taskEvidence.review.status === "approved"
-                                    ? root.accent : root.mutedForeground
+                                  text: root.reviewHeadline(taskEvidence.review)
+                                  color: root.reviewHeadlineColor(taskEvidence.review)
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.bodySmall
+                                  wrapMode: Text.WordWrap
+                                }
+                                Text {
+                                  width: parent.width
+                                  visible: root.reviewDetail(taskEvidence.review) !== ""
+                                  text: root.reviewDetail(taskEvidence.review)
+                                  color: root.mutedForeground
                                   font.family: root.fontFamily
                                   font.pixelSize: Style.font.bodySmall
                                   wrapMode: Text.WordWrap
@@ -3280,12 +3330,8 @@ Item {
                         Text {
                           visible: changesSection.review !== null
                           width: parent.width
-                          text: changesSection.review
-                            ? "Independent review · " + changesSection.review.reviewer
-                              + " · " + changesSection.review.status : ""
-                          color: changesSection.review
-                            && changesSection.review.status === "approved"
-                            ? root.accent : root.foreground
+                          text: root.reviewHeadline(changesSection.review)
+                          color: root.reviewHeadlineColor(changesSection.review)
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.bodySmall
                           font.bold: true
