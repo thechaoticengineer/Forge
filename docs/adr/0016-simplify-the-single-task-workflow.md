@@ -1,6 +1,6 @@
 # ADR-0016: Simplify the Single-Task Workflow
 
-- Status: Proposed
+- Status: Proposed; contracts specified 2026-09-04 and awaiting a decision
 - Date: 2026-09-02
 - Decision owners: Project maintainers
 
@@ -44,11 +44,109 @@ Routine stages after implementer selection do not require separate clicks.
 Failures remain visible and retryable, automatic correction is bounded, and
 the implementing agent is never the sole reviewer of its own work.
 
-This ADR remains proposed until the exact branch-switching, rejection,
-rollback, push-failure, and recovery contracts are specified. If accepted, it
-will supersede ADR-0006, the worktree-specific parts of ADR-0007, and the
-separate integration interaction in ADR-0013. ADR-0012 will also need revision
-or supersession where it requires a separate commit-approval step.
+If accepted, this supersedes ADR-0006, the worktree-specific parts of
+ADR-0007, and the separate integration interaction in ADR-0013. ADR-0012 also
+needs revision where it requires a separate commit-approval step.
+
+## Contracts
+
+These were the open questions that kept the decision proposed. They are
+specified here so the proposal can be accepted or rejected on its merits
+rather than on its gaps.
+
+### 1. Checkout ownership
+
+Forge takes exclusive, durable ownership of the selected checkout for the
+lifetime of one task. Ownership records the repository path, the owning run
+and task, the branch the user was on (the **origin branch**), that branch's
+head at acquisition, and the temporary branch name.
+
+Acquisition requires all of: a non-bare Git worktree; `git status --porcelain`
+empty, including untracked files; no in-progress rebase, merge, cherry-pick,
+revert, or bisect; `HEAD` attached to a branch; and no existing Forge
+ownership of the same repository. A failed precondition is reported as a
+refusal naming the condition, never worked around.
+
+Ownership is recorded before the checkout is touched and settled after, so an
+interrupted acquisition is always visible as a reservation rather than as
+silent partial state. At most one task owns a repository at a time.
+
+### 2. External interference
+
+The user keeps a normal checkout and may edit it. Before every consequential
+step — verification, review evidence capture, final inspection, and merge —
+Forge re-reads the repository and requires that `HEAD` is still the temporary
+branch, that the temporary branch head matches what Forge last recorded, and
+that the origin branch head is unchanged since acquisition.
+
+Any mismatch stops the task in an `interference detected` state that names
+what changed. Forge never resets, force-updates, checks out over, or discards
+to recover from interference. The user chooses to re-inspect or to abandon.
+
+### 3. Rejection preserves work
+
+Rejection never deletes anything. Forge commits any dirty state on the
+temporary branch, renames that branch to a durable `forge/rejected/<run>/<task>`
+name, returns the checkout to the origin branch, and records the branch name
+in run history. Forge does not delete the branch. Removing it is a separate,
+explicitly confirmed action, consistent with the worktree-retirement rule this
+ADR otherwise removes.
+
+### 4. Merge and push are ordered, not atomic
+
+Combining the two creates a partial-success case that must be reported
+honestly rather than hidden.
+
+Forge merges first: fast-forward only, onto the origin branch. A branch that
+cannot fast-forward stops the task; Forge does not rebase, squash, or resolve
+conflicts. Forge pushes second, only the origin branch, only to its configured
+upstream, never with `--force`.
+
+Three terminal outcomes are recorded and distinguished in the interface:
+
+- **merged and pushed** — local and remote both advanced;
+- **merged, not pushed** — the local branch advanced and the remote did not,
+  with the exact push error and a retry-push action;
+- **not merged** — nothing changed anywhere.
+
+Forge does not undo a successful local merge to make the pair look atomic.
+Reversing a completed merge is itself a history rewrite, which this project
+does not perform without explicit permission. The interface states plainly
+that local and remote differ until the push succeeds or the user acts.
+
+### 5. Recovery
+
+Every consequential transition is reserved before its Git operation and
+settled after it, so a crash leaves a reserved record rather than an unknown
+state. On startup Forge inspects the real repository for each reserved record
+and classifies it: still on the temporary branch means ownership resumes; back
+on the origin branch with the temporary branch present means ownership was
+released and the task needs a decision; a missing temporary branch is recorded
+as a loss and never recreated.
+
+Forge never replays a consequential Git operation during recovery.
+
+### 6. Where the automatic path still stops
+
+Routine transitions need no confirmation. Forge stops for the user on
+unresolved review findings, architecture, security or product judgment,
+detected interference, a non-fast-forward merge, a push failure, and repeated
+correction failure within the existing bounded limit.
+
+### 7. Relationship to verification policy
+
+ADR-0017 reads a project's verification policy as committed at the task's base
+revision. Without a linked worktree that base revision is the origin branch
+head recorded at acquisition, so the rule survives this change unaltered: the
+policy that gates a task is still the one committed before the task started.
+
+### 8. Multi-task sequencing
+
+Removing worktrees does not remove the need for an accepted base. The origin
+branch head at acquisition is that base, and a completed merge advances it, so
+a dependent task acquires the checkout at a revision that already contains its
+prerequisites. Sequential dependency composition is preserved; only concurrent
+sibling implementation is given up.
 
 ## Consequences
 
@@ -77,14 +175,13 @@ or supersession where it requires a separate commit-approval step.
 
 ### Follow-up
 
-- Specify ownership and recovery rules for the selected checkout and any
-  hidden temporary branch.
-- Define rejection behavior without silently deleting useful changes.
-- Define the exact atomicity and UI for merge success followed by push failure.
 - Replace worktree and integration controls with one next-action-oriented
   workflow.
 - Add end-to-end tests for the automatic verification, review, correction,
-  final inspection, integration, push, and cleanup sequence.
+  final inspection, merge, push, and cleanup sequence, including the
+  merged-but-not-pushed and interference cases.
+- Decide whether rejected branches are ever pruned automatically after an
+  explicit retention period, or only by confirmed user action.
 - Supersede the affected accepted ADRs when this proposal is accepted.
 
 ## Alternatives Considered
@@ -115,4 +212,5 @@ pipeline transitions should not.
 - [ADR-0010](0010-run-independent-reviews-in-fresh-agent-sessions.md)
 - [ADR-0012](0012-separate-final-inspection-from-commit-approval.md)
 - [ADR-0013](0013-fast-forward-approved-task-commits.md)
+- [ADR-0017](0017-read-project-verification-policy-from-the-task-base-revision.md)
 - [Roadmap](../../ROADMAP.md)

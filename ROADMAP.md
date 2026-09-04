@@ -34,8 +34,10 @@ The proposed path removes linked worktrees from the initial single-task
 workflow. Forge may use a hidden temporary branch in the selected clean
 checkout, but branch creation, switching, integration, push reporting, and
 cleanup must not become user-managed steps. Only one task may modify a project
-at a time. Exact safety and recovery behavior remains to be decided before
-implementation. See [ADR-0016](docs/adr/0016-simplify-the-single-task-workflow.md).
+at a time. Checkout ownership, interference, rejection, merge-and-push atomicity, and
+recovery are now specified as contracts in the ADR, which awaits an accept or
+reject decision before implementation. See
+[ADR-0016](docs/adr/0016-simplify-the-single-task-workflow.md).
 
 ## Immediate Validation — First Self-Hosted Run
 
