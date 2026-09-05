@@ -31,6 +31,14 @@ Item {
   readonly property var plan: engineState ? engineState.plan : null
   readonly property string phase: engineState ? engineState.phase : "offline"
   readonly property bool busy: phase === "planning" || phase === "running"
+    || (engineState !== null && engineState.current_step.indexOf("cloning") === 0)
+  readonly property string projectName: engineState
+    ? engineState.project.split("/").filter(function(p) { return p !== "" }).pop() || "?"
+    : "?"
+
+  property bool chooserOpen: false
+  property var projectsData: null
+  property bool manualEntry: false
 
   function open(payloadJson) {
     closingFromHost = false
@@ -72,6 +80,49 @@ Item {
   function act(path, body) {
     localError = ""
     api("POST", path, body || {}, function() { root.refresh() })
+  }
+
+  function openChooser() {
+    manualEntry = false
+    api("GET", "/api/projects", null, function(resp) {
+      if (!resp) return
+      root.projectsData = resp
+      root.chooserOpen = true
+    })
+  }
+
+  function chooserRows(data, filter) {
+    if (!data) return []
+    const f = filter.toLowerCase()
+    const rows = []
+    const local = (data.local || []).filter(function(p) {
+      return f === "" || p.name.toLowerCase().indexOf(f) !== -1
+    })
+    if (local.length > 0) rows.push({ kind: "header", label: "Local" })
+    local.forEach(function(p) { rows.push({ kind: "local", name: p.name, path: p.path }) })
+    const remote = (data.remote || []).filter(function(r) {
+      return f === "" || r.full_name.toLowerCase().indexOf(f) !== -1
+    })
+    if (remote.length > 0 || data.remote_error) rows.push({ kind: "header", label: "GitHub" })
+    if (data.remote_error) rows.push({ kind: "note", label: data.remote_error })
+    remote.forEach(function(r) {
+      rows.push({ kind: "remote", name: r.full_name, cloned: r.cloned,
+                  isPrivate: r.private })
+    })
+    rows.push({ kind: "path", label: "path…" })
+    return rows
+  }
+
+  function chooseRow(row) {
+    if (row.kind === "local") {
+      act("/api/project/select", { path: row.path })
+      chooserOpen = false
+    } else if (row.kind === "remote") {
+      act("/api/project/select", { repo: row.name })
+      chooserOpen = false
+    } else if (row.kind === "path") {
+      manualEntry = !manualEntry
+    }
   }
 
   function cycleTool(key) {
@@ -159,33 +210,31 @@ Item {
         // -------------------------------------------- project + tools
         Row {
           width: parent.width
-          spacing: Style.space(8)
+          spacing: Style.space(10)
 
-          Rectangle {
-            width: parent.width - setProjectButton.width - parent.spacing
-            height: Style.space(30)
-            color: root.surface
-            radius: 4
-            border.width: 1
-            border.color: projectField.activeFocus
-              ? root.accent : Qt.darker(root.foreground, 3)
-            TextInput {
-              id: projectField
-              anchors.fill: parent
-              anchors.margins: Style.space(6)
-              verticalAlignment: TextInput.AlignVCenter
+          Column {
+            width: parent.width - changeProjectButton.width - parent.spacing
+            Text {
+              text: root.projectName
               color: root.foreground
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(12)
-              clip: true
-              text: root.engineState && !activeFocus ? root.engineState.project : text
+              font.pixelSize: Style.fontSize(13)
+              font.bold: true
+            }
+            Text {
+              width: parent.width
+              text: root.engineState ? root.engineState.project : ""
+              color: root.mutedForeground
+              elide: Text.ElideMiddle
+              font.family: root.fontFamily
+              font.pixelSize: Style.fontSize(10)
             }
           }
           PanelButton {
-            id: setProjectButton
-            label: "Set project"
-            enabled: !root.busy
-            onClicked: root.act("/api/project", { path: projectField.text })
+            id: changeProjectButton
+            label: "Change project"
+            enabled: !root.busy && root.engineOnline
+            onClicked: root.openChooser()
           }
         }
 
@@ -373,6 +422,166 @@ Item {
               wrapMode: Text.Wrap
               font.family: root.fontFamily
               font.pixelSize: Style.fontSize(10)
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------ project chooser
+      Rectangle {
+        visible: root.chooserOpen
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.55)
+        MouseArea { anchors.fill: parent; onClicked: root.chooserOpen = false }
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.82
+          height: parent.height * 0.82
+          radius: 6
+          color: root.surface
+          border.width: 1
+          border.color: Qt.darker(root.foreground, 3)
+          MouseArea { anchors.fill: parent }
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              Rectangle {
+                width: parent.width - closeChooserButton.width - parent.spacing
+                height: Style.space(28)
+                color: root.background
+                radius: 4
+                border.width: 1
+                border.color: filterField.activeFocus
+                  ? root.accent : Qt.darker(root.foreground, 3)
+                TextInput {
+                  id: filterField
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  verticalAlignment: TextInput.AlignVCenter
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.fontSize(12)
+                  clip: true
+                  Text {
+                    visible: filterField.text === "" && !filterField.activeFocus
+                    text: "filter projects…"
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.fontSize(12)
+                  }
+                }
+              }
+              PanelButton {
+                id: closeChooserButton
+                label: "Close"
+                onClicked: root.chooserOpen = false
+              }
+            }
+
+            ListView {
+              id: chooserList
+              width: parent.width
+              height: parent.height - y - (root.manualEntry ? Style.space(38) : 0)
+              clip: true
+              spacing: 2
+              model: root.chooserRows(root.projectsData, filterField.text)
+              delegate: Rectangle {
+                id: chooserRow
+                required property var modelData
+                readonly property bool selectable: modelData.kind === "local"
+                  || modelData.kind === "remote" || modelData.kind === "path"
+                width: chooserList.width
+                height: rowText.implicitHeight + Style.space(10)
+                radius: 4
+                color: chooserRowArea.containsMouse && selectable
+                  ? Qt.darker(root.accent, 2.8) : "transparent"
+
+                Row {
+                  anchors.verticalCenter: parent.verticalCenter
+                  x: Style.space(6)
+                  spacing: Style.space(8)
+                  Text {
+                    id: rowText
+                    text: chooserRow.modelData.kind === "local"
+                      || chooserRow.modelData.kind === "remote"
+                      ? chooserRow.modelData.name : chooserRow.modelData.label
+                    color: chooserRow.modelData.kind === "header" ? root.accent
+                      : chooserRow.modelData.kind === "local"
+                        || chooserRow.modelData.kind === "remote"
+                        ? root.foreground : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.bold: chooserRow.modelData.kind === "header"
+                    font.pixelSize: Style.fontSize(
+                      chooserRow.modelData.kind === "note" ? 10 : 12)
+                  }
+                  Text {
+                    visible: chooserRow.modelData.kind === "local"
+                    text: chooserRow.modelData.path || ""
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.fontSize(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  Text {
+                    visible: chooserRow.modelData.kind === "remote"
+                    text: (chooserRow.modelData.isPrivate ? "private · " : "")
+                      + (chooserRow.modelData.cloned ? "cloned" : "will clone")
+                    color: chooserRow.modelData.cloned
+                      ? root.accent : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.fontSize(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+                MouseArea {
+                  id: chooserRowArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  enabled: chooserRow.selectable
+                  onClicked: root.chooseRow(chooserRow.modelData)
+                }
+              }
+            }
+
+            Row {
+              id: manualRow
+              visible: root.manualEntry
+              width: parent.width
+              spacing: Style.space(8)
+              Rectangle {
+                width: parent.width - manualSetButton.width - parent.spacing
+                height: Style.space(28)
+                color: root.background
+                radius: 4
+                border.width: 1
+                border.color: manualField.activeFocus
+                  ? root.accent : Qt.darker(root.foreground, 3)
+                TextInput {
+                  id: manualField
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  verticalAlignment: TextInput.AlignVCenter
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.fontSize(12)
+                  clip: true
+                }
+              }
+              PanelButton {
+                id: manualSetButton
+                label: "Set"
+                onClicked: {
+                  root.act("/api/project", { path: manualField.text })
+                  root.chooserOpen = false
+                }
+              }
             }
           }
         }
