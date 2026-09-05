@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge</title>
+<style>
+  :root { --bg:#101418; --panel:#1a2026; --line:#2b333c; --fg:#d8dee6;
+          --dim:#8b98a5; --acc:#e8a33d; --ok:#5fb26a; --bad:#d06060; --run:#5b9dd6; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 system-ui, sans-serif; }
+  main { max-width:1060px; margin:0 auto; padding:20px; display:grid; gap:14px; }
+  h1 { font-size:18px; margin:0; color:var(--acc); letter-spacing:2px; }
+  section { background:var(--panel); border:1px solid var(--line);
+            border-radius:8px; padding:14px; }
+  h2 { font-size:12px; margin:0 0 10px; color:var(--dim); text-transform:uppercase;
+       letter-spacing:1px; }
+  input, select, textarea, button { background:#12171c; color:var(--fg);
+      border:1px solid var(--line); border-radius:5px; padding:7px 9px;
+      font:inherit; }
+  textarea { width:100%; min-height:70px; resize:vertical; }
+  button { cursor:pointer; background:#232c35; }
+  button.primary { background:var(--acc); color:#141414; font-weight:600; }
+  button:disabled { opacity:.4; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .grow { flex:1; min-width:200px; }
+  .badge { padding:1px 9px; border-radius:10px; font-size:12px;
+           border:1px solid var(--line); color:var(--dim); }
+  .badge.running, .badge.planning { color:var(--run); border-color:var(--run); }
+  .badge.done, .badge.committed, .badge.approved { color:var(--ok); border-color:var(--ok); }
+  .badge.blocked, .badge.failed { color:var(--bad); border-color:var(--bad); }
+  .badge.in_progress, .badge.plan_ready { color:var(--acc); border-color:var(--acc); }
+  .stage { border:1px solid var(--line); border-radius:6px; padding:10px;
+           margin-bottom:8px; }
+  .stage .title { font-weight:600; }
+  .stage .commitmsg { color:var(--acc); font-family:monospace; font-size:12px; }
+  .stage .instr { color:var(--dim); font-size:13px; white-space:pre-wrap;
+                  margin-top:4px; }
+  pre { background:#0c1014; border:1px solid var(--line); border-radius:6px;
+        padding:10px; overflow:auto; max-height:340px; font-size:12px;
+        white-space:pre-wrap; word-break:break-word; }
+  .hist .error { color:var(--bad); }
+  .hist .git { color:var(--ok); }
+  .hist .check { color:var(--run); }
+  .hist .t { color:var(--dim); }
+  label { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="row">
+    <h1>FORGE</h1>
+    <span id="phase" class="badge">…</span>
+    <span id="step" style="color:var(--dim)"></span>
+  </div>
+
+  <section>
+    <h2>Project & agents</h2>
+    <div class="row">
+      <input id="project" class="grow" placeholder="/path/to/repo">
+      <button onclick="setProject()">Set project</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>planner <select id="planner"><option>claude</option><option>codex</option></select></label>
+      <label>implementer <select id="implementer"><option>codex</option><option>claude</option></select></label>
+      <label>checker <select id="checker"><option>claude</option><option>codex</option></select></label>
+      <label>impl. model <input id="implementer_model" size="12" placeholder="default"></label>
+      <label>fix rounds <input id="max_fix_rounds" size="2" value="3"></label>
+      <label><input type="checkbox" id="auto_push" checked> push at end</label>
+      <button onclick="saveSettings()">Save</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Goal & plan</h2>
+    <textarea id="goal" placeholder="What should be built?"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="btnPlan" onclick="makePlan()">Create plan</button>
+      <button id="btnApprove" onclick="post('/api/approve')">Plan is OK — approve</button>
+      <button id="btnRun" class="primary" onclick="post('/api/run')">Start implementing</button>
+      <button id="btnStop" onclick="post('/api/stop')">Stop</button>
+      <button onclick="if(confirm('Discard plan?'))post('/api/reset_plan')">Discard plan</button>
+    </div>
+    <div id="stages" style="margin-top:10px"></div>
+  </section>
+
+  <section>
+    <h2>History</h2>
+    <pre id="history" class="hist"></pre>
+  </section>
+
+  <section>
+    <h2>Git log</h2>
+    <pre id="gitlog"></pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let editedGoal = false, editedProject = false;
+$('goal').addEventListener('input', () => editedGoal = true);
+$('project').addEventListener('input', () => editedProject = true);
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body||{})});
+  const j = await r.json();
+  if (j.error) alert(j.error);
+  refresh();
+}
+function setProject(){ editedProject = false; post('/api/project', {path: $('project').value}); }
+function makePlan(){ editedGoal = false; post('/api/plan', {goal: $('goal').value}); }
+function saveSettings(){
+  post('/api/settings', {
+    planner: $('planner').value, implementer: $('implementer').value,
+    checker: $('checker').value, implementer_model: $('implementer_model').value,
+    max_fix_rounds: parseInt($('max_fix_rounds').value)||3,
+    auto_push: $('auto_push').checked });
+}
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/state')).json(); } catch { return; }
+  $('phase').textContent = s.phase;
+  $('phase').className = 'badge ' + s.phase;
+  $('step').textContent = s.current_step ? `stage ${s.current_stage}: ${s.current_step}` : '';
+  if (!editedProject) $('project').value = s.project;
+  if (!editedGoal && !$('goal').value) $('goal').value = s.goal || (s.plan && s.plan.goal) || '';
+
+  const plan = s.plan;
+  const busy = s.phase === 'planning' || s.phase === 'running';
+  $('btnPlan').disabled = busy;
+  $('btnApprove').disabled = busy || !plan || plan.status !== 'draft';
+  $('btnRun').disabled = busy || !plan || (plan.status !== 'approved' && plan.status !== 'done');
+  $('btnStop').disabled = s.phase !== 'running';
+
+  $('stages').innerHTML = !plan ? '<span style="color:var(--dim)">no plan yet</span>' :
+    `<div class="row" style="margin-bottom:8px">plan status:
+       <span class="badge ${esc(plan.status)}">${esc(plan.status)}</span></div>` +
+    plan.stages.map(st => `
+      <div class="stage">
+        <div class="row">
+          <span class="title">${st.id}. ${esc(st.title)}</span>
+          <span class="badge ${esc(st.status)}">${esc(st.status)}</span>
+          ${st.sha ? `<span class="badge committed">${esc(st.sha)}</span>` : ''}
+          ${st.rounds > 1 ? `<span class="badge">round ${st.rounds}</span>` : ''}
+        </div>
+        <div class="commitmsg">${esc(st.commit)}</div>
+        <div class="instr">${esc(st.instructions)}</div>
+      </div>`).join('');
+
+  $('history').innerHTML = (s.history||[]).slice(-120).map(h =>
+    `<span class="t">${h.t}</span> <span class="${esc(h.kind)}">[${esc(h.kind)}]</span> ${esc(h.text)}`
+  ).join('\n');
+  $('gitlog').textContent = s.git_log || '';
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
