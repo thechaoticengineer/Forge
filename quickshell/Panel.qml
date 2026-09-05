@@ -43,8 +43,40 @@ Item {
   property var projectsData: null
   property bool manualEntry: false
 
+  readonly property var agent: engineState ? engineState.agent : null
+  readonly property bool agentActive: agent !== null && agent !== undefined
+    && agent.role !== ""
+  readonly property string agentSession: agentActive
+    ? JSON.stringify([engineState.project, engineState.run_started_unix,
+                      agent.started_unix, agent.role, agent.tool, agent.model]) : ""
+  property double agentNow: Date.now() / 1000
+  property bool liveTab: false
+  property string agentLog: ""
+  property double agentLogOffset: 0
+  property string logSession: ""
+  property bool agentLogPending: false
+
+  onBusyChanged: liveTab = busy
+  onAgentSessionChanged: {
+    if (agentSession !== "" && agentSession !== logSession) {
+      logSession = agentSession
+      agentLog = ""
+      agentLogOffset = 0
+      liveOutput.followTail = true
+    }
+    agentNow = Date.now() / 1000
+  }
+
+  function agentElapsed() {
+    const seconds = agentActive && agent.started_unix > 0
+      ? Math.max(0, Math.floor(agentNow - agent.started_unix)) : 0
+    return Math.floor(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "")
+      + (seconds % 60)
+  }
+
   function open(payloadJson) {
     closingFromHost = false
+    liveTab = busy
     window.visible = true
     refresh()
   }
@@ -63,6 +95,7 @@ Item {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
       if (xhr.status === 0) {
         root.engineOnline = false
+        if (done) done(null)
         return
       }
       root.engineOnline = true
@@ -77,6 +110,25 @@ Item {
   function refresh() {
     api("GET", "/api/state", null, function(resp) {
       if (resp) root.engineState = resp
+    })
+  }
+
+  function refreshAgentLog() {
+    if (!window.visible || !busy || agentLogPending) return
+    agentLogPending = true
+    const session = logSession
+    api("GET", "/api/agent_log?offset=" + agentLogOffset, null, function(resp) {
+      root.agentLogPending = false
+      if (session !== root.logSession || !resp
+          || typeof resp.log !== "string" || typeof resp.size !== "number") return
+      // Offsets are bytes supplied by the engine, not JavaScript string lengths.
+      if (resp.size < root.agentLogOffset) {
+        liveOutput.followTail = true
+        root.agentLog = resp.log
+      } else {
+        root.agentLog += resp.log
+      }
+      root.agentLogOffset = resp.size
     })
   }
 
@@ -137,10 +189,25 @@ Item {
   }
 
   Timer {
-    interval: 2000
+    interval: root.busy ? 1000 : 2000
     repeat: true
     running: window.visible
     onTriggered: root.refresh()
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: window.visible && root.busy
+    onTriggered: root.refreshAgentLog()
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: window.visible && agentCard.visible
+    triggeredOnStart: true
+    onTriggered: root.agentNow = Date.now() / 1000
   }
 
   FloatingWindow {
@@ -149,8 +216,8 @@ Item {
     title: "Forge"
     color: root.background
     implicitWidth: 760
-    implicitHeight: 620
-    minimumSize: Qt.size(560, 440)
+    implicitHeight: 760
+    minimumSize: Qt.size(560, 680)
 
     onVisibleChanged: {
       if (!visible && !root.closingFromHost && root.shell
@@ -207,6 +274,50 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.fs(12)
             anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+
+        // ------------------------------------------------ live agent
+        Rectangle {
+          id: agentCard
+          visible: root.agentActive
+          width: parent.width
+          height: agentSummary.implicitHeight + Style.space(16)
+          color: root.surface
+          radius: 4
+
+          Row {
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            spacing: Style.space(10)
+            Text {
+              id: agentSummary
+              width: Math.min(implicitWidth, parent.width * 0.45)
+              text: root.agentActive ? root.agent.role + " · " + root.agent.tool
+                + (root.agent.model ? " · " + root.agent.model : "") : ""
+              textFormat: Text.PlainText
+              color: root.accent
+              elide: Text.ElideRight
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(11)
+            }
+            Text {
+              id: agentTime
+              text: root.agentElapsed()
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(11)
+            }
+            Text {
+              width: Math.max(0, parent.width - agentSummary.width - agentTime.width
+                - parent.spacing * 2)
+              text: root.agentActive ? root.agent.last_line : ""
+              textFormat: Text.PlainText
+              color: root.mutedForeground
+              elide: Text.ElideRight
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(11)
+            }
           }
         }
 
@@ -399,15 +510,65 @@ Item {
           }
         }
 
-        // ------------------------------------------------- history
+        // ------------------------------------------- live / history
+        Row {
+          spacing: Style.space(8)
+          PanelButton {
+            label: "Live"
+            primary: root.liveTab
+            onClicked: root.liveTab = true
+          }
+          PanelButton {
+            label: "History"
+            primary: !root.liveTab
+            onClicked: root.liveTab = false
+          }
+        }
+
         Rectangle {
           width: parent.width
           height: parent.height
             - y  // fill the remaining space
           color: root.surface
           radius: 4
+          Flickable {
+            id: liveOutput
+            visible: root.liveTab
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            clip: true
+            contentWidth: width
+            contentHeight: liveText.height
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            property bool followTail: true
+
+            function scrollToTail() {
+              if (followTail && !moving)
+                contentY = Math.max(0, contentHeight - height)
+            }
+            onContentYChanged: {
+              if (moving) followTail = atYEnd
+            }
+            onMovementEnded: followTail = atYEnd
+            onContentHeightChanged: Qt.callLater(scrollToTail)
+            onHeightChanged: Qt.callLater(scrollToTail)
+            onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
+
+            Text {
+              id: liveText
+              width: liveOutput.width
+              text: root.agentLog
+              textFormat: Text.PlainText
+              color: root.mutedForeground
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(10)
+            }
+          }
           ListView {
             id: historyList
+            visible: !root.liveTab
             anchors.fill: parent
             anchors.margins: Style.space(8)
             clip: true
