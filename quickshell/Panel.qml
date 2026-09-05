@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -28,6 +29,30 @@ Item {
   readonly property color accent: Color.accent
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: Style.font.family
+
+  // Semantic status colors from the active theme's full palette; the shell's
+  // Color singleton only exposes five roles, so read colors.toml directly.
+  property color success: "#4faf72"
+  property color working: "#d5a542"
+  property color info: "#56a8c7"
+
+  function loadPalette(raw) {
+    function grab(key, fallback) {
+      const m = String(raw).match(new RegExp('^' + key + '\\s*=\\s*"([^"]+)"', "m"))
+      return m ? m[1] : fallback
+    }
+    success = grab("green", success)
+    working = grab("yellow", working)
+    info = grab("cyan", info)
+  }
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.loadPalette(text())
+    onFileChanged: reload()
+  }
 
   // Font size in design pixels; Style.fontPx takes a multiplier of the 12px base.
   function fs(px) { return Style.fontPx(px / 12) }
@@ -288,13 +313,19 @@ Item {
             color: "transparent"
             border.width: 1
             border.color: root.phase === "failed" || root.phase === "blocked"
-              ? root.urgent : root.accent
+              ? root.urgent
+              : root.busy ? root.working
+              : root.phase === "done" ? root.success
+              : root.mutedForeground
             Text {
               id: phaseText
               anchors.centerIn: parent
               text: root.engineOnline ? root.phase : "engine offline"
               color: root.phase === "failed" || root.phase === "blocked"
-                ? root.urgent : root.foreground
+                ? root.urgent
+                : root.busy ? root.working
+                : root.phase === "done" ? root.success
+                : root.foreground
               font.family: root.fontFamily
               font.pixelSize: root.fs(11)
             }
@@ -331,7 +362,7 @@ Item {
               text: root.agentActive ? root.agent.role + " · " + root.agent.tool
                 + (root.agent.model ? " · " + root.agent.model : "") : ""
               textFormat: Text.PlainText
-              color: root.accent
+              color: root.working
               elide: Text.ElideRight
               font.family: root.fontFamily
               font.pixelSize: root.fs(11)
@@ -526,8 +557,8 @@ Item {
                     text: stageRow.modelData.status === "committed" ? "✓"
                       : stageRow.modelData.status === "in_progress" ? "●"
                       : stageRow.modelData.status === "blocked" ? "!" : "·"
-                    color: stageRow.modelData.status === "committed"
-                      || stageRow.modelData.status === "in_progress" ? root.accent
+                    color: stageRow.modelData.status === "committed" ? root.success
+                      : stageRow.modelData.status === "in_progress" ? root.working
                       : stageRow.modelData.status === "blocked" ? root.urgent
                       : root.mutedForeground
                     font.family: root.fontFamily
@@ -552,7 +583,8 @@ Item {
                     + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
                     + (stageRow.modelData.rounds > 1
                        ? " (round " + stageRow.modelData.rounds + ")" : "")
-                  color: stageRow.modelData.status === "committed" ? root.accent
+                  color: stageRow.modelData.status === "committed" ? root.success
+                    : stageRow.modelData.status === "in_progress" ? root.working
                     : stageRow.modelData.status === "blocked" ? root.urgent
                     : root.mutedForeground
                   wrapMode: Text.Wrap
@@ -566,7 +598,7 @@ Item {
                     && stageRow.modelData.id === root.engineState.current_stage
                     ? root.engineState.current_step || "" : ""
                   textFormat: Text.PlainText
-                  color: root.accent
+                  color: root.working
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
@@ -582,9 +614,10 @@ Item {
               }
               Text {
                 text: stageRow.modelData.commit
-                color: root.accent
+                color: root.mutedForeground
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(11)
+                font.italic: true
               }
               Text {
                 visible: !stageRow.expanded
@@ -709,7 +742,8 @@ Item {
               text: historyRow.modelData.t + "  [" + historyRow.modelData.kind + "]  "
                 + historyRow.modelData.text
               color: historyRow.modelData.kind === "error" ? root.urgent
-                : historyRow.modelData.kind === "git" ? root.accent
+                : historyRow.modelData.kind === "git" ? root.success
+                : historyRow.modelData.kind === "check" ? root.working
                 : root.mutedForeground
               wrapMode: Text.Wrap
               font.family: root.fontFamily
@@ -794,9 +828,9 @@ Item {
                 width: diffList.width
                 text: modelData === "" ? " " : modelData
                 textFormat: Text.PlainText
-                color: header ? root.accent
+                color: header ? root.info
                   : modelData.indexOf("+") === 0 && modelData.indexOf("+++") !== 0
-                    ? root.accent
+                    ? root.success
                   : modelData.indexOf("-") === 0 && modelData.indexOf("---") !== 0
                     ? root.urgent : root.foreground
                 font.family: root.fontFamily
@@ -926,7 +960,7 @@ Item {
                     text: (chooserRow.modelData.isPrivate ? "private · " : "")
                       + (chooserRow.modelData.cloned ? "cloned" : "will clone")
                     color: chooserRow.modelData.cloned
-                      ? root.accent : root.mutedForeground
+                      ? root.success : root.mutedForeground
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(10)
                     anchors.verticalCenter: parent.verticalCenter
@@ -991,16 +1025,16 @@ Item {
     width: buttonText.implicitWidth + Style.space(18)
     height: buttonText.implicitHeight + Style.space(10)
     radius: 4
-    color: button.primary ? root.accent : root.surface
-    border.width: button.primary ? 0 : 1
+    color: button.primary && button.enabled ? root.accent : root.surface
+    border.width: button.primary && button.enabled ? 0 : 1
     border.color: Qt.darker(root.foreground, 3)
-    opacity: button.enabled ? (buttonArea.containsMouse ? 0.85 : 1.0) : 0.35
+    opacity: button.enabled ? (buttonArea.containsMouse ? 0.85 : 1.0) : 0.45
 
     Text {
       id: buttonText
       anchors.centerIn: parent
       text: button.label
-      color: button.primary ? root.background : root.foreground
+      color: button.primary && button.enabled ? root.background : root.foreground
       font.family: root.fontFamily
       font.pixelSize: root.fs(11)
     }

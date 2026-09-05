@@ -20,6 +20,7 @@ const FORGE_DIR: &str = ".forge";
 
 struct App {
     state: Mutex<State>,
+    queue_lock: Mutex<()>,
     stop_requested: AtomicBool,
     busy: AtomicBool,
     gh_cache: Mutex<Option<(Instant, Value, Option<String>)>>,
@@ -213,6 +214,55 @@ fn default_settings() -> Value {
     })
 }
 
+fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Result<String, &'static str> {
+    let items = queue["items"].as_array_mut().ok_or("invalid queue")?;
+    match action {
+        "add" => {
+            let goal = body["goal"].as_str().unwrap_or("").trim();
+            if goal.is_empty() {
+                return Err("goal required");
+            }
+            let id = items.iter().filter_map(|item| item["id"].as_u64())
+                .max().unwrap_or(0).checked_add(1).ok_or("queue id limit reached")?;
+            items.push(json!({
+                "id": id,
+                "goal": goal,
+                "status": "queued",
+                "added_unix": unix_timestamp(),
+            }));
+            Ok(format!("added goal {id}"))
+        }
+        "remove" | "move" => {
+            let id = body["id"].as_u64().ok_or("id required")?;
+            let idx = items.iter().position(|item| item["id"].as_u64() == Some(id))
+                .ok_or("queue item not found")?;
+            if items[idx]["status"] != "queued" {
+                return Err("item is not queued");
+            }
+            if action == "remove" {
+                items.remove(idx);
+                return Ok(format!("removed goal {id}"));
+            }
+            let dir = body["dir"].as_str().unwrap_or("");
+            let neighbor = match dir {
+                "up" => (0..idx).rev().find(|&i| items[i]["status"] == "queued"),
+                "down" => (idx + 1..items.len()).find(|&i| items[i]["status"] == "queued"),
+                _ => return Err("dir must be up or down"),
+            };
+            if let Some(neighbor) = neighbor {
+                items.swap(idx, neighbor);
+            }
+            Ok(format!("moved goal {id} {dir}"))
+        }
+        "clear" => {
+            let before = items.len();
+            items.retain(|item| item["status"] != "queued");
+            Ok(format!("cleared {} queued goals", before - items.len()))
+        }
+        _ => Err("unknown queue action"),
+    }
+}
+
 impl App {
     fn project(&self) -> String {
         self.state.lock().unwrap().project.clone()
@@ -261,6 +311,21 @@ impl App {
         );
     }
 
+    fn load_queue(&self) -> Value {
+        fs::read_to_string(self.forge_path("queue.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|queue| queue.get("items").is_some_and(Value::is_array))
+            .unwrap_or_else(|| json!({"items": []}))
+    }
+
+    fn save_queue(&self, queue: &Value) {
+        let _ = fs::write(
+            self.forge_path("queue.json"),
+            serde_json::to_string_pretty(queue).unwrap(),
+        );
+    }
+
     fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) {
         let stage = &mut plan["stages"][idx];
         let finished = unix_timestamp();
@@ -302,6 +367,8 @@ impl App {
         if !PathBuf::from(path).join(".git").exists() {
             return Err(format!("{path} is not a git repository"));
         }
+        // Keep queue reads, writes, and their events in the same project.
+        let _queue_guard = self.queue_lock.lock().unwrap();
         self.state.lock().unwrap().project = path.to_string();
         let phase = if self.load_plan().is_some() { "plan_ready" } else { "idle" };
         self.set_phase(phase);
@@ -911,6 +978,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
 
     match (method, path) {
         (tiny_http::Method::Get, "/api/state") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
             let snap = {
                 let s = app.state.lock().unwrap();
                 json!({
@@ -933,6 +1001,9 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             };
             let mut snap = snap;
             snap["plan"] = app.load_plan().unwrap_or(Value::Null);
+            snap["queue"] = app.load_queue()["items"].clone();
+            snap["queue_active"] = json!(false);
+            drop(_queue_guard);
             snap["history"] = app.read_history();
             snap["git_log"] = json!(app.git(&["log", "--oneline", "-12"]).unwrap_or_default());
             respond(req, 200, snap);
@@ -1092,6 +1163,20 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 400, json!({"error": "path or repo required"}));
             }
         }
+        (tiny_http::Method::Post, "/api/queue/add" | "/api/queue/remove"
+            | "/api/queue/move" | "/api/queue/clear") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            let mut queue = app.load_queue();
+            let action = path.strip_prefix("/api/queue/").unwrap();
+            match mutate_queue(&mut queue, action, &body) {
+                Ok(event) => {
+                    app.save_queue(&queue);
+                    app.log_event("queue", &event);
+                    respond(req, 200, json!({"ok": true}));
+                }
+                Err(e) => respond(req, 400, json!({"error": e})),
+            }
+        }
         (tiny_http::Method::Post, "/api/plan") => {
             let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
             if app.acquire_busy().is_err() {
@@ -1179,6 +1264,7 @@ fn main() {
     let mut settings = default_settings();
     settings["projects_root"] = json!(projects_root);
     let app = Arc::new(App {
+        queue_lock: Mutex::new(()),
         state: Mutex::new(State {
             project,
             settings,
@@ -1219,6 +1305,111 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_add_uses_max_id_and_records_goal_metadata() {
+        let mut queue = json!({"items": []});
+        let started = unix_timestamp();
+        mutate_queue(&mut queue, "add", &json!({"goal": "  First goal\n"})).unwrap();
+        mutate_queue(&mut queue, "add", &json!({"goal": "Second goal"})).unwrap();
+        assert_eq!(queue["items"][0]["id"], 1);
+        assert_eq!(queue["items"][1]["id"], 2);
+        assert_eq!(queue["items"][0]["goal"], "First goal");
+        assert_eq!(queue["items"][0]["status"], "queued");
+        let added = queue["items"][0]["added_unix"].as_i64().unwrap();
+        assert!((started..=unix_timestamp()).contains(&added));
+
+        queue["items"][0]["id"] = json!(10);
+        queue["items"][0]["status"] = json!("done");
+        mutate_queue(&mut queue, "add", &json!({"goal": "Third goal"})).unwrap();
+        assert_eq!(queue["items"][2]["id"], 11);
+    }
+
+    #[test]
+    fn queue_invalid_mutations_leave_items_unchanged() {
+        let original = json!({"items": [
+            {"id": 1, "status": "queued"},
+            {"id": 2, "status": "running"},
+            {"id": 3, "status": "done"},
+        ]});
+        for (action, body) in [
+            ("add", json!({})),
+            ("add", json!({"goal": ""})),
+            ("add", json!({"goal": " \t\n\u{2003}"})),
+            ("add", json!({"goal": 123})),
+            ("remove", json!({})),
+            ("remove", json!({"id": "1"})),
+            ("remove", json!({"id": -1})),
+            ("remove", json!({"id": 1.5})),
+            ("remove", json!({"id": 99})),
+            ("remove", json!({"id": 2})),
+            ("remove", json!({"id": 3})),
+            ("move", json!({"id": 1})),
+            ("move", json!({"id": 1, "dir": "left"})),
+            ("move", json!({"id": 2, "dir": "up"})),
+            ("move", json!({"id": 3, "dir": "down"})),
+            ("move", json!({"id": 99, "dir": "down"})),
+        ] {
+            let mut queue = original.clone();
+            assert!(mutate_queue(&mut queue, action, &body).is_err());
+            assert_eq!(queue, original);
+        }
+    }
+
+    #[test]
+    fn queue_moves_only_swap_queued_neighbors_and_allow_edges() {
+        let original = json!({"items": [
+            {"id": 1, "status": "running"},
+            {"id": 2, "status": "queued"},
+            {"id": 3, "status": "done"},
+            {"id": 4, "status": "queued"},
+            {"id": 5, "status": "failed"},
+        ]});
+        let mut queue = original.clone();
+        mutate_queue(&mut queue, "move", &json!({"id": 2, "dir": "up"})).unwrap();
+        mutate_queue(&mut queue, "move", &json!({"id": 4, "dir": "down"})).unwrap();
+        assert_eq!(queue, original);
+        mutate_queue(&mut queue, "move", &json!({"id": 4, "dir": "up"})).unwrap();
+        let mut swapped = original.clone();
+        swapped["items"].as_array_mut().unwrap().swap(1, 3);
+        assert_eq!(queue, swapped);
+        mutate_queue(&mut queue, "move", &json!({"id": 4, "dir": "down"})).unwrap();
+        assert_eq!(queue, original);
+    }
+
+    #[test]
+    fn queue_remove_and_clear_preserve_nonqueued_items() {
+        let mut queue = json!({"items": [
+            {"id": 1, "status": "running"},
+            {"id": 2, "status": "queued"},
+            {"id": 3, "status": "done"},
+            {"id": 4, "status": "queued"},
+            {"id": 5, "status": "failed"},
+        ]});
+        mutate_queue(&mut queue, "remove", &json!({"id": 2})).unwrap();
+        assert_eq!(queue["items"].as_array().unwrap().len(), 4);
+        assert_eq!(queue["items"][1]["id"], 3);
+        mutate_queue(&mut queue, "clear", &json!({})).unwrap();
+        assert_eq!(queue, json!({"items": [
+            {"id": 1, "status": "running"},
+            {"id": 3, "status": "done"},
+            {"id": 5, "status": "failed"},
+        ]}));
+        let preserved = queue.clone();
+        mutate_queue(&mut queue, "clear", &json!({})).unwrap();
+        assert_eq!(queue, preserved);
+        let mut empty = json!({"items": []});
+        mutate_queue(&mut empty, "clear", &json!({})).unwrap();
+        assert_eq!(empty, json!({"items": []}));
+    }
+
+    #[test]
+    fn queue_id_overflow_is_rejected_without_mutation() {
+        let mut queue = json!({"items": [{"id": u64::MAX, "status": "done"}]});
+        let original = queue.clone();
+        assert!(mutate_queue(&mut queue, "add", &json!({"goal": "Next"})).is_err());
+        assert_eq!(queue, original);
+    }
 
     #[test]
     fn claude_assistant_text() {
