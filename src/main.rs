@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PORT: u16 = 8734;
 const FORGE_DIR: &str = ".forge";
@@ -21,6 +22,7 @@ struct App {
     state: Mutex<State>,
     stop_requested: AtomicBool,
     busy: AtomicBool,
+    gh_cache: Mutex<Option<(Instant, Value, Option<String>)>>,
 }
 
 struct State {
@@ -113,6 +115,60 @@ impl App {
             .as_str()
             .unwrap_or("")
             .to_string()
+    }
+
+    /// Raw `gh repo list` result, cached for 60 seconds so panel polling
+    /// does not spawn a gh process every request. Returns (repos, error).
+    fn remote_repos_raw(&self) -> (Value, Option<String>) {
+        let mut cache = self.gh_cache.lock().unwrap();
+        if let Some((at, repos, err)) = cache.as_ref()
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return (repos.clone(), err.clone());
+        }
+        let out = Command::new("gh")
+            .args(["repo", "list", "--limit", "100",
+                   "--json", "nameWithOwner,name,updatedAt,isPrivate"])
+            .output();
+        let (repos, err) = match out {
+            Err(e) => (json!([]), Some(format!("failed to launch gh: {e}"))),
+            Ok(o) if !o.status.success() => (
+                json!([]),
+                Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            ),
+            Ok(o) => match serde_json::from_slice::<Value>(&o.stdout) {
+                Ok(v) if v.is_array() => (v, None),
+                _ => (json!([]), Some("unparseable gh output".to_string())),
+            },
+        };
+        *cache = Some((Instant::now(), repos.clone(), err.clone()));
+        (repos, err)
+    }
+
+    /// Remote entries for /api/projects, with `cloned` computed against
+    /// the local project names, sorted by most recently updated.
+    fn remote_repos(&self, local_names: &[String]) -> (Value, Option<String>) {
+        let (raw, err) = self.remote_repos_raw();
+        let mut remote: Vec<Value> = raw
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let name = r["name"].as_str().unwrap_or("");
+                json!({
+                    "name": name,
+                    "full_name": r["nameWithOwner"].as_str().unwrap_or(""),
+                    "private": r["isPrivate"].as_bool().unwrap_or(false),
+                    "updated_at": r["updatedAt"].as_str().unwrap_or(""),
+                    "cloned": local_names.iter().any(|l| l == name),
+                })
+            })
+            .collect();
+        remote.sort_by(|a, b| {
+            b["updated_at"].as_str().unwrap_or("")
+                .cmp(a["updated_at"].as_str().unwrap_or(""))
+        });
+        (Value::Array(remote), err)
     }
 
     // ------------------------------------------------------------ git
@@ -605,11 +661,20 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 let b = b["name"].as_str().unwrap_or("");
                 a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
             });
-            respond(req, 200, json!({
+            let local_names: Vec<String> = local
+                .iter()
+                .filter_map(|l| l["name"].as_str().map(String::from))
+                .collect();
+            let (remote, remote_error) = app.remote_repos(&local_names);
+            let mut resp = json!({
                 "projects_root": projects_root,
                 "local": local,
-                "remote": [],
-            }));
+                "remote": remote,
+            });
+            if let Some(e) = remote_error {
+                resp["remote_error"] = json!(e);
+            }
+            respond(req, 200, resp);
         }
         (tiny_http::Method::Post, "/api/settings") => {
             let mut s = app.state.lock().unwrap();
@@ -734,6 +799,7 @@ fn main() {
         }),
         stop_requested: AtomicBool::new(false),
         busy: AtomicBool::new(false),
+        gh_cache: Mutex::new(None),
     });
     if app.load_plan().is_some() {
         app.set_phase("plan_ready");
