@@ -54,15 +54,95 @@ fn last_chars(text: &str, limit: usize) -> String {
     text.chars().skip(count.saturating_sub(limit)).collect()
 }
 
-fn stream_agent_output<R: std::io::Read>(
+#[derive(Default)]
+struct ClaudeActivity {
+    lines: Vec<String>,
+    result: Option<String>,
+}
+
+fn claude_activity(line: &str) -> ClaudeActivity {
+    let event: Value = match serde_json::from_str(line) {
+        Ok(event) => event,
+        Err(_) => {
+            return ClaudeActivity {
+                lines: vec![line.to_string()],
+                result: None,
+            };
+        }
+    };
+    let mut activity = ClaudeActivity::default();
+    match event["type"].as_str() {
+        Some("assistant") => {
+            if let Some(contents) = event["message"]["content"].as_array() {
+                for content in contents {
+                    match content["type"].as_str() {
+                        Some("text") => {
+                            if let Some(text) = content["text"].as_str() {
+                                activity.lines.push(text.chars().take(400).collect());
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = content["name"].as_str().unwrap_or("tool");
+                            let input = &content["input"];
+                            let summary = ["file_path", "command", "pattern", "description", "url"]
+                                .iter()
+                                .find_map(|key| input.get(*key))
+                                .unwrap_or(input);
+                            let summary = summary
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| summary.to_string());
+                            let summary: String = summary
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(160)
+                                .collect();
+                            activity.lines.push(format!("» {name}: {summary}"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("result") => {
+            activity.result = event["result"].as_str().map(str::to_string);
+            let result = if event["is_error"].as_bool() == Some(true) {
+                event["subtype"].as_str()
+            } else {
+                activity
+                    .result
+                    .as_deref()
+                    .or_else(|| event["subtype"].as_str())
+            };
+            if let Some(result) = result {
+                let result: String = result.chars().take(400).collect();
+                activity.lines.push(format!("✔ result: {result}"));
+            }
+        }
+        Some("system") if event["subtype"] == "init" => {
+            let model = event["model"].as_str().unwrap_or("unknown");
+            activity
+                .lines
+                .push(format!("session started (model {model})"));
+        }
+        _ => {}
+    }
+    activity
+}
+
+fn stream_agent_output<R: std::io::Read, W: std::io::Write>(
     input: R,
-    log: &Arc<Mutex<fs::File>>,
+    log: &Arc<Mutex<W>>,
     state: &Mutex<State>,
     tail_limit: usize,
+    claude: bool,
 ) -> Result<String, String> {
     let mut reader = BufReader::new(input);
     let mut bytes = Vec::new();
     let mut tail = String::new();
+    let mut result_tail = None;
 
     loop {
         bytes.clear();
@@ -75,28 +155,40 @@ fn stream_agent_output<R: std::io::Read>(
 
         let lossy = String::from_utf8_lossy(&bytes);
         let line = lossy.trim_end_matches(&['\r', '\n'][..]);
-        {
-            let mut file = log
-                .lock()
-                .map_err(|_| "agent log lock was poisoned".to_string())?;
-            writeln!(file, "{line}").map_err(|e| format!("failed to write agent log: {e}"))?;
-            file.flush()
-                .map_err(|e| format!("failed to flush agent log: {e}"))?;
-        }
-
+        // Retain raw output as a fallback when Claude never sends a result.
         tail.push_str(line);
         tail.push('\n');
         tail = last_chars(&tail, tail_limit);
 
-        let mut s = state.lock().unwrap();
-        s.agent_lines += 1;
-        let latest = line.trim();
-        if !latest.is_empty() {
-            s.agent_last_line = latest.chars().take(200).collect();
+        let lines = if claude {
+            let activity = claude_activity(line);
+            if let Some(result) = activity.result {
+                result_tail = Some(last_chars(&result, tail_limit));
+            }
+            activity.lines
+        } else {
+            vec![line.to_string()]
+        };
+        for line in lines {
+            {
+                let mut file = log
+                    .lock()
+                    .map_err(|_| "agent log lock was poisoned".to_string())?;
+                writeln!(file, "{line}").map_err(|e| format!("failed to write agent log: {e}"))?;
+                file.flush()
+                    .map_err(|e| format!("failed to flush agent log: {e}"))?;
+            }
+
+            let mut s = state.lock().unwrap();
+            s.agent_lines += 1;
+            let latest = line.trim();
+            if !latest.is_empty() {
+                s.agent_last_line = latest.chars().take(200).collect();
+            }
         }
     }
 
-    Ok(tail.trim().to_string())
+    Ok(result_tail.unwrap_or(tail).trim().to_string())
 }
 
 fn default_settings() -> Value {
@@ -297,7 +389,10 @@ impl App {
         let mut cmd = match tool {
             "claude" => {
                 let mut c = Command::new("claude");
-                c.args(["-p", prompt, "--dangerously-skip-permissions"]);
+                c.args([
+                    "-p", prompt, "--dangerously-skip-permissions",
+                    "--verbose", "--output-format", "stream-json",
+                ]);
                 if !model.is_empty() {
                     c.args(["--model", model]);
                 }
@@ -378,9 +473,9 @@ impl App {
         let stderr_log = Arc::clone(&log);
         let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
             let stderr_reader = scope.spawn(|| {
-                stream_agent_output(stderr, &stderr_log, &self.state, 1500)
+                stream_agent_output(stderr, &stderr_log, &self.state, 1500, false)
             });
-            let stdout_result = stream_agent_output(stdout, &log, &self.state, 600);
+            let stdout_result = stream_agent_output(stdout, &log, &self.state, 600, tool == "claude");
             let status_result = child.wait();
             let stderr_result = stderr_reader
                 .join()
@@ -1082,5 +1177,169 @@ fn main() {
     for req in server.incoming_requests() {
         let app = Arc::clone(&app);
         std::thread::spawn(move || handle(&app, req));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_assistant_text() {
+        let event = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "Inspecting the code."},
+                {"type": "tool_result", "content": "ignored"},
+                {"type": "text", "text": "界".repeat(401)}
+            ]}
+        });
+        let activity = claude_activity(&event.to_string());
+        assert_eq!(
+            activity.lines,
+            ["Inspecting the code.".to_string(), "界".repeat(400)]
+        );
+        assert!(activity.result.is_none());
+    }
+
+    #[test]
+    fn claude_tool_use_summary_priority_and_single_line() {
+        let event = json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Read", "input": {
+                    "file_path": "src/main.rs", "command": "ignored"
+                }},
+                {"type": "tool_use", "name": "Bash", "input": {
+                    "command": "cargo build\n  cargo test"
+                }},
+                {"type": "tool_use", "name": "Custom", "input": {"value": 42}}
+            ]}
+        });
+        assert_eq!(
+            claude_activity(&event.to_string()).lines,
+            [
+                "» Read: src/main.rs",
+                "» Bash: cargo build cargo test",
+                "» Custom: {\"value\":42}",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_tool_summary_fields_and_unicode_limit() {
+        for field in ["file_path", "command", "pattern", "description", "url"] {
+            let event = json!({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Tool", "input": {field: "界".repeat(161)}
+                }]}
+            });
+            assert_eq!(
+                claude_activity(&event.to_string()).lines,
+                [format!("» Tool: {}", "界".repeat(160))]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_keeps_full_text_for_history() {
+        let result = "界".repeat(701);
+        let event = json!({"type": "result", "subtype": "success", "result": result});
+        let activity = claude_activity(&event.to_string());
+        assert_eq!(activity.lines, [format!("✔ result: {}", "界".repeat(400))]);
+        assert_eq!(activity.result.as_deref(), Some(result.as_str()));
+    }
+
+    #[test]
+    fn claude_error_result_uses_subtype() {
+        let event = r#"{"type":"result","is_error":true,"subtype":"error_during_execution","result":"failed"}"#;
+        assert_eq!(
+            claude_activity(event).lines,
+            ["✔ result: error_during_execution"]
+        );
+        let event = r#"{"type":"result","subtype":"error_max_turns"}"#;
+        assert_eq!(claude_activity(event).lines, ["✔ result: error_max_turns"]);
+    }
+
+    #[test]
+    fn claude_init_and_ignored_events() {
+        let event = r#"{"type":"system","subtype":"init","model":"claude-test"}"#;
+        assert_eq!(
+            claude_activity(event).lines,
+            ["session started (model claude-test)"]
+        );
+        for event in [
+            r#"{"type":"system","subtype":"other"}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ignored"}]}}"#,
+            r#"{"type":"assistant","message":{}}"#,
+            r#"{"type":"unknown"}"#,
+            "null",
+        ] {
+            assert!(claude_activity(event).lines.is_empty());
+        }
+    }
+
+    #[test]
+    fn claude_non_json_passes_through() {
+        for line in ["plain output", "{invalid json", "", "  keep spacing  "] {
+            assert_eq!(claude_activity(line).lines, [line]);
+        }
+    }
+
+    fn capture_stream(input: &str, claude: bool) -> (String, String, State) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let state = Mutex::new(State {
+            project: String::new(),
+            settings: json!({}),
+            phase: String::new(),
+            goal: String::new(),
+            current_stage: None,
+            current_step: String::new(),
+            agent_role: String::new(),
+            agent_tool: String::new(),
+            agent_model: String::new(),
+            agent_started_unix: 0,
+            agent_lines: 0,
+            agent_last_line: String::new(),
+        });
+        let tail = stream_agent_output(input.as_bytes(), &log, &state, 600, claude).unwrap();
+        let output = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        (tail, output, state.into_inner().unwrap())
+    }
+
+    #[test]
+    fn claude_stream_updates_activity_and_prefers_result_for_history() {
+        let input = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Working\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"Done\"}\n",
+            "{\"type\":\"unknown\"}\n",
+        );
+        let (tail, output, state) = capture_stream(input, true);
+        assert_eq!(tail, "Done");
+        assert_eq!(output, "Working\n✔ result: Done\n");
+        assert_eq!(state.agent_lines, 2);
+        assert_eq!(state.agent_last_line, "✔ result: Done");
+    }
+
+    #[test]
+    fn claude_stream_history_falls_back_to_raw_output() {
+        let input = "{\"type\":\"unknown\"}\nplain output";
+        let (tail, output, state) = capture_stream(input, true);
+        assert_eq!(tail, input);
+        assert_eq!(output, "plain output\n");
+        assert_eq!(state.agent_lines, 1);
+        assert_eq!(state.agent_last_line, "plain output");
+    }
+
+    #[test]
+    fn raw_stream_preserves_codex_and_stderr_behavior() {
+        let input = "  Working  \r\n{\"type\":\"result\",\"result\":\"raw JSON\"}\n\nDone";
+        let (tail, output, state) = capture_stream(input, false);
+        let expected = "  Working  \n{\"type\":\"result\",\"result\":\"raw JSON\"}\n\nDone\n";
+        assert_eq!(tail, expected.trim());
+        assert_eq!(output, expected);
+        assert_eq!(state.agent_lines, 4);
+        assert_eq!(state.agent_last_line, "Done");
     }
 }
