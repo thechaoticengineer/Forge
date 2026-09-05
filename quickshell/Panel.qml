@@ -19,6 +19,9 @@ Item {
   property string apiBase: "http://127.0.0.1:8734"
   property string localError: ""
   property int expandedStageId: -1
+  property string lastProject: ""
+  property int projectViewRevision: 0
+  property var goalDrafts: ({})
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id : "dev.omarchy-ai-build-orchestrator"
@@ -58,10 +61,20 @@ Item {
   function fs(px) { return Style.fontPx(px / 12) }
 
   readonly property var plan: engineState ? engineState.plan : null
+  readonly property var sessions: engineState && engineState.sessions ? engineState.sessions : []
+  readonly property string activeProject: engineState
+    ? engineState.active_project || engineState.project : ""
+  readonly property int activeProjectCount: sessions.filter(function(session) {
+    return session.busy || session.queue_active
+  }).length
+  readonly property bool backgroundBusy: sessions.some(function(session) {
+    return session.project !== root.activeProject && (session.busy || session.queue_active)
+  })
   readonly property var queue: engineState && engineState.queue ? engineState.queue : []
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
   readonly property bool hasQueuedGoals: queue.some(function(item) { return item.status === "queued" })
   readonly property string phase: engineState ? engineState.phase : "offline"
+  // Only the displayed project's work gates its controls, never background sessions.
   readonly property bool busy: phase === "planning" || phase === "running"
     || (engineState !== null && engineState.current_step.indexOf("cloning") === 0)
   readonly property string projectName: engineState
@@ -90,6 +103,31 @@ Item {
   property double agentLogOffset: 0
   property string logSession: ""
   property bool agentLogPending: false
+
+  onEngineStateChanged: {
+    const project = engineState ? engineState.project : ""
+    if (project === lastProject) return
+    if (lastProject !== "") goalDrafts[lastProject] = goalField.text
+    lastProject = project
+    // Ignore log/diff responses from an earlier visit, even after switching back.
+    projectViewRevision++
+    goalField.text = goalDrafts[project] || ""
+    goalFlick.contentY = 0
+    expandedStageId = -1
+    diffOpen = false
+    diffText = ""
+    diffError = ""
+    diffPending = false
+    localError = ""
+    agentLog = ""
+    agentLogOffset = 0
+    agentLogPending = false
+    logSession = agentSession
+    liveOutput.followTail = true
+    liveTab = busy
+    historyFilter = "all"
+    historyList.positionViewAtBeginning()
+  }
 
   onBusyChanged: liveTab = busy
   onAgentSessionChanged: {
@@ -152,7 +190,10 @@ Item {
     if (!window.visible || !busy || agentLogPending) return
     agentLogPending = true
     const session = logSession
-    api("GET", "/api/agent_log?offset=" + agentLogOffset, null, function(resp) {
+    const revision = projectViewRevision
+    api("GET", "/api/agent_log?offset=" + agentLogOffset
+        + "&project=" + encodeURIComponent(lastProject), null, function(resp) {
+      if (revision !== root.projectViewRevision) return
       root.agentLogPending = false
       if (session !== root.logSession || !resp
           || typeof resp.log !== "string" || typeof resp.size !== "number") return
@@ -192,7 +233,9 @@ Item {
   function refreshDiff() {
     if (diffPending) return
     diffPending = true
-    api("GET", "/api/diff", null, function(resp) {
+    const revision = projectViewRevision
+    api("GET", "/api/diff?project=" + encodeURIComponent(lastProject), null, function(resp) {
+      if (revision !== root.projectViewRevision) return
       root.diffPending = false
       if (resp && typeof resp.diff === "string") {
         root.diffError = ""
@@ -338,13 +381,25 @@ Item {
           spacing: Style.space(10)
 
           Text {
+            id: forgeTitle
             text: "FORGE"
             color: root.accent
             font.family: root.fontFamily
             font.pixelSize: root.fs(18)
             font.bold: true
           }
+          Text {
+            id: projectActivity
+            visible: root.backgroundBusy
+            text: root.activeProjectCount + " project"
+              + (root.activeProjectCount === 1 ? "" : "s") + " active"
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(10)
+            anchors.verticalCenter: parent.verticalCenter
+          }
           Rectangle {
+            id: phaseBadge
             width: phaseText.implicitWidth + Style.space(16)
             height: phaseText.implicitHeight + Style.space(6)
             radius: height / 2
@@ -370,6 +425,10 @@ Item {
           }
           Text {
             visible: root.engineState !== null && root.engineState.current_step !== ""
+            width: Math.max(0, parent.width - forgeTitle.width - phaseBadge.width
+              - (projectActivity.visible ? projectActivity.width + parent.spacing : 0)
+              - 2 * parent.spacing)
+            elide: Text.ElideRight
             text: root.engineState && root.engineState.current_stage !== null
               ? "stage " + root.engineState.current_stage + ": "
                 + root.engineState.current_step
@@ -500,6 +559,32 @@ Item {
           }
         }
 
+        // ----------------------------------------------- project tabs
+        Flow {
+          id: projectTabs
+          visible: root.sessions.length > 1
+          width: parent.width
+          spacing: Style.space(8)
+          Repeater {
+            model: root.sessions
+            delegate: PanelButton {
+              required property var modelData
+              readonly property bool needsAttention: modelData.phase === "blocked"
+                || modelData.phase === "failed"
+              label: modelData.name + " "
+                + (modelData.busy || modelData.queue_active ? "●" : needsAttention ? "!"
+                  : modelData.phase === "done" ? "✓" : "·")
+                + (modelData.queued > 0 ? " +" + modelData.queued : "")
+              width: Math.min(implicitWidth, projectTabs.width)
+              primary: modelData.project === root.activeProject
+              labelColor: !primary && needsAttention ? root.urgent
+                : primary && enabled ? root.background : root.foreground
+              enabled: root.engineOnline
+              onClicked: root.act("/api/project/select", { path: modelData.project })
+            }
+          }
+        }
+
         // -------------------------------------------- project + tools
         Row {
           width: parent.width
@@ -526,7 +611,7 @@ Item {
           PanelButton {
             id: changeProjectButton
             label: "Change project"
-            enabled: !root.busy && root.engineOnline
+            enabled: root.engineOnline
             onClicked: root.openChooser()
           }
         }
@@ -1344,9 +1429,11 @@ Item {
     property string label: ""
     property bool primary: false
     property bool enabled: true
+    property color labelColor: primary && enabled ? root.background : root.foreground
     signal clicked()
 
-    width: buttonText.implicitWidth + Style.space(18)
+    implicitWidth: buttonText.implicitWidth + Style.space(18)
+    width: implicitWidth
     height: buttonText.implicitHeight + Style.space(10)
     radius: 4
     color: button.primary && button.enabled ? root.accent : root.surface
@@ -1357,8 +1444,11 @@ Item {
     Text {
       id: buttonText
       anchors.centerIn: parent
+      width: Math.max(0, button.width - Style.space(18))
       text: button.label
-      color: button.primary && button.enabled ? root.background : root.foreground
+      textFormat: Text.PlainText
+      elide: Text.ElideRight
+      color: button.labelColor
       font.family: root.fontFamily
       font.pixelSize: root.fs(11)
     }
