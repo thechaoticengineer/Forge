@@ -9,6 +9,7 @@
 //! Serves a JSON API on 127.0.0.1:8734 for the Quickshell panel.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::PathBuf;
@@ -21,29 +22,44 @@ const PORT: u16 = 8734;
 const FORGE_DIR: &str = ".forge";
 
 struct App {
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    active_project: Mutex<String>,
+    settings: Mutex<Value>,
+    gh_cache: Mutex<Option<(Instant, Value, Option<String>)>>,
+}
+
+struct Session {
     state: Mutex<State>,
     queue_lock: Mutex<()>,
     stop_requested: AtomicBool,
     busy: AtomicBool,
     queue_active: AtomicBool,
-    gh_cache: Mutex<Option<(Instant, Value, Option<String>)>>,
 }
 
-/// Each worker owns one busy claim, including while it advances the queue.
-struct WorkerGuard<'a>(&'a App);
+/// A worker keeps this project and session even when the UI switches projects.
+#[derive(Clone)]
+struct Ctx {
+    app: Arc<App>,
+    project: String,
+    session: Arc<Session>,
+}
+
+/// Each worker owns one session's busy claim, including while advancing its queue.
+struct WorkerGuard<'a>(&'a Session);
 
 impl Drop for WorkerGuard<'_> {
     fn drop(&mut self) {
-        self.0.set_step(None, "");
-        self.0.state.lock().unwrap().run_started_unix = 0;
+        let mut state = self.0.state.lock().unwrap();
+        state.current_stage = None;
+        state.current_step.clear();
+        state.run_started_unix = 0;
         self.0.stop_requested.store(false, Ordering::SeqCst);
         self.0.busy.store(false, Ordering::SeqCst);
     }
 }
 
+#[derive(Default)]
 struct State {
-    project: String,
-    settings: Value,
     phase: String, // idle|planning|plan_ready|running|blocked|done|failed
     goal: String,
     current_stage: Option<i64>,
@@ -55,6 +71,25 @@ struct State {
     agent_started_unix: i64,
     agent_lines: i64,
     agent_last_line: String,
+}
+
+/// Resolve existing ancestors too, so a clone destination has a stable key
+/// before its directory exists (including under a symlinked projects root).
+fn canonical_project(path: &str) -> String {
+    fn resolve(path: &std::path::Path) -> PathBuf {
+        if let Ok(path) = fs::canonicalize(path) {
+            return path;
+        }
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => resolve(parent).join(name),
+            _ => path.to_path_buf(),
+        }
+    }
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() { path } else {
+        std::env::current_dir().unwrap().join(path)
+    };
+    resolve(&path).display().to_string()
 }
 
 fn unix_timestamp() -> i64 {
@@ -289,130 +324,101 @@ fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Result<String,
 }
 
 impl App {
-    fn project(&self) -> String {
-        self.state.lock().unwrap().project.clone()
+    fn new(project: &str, settings: Value) -> Self {
+        let app = Self {
+            sessions: Mutex::new(HashMap::new()),
+            active_project: Mutex::new(canonical_project(project)),
+            settings: Mutex::new(settings),
+            gh_cache: Mutex::new(None),
+        };
+        app.active_session();
+        app
     }
 
-    fn forge_path(&self, name: &str) -> PathBuf {
-        let dir = PathBuf::from(self.project()).join(FORGE_DIR);
-        let _ = fs::create_dir_all(&dir);
-        dir.join(name)
-    }
-
-    fn log_event(&self, kind: &str, text: &str) {
-        let t = clock_hms();
-        let mut entry = json!({"t": t, "unix": unix_timestamp(), "kind": kind, "text": text});
-        {
-            // Callers release the state lock before logging; release it here
-            // before forge_path takes it again to resolve the project directory.
-            let s = self.state.lock().unwrap();
-            if !s.goal.is_empty() {
-                entry["goal"] = json!(s.goal.chars().take(120).collect::<String>());
-            }
-            if let Some(stage) = s.current_stage {
-                entry["stage"] = json!(stage);
-            }
+    fn session(&self, project: &str) -> Arc<Session> {
+        let project = canonical_project(project);
+        if let Some(session) = self.sessions.lock().unwrap().get(&project).cloned() {
+            return session;
         }
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.forge_path("history.jsonl"))
-        {
-            let _ = writeln!(f, "{entry}");
-        }
-        println!("[{kind}] {text}");
+        // Read persisted state before taking the map lock. No session state
+        // or queue lock may be held while the sessions map is locked.
+        let plan = fs::read_to_string(PathBuf::from(&project).join(FORGE_DIR).join("plan.json"))
+            .ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|plan| plan.get("stages").is_some_and(Value::is_array));
+        let session = Arc::new(Session {
+            state: Mutex::new(State {
+                phase: if plan.is_some() { "plan_ready" } else { "idle" }.into(),
+                goal: plan.as_ref().and_then(|plan| plan["goal"].as_str())
+                    .unwrap_or("").to_string(),
+                ..State::default()
+            }),
+            queue_lock: Mutex::new(()),
+            stop_requested: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            queue_active: AtomicBool::new(false),
+        });
+        self.sessions.lock().unwrap().entry(project).or_insert(session).clone()
     }
 
-    fn read_history(&self) -> Value {
-        let text = fs::read_to_string(self.forge_path("history.jsonl")).unwrap_or_default();
-        let items: Vec<Value> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        let skip = items.len().saturating_sub(400);
-        Value::Array(items.into_iter().skip(skip).collect())
+    fn active_session(&self) -> Arc<Session> {
+        let project = self.active_project.lock().unwrap().clone();
+        self.session(&project)
     }
 
-    fn load_plan(&self) -> Option<Value> {
-        let text = fs::read_to_string(self.forge_path("plan.json")).ok()?;
-        let plan: Value = serde_json::from_str(&text).ok()?;
-        plan.get("stages")?.as_array()?;
-        Some(plan)
-    }
-
-    fn save_plan(&self, plan: &Value) {
-        let _ = fs::write(
-            self.forge_path("plan.json"),
-            serde_json::to_string_pretty(plan).unwrap(),
-        );
-    }
-
-    fn load_queue(&self) -> Value {
-        fs::read_to_string(self.forge_path("queue.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .filter(|queue| queue.get("items").is_some_and(Value::is_array))
-            .unwrap_or_else(|| json!({"items": []}))
-    }
-
-    fn save_queue(&self, queue: &Value) {
-        let _ = fs::write(
-            self.forge_path("queue.json"),
-            serde_json::to_string_pretty(queue).unwrap(),
-        );
-    }
-
-    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> i64 {
-        let stage = &mut plan["stages"][idx];
-        let finished = unix_timestamp();
-        let started = stage["started_unix"].as_i64().unwrap_or(finished);
-        stage["status"] = json!(status);
-        stage["finished_unix"] = json!(finished);
-        stage["duration_secs"] = json!(finished - started);
-        self.save_plan(plan);
-        finished - started
-    }
-
-    fn set_phase(&self, phase: &str) {
-        self.state.lock().unwrap().phase = phase.to_string();
-    }
-
-    fn set_step(&self, stage: Option<i64>, step: &str) {
-        let mut s = self.state.lock().unwrap();
-        s.current_stage = stage;
-        s.current_step = step.to_string();
+    fn context(self: &Arc<Self>, project: &str) -> Ctx {
+        let project = canonical_project(project);
+        let session = self.session(&project);
+        Ctx { app: Arc::clone(self), project, session }
     }
 
     fn setting(&self, key: &str) -> String {
-        self.state.lock().unwrap().settings[key]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
+        self.settings.lock().unwrap()[key].as_str().unwrap_or("").to_string()
     }
 
-    /// Atomically claim the busy flag; Err means other work is in flight.
-    /// Prevents two requests that both saw busy=false from racing to spawn.
-    fn acquire_busy(&self) -> Result<(), ()> {
-        self.busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map(|_| ())
-            .map_err(|_| ())
-    }
-
-    /// Point Forge at an existing local git repository and recompute phase.
+    /// Selection never changes or waits for an existing session's work.
     fn set_project(&self, path: &str) -> Result<(), String> {
         if !PathBuf::from(path).join(".git").exists() {
             return Err(format!("{path} is not a git repository"));
         }
-        // Keep queue reads, writes, and their events in the same project.
-        let _queue_guard = self.queue_lock.lock().unwrap();
-        if self.queue_active.load(Ordering::SeqCst) {
-            return Err("queue is active".to_string());
-        }
-        self.state.lock().unwrap().project = path.to_string();
-        let phase = if self.load_plan().is_some() { "plan_ready" } else { "idle" };
-        self.set_phase(phase);
+        let project = canonical_project(path);
+        self.session(&project);
+        *self.active_project.lock().unwrap() = project;
         Ok(())
+    }
+
+    fn open_sessions(&self) -> Vec<(String, Arc<Session>)> {
+        self.sessions.lock().unwrap().iter()
+            .map(|(project, session)| (project.clone(), Arc::clone(session))).collect()
+    }
+
+    fn any_busy(&self) -> bool {
+        self.open_sessions().iter().any(|(_, session)| {
+            session.busy.load(Ordering::SeqCst) || session.queue_active.load(Ordering::SeqCst)
+        })
+    }
+
+    fn session_summaries(self: &Arc<Self>, active: &str) -> Value {
+        let mut sessions = self.open_sessions();
+        sessions.sort_by(|(a, _), (b, _)| {
+            (a != active).cmp(&(b != active)).then_with(|| a.cmp(b))
+        });
+        Value::Array(sessions.into_iter().map(|(project, session)| {
+            let ctx = Ctx { app: Arc::clone(self), project, session };
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            let queued = ctx.load_queue()["items"].as_array().unwrap().iter()
+                .filter(|item| item["status"] == "queued").count();
+            let s = ctx.session.state.lock().unwrap();
+            json!({
+                "project": ctx.project,
+                "name": PathBuf::from(&ctx.project).file_name().unwrap_or_default().to_string_lossy(),
+                "phase": s.phase,
+                "busy": ctx.session.busy.load(Ordering::SeqCst),
+                "queue_active": ctx.session.queue_active.load(Ordering::SeqCst),
+                "queued": queued,
+                "current_step": s.current_step,
+                "goal": s.goal,
+            })
+        }).collect())
     }
 
     /// Raw `gh repo list` result, cached for 60 seconds so panel polling
@@ -467,6 +473,120 @@ impl App {
                 .cmp(a["updated_at"].as_str().unwrap_or(""))
         });
         (Value::Array(remote), err)
+    }
+
+}
+
+impl Ctx {
+    fn project(&self) -> &str {
+        &self.project
+    }
+
+    fn forge_path(&self, name: &str) -> PathBuf {
+        PathBuf::from(self.project()).join(FORGE_DIR).join(name)
+    }
+
+    fn ensure_forge_dir(&self) {
+        let _ = fs::create_dir_all(self.forge_path(""));
+    }
+
+    fn log_event(&self, kind: &str, text: &str) {
+        self.ensure_forge_dir();
+        let t = clock_hms();
+        let mut entry = json!({"t": t, "unix": unix_timestamp(), "kind": kind, "text": text});
+        {
+            // Callers release the session state lock before logging.
+            let s = self.session.state.lock().unwrap();
+            if !s.goal.is_empty() {
+                entry["goal"] = json!(s.goal.chars().take(120).collect::<String>());
+            }
+            if let Some(stage) = s.current_stage {
+                entry["stage"] = json!(stage);
+            }
+        }
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.forge_path("history.jsonl"))
+        {
+            let _ = writeln!(f, "{entry}");
+        }
+        println!("[{kind}] {text}");
+    }
+
+    fn read_history(&self) -> Value {
+        let text = fs::read_to_string(self.forge_path("history.jsonl")).unwrap_or_default();
+        let items: Vec<Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let skip = items.len().saturating_sub(400);
+        Value::Array(items.into_iter().skip(skip).collect())
+    }
+
+    fn load_plan(&self) -> Option<Value> {
+        let text = fs::read_to_string(self.forge_path("plan.json")).ok()?;
+        let plan: Value = serde_json::from_str(&text).ok()?;
+        plan.get("stages")?.as_array()?;
+        Some(plan)
+    }
+
+    fn save_plan(&self, plan: &Value) {
+        self.ensure_forge_dir();
+        let _ = fs::write(
+            self.forge_path("plan.json"),
+            serde_json::to_string_pretty(plan).unwrap(),
+        );
+    }
+
+    fn load_queue(&self) -> Value {
+        fs::read_to_string(self.forge_path("queue.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|queue| queue.get("items").is_some_and(Value::is_array))
+            .unwrap_or_else(|| json!({"items": []}))
+    }
+
+    fn save_queue(&self, queue: &Value) {
+        self.ensure_forge_dir();
+        let _ = fs::write(
+            self.forge_path("queue.json"),
+            serde_json::to_string_pretty(queue).unwrap(),
+        );
+    }
+
+    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> i64 {
+        let stage = &mut plan["stages"][idx];
+        let finished = unix_timestamp();
+        let started = stage["started_unix"].as_i64().unwrap_or(finished);
+        stage["status"] = json!(status);
+        stage["finished_unix"] = json!(finished);
+        stage["duration_secs"] = json!(finished - started);
+        self.save_plan(plan);
+        finished - started
+    }
+
+    fn set_phase(&self, phase: &str) {
+        self.session.state.lock().unwrap().phase = phase.to_string();
+    }
+
+    fn set_step(&self, stage: Option<i64>, step: &str) {
+        let mut s = self.session.state.lock().unwrap();
+        s.current_stage = stage;
+        s.current_step = step.to_string();
+    }
+
+    fn setting(&self, key: &str) -> String {
+        self.app.setting(key)
+    }
+
+    /// Atomically claim the busy flag; Err means other work is in flight.
+    /// Prevents two requests that both saw busy=false from racing to spawn.
+    fn acquire_busy(&self) -> Result<(), ()> {
+        self.session.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     // ------------------------------------------------------------ git
@@ -567,7 +687,7 @@ impl App {
         };
 
         {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.session.state.lock().unwrap();
             s.agent_role = role.to_string();
             s.agent_tool = tool.to_string();
             s.agent_model = model.to_string();
@@ -598,9 +718,9 @@ impl App {
         let stderr_log = Arc::clone(&log);
         let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
             let stderr_reader = scope.spawn(|| {
-                stream_agent_output(stderr, &stderr_log, &self.state, 1500, false)
+                stream_agent_output(stderr, &stderr_log, &self.session.state, 1500, false)
             });
-            let stdout_result = stream_agent_output(stdout, &log, &self.state, 600, tool == "claude");
+            let stdout_result = stream_agent_output(stdout, &log, &self.session.state, 600, tool == "claude");
             let status_result = child.wait();
             let stderr_result = stderr_reader
                 .join()
@@ -641,7 +761,7 @@ impl App {
     }
 
     fn clear_agent_activity(&self) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.session.state.lock().unwrap();
         s.agent_role.clear();
         s.agent_tool.clear();
         s.agent_model.clear();
@@ -650,11 +770,11 @@ impl App {
         s.agent_last_line.clear();
     }
 
-    /// Fake agent used by the self-test. Never reachable from normal settings.
+    /// Fake agent used by the self-test and local API smoke tests.
     fn mock_agent(&self, role: &str) -> Result<(), String> {
         match role {
             "planner" => {
-                let goal = self.state.lock().unwrap().goal.clone();
+                let goal = self.session.state.lock().unwrap().goal.clone();
                 self.save_plan(&json!({
                     "goal": goal, "status": "draft",
                     "stages": [
@@ -689,7 +809,7 @@ impl App {
     // ------------------------------------------------------ orchestrator
 
     fn plan_worker(&self, goal: &str) {
-        let _worker = WorkerGuard(self);
+        let _worker = WorkerGuard(&self.session);
         self.plan_worker_inner(goal);
     }
 
@@ -754,7 +874,7 @@ impl App {
         plan["status"] = json!("approved");
         self.save_plan(plan);
         self.set_queue_status(queue, id, "running");
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.session.state.lock().unwrap();
         s.goal = plan["goal"].as_str().unwrap_or("").to_string();
         s.phase = "running".into();
         s.run_started_unix = unix_timestamp();
@@ -762,8 +882,8 @@ impl App {
 
     fn run_queue_item(&self, id: u64) -> bool {
         self.run_worker_core();
-        let _queue_guard = self.queue_lock.lock().unwrap();
-        let phase = self.state.lock().unwrap().phase.clone();
+        let _queue_guard = self.session.queue_lock.lock().unwrap();
+        let phase = self.session.state.lock().unwrap().phase.clone();
         // A user-stopped run retains its plan for human intervention.
         let status = match phase.as_str() {
             "done" => "done",
@@ -772,14 +892,14 @@ impl App {
         };
         self.set_queue_status(&mut self.load_queue(), id, status);
         if status != "done" {
-            self.queue_active.store(false, Ordering::SeqCst);
+            self.session.queue_active.store(false, Ordering::SeqCst);
         }
-        status == "done" && self.queue_active.load(Ordering::SeqCst)
+        status == "done" && self.session.queue_active.load(Ordering::SeqCst)
     }
 
     /// Start fresh, or finish an explicitly approved item before taking the next.
     fn queue_worker(&self, approved: Option<u64>) {
-        let _worker = WorkerGuard(self);
+        let _worker = WorkerGuard(&self.session);
         if let Some(id) = approved
             && !self.run_queue_item(id)
         {
@@ -787,22 +907,22 @@ impl App {
         }
         loop {
             let (id, goal) = {
-                let _queue_guard = self.queue_lock.lock().unwrap();
-                if !self.queue_active.load(Ordering::SeqCst) {
+                let _queue_guard = self.session.queue_lock.lock().unwrap();
+                if !self.session.queue_active.load(Ordering::SeqCst) {
                     return;
                 }
                 let mut queue = self.load_queue();
                 let Some(item) = queue["items"].as_array().unwrap().iter()
                     .find(|item| item["status"] == "queued")
                 else {
-                    self.queue_active.store(false, Ordering::SeqCst);
+                    self.session.queue_active.store(false, Ordering::SeqCst);
                     self.log_event("queue", "queue complete");
                     return;
                 };
                 let id = item["id"].as_u64().unwrap();
                 let goal = item["goal"].as_str().unwrap_or("").to_string();
                 {
-                    let mut s = self.state.lock().unwrap();
+                    let mut s = self.session.state.lock().unwrap();
                     s.goal = goal.clone();
                     s.phase = "planning".into();
                 }
@@ -811,18 +931,18 @@ impl App {
             };
             let planned = self.plan_worker_inner(&goal);
             {
-                let _queue_guard = self.queue_lock.lock().unwrap();
+                let _queue_guard = self.session.queue_lock.lock().unwrap();
                 let mut queue = self.load_queue();
                 if !planned {
                     self.set_queue_status(&mut queue, id, "failed");
-                    self.queue_active.store(false, Ordering::SeqCst);
+                    self.session.queue_active.store(false, Ordering::SeqCst);
                     return;
                 }
-                if !self.queue_active.load(Ordering::SeqCst) {
+                if !self.session.queue_active.load(Ordering::SeqCst) {
                     self.set_queue_status(&mut queue, id, "blocked");
                     return;
                 }
-                let auto_approve = self.state.lock().unwrap().settings["queue_auto_approve"]
+                let auto_approve = self.app.settings.lock().unwrap()["queue_auto_approve"]
                     .as_bool().unwrap_or(false);
                 if !auto_approve {
                     self.set_queue_status(&mut queue, id, "awaiting_approval");
@@ -863,14 +983,14 @@ impl App {
 
     /// Implement + independent check + bounded fix loop for one stage.
     fn run_one_stage(&self, plan: &mut Value, idx: usize) -> Result<&'static str, String> {
-        let max_rounds = self.state.lock().unwrap().settings["max_fix_rounds"]
+        let max_rounds = self.app.settings.lock().unwrap()["max_fix_rounds"]
             .as_i64()
             .unwrap_or(3);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
         let mut issues: Option<Vec<String>> = None;
 
         for round in 0..=max_rounds {
-            if self.stop_requested.load(Ordering::SeqCst) {
+            if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
             plan["stages"][idx]["rounds"] = json!(round + 1);
@@ -894,7 +1014,7 @@ impl App {
                                    &self.setting("implementer_model"))?;
                 }
             }
-            if self.stop_requested.load(Ordering::SeqCst) {
+            if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
 
@@ -904,7 +1024,7 @@ impl App {
             let p = self.stage_prompt(CHECK_PROMPT, plan, &stage);
             self.run_agent("checker", &self.setting("checker"), &p,
                            &self.setting("checker_model"))?;
-            if self.stop_requested.load(Ordering::SeqCst) {
+            if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
 
@@ -956,7 +1076,7 @@ impl App {
     }
 
     fn run_worker(&self) {
-        let _worker = WorkerGuard(self);
+        let _worker = WorkerGuard(&self.session);
         self.run_worker_core();
     }
 
@@ -968,7 +1088,7 @@ impl App {
             self.log_event("error", &format!("run failed: {e}"));
         }
         self.set_step(None, "");
-        self.state.lock().unwrap().run_started_unix = 0;
+        self.session.state.lock().unwrap().run_started_unix = 0;
     }
 
     fn run_worker_inner(&self) -> Result<(), String> {
@@ -978,7 +1098,7 @@ impl App {
             if plan["stages"][idx]["status"] == json!("committed") {
                 continue;
             }
-            if self.stop_requested.load(Ordering::SeqCst) {
+            if self.session.stop_requested.load(Ordering::SeqCst) {
                 self.set_phase("plan_ready");
                 self.log_event("run", "stopped by user; progress is saved, run again to continue");
                 return Ok(());
@@ -1022,7 +1142,7 @@ impl App {
 
         plan["status"] = json!("done");
         self.save_plan(&plan);
-        if self.state.lock().unwrap().settings["auto_push"].as_bool() == Some(true) {
+        if self.app.settings.lock().unwrap()["auto_push"].as_bool() == Some(true) {
             self.set_step(None, "pushing");
             match self.git(&["push", "-u", "origin", "HEAD"]) {
                 Ok(out) => self.log_event("git", &format!("pushed to origin: {}",
@@ -1032,7 +1152,7 @@ impl App {
             }
         }
         self.set_phase("done");
-        let started = self.state.lock().unwrap().run_started_unix;
+        let started = self.session.state.lock().unwrap().run_started_unix;
         let duration = fmt_duration(if started > 0 { unix_timestamp() - started } else { 0 });
         self.log_event("run", &format!("all stages committed — run complete in {duration}"));
         Ok(())
@@ -1133,6 +1253,31 @@ fn respond(req: tiny_http::Request, code: u32, body: Value) {
     let _ = req.respond(resp);
 }
 
+fn query_value(query: &str, key: &str) -> Result<Option<String>, &'static str> {
+    let Some(value) = query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == key).then_some(value)
+    }) else {
+        return Ok(None);
+    };
+    let mut decoded = Vec::new();
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(match byte {
+            b'+' => b' ',
+            b'%' => {
+                let high = bytes.next().and_then(|b| (b as char).to_digit(16))
+                    .ok_or("invalid project query encoding")?;
+                let low = bytes.next().and_then(|b| (b as char).to_digit(16))
+                    .ok_or("invalid project query encoding")?;
+                (high * 16 + low) as u8
+            }
+            byte => byte,
+        });
+    }
+    String::from_utf8(decoded).map(Some).map_err(|_| "invalid project query encoding")
+}
+
 fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
@@ -1140,16 +1285,44 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let mut body_text = String::new();
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-    let busy = app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst);
+    let project_endpoint = matches!(path, "/api/state" | "/api/agent_log" | "/api/diff"
+        | "/api/plan" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        || path.starts_with("/api/queue/");
+    let target = if !project_endpoint {
+        Ok(None)
+    } else if method == tiny_http::Method::Get {
+        query_value(query, "project")
+    } else {
+        match body.get("project") {
+            None => Ok(None),
+            Some(Value::String(project)) => Ok(Some(project.clone())),
+            Some(_) => Err("project must be a string"),
+        }
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            respond(req, 400, json!({"error": error}));
+            return;
+        }
+    };
+    if let Some(project) = &target
+        && !PathBuf::from(project).join(".git").exists()
+    {
+        respond(req, 400, json!({"error": format!("{project} is not a git repository")}));
+        return;
+    }
+    let active_project = app.active_project.lock().unwrap().clone();
+    let ctx = app.context(if project_endpoint { target.as_deref().unwrap_or(&active_project) }
+        else { &active_project });
 
     match (method, path) {
         (tiny_http::Method::Get, "/api/state") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
             let snap = {
-                let s = app.state.lock().unwrap();
+                let s = ctx.session.state.lock().unwrap();
                 json!({
-                    "project": s.project,
-                    "settings": s.settings,
+                    "project": ctx.project,
                     "phase": s.phase,
                     "goal": s.goal,
                     "current_stage": s.current_stage,
@@ -1166,16 +1339,20 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 })
             };
             let mut snap = snap;
-            snap["plan"] = app.load_plan().unwrap_or(Value::Null);
-            snap["queue"] = app.load_queue()["items"].clone();
-            snap["queue_active"] = json!(app.queue_active.load(Ordering::SeqCst));
+            snap["settings"] = app.settings.lock().unwrap().clone();
+            snap["busy"] = json!(ctx.session.busy.load(Ordering::SeqCst));
+            snap["plan"] = ctx.load_plan().unwrap_or(Value::Null);
+            snap["queue"] = ctx.load_queue()["items"].clone();
+            snap["queue_active"] = json!(ctx.session.queue_active.load(Ordering::SeqCst));
             drop(_queue_guard);
-            snap["history"] = app.read_history();
-            snap["git_log"] = json!(app.git(&["log", "--oneline", "-12"]).unwrap_or_default());
+            snap["active_project"] = json!(active_project);
+            snap["sessions"] = app.session_summaries(&active_project);
+            snap["history"] = ctx.read_history();
+            snap["git_log"] = json!(ctx.git(&["log", "--oneline", "-12"]).unwrap_or_default());
             respond(req, 200, snap);
         }
         (tiny_http::Method::Get, "/api/agent_log") => {
-            let data = fs::read(app.forge_path("agent.log")).unwrap_or_default();
+            let data = fs::read(ctx.forge_path("agent.log")).unwrap_or_default();
             let size = data.len();
             let offset = query.split('&').find_map(|part| {
                 part.strip_prefix("offset=")?.parse::<usize>().ok()
@@ -1189,7 +1366,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             respond(req, 200, json!({"log": log, "size": size}));
         }
         (tiny_http::Method::Get, "/api/diff") => {
-            let diff = app.git(&["diff", "HEAD"]).unwrap_or_default();
+            let diff = ctx.git(&["diff", "HEAD"]).unwrap_or_default();
             let tail: String = diff.chars().rev().take(40000).collect::<Vec<_>>()
                 .into_iter().rev().collect();
             respond(req, 200, json!({"diff": tail}));
@@ -1240,34 +1417,28 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             respond(req, 200, resp);
         }
         (tiny_http::Method::Post, "/api/settings") => {
-            let mut s = app.state.lock().unwrap();
+            let mut settings = app.settings.lock().unwrap();
             if let Some(obj) = body.as_object() {
                 for (k, v) in obj {
-                    if s.settings.get(k).is_some() {
-                        s.settings[k] = v.clone();
+                    if settings.get(k).is_some() {
+                        settings[k] = v.clone();
                     }
                 }
             }
-            drop(s);
+            drop(settings);
             respond(req, 200, json!({"ok": true}));
         }
         (tiny_http::Method::Post, "/api/project") => {
             let path = body["path"].as_str().unwrap_or("").trim().to_string();
-            if busy {
-                respond(req, 409, json!({"error": "busy"}));
-            } else {
-                match app.set_project(&path) {
-                    Ok(()) => respond(req, 200, json!({"ok": true})),
-                    Err(e) => respond(req, 400, json!({"error": e})),
-                }
+            match app.set_project(&path) {
+                Ok(()) => respond(req, 200, json!({"ok": true})),
+                Err(e) => respond(req, 400, json!({"error": e})),
             }
         }
         (tiny_http::Method::Post, "/api/project/select") => {
             let path = body["path"].as_str().unwrap_or("").trim().to_string();
             let repo = body["repo"].as_str().unwrap_or("").trim().to_string();
-            if busy {
-                respond(req, 409, json!({"error": "busy"}));
-            } else if !path.is_empty() {
+            if !path.is_empty() {
                 match app.set_project(&path) {
                     Ok(()) => respond(req, 200, json!({"ok": true})),
                     Err(e) => respond(req, 400, json!({"error": e})),
@@ -1289,39 +1460,37 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 }
                 let name = parts[1].to_string();
                 let target = PathBuf::from(app.setting("projects_root")).join(&name);
+                let ctx = app.context(&target.display().to_string());
                 if target.join(".git").exists() {
                     match app.set_project(&target.display().to_string()) {
                         Ok(()) => respond(req, 200, json!({"ok": true})),
                         Err(e) => respond(req, 400, json!({"error": e})),
                     }
-                } else if app.acquire_busy().is_err() {
+                } else if ctx.acquire_busy().is_err() {
                     respond(req, 409, json!({"error": "busy"}));
                 } else {
-                    app.set_step(None, &format!("cloning {repo}"));
-                    app.log_event("git", &format!("cloning {repo} into {}", target.display()));
-                    let app2 = Arc::clone(app);
+                    ctx.set_step(None, &format!("cloning {repo}"));
+                    println!("cloning {repo} into {}", target.display());
+                    let ctx2 = ctx.clone();
                     std::thread::spawn(move || {
+                        let _worker = WorkerGuard(&ctx2.session);
                         let out = Command::new("gh")
                             .args(["repo", "clone", &repo])
                             .arg(&target)
                             .output();
                         match out {
                             Ok(o) if o.status.success() => {
-                                match app2.set_project(&target.display().to_string()) {
-                                    Ok(()) => app2.log_event("git",
+                                match ctx2.app.set_project(&target.display().to_string()) {
+                                    Ok(()) => ctx2.log_event("git",
                                         &format!("clone finished: {repo} -> {}", target.display())),
-                                    Err(e) => app2.log_event("error",
+                                    Err(e) => ctx2.log_event("error",
                                         &format!("clone finished but selection failed: {e}")),
                                 }
                             }
-                            Ok(o) => app2.log_event("error", &format!(
-                                "clone of {repo} failed: {}",
-                                String::from_utf8_lossy(&o.stderr).trim())),
-                            Err(e) => app2.log_event("error",
-                                &format!("failed to launch gh clone: {e}")),
+                            Ok(o) => eprintln!("clone of {repo} failed: {}",
+                                String::from_utf8_lossy(&o.stderr).trim()),
+                            Err(e) => eprintln!("failed to launch gh clone: {e}"),
                         }
-                        app2.set_step(None, "");
-                        app2.busy.store(false, Ordering::SeqCst);
                     });
                     respond(req, 200, json!({"ok": true, "cloning": true}));
                 }
@@ -1331,154 +1500,153 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         }
         (tiny_http::Method::Post, "/api/queue/add" | "/api/queue/remove"
             | "/api/queue/move" | "/api/queue/clear") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            let mut queue = app.load_queue();
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            let mut queue = ctx.load_queue();
             let action = path.strip_prefix("/api/queue/").unwrap();
             match mutate_queue(&mut queue, action, &body) {
                 Ok(event) => {
-                    app.save_queue(&queue);
-                    app.log_event("queue", &event);
+                    ctx.save_queue(&queue);
+                    ctx.log_event("queue", &event);
                     respond(req, 200, json!({"ok": true}));
                 }
                 Err(e) => respond(req, 400, json!({"error": e})),
             }
         }
         (tiny_http::Method::Post, "/api/queue/start") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
                 respond(req, 409, json!({"error": "busy"}));
                 return;
             }
-            let queue = app.load_queue();
+            let queue = ctx.load_queue();
             if !queue["items"].as_array().unwrap().iter()
                 .any(|item| item["status"] == "queued")
             {
                 respond(req, 400, json!({"error": "no queued goals"}));
-            } else if app.acquire_busy().is_err() {
+            } else if ctx.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
-                app.stop_requested.store(false, Ordering::SeqCst);
-                app.queue_active.store(true, Ordering::SeqCst);
-                app.log_event("queue", "queue started");
-                let app2 = Arc::clone(app);
-                std::thread::spawn(move || app2.queue_worker(None));
+                ctx.session.stop_requested.store(false, Ordering::SeqCst);
+                ctx.session.queue_active.store(true, Ordering::SeqCst);
+                ctx.log_event("queue", "queue started");
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || ctx2.queue_worker(None));
                 respond(req, 200, json!({"ok": true}));
             }
         }
         (tiny_http::Method::Post, "/api/plan") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
             let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
-            if app.queue_active.load(Ordering::SeqCst) || app.acquire_busy().is_err() {
+            if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
-                app.stop_requested.store(false, Ordering::SeqCst);
+                ctx.session.stop_requested.store(false, Ordering::SeqCst);
                 {
-                    let mut s = app.state.lock().unwrap();
+                    let mut s = ctx.session.state.lock().unwrap();
                     s.goal = goal.clone();
                     s.phase = "planning".into();
                 }
-                let mut short = goal.clone();
-                short.truncate(300);
-                app.log_event("plan", &format!("planning started for goal: {short}"));
-                let app2 = Arc::clone(app);
-                std::thread::spawn(move || app2.plan_worker(&goal));
+                let short: String = goal.chars().take(300).collect();
+                ctx.log_event("plan", &format!("planning started for goal: {short}"));
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || ctx2.plan_worker(&goal));
                 respond(req, 200, json!({"ok": true}));
             }
         }
         (tiny_http::Method::Post, "/api/approve") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            if app.busy.load(Ordering::SeqCst) {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            if ctx.session.busy.load(Ordering::SeqCst) {
                 respond(req, 409, json!({"error": "busy"}));
                 return;
             }
-            let Some(mut plan) = app.load_plan() else {
+            let Some(mut plan) = ctx.load_plan() else {
                 respond(req, 400, json!({"error": "no plan"}));
                 return;
             };
-            let mut queue = app.load_queue();
+            let mut queue = ctx.load_queue();
             let awaiting = queue["items"].as_array().unwrap().iter()
                 .find(|item| !matches!(item["status"].as_str(), Some("done" | "failed" | "blocked")))
                 .filter(|item| item["status"] == "awaiting_approval")
                 .and_then(|item| item["id"].as_u64());
             if let Some(id) = awaiting {
-                if app.acquire_busy().is_err() {
+                if ctx.acquire_busy().is_err() {
                     respond(req, 409, json!({"error": "busy"}));
                     return;
                 }
-                app.stop_requested.store(false, Ordering::SeqCst);
-                app.queue_active.store(true, Ordering::SeqCst);
-                app.start_queue_run(&mut queue, id, &mut plan);
-                app.log_event("queue", &format!("goal {id}: approved by user"));
-                let app2 = Arc::clone(app);
-                std::thread::spawn(move || app2.queue_worker(Some(id)));
+                ctx.session.stop_requested.store(false, Ordering::SeqCst);
+                ctx.session.queue_active.store(true, Ordering::SeqCst);
+                ctx.start_queue_run(&mut queue, id, &mut plan);
+                ctx.log_event("queue", &format!("goal {id}: approved by user"));
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || ctx2.queue_worker(Some(id)));
             } else {
                 plan["status"] = json!("approved");
-                app.save_plan(&plan);
+                ctx.save_plan(&plan);
             }
-            app.log_event("plan", "plan approved by user");
+            ctx.log_event("plan", "plan approved by user");
             respond(req, 200, json!({"ok": true}));
         }
         (tiny_http::Method::Post, "/api/run") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            if app.queue_active.load(Ordering::SeqCst) {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            if ctx.session.queue_active.load(Ordering::SeqCst) {
                 respond(req, 409, json!({"error": "busy"}));
                 return;
             }
-            let plan = app.load_plan();
+            let plan = ctx.load_plan();
             let status = plan
                 .as_ref()
                 .and_then(|p| p["status"].as_str())
                 .unwrap_or("");
             if status != "approved" && status != "done" {
                 respond(req, 400, json!({"error": "plan is not approved"}));
-            } else if app.acquire_busy().is_err() {
+            } else if ctx.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
                 {
-                    let mut s = app.state.lock().unwrap();
+                    let mut s = ctx.session.state.lock().unwrap();
                     s.phase = "running".into();
                     s.run_started_unix = unix_timestamp();
                     if let Some(g) = plan.as_ref().and_then(|p| p["goal"].as_str()) {
                         s.goal = g.to_string();
                     }
                 }
-                app.stop_requested.store(false, Ordering::SeqCst);
-                app.log_event("run", "run started");
-                let app2 = Arc::clone(app);
-                std::thread::spawn(move || app2.run_worker());
+                ctx.session.stop_requested.store(false, Ordering::SeqCst);
+                ctx.log_event("run", "run started");
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || ctx2.run_worker());
                 respond(req, 200, json!({"ok": true}));
             }
         }
         (tiny_http::Method::Post, "/api/stop") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            app.stop_requested.store(true, Ordering::SeqCst);
-            app.queue_active.store(false, Ordering::SeqCst);
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            ctx.session.stop_requested.store(true, Ordering::SeqCst);
+            ctx.session.queue_active.store(false, Ordering::SeqCst);
             // No worker remains to transition a plan paused for approval.
-            let mut queue = app.load_queue();
+            let mut queue = ctx.load_queue();
             let awaiting: Vec<u64> = queue["items"].as_array().unwrap().iter()
                 .filter(|item| item["status"] == "awaiting_approval")
                 .filter_map(|item| item["id"].as_u64())
                 .collect();
             for id in awaiting {
-                app.set_queue_status(&mut queue, id, "blocked");
+                ctx.set_queue_status(&mut queue, id, "blocked");
             }
-            app.log_event("queue", "queue stopped by user");
-            app.log_event("run", "stop requested; finishing current agent session");
+            ctx.log_event("queue", "queue stopped by user");
+            ctx.log_event("run", "stop requested; finishing current agent session");
             respond(req, 200, json!({"ok": true}));
         }
         (tiny_http::Method::Post, "/api/reset_plan") => {
-            let _queue_guard = app.queue_lock.lock().unwrap();
-            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
-                let _ = fs::remove_file(app.forge_path("plan.json"));
-                app.set_phase("idle");
-                app.log_event("plan", "plan discarded");
+                let _ = fs::remove_file(ctx.forge_path("plan.json"));
+                ctx.set_phase("idle");
+                ctx.log_event("plan", "plan discarded");
                 respond(req, 200, json!({"ok": true}));
             }
         }
         (tiny_http::Method::Post, "/api/self_update") => {
-            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
+            if app.any_busy() {
                 respond(req, 409, json!({"error": "busy"}));
                 return;
             }
@@ -1499,7 +1667,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 .output();
             match out {
                 Ok(o) if o.status.success() => {
-                    app.log_event("update",
+                    ctx.log_event("update",
                         "self-update started; engine and shell will restart \
                          (log: journalctl --user -u forge-update)");
                     respond(req, 200, json!({"ok": true}));
@@ -1531,31 +1699,7 @@ fn main() {
         .to_string();
     let mut settings = default_settings();
     settings["projects_root"] = json!(projects_root);
-    let app = Arc::new(App {
-        queue_lock: Mutex::new(()),
-        state: Mutex::new(State {
-            project,
-            settings,
-            phase: "idle".into(),
-            goal: String::new(),
-            current_stage: None,
-            current_step: String::new(),
-            run_started_unix: 0,
-            agent_role: String::new(),
-            agent_tool: String::new(),
-            agent_model: String::new(),
-            agent_started_unix: 0,
-            agent_lines: 0,
-            agent_last_line: String::new(),
-        }),
-        stop_requested: AtomicBool::new(false),
-        busy: AtomicBool::new(false),
-        queue_active: AtomicBool::new(false),
-        gh_cache: Mutex::new(None),
-    });
-    if app.load_plan().is_some() {
-        app.set_phase("plan_ready");
-    }
+    let app = Arc::new(App::new(&project, settings));
     let port: u16 = std::env::var("FORGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1563,7 +1707,7 @@ fn main() {
     let server = tiny_http::Server::http(("127.0.0.1", port)).expect("bind server");
     println!(
         "Forge engine on http://127.0.0.1:{port}  (project: {})",
-        app.project()
+        app.active_project.lock().unwrap()
     );
     for req in server.incoming_requests() {
         let app = Arc::clone(&app);
@@ -1691,12 +1835,16 @@ mod tests {
     }
 
     struct QueueTest {
-        app: App,
+        app: Ctx,
         path: PathBuf,
     }
 
     impl QueueTest {
         fn new(auto_approve: bool) -> Self {
+            Self::with_engine(auto_approve, None)
+        }
+
+        fn with_engine(auto_approve: bool, engine: Option<Arc<App>>) -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
                 "forge-queue-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst),
@@ -1708,19 +1856,8 @@ mod tests {
             settings["checker"] = json!("mock");
             settings["auto_push"] = json!(false);
             settings["queue_auto_approve"] = json!(auto_approve);
-            let app = App {
-                state: Mutex::new(State {
-                    project: path.display().to_string(), settings,
-                    phase: "idle".into(), goal: String::new(), current_stage: None,
-                    current_step: String::new(), run_started_unix: 0,
-                    agent_role: String::new(), agent_tool: String::new(),
-                    agent_model: String::new(), agent_started_unix: 0,
-                    agent_lines: 0, agent_last_line: String::new(),
-                }),
-                queue_lock: Mutex::new(()), stop_requested: AtomicBool::new(false),
-                busy: AtomicBool::new(false), queue_active: AtomicBool::new(false),
-                gh_cache: Mutex::new(None),
-            };
+            let engine = engine.unwrap_or_else(|| Arc::new(App::new(&path.display().to_string(), settings)));
+            let app = engine.context(&path.display().to_string());
             app.git(&["init", "-q"]).unwrap();
             for (key, value) in [
                 ("user.name", "Forge Test"), ("user.email", "test@example.invalid"),
@@ -1739,7 +1876,7 @@ mod tests {
 
         fn start(&self) {
             self.app.acquire_busy().unwrap();
-            self.app.queue_active.store(true, Ordering::SeqCst);
+            self.app.session.queue_active.store(true, Ordering::SeqCst);
             self.app.queue_worker(None);
         }
 
@@ -1760,15 +1897,15 @@ mod tests {
         let test = QueueTest::new(true);
         let before = unix_timestamp();
         test.app.log_event("run", "idle event");
-        test.app.state.lock().unwrap().goal = "short goal".into();
+        test.app.session.state.lock().unwrap().goal = "short goal".into();
         test.app.log_event("plan", "goal event");
         {
-            let mut s = test.app.state.lock().unwrap();
+            let mut s = test.app.session.state.lock().unwrap();
             s.goal = "界🙂".repeat(61);
             s.current_stage = Some(3);
         }
         test.app.log_event("stage", "active event");
-        test.app.state.lock().unwrap().goal.clear();
+        test.app.session.state.lock().unwrap().goal.clear();
         test.app.log_event("stage", "stage event");
 
         let text = fs::read_to_string(test.path.join(FORGE_DIR).join("history.jsonl")).unwrap();
@@ -1818,7 +1955,7 @@ mod tests {
         test.app.save_plan(&json!({"stages": [], "status": "approved"}));
         let started = unix_timestamp() - 252;
         {
-            let mut s = test.app.state.lock().unwrap();
+            let mut s = test.app.session.state.lock().unwrap();
             s.goal = "timed goal".into();
             s.run_started_unix = started;
         }
@@ -1831,7 +1968,7 @@ mod tests {
         assert!((252..=elapsed).any(|secs| {
             entry["text"] == format!("all stages committed — run complete in {}", fmt_duration(secs))
         }));
-        assert_eq!(test.app.state.lock().unwrap().run_started_unix, 0);
+        assert_eq!(test.app.session.state.lock().unwrap().run_started_unix, 0);
     }
 
     #[test]
@@ -1839,10 +1976,10 @@ mod tests {
         let test = QueueTest::new(true);
         test.start();
         assert_eq!(test.statuses(), ["done", "done"]);
-        assert!(!test.app.queue_active.load(Ordering::SeqCst));
-        assert!(!test.app.busy.load(Ordering::SeqCst));
-        assert_eq!(test.app.state.lock().unwrap().phase, "done");
-        assert_eq!(test.app.state.lock().unwrap().goal, "second goal");
+        assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+        assert_eq!(test.app.session.state.lock().unwrap().goal, "second goal");
         assert_eq!(test.app.git(&["log", "--format=%s", "-4"]).unwrap(),
             "feat: line two\nfeat: line one\nfeat: line two\nfeat: line one");
 
@@ -1870,43 +2007,215 @@ mod tests {
     }
 
     #[test]
+    fn two_sessions_run_mock_queues_concurrently() {
+        let first = QueueTest::new(true);
+        let second = QueueTest::with_engine(true, Some(Arc::clone(&first.app.app)));
+        let engine = &first.app.app;
+        let barrier = std::sync::Barrier::new(2);
+        // Distinct goals make crossed plan/history writes observable too.
+        let mut queue = second.app.load_queue();
+        for item in queue["items"].as_array_mut().unwrap() {
+            item["goal"] = json!(format!("other project goal {}", item["id"]));
+        }
+        second.app.save_queue(&queue);
+        for test in [&first, &second] {
+            test.app.acquire_busy().unwrap();
+            test.app.session.queue_active.store(true, Ordering::SeqCst);
+        }
+        engine.set_project(second.app.project()).unwrap();
+        assert!(Arc::ptr_eq(&engine.active_session(), &second.app.session));
+        let summaries = engine.session_summaries(second.app.project());
+        assert_eq!(summaries[0]["project"], second.app.project());
+        assert_eq!(summaries[1]["project"], first.app.project());
+        for summary in summaries.as_array().unwrap() {
+            assert_eq!(summary["busy"], true);
+            assert_eq!(summary["queue_active"], true);
+            assert_eq!(summary["queued"], 2);
+        }
+        std::thread::scope(|scope| {
+            for test in [&first, &second] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    test.app.queue_worker(None);
+                });
+            }
+        });
+        for test in [&first, &second] {
+            assert_eq!(test.statuses(), ["done", "done"]);
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
+            assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+            assert_eq!(test.app.git(&["rev-list", "--count", "HEAD"]).unwrap(), "5");
+            assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap().lines().count(), 4);
+            let goal = test.app.load_queue()["items"][1]["goal"].clone();
+            assert_eq!(test.app.load_plan().unwrap()["goal"], goal);
+            assert!(test.app.read_history().as_array().unwrap().iter().all(|entry| {
+                test.app.load_queue()["items"].as_array().unwrap().iter()
+                    .any(|item| item["goal"] == entry["goal"])
+            }));
+        }
+        assert!(!engine.any_busy());
+    }
+
+    #[test]
+    fn session_aliases_and_selection_preserve_existing_work() {
+        let test = QueueTest::new(true);
+        let engine = &test.app.app;
+        let alias = test.path.join("alias");
+        std::os::unix::fs::symlink(&test.path, &alias).unwrap();
+        let session = engine.session(&alias.display().to_string());
+        assert!(Arc::ptr_eq(&session, &test.app.session));
+        test.app.acquire_busy().unwrap();
+        session.state.lock().unwrap().goal = "in flight".into();
+        test.app.set_phase("running");
+        test.app.set_step(Some(2), "checking");
+        engine.set_project(&alias.display().to_string()).unwrap();
+        assert!(engine.set_project(&test.path.join(FORGE_DIR).display().to_string()).is_err());
+        assert_eq!(*engine.active_project.lock().unwrap(), test.app.project());
+        assert_eq!(engine.open_sessions().len(), 1);
+        assert_eq!(session.state.lock().unwrap().phase, "running");
+        let summary = engine.session_summaries(test.app.project());
+        assert_eq!(summary[0]["goal"], "in flight");
+        assert_eq!(summary[0]["current_step"], "checking");
+        assert_eq!(summary[0]["name"], test.path.file_name().unwrap().to_string_lossy().as_ref());
+        assert!(session.busy.load(Ordering::SeqCst));
+    }
+
+    fn api_request(engine: &Arc<App>, method: &str, path: &str, body: Value) -> (u16, Value) {
+        use std::io::Read as _;
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| handle(engine, server.recv().unwrap()));
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body = body.to_string();
+            write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+            (status, serde_json::from_str(body).unwrap())
+        })
+    }
+
+    fn wait_for_worker(ctx: &Ctx) {
+        let started = Instant::now();
+        while ctx.session.busy.load(Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(5), "worker did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn api_routes_projects_while_another_session_is_busy() {
+        let first = QueueTest::new(true);
+        let engine = &first.app.app;
+        let second = QueueTest::with_engine(true, Some(Arc::clone(engine)));
+        first.app.acquire_busy().unwrap();
+        let _worker = WorkerGuard(&first.app.session);
+        first.app.set_phase("running");
+        first.app.set_step(Some(1), "checking");
+        first.app.session.state.lock().unwrap().goal = "first project's work".into();
+        first.app.session.queue_active.store(true, Ordering::SeqCst);
+        first.app.save_plan(&json!({"goal": "first project's work", "stages": []}));
+        let post = |path: &str, body: Value| api_request(engine, "POST", path, body).0;
+        for route in ["/api/project", "/api/project/select"] {
+            assert_eq!(post(route, json!({"path": second.app.project()})), 200);
+            assert_eq!(post(route, json!({"path": first.app.project()})), 200);
+        }
+        assert_eq!(post("/api/project/select", json!({"path": second.app.project()})), 200);
+        assert_eq!(post("/api/plan", json!({"goal": "default target"})), 200);
+        wait_for_worker(&second.app);
+        assert_eq!(second.app.load_plan().unwrap()["goal"], "default target");
+        assert_eq!(post("/api/plan", json!({"project": first.app.project(), "goal": "busy target"})), 409);
+
+        // Explicit writes to B keep working when the active project is busy A.
+        assert_eq!(post("/api/project", json!({"path": first.app.project()})), 200);
+        let target = json!({"project": second.app.project()});
+        assert_eq!(post("/api/plan", json!({"project": second.app.project(), "goal": "explicit target"})), 200);
+        wait_for_worker(&second.app);
+        assert_eq!(post("/api/approve", target.clone()), 200);
+        assert_eq!(post("/api/run", target.clone()), 200);
+        wait_for_worker(&second.app);
+        assert_eq!(second.app.load_plan().unwrap()["goal"], "explicit target");
+        assert_eq!(post("/api/queue/start", target.clone()), 200);
+        wait_for_worker(&second.app);
+        assert_eq!(second.statuses(), ["done", "done"]);
+        assert_eq!(first.statuses(), ["queued", "queued"]);
+
+        // Decode project paths independently of other query parameters.
+        let alias = second.path.join("project + space");
+        std::os::unix::fs::symlink(&second.path, &alias).unwrap();
+        let encoded = alias.display().to_string().replace('/', "%2F").replace('+', "%2B").replace(' ', "%20");
+        let get = |route: &str| api_request(engine, "GET", &format!("{route}?offset=2&project={encoded}"), json!({}));
+        let (status, state) = get("/api/state");
+        assert_eq!(status, 200);
+        assert_eq!(state["project"], second.app.project());
+        assert_eq!(state["active_project"], first.app.project());
+        assert_eq!(state["phase"], "done");
+        assert_eq!(state["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(state["sessions"][0]["project"], first.app.project());
+        assert_eq!(state["sessions"][0]["busy"], true);
+        assert_eq!(state["sessions"][0]["queued"], 2);
+        assert_eq!(state["sessions"][0]["goal"], "first project's work");
+        assert_eq!(state["sessions"][0]["current_step"], "checking");
+        assert_eq!(state["sessions"][1]["busy"], false);
+        assert_eq!(state["sessions"][1]["queued"], 0);
+        fs::write(second.app.forge_path("agent.log"), "B log").unwrap();
+        assert_eq!(get("/api/agent_log").1["log"], "log");
+        fs::write(second.path.join("mock.txt"), "B diff\n").unwrap();
+        assert!(get("/api/diff").1["diff"].as_str().unwrap().contains("+B diff"));
+        assert_eq!(post("/api/stop", target.clone()), 200);
+        assert!(!first.app.session.stop_requested.load(Ordering::SeqCst));
+        assert!(first.app.session.queue_active.load(Ordering::SeqCst));
+        assert_eq!(post("/api/reset_plan", target), 200);
+        assert!(second.app.load_plan().is_none());
+        assert_eq!(first.app.load_plan().unwrap()["goal"], "first project's work");
+        assert_eq!(post("/api/project/select", json!({"path": second.app.forge_path("")})), 400);
+        assert_eq!(post("/api/stop", json!({"project": 42})), 400);
+        assert_eq!(api_request(engine, "GET", "/api/state?project=%ZZ", json!({})).0, 400);
+    }
+
+    #[test]
     fn queue_manual_approval_pauses_again_after_each_goal() {
         assert_eq!(default_settings()["queue_auto_approve"], false);
         let test = QueueTest::new(false);
         test.start();
         assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
-        assert_eq!(test.app.state.lock().unwrap().phase, "plan_ready");
-        assert!(test.app.queue_active.load(Ordering::SeqCst));
-        assert!(!test.app.busy.load(Ordering::SeqCst));
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+        assert!(test.app.session.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
         for id in [1, 2] {
             test.app.acquire_busy().unwrap();
             {
-                let _queue_guard = test.app.queue_lock.lock().unwrap();
+                let _queue_guard = test.app.session.queue_lock.lock().unwrap();
                 test.app.start_queue_run(
                     &mut test.app.load_queue(), id, &mut test.app.load_plan().unwrap(),
                 );
             }
             test.app.queue_worker(Some(id));
-            assert!(!test.app.busy.load(Ordering::SeqCst));
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
             if id == 1 {
                 assert_eq!(test.statuses(), ["done", "awaiting_approval"]);
-                assert_eq!(test.app.state.lock().unwrap().phase, "plan_ready");
+                assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
             }
         }
         assert_eq!(test.statuses(), ["done", "done"]);
-        assert!(!test.app.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
     }
 
     #[test]
     fn queue_agent_failures_halt_and_leave_remaining_goals_queued() {
         for role in ["planner", "implementer", "checker"] {
             let test = QueueTest::new(true);
-            test.app.state.lock().unwrap().settings[role] = json!("invalid-agent");
+            test.app.app.settings.lock().unwrap()[role] = json!("invalid-agent");
             test.start();
             assert_eq!(test.statuses(), ["failed", "queued"], "{role}");
-            assert_eq!(test.app.state.lock().unwrap().phase, "failed");
-            assert!(!test.app.queue_active.load(Ordering::SeqCst));
-            assert!(!test.app.busy.load(Ordering::SeqCst));
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "failed");
+            assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
         }
     }
 
@@ -1914,12 +2223,12 @@ mod tests {
     fn queue_blocked_stage_halts_and_releases_busy() {
         let test = QueueTest::new(true);
         // An exhausted review budget exercises the blocked-stage exit.
-        test.app.state.lock().unwrap().settings["max_fix_rounds"] = json!(-1);
+        test.app.app.settings.lock().unwrap()["max_fix_rounds"] = json!(-1);
         test.start();
         assert_eq!(test.statuses(), ["blocked", "queued"]);
-        assert_eq!(test.app.state.lock().unwrap().phase, "blocked");
-        assert!(!test.app.queue_active.load(Ordering::SeqCst));
-        assert!(!test.app.busy.load(Ordering::SeqCst));
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "blocked");
+        assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
         let plan = test.app.load_plan().unwrap();
         let duration = fmt_duration(plan["stages"][0]["duration_secs"].as_i64().unwrap());
         let history = test.app.read_history();
@@ -2036,8 +2345,6 @@ mod tests {
     fn capture_stream(input: &str, claude: bool) -> (String, String, State) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let state = Mutex::new(State {
-            project: String::new(),
-            settings: json!({}),
             phase: String::new(),
             goal: String::new(),
             current_stage: None,
