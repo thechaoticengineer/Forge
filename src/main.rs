@@ -32,12 +32,20 @@ struct State {
     goal: String,
     current_stage: Option<i64>,
     current_step: String,
+    run_started_unix: i64,
     agent_role: String,
     agent_tool: String,
     agent_model: String,
     agent_started_unix: i64,
     agent_lines: i64,
     agent_last_line: String,
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn clock_hms() -> String {
@@ -251,6 +259,16 @@ impl App {
             self.forge_path("plan.json"),
             serde_json::to_string_pretty(plan).unwrap(),
         );
+    }
+
+    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) {
+        let stage = &mut plan["stages"][idx];
+        let finished = unix_timestamp();
+        let started = stage["started_unix"].as_i64().unwrap_or(finished);
+        stage["status"] = json!(status);
+        stage["finished_unix"] = json!(finished);
+        stage["duration_secs"] = json!(finished - started);
+        self.save_plan(plan);
     }
 
     fn set_phase(&self, phase: &str) {
@@ -670,6 +688,10 @@ impl App {
                 .and_then(|t| serde_json::from_str(&t).ok());
             match verdict {
                 Some(v) if v["approved"].as_bool() == Some(true) => {
+                    plan["stages"][idx]["last_verdict"] = json!({
+                        "approved": true, "issues": [],
+                    });
+                    self.save_plan(plan);
                     self.log_event("check", &format!("stage {sid} approved by checker"));
                     return Ok("approved");
                 }
@@ -683,18 +705,25 @@ impl App {
                         })
                         .filter(|l: &Vec<String>| !l.is_empty())
                         .unwrap_or_else(|| vec!["reviewer rejected without details".into()]);
-                    let mut summary = list.join("; ");
-                    summary.truncate(1500);
+                    plan["stages"][idx]["last_verdict"] = json!({
+                        "approved": false, "issues": list,
+                    });
+                    self.save_plan(plan);
+                    let summary: String = list.join("; ").chars().take(1500).collect();
                     self.log_event("check", &format!("stage {sid} rejected: {summary}"));
                     issues = Some(list);
                 }
                 None => {
-                    self.log_event("error", "checker produced no readable verdict; retrying stage");
                     issues = Some(vec![
                         "The previous review session failed to produce a verdict. \
                          Re-verify the implementation end to end."
                             .into(),
                     ]);
+                    plan["stages"][idx]["last_verdict"] = json!({
+                        "approved": false, "issues": issues.as_ref().unwrap(),
+                    });
+                    self.save_plan(plan);
+                    self.log_event("error", "checker produced no readable verdict; retrying stage");
                 }
             }
         }
@@ -708,6 +737,7 @@ impl App {
             self.log_event("error", &format!("run failed: {e}"));
         }
         self.set_step(None, "");
+        self.state.lock().unwrap().run_started_unix = 0;
         self.stop_requested.store(false, Ordering::SeqCst);
         self.busy.store(false, Ordering::SeqCst);
     }
@@ -727,6 +757,11 @@ impl App {
             let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
             let title = plan["stages"][idx]["title"].as_str().unwrap_or("").to_string();
             plan["stages"][idx]["status"] = json!("in_progress");
+            plan["stages"][idx]["started_unix"] = json!(unix_timestamp());
+            // A resumed stage starts a new attempt; completion timing is no longer current.
+            let stage = plan["stages"][idx].as_object_mut().unwrap();
+            stage.remove("finished_unix");
+            stage.remove("duration_secs");
             self.save_plan(&plan);
             self.log_event("stage", &format!("stage {sid} started: {title}"));
 
@@ -737,8 +772,7 @@ impl App {
                     return Ok(());
                 }
                 "exhausted" => {
-                    plan["stages"][idx]["status"] = json!("blocked");
-                    self.save_plan(&plan);
+                    self.finish_stage(&mut plan, idx, "blocked");
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
                         "stage {sid} blocked: checker still rejecting after max fix rounds — needs a human"));
@@ -747,11 +781,10 @@ impl App {
                 _approved => {
                     let msg = plan["stages"][idx]["commit"].as_str().unwrap_or("forge: stage").to_string();
                     let sha = self.commit_stage(&msg)?;
-                    plan["stages"][idx]["status"] = json!("committed");
                     if let Some(sha) = sha {
                         plan["stages"][idx]["sha"] = json!(sha);
                     }
-                    self.save_plan(&plan);
+                    self.finish_stage(&mut plan, idx, "committed");
                 }
             }
         }
@@ -887,6 +920,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                     "goal": s.goal,
                     "current_stage": s.current_stage,
                     "current_step": s.current_step,
+                    "run_started_unix": s.run_started_unix,
                     "agent": {
                         "role": s.agent_role,
                         "tool": s.agent_tool,
@@ -1099,6 +1133,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 {
                     let mut s = app.state.lock().unwrap();
                     s.phase = "running".into();
+                    s.run_started_unix = unix_timestamp();
                     if let Some(g) = plan.as_ref().and_then(|p| p["goal"].as_str()) {
                         s.goal = g.to_string();
                     }
@@ -1151,6 +1186,7 @@ fn main() {
             goal: String::new(),
             current_stage: None,
             current_step: String::new(),
+            run_started_unix: 0,
             agent_role: String::new(),
             agent_tool: String::new(),
             agent_model: String::new(),
@@ -1296,6 +1332,7 @@ mod tests {
             goal: String::new(),
             current_stage: None,
             current_step: String::new(),
+            run_started_unix: 0,
             agent_role: String::new(),
             agent_tool: String::new(),
             agent_model: String::new(),
