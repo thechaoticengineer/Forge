@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.omarchy-ai-build-orchestrator",
+  "name": "Forge",
+  "version": "0.2.0",
+  "author": "Project contributors",
+  "license": "MIT",
+  "description": "Minimal AI build orchestrator: staged plan, independent check loop, automatic commits and push.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "quickshell/BarWidget.qml",
+    "panel": "quickshell/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Forge",
+    "description": "Shows whether the Forge engine is available or needs attention.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
