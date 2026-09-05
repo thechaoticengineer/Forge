@@ -346,40 +346,115 @@ Item {
           }
         }
 
-        // ------------------------------------------------ live agent
+        // ------------------------------------------------ now working
         Rectangle {
           id: agentCard
-          visible: root.agentActive
+          readonly property var stages: root.plan && root.plan.stages ? root.plan.stages : []
+          readonly property var currentStage: stages.find(function(stage) {
+            return root.engineState && stage.id === root.engineState.current_stage
+          })
+          readonly property int committedStages: stages.filter(function(stage) {
+            return stage.status === "committed"
+          }).length
+          readonly property int runSeconds: root.engineState && root.engineState.run_started_unix > 0
+            ? Math.max(0, Math.floor(root.agentNow - root.engineState.run_started_unix)) : 0
+
+          visible: root.busy
           width: parent.width
-          height: agentSummary.implicitHeight + Style.space(16)
+          height: visible ? workingSummary.implicitHeight + Style.space(16) : 0
           color: root.surface
           radius: 4
 
-          Row {
-            anchors.fill: parent
+          Column {
+            id: workingSummary
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
             anchors.margins: Style.space(8)
-            spacing: Style.space(10)
+            spacing: Style.space(4)
             Text {
-              id: agentSummary
-              width: Math.min(implicitWidth, parent.width * 0.45)
-              text: root.agentActive ? root.agent.role + " · " + root.agent.tool
-                + (root.agent.model ? " · " + root.agent.model : "") : ""
+              width: parent.width
+              text: root.engineState ? root.engineState.goal : ""
               textFormat: Text.PlainText
-              color: root.working
+              color: root.foreground
+              wrapMode: Text.Wrap
+              maximumLineCount: 2
+              elide: Text.ElideRight
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(12)
+              font.bold: true
+            }
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                width: parent.width - (workingStep.visible ? workingStep.width + parent.spacing : 0)
+                text: root.phase === "planning" ? "planning…"
+                  : root.engineState && root.engineState.current_stage !== null
+                    ? "stage " + root.engineState.current_stage
+                      + (agentCard.currentStage ? " · " + agentCard.currentStage.title : "")
+                    : "now working"
+                textFormat: Text.PlainText
+                color: root.working
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              Text {
+                id: workingStep
+                visible: root.phase !== "planning" && text !== ""
+                width: Math.min(implicitWidth, parent.width * 0.4)
+                text: root.engineState ? root.engineState.current_step : ""
+                textFormat: Text.PlainText
+                color: root.working
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+            }
+            Text {
+              visible: root.phase !== "planning"
+                || (root.engineState !== null && root.engineState.run_started_unix > 0)
+              width: parent.width
+              text: (root.phase !== "planning"
+                  ? agentCard.committedStages + "/" + agentCard.stages.length + " stages committed" : "")
+                + (root.engineState && root.engineState.run_started_unix > 0
+                  ? (root.phase !== "planning" ? " · " : "")
+                    + "run " + Math.floor(agentCard.runSeconds / 60) + "m "
+                    + (agentCard.runSeconds % 60) + "s" : "")
+              textFormat: Text.PlainText
+              color: root.mutedForeground
               elide: Text.ElideRight
               font.family: root.fontFamily
               font.pixelSize: root.fs(11)
             }
-            Text {
-              id: agentTime
-              text: root.agentElapsed()
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
+            Row {
+              visible: root.agentActive
+              width: parent.width
+              spacing: Style.space(10)
+              Text {
+                id: agentSummary
+                width: Math.max(0, parent.width - agentTime.width - parent.spacing)
+                text: root.agentActive ? root.agent.role + " · " + root.agent.tool
+                  + (root.agent.model ? " · " + root.agent.model : "") : ""
+                textFormat: Text.PlainText
+                color: root.working
+                elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              Text {
+                id: agentTime
+                text: root.agentActive ? root.agentElapsed() + " · " + root.agent.lines + " lines" : ""
+                textFormat: Text.PlainText
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
             }
             Text {
-              width: Math.max(0, parent.width - agentSummary.width - agentTime.width
-                - parent.spacing * 2)
+              visible: root.agentActive
+              width: parent.width
               text: root.agentActive ? root.agent.last_line : ""
               textFormat: Text.PlainText
               color: root.mutedForeground
