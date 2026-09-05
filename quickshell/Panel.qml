@@ -457,26 +457,51 @@ Item {
         // ---------------------------------------------------- goal
         Rectangle {
           width: parent.width
-          height: Style.space(52)
+          height: Math.min(Math.max(Style.space(52),
+            goalField.contentHeight + Style.space(16)), Style.space(140))
           color: root.surface
           radius: 4
           border.width: 1
           border.color: goalField.activeFocus
             ? root.accent : Qt.darker(root.foreground, 3)
-          TextEdit {
-            id: goalField
+          Flickable {
+            id: goalFlick
             anchors.fill: parent
             anchors.margins: Style.space(6)
-            wrapMode: TextEdit.Wrap
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            Text {
-              visible: goalField.text === "" && !goalField.activeFocus
-              text: "What should be built?"
-              color: root.mutedForeground
+            clip: true
+            contentWidth: goalField.width
+            contentHeight: goalField.height
+            flickableDirection: Flickable.VerticalFlick
+            boundsBehavior: Flickable.StopAtBounds
+
+            function ensureCursorVisible() {
+              const cursor = goalField.cursorRectangle
+              if (contentY > cursor.y)
+                contentY = cursor.y
+              else if (contentY + height < cursor.y + cursor.height)
+                contentY = cursor.y + cursor.height - height
+              contentY = Math.max(0, Math.min(contentY, contentHeight - height))
+            }
+
+            onHeightChanged: Qt.callLater(ensureCursorVisible)
+            onContentHeightChanged: Qt.callLater(ensureCursorVisible)
+
+            TextEdit {
+              id: goalField
+              width: goalFlick.width
+              height: Math.max(contentHeight, goalFlick.height)
+              wrapMode: TextEdit.Wrap
+              color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: root.fs(12)
+              onCursorRectangleChanged: goalFlick.ensureCursorVisible()
+              Text {
+                visible: goalField.text === "" && !goalField.activeFocus
+                text: "What should be built?"
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+              }
             }
           }
         }
