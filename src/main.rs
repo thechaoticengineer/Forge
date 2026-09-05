@@ -8,12 +8,12 @@
 
 use serde_json::{Value, json};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PORT: u16 = 8734;
 const FORGE_DIR: &str = ".forge";
@@ -32,6 +32,71 @@ struct State {
     goal: String,
     current_stage: Option<i64>,
     current_step: String,
+    agent_role: String,
+    agent_tool: String,
+    agent_model: String,
+    agent_started_unix: i64,
+    agent_lines: i64,
+    agent_last_line: String,
+}
+
+fn clock_hms() -> String {
+    Command::new("date")
+        .arg("+%H:%M:%S")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn last_chars(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(limit)).collect()
+}
+
+fn stream_agent_output<R: std::io::Read>(
+    input: R,
+    log: &Arc<Mutex<fs::File>>,
+    state: &Mutex<State>,
+    tail_limit: usize,
+) -> Result<String, String> {
+    let mut reader = BufReader::new(input);
+    let mut bytes = Vec::new();
+    let mut tail = String::new();
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| format!("failed to read agent output: {e}"))?;
+        if read == 0 {
+            break;
+        }
+
+        let lossy = String::from_utf8_lossy(&bytes);
+        let line = lossy.trim_end_matches(&['\r', '\n'][..]);
+        {
+            let mut file = log
+                .lock()
+                .map_err(|_| "agent log lock was poisoned".to_string())?;
+            writeln!(file, "{line}").map_err(|e| format!("failed to write agent log: {e}"))?;
+            file.flush()
+                .map_err(|e| format!("failed to flush agent log: {e}"))?;
+        }
+
+        tail.push_str(line);
+        tail.push('\n');
+        tail = last_chars(&tail, tail_limit);
+
+        let mut s = state.lock().unwrap();
+        s.agent_lines += 1;
+        let latest = line.trim();
+        if !latest.is_empty() {
+            s.agent_last_line = latest.chars().take(200).collect();
+        }
+    }
+
+    Ok(tail.trim().to_string())
 }
 
 fn default_settings() -> Value {
@@ -60,11 +125,7 @@ impl App {
     }
 
     fn log_event(&self, kind: &str, text: &str) {
-        let now = Command::new("date").arg("+%H:%M:%S").output();
-        let t = now
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let t = clock_hms();
         let entry = json!({"t": t, "kind": kind, "text": text});
         if let Ok(mut f) = fs::OpenOptions::new()
             .create(true)
@@ -255,22 +316,115 @@ impl App {
             other => return Err(format!("unknown tool {other}")),
         };
         self.log_event("agent", &format!("[{role}] starting {tool} session"));
-        let out = cmd
+        let log = match fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(self.forge_path("agent.log"))
+        {
+            Ok(mut file) => {
+                if let Err(e) = writeln!(
+                    file,
+                    "=== [{role}] {tool} ({model}) started {} ===",
+                    clock_hms()
+                )
+                .and_then(|_| file.flush())
+                {
+                    let message = format!("failed to initialize agent log: {e}");
+                    self.log_event("error", &format!("[{role}] {message}"));
+                    return Err(message);
+                }
+                Arc::new(Mutex::new(file))
+            }
+            Err(e) => {
+                let message = format!("failed to initialize agent log: {e}");
+                self.log_event("error", &format!("[{role}] {message}"));
+                return Err(message);
+            }
+        };
+
+        {
+            let mut s = self.state.lock().unwrap();
+            s.agent_role = role.to_string();
+            s.agent_tool = tool.to_string();
+            s.agent_model = model.to_string();
+            s.agent_started_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            s.agent_lines = 0;
+            s.agent_last_line.clear();
+        }
+
+        let child = cmd
             .current_dir(self.project())
-            .output()
-            .map_err(|e| format!("failed to launch {tool}: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let tail: String = stdout.trim().chars().rev().take(600).collect::<Vec<_>>()
-            .into_iter().rev().collect();
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let etail: String = err.trim().chars().rev().take(1500).collect::<Vec<_>>()
-                .into_iter().rev().collect();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                self.clear_agent_activity();
+                let message = format!("failed to launch {tool}: {e}");
+                self.log_event("error", &format!("[{role}] {message}"));
+                return Err(message);
+            }
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stderr_log = Arc::clone(&log);
+        let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
+            let stderr_reader = scope.spawn(|| {
+                stream_agent_output(stderr, &stderr_log, &self.state, 1500)
+            });
+            let stdout_result = stream_agent_output(stdout, &log, &self.state, 600);
+            let status_result = child.wait();
+            let stderr_result = stderr_reader
+                .join()
+                .unwrap_or_else(|_| Err("agent stderr reader panicked".to_string()));
+            (stdout_result, stderr_result, status_result)
+        });
+        self.clear_agent_activity();
+
+        let tail = match stdout_result {
+            Ok(tail) => tail,
+            Err(e) => {
+                self.log_event("error", &format!("[{role}] {tool} output failed: {e}"));
+                return Err(e);
+            }
+        };
+        let etail = match stderr_result {
+            Ok(tail) => tail,
+            Err(e) => {
+                self.log_event("error", &format!("[{role}] {tool} output failed: {e}"));
+                return Err(e);
+            }
+        };
+        let status = match status_result {
+            Ok(status) => status,
+            Err(e) => {
+                let message = format!("failed to wait for {tool}: {e}");
+                self.log_event("error", &format!("[{role}] {message}"));
+                return Err(message);
+            }
+        };
+
+        if !status.success() {
             self.log_event("error", &format!("[{role}] {tool} failed: {etail}"));
-            return Err(format!("{tool} exited with {}", out.status));
+            return Err(format!("{tool} exited with {status}: {etail}"));
         }
         self.log_event("agent", &format!("[{role}] {tool} finished: {tail}"));
         Ok(())
+    }
+
+    fn clear_agent_activity(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.agent_role.clear();
+        s.agent_tool.clear();
+        s.agent_model.clear();
+        s.agent_started_unix = 0;
+        s.agent_lines = 0;
+        s.agent_last_line.clear();
     }
 
     /// Fake agent used by the self-test. Never reachable from normal settings.
@@ -617,13 +771,14 @@ fn respond(req: tiny_http::Request, code: u32, body: Value) {
 
 fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let url = req.url().to_string();
+    let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let method = req.method().clone();
     let mut body_text = String::new();
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let busy = app.busy.load(Ordering::SeqCst);
 
-    match (method, url.as_str()) {
+    match (method, path) {
         (tiny_http::Method::Get, "/api/state") => {
             let snap = {
                 let s = app.state.lock().unwrap();
@@ -634,6 +789,14 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                     "goal": s.goal,
                     "current_stage": s.current_stage,
                     "current_step": s.current_step,
+                    "agent": {
+                        "role": s.agent_role,
+                        "tool": s.agent_tool,
+                        "model": s.agent_model,
+                        "started_unix": s.agent_started_unix,
+                        "lines": s.agent_lines,
+                        "last_line": s.agent_last_line,
+                    },
                 })
             };
             let mut snap = snap;
@@ -641,6 +804,20 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             snap["history"] = app.read_history();
             snap["git_log"] = json!(app.git(&["log", "--oneline", "-12"]).unwrap_or_default());
             respond(req, 200, snap);
+        }
+        (tiny_http::Method::Get, "/api/agent_log") => {
+            let data = fs::read(app.forge_path("agent.log")).unwrap_or_default();
+            let size = data.len();
+            let offset = query.split('&').find_map(|part| {
+                part.strip_prefix("offset=")?.parse::<usize>().ok()
+            });
+            let log = match offset {
+                Some(offset) if offset <= size => {
+                    String::from_utf8_lossy(&data[offset..]).into_owned()
+                }
+                Some(_) | None => last_chars(&String::from_utf8_lossy(&data), 30_000),
+            };
+            respond(req, 200, json!({"log": log, "size": size}));
         }
         (tiny_http::Method::Get, "/api/diff") => {
             let diff = app.git(&["diff", "HEAD"]).unwrap_or_default();
@@ -876,6 +1053,12 @@ fn main() {
             goal: String::new(),
             current_stage: None,
             current_step: String::new(),
+            agent_role: String::new(),
+            agent_tool: String::new(),
+            agent_model: String::new(),
+            agent_started_unix: 0,
+            agent_lines: 0,
+            agent_last_line: String::new(),
         }),
         stop_requested: AtomicBool::new(false),
         busy: AtomicBool::new(false),
