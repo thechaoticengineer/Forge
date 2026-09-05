@@ -272,8 +272,11 @@ impl App {
     }
 
     fn commit_stage(&self, message: &str) -> Result<Option<String>, String> {
+        // A pathspec naming FORGE_DIR makes `git add` fail when the project also
+        // gitignores it, so stage everything and unstage FORGE_DIR instead.
+        self.git(&["add", "-A"])?;
+        self.git(&["reset", "-q", "--", FORGE_DIR])?;
         let exclude = format!(":(exclude){FORGE_DIR}");
-        self.git(&["add", "-A", "--", ".", &exclude])?;
         let dirty = self.git(&["status", "--porcelain", "--", ".", &exclude])?;
         if dirty.is_empty() {
             self.log_event("git", "nothing to commit for this stage");
