@@ -8,6 +8,13 @@ BarWidget {
 
   property bool engineOnline: false
   property string phase: "offline"
+  property var currentStage: null
+  property string currentStep: ""
+  property string agentRole: ""
+  property string agentTool: ""
+  property string goal: ""
+  property int committedStages: 0
+  property int totalStages: 0
 
   readonly property string statusGlyph: {
     if (!engineOnline) return "◇"
@@ -22,7 +29,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   Timer {
-    interval: 5000
+    interval: root.phase === "running" || root.phase === "planning" ? 2000 : 5000
     repeat: true
     running: true
     triggeredOnStart: true
@@ -38,10 +45,19 @@ BarWidget {
         }
         try {
           const s = JSON.parse(xhr.responseText)
+          root.currentStage = s.current_stage ?? null
+          root.currentStep = s.current_step || ""
+          root.agentRole = s.agent ? s.agent.role || "" : ""
+          root.agentTool = s.agent ? s.agent.tool || "" : ""
+          root.goal = s.goal || ""
+          const stages = s.plan ? s.plan.stages : []
+          root.committedStages = stages.filter(stage => stage.status === "committed").length
+          root.totalStages = stages.length
           root.engineOnline = true
           root.phase = s.phase
         } catch (e) {
           root.engineOnline = false
+          root.phase = "offline"
         }
       }
       xhr.send()
@@ -52,15 +68,27 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.statusGlyph
+    text: root.phase === "running" && root.totalStages > 0
+      ? root.statusGlyph + " " + root.committedStages + "/" + root.totalStages
+      : root.statusGlyph
     active: root.engineOnline && root.phase !== "idle"
     activeColor: root.phase === "failed" || root.phase === "blocked"
       ? (root.bar ? root.bar.urgent : Color.urgent)
       : (root.bar ? root.bar.foreground : Color.foreground)
     dimmed: !root.engineOnline
-    tooltipText: root.engineOnline
-      ? "Forge: " + root.phase
-      : "Forge: engine offline"
+    tooltipText: {
+      if (!root.engineOnline) return "Forge: engine offline"
+      let tooltip = "Forge: " + root.phase
+      if (root.phase === "running") {
+        if (root.currentStage !== null)
+          tooltip += "\nstage " + root.currentStage + ": " + root.currentStep
+        if (root.agentRole)
+          tooltip += "\n" + root.agentRole + " · " + root.agentTool
+      }
+      if (root.goal && root.phase !== "idle")
+        tooltip += "\ngoal: " + root.goal.slice(0, 80)
+      return tooltip
+    }
 
     onPressed: function(mouseButton) {
       if (!root.bar || mouseButton !== Qt.LeftButton) return
