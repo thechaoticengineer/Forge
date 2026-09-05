@@ -85,6 +85,7 @@ Item {
                       agent.started_unix, agent.role, agent.tool, agent.model]) : ""
   property double agentNow: Date.now() / 1000
   property bool liveTab: false
+  property string historyFilter: "all"
   property string agentLog: ""
   property double agentLogOffset: 0
   property string logSession: ""
@@ -200,6 +201,40 @@ Item {
         root.diffError = "Unable to load diff"
       }
     })
+  }
+
+  function historyRows(history, filter) {
+    const rows = []
+    const entries = history || []
+    let previousGoal = ""
+    entries.forEach(function(entry) {
+      const matches = filter === "all"
+        || (filter === "runs"
+            && ["run", "stage", "plan", "queue", "update"].indexOf(entry.kind) !== -1)
+        || (filter === "git" && entry.kind === "git")
+        || (filter === "checks" && entry.kind === "check")
+        || (filter === "errors" && entry.kind === "error")
+      if (!matches) return
+      if (entry.goal && entry.goal !== previousGoal)
+        rows.push({ kind: "sep", goal: entry.goal })
+      rows.push({ kind: "entry", event: entry })
+      previousGoal = entry.goal || ""
+    })
+    return rows
+  }
+
+  function historyTime(entry, now) {
+    let prefix = ""
+    if (typeof entry.unix === "number") {
+      const date = new Date(entry.unix * 1000)
+      const today = new Date(now * 1000)
+      const day = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+      const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate())
+      if (day < todayStart)
+        prefix = (date.getMonth() < 9 ? "0" : "") + (date.getMonth() + 1)
+          + "-" + (date.getDate() < 10 ? "0" : "") + date.getDate() + " "
+    }
+    return prefix + entry.t
   }
 
   function chooserRows(data, filter) {
@@ -960,23 +995,79 @@ Item {
               font.pixelSize: root.fs(10)
             }
           }
+          Row {
+            id: historyFilters
+            visible: !root.liveTab
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.margins: Style.space(8)
+            spacing: Style.space(4)
+            Repeater {
+              model: ["all", "runs", "git", "checks", "errors"]
+              delegate: PanelButton {
+                required property string modelData
+                label: modelData
+                primary: root.historyFilter === modelData
+                onClicked: root.historyFilter = modelData
+              }
+            }
+          }
           ListView {
             id: historyList
             visible: !root.liveTab
-            anchors.fill: parent
+            anchors.top: historyFilters.bottom
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
             anchors.margins: Style.space(8)
             clip: true
-            model: root.engineState ? root.engineState.history : []
-            onCountChanged: positionViewAtEnd()
+            boundsBehavior: Flickable.StopAtBounds
+            model: root.historyRows(root.engineState ? root.engineState.history : [],
+                                    root.historyFilter)
+            property bool followTail: true
+            property real readingY: 0
+
+            function scrollToTail() {
+              if (followTail && !moving) positionViewAtEnd()
+            }
+            function restoreReadingPosition() {
+              // Replacing a JavaScript array resets ListView's position on every poll.
+              if (!followTail && !moving)
+                contentY = Math.max(originY, Math.min(readingY,
+                  originY + contentHeight - height))
+            }
+            onContentYChanged: {
+              if (moving) {
+                followTail = atYEnd
+                readingY = contentY
+              }
+            }
+            onMovementEnded: {
+              followTail = atYEnd
+              readingY = contentY
+            }
+            onModelChanged: Qt.callLater(restoreReadingPosition)
+            onCountChanged: Qt.callLater(scrollToTail)
+            onContentHeightChanged: Qt.callLater(scrollToTail)
+            onHeightChanged: Qt.callLater(scrollToTail)
+            onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
+
             delegate: Text {
               id: historyRow
               required property var modelData
+              readonly property bool separator: modelData.kind === "sep"
+              readonly property var event: separator ? null : modelData.event
               width: historyList.width
-              text: historyRow.modelData.t + "  [" + historyRow.modelData.kind + "]  "
-                + historyRow.modelData.text
-              color: historyRow.modelData.kind === "error" ? root.urgent
-                : historyRow.modelData.kind === "git" ? root.success
-                : historyRow.modelData.kind === "check" ? root.working
+              topPadding: separator ? Style.space(6) : 0
+              bottomPadding: separator ? Style.space(4) : 0
+              text: separator ? "— goal: " + modelData.goal
+                : root.historyTime(event, root.agentNow) + "  [" + event.kind + "]  "
+                  + event.text
+              textFormat: Text.PlainText
+              color: separator ? root.accent
+                : event.kind === "error" ? root.urgent
+                : event.kind === "git" ? root.success
+                : event.kind === "check" ? root.working
                 : root.mutedForeground
               wrapMode: Text.Wrap
               font.family: root.fontFamily
