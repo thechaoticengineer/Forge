@@ -64,6 +64,15 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn fmt_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
 fn clock_hms() -> String {
     Command::new("date")
         .arg("+%H:%M:%S")
@@ -292,7 +301,18 @@ impl App {
 
     fn log_event(&self, kind: &str, text: &str) {
         let t = clock_hms();
-        let entry = json!({"t": t, "kind": kind, "text": text});
+        let mut entry = json!({"t": t, "unix": unix_timestamp(), "kind": kind, "text": text});
+        {
+            // Callers release the state lock before logging; release it here
+            // before forge_path takes it again to resolve the project directory.
+            let s = self.state.lock().unwrap();
+            if !s.goal.is_empty() {
+                entry["goal"] = json!(s.goal.chars().take(120).collect::<String>());
+            }
+            if let Some(stage) = s.current_stage {
+                entry["stage"] = json!(stage);
+            }
+        }
         if let Ok(mut f) = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -342,7 +362,7 @@ impl App {
         );
     }
 
-    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) {
+    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> i64 {
         let stage = &mut plan["stages"][idx];
         let finished = unix_timestamp();
         let started = stage["started_unix"].as_i64().unwrap_or(finished);
@@ -350,6 +370,7 @@ impl App {
         stage["finished_unix"] = json!(finished);
         stage["duration_secs"] = json!(finished - started);
         self.save_plan(plan);
+        finished - started
     }
 
     fn set_phase(&self, phase: &str) {
@@ -780,10 +801,12 @@ impl App {
                 };
                 let id = item["id"].as_u64().unwrap();
                 let goal = item["goal"].as_str().unwrap_or("").to_string();
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.goal = goal.clone();
+                    s.phase = "planning".into();
+                }
                 self.set_queue_status(&mut queue, id, "planning");
-                let mut s = self.state.lock().unwrap();
-                s.goal = goal.clone();
-                s.phase = "planning".into();
                 (id, goal)
             };
             let planned = self.plan_worker_inner(&goal);
@@ -969,6 +992,7 @@ impl App {
             stage.remove("finished_unix");
             stage.remove("duration_secs");
             self.save_plan(&plan);
+            self.set_step(Some(sid), "implementing");
             self.log_event("stage", &format!("stage {sid} started: {title}"));
 
             match self.run_one_stage(&mut plan, idx)? {
@@ -978,10 +1002,10 @@ impl App {
                     return Ok(());
                 }
                 "exhausted" => {
-                    self.finish_stage(&mut plan, idx, "blocked");
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked"));
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
-                        "stage {sid} blocked: checker still rejecting after max fix rounds — needs a human"));
+                        "stage {sid} blocked after {duration}: checker still rejecting after max fix rounds — needs a human"));
                     return Ok(());
                 }
                 _approved => {
@@ -990,7 +1014,8 @@ impl App {
                     if let Some(sha) = sha {
                         plan["stages"][idx]["sha"] = json!(sha);
                     }
-                    self.finish_stage(&mut plan, idx, "committed");
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "committed"));
+                    self.log_event("stage", &format!("stage {sid} committed in {duration}"));
                 }
             }
         }
@@ -1007,7 +1032,9 @@ impl App {
             }
         }
         self.set_phase("done");
-        self.log_event("run", "all stages committed — run complete");
+        let started = self.state.lock().unwrap().run_started_unix;
+        let duration = fmt_duration(if started > 0 { unix_timestamp() - started } else { 0 });
+        self.log_event("run", &format!("all stages committed — run complete in {duration}"));
         Ok(())
     }
 }
@@ -1549,6 +1576,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duration_formats_seconds_and_minutes() {
+        for (secs, expected) in [
+            (-1, "0s"), (0, "0s"), (58, "58s"), (60, "1m 0s"),
+            (61, "1m 1s"), (252, "4m 12s"), (3600, "60m 0s"),
+        ] {
+            assert_eq!(fmt_duration(secs), expected);
+        }
+    }
+
+    #[test]
     fn queue_add_uses_max_id_and_records_goal_metadata() {
         let mut queue = json!({"items": []});
         let started = unix_timestamp();
@@ -1719,6 +1756,85 @@ mod tests {
     }
 
     #[test]
+    fn history_entries_include_timestamp_and_only_available_context() {
+        let test = QueueTest::new(true);
+        let before = unix_timestamp();
+        test.app.log_event("run", "idle event");
+        test.app.state.lock().unwrap().goal = "short goal".into();
+        test.app.log_event("plan", "goal event");
+        {
+            let mut s = test.app.state.lock().unwrap();
+            s.goal = "界🙂".repeat(61);
+            s.current_stage = Some(3);
+        }
+        test.app.log_event("stage", "active event");
+        test.app.state.lock().unwrap().goal.clear();
+        test.app.log_event("stage", "stage event");
+
+        let text = fs::read_to_string(test.path.join(FORGE_DIR).join("history.jsonl")).unwrap();
+        let entries: Vec<Value> = text.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(entries.len(), 4);
+        for entry in &entries {
+            assert!((before..=unix_timestamp()).contains(&entry["unix"].as_i64().unwrap()));
+            assert_eq!(entry["t"].as_str().unwrap().split(':').count(), 3);
+        }
+        assert!(entries[0].get("goal").is_none());
+        assert!(entries[0].get("stage").is_none());
+        assert_eq!(entries[1]["goal"], "short goal");
+        assert!(entries[1].get("stage").is_none());
+        assert_eq!(entries[2]["goal"], "界🙂".repeat(60));
+        assert_eq!(entries[2]["stage"], 3);
+        assert_eq!(entries[2]["kind"], "stage");
+        assert_eq!(entries[2]["text"], "active event");
+        assert!(entries[3].get("goal").is_none());
+        assert_eq!(entries[3]["stage"], 3);
+    }
+
+    #[test]
+    fn history_keeps_last_400_parsed_entries_and_preserves_legacy_shape() {
+        let test = QueueTest::new(true);
+        let legacy: Vec<Value> = (0..402).map(|i| {
+            json!({"t": "12:34:56", "kind": "stage", "text": format!("old event {i}")})
+        }).collect();
+        let mut text = legacy.iter().map(|entry| format!("{entry}\n")).collect::<String>();
+        text.push_str("not json\n\n");
+        let path = test.app.forge_path("history.jsonl");
+        fs::write(&path, &text).unwrap();
+        test.app.log_event("run", "new event");
+
+        let history = test.app.read_history();
+        let entries = history.as_array().unwrap();
+        assert_eq!(entries.len(), 400);
+        assert_eq!(&entries[..399], &legacy[3..]);
+        assert!(entries[399]["unix"].is_i64());
+        assert_eq!(entries[399]["text"], "new event");
+        assert!(fs::read_to_string(path).unwrap().starts_with(&text));
+    }
+
+    #[test]
+    fn run_completion_uses_run_start_time_before_cleanup() {
+        let test = QueueTest::new(true);
+        test.app.save_plan(&json!({"stages": [], "status": "approved"}));
+        let started = unix_timestamp() - 252;
+        {
+            let mut s = test.app.state.lock().unwrap();
+            s.goal = "timed goal".into();
+            s.run_started_unix = started;
+        }
+        test.app.run_worker();
+        let elapsed = unix_timestamp() - started;
+        let history = test.app.read_history();
+        let entry = history.as_array().unwrap().last().unwrap();
+        assert_eq!(entry["kind"], "run");
+        assert_eq!(entry["goal"], "timed goal");
+        assert!((252..=elapsed).any(|secs| {
+            entry["text"] == format!("all stages committed — run complete in {}", fmt_duration(secs))
+        }));
+        assert_eq!(test.app.state.lock().unwrap().run_started_unix, 0);
+    }
+
+    #[test]
     fn queue_auto_approval_commits_both_goals_and_releases_busy() {
         let test = QueueTest::new(true);
         test.start();
@@ -1729,6 +1845,28 @@ mod tests {
         assert_eq!(test.app.state.lock().unwrap().goal, "second goal");
         assert_eq!(test.app.git(&["log", "--format=%s", "-4"]).unwrap(),
             "feat: line two\nfeat: line one\nfeat: line two\nfeat: line one");
+
+        let history = test.app.read_history();
+        let entries = history.as_array().unwrap();
+        assert!(entries.iter().all(|entry| entry["unix"].is_i64()));
+        for (id, goal) in [(1, "first goal"), (2, "second goal")] {
+            let events: Vec<_> = entries.iter().filter(|entry| entry["goal"] == goal).collect();
+            assert!(events.iter().any(|entry| entry["text"] == format!("goal {id}: planning")));
+            for sid in [1, 2] {
+                for prefix in [format!("stage {sid} started:"), format!("stage {sid} committed in ")] {
+                    let event = events.iter().find(|entry| entry["text"].as_str().unwrap().starts_with(&prefix))
+                        .expect("stage lifecycle event");
+                    assert_eq!(event["stage"], sid);
+                }
+            }
+            assert!(events.iter().any(|entry| entry["text"].as_str().unwrap()
+                .starts_with("all stages committed — run complete in ")));
+        }
+        for stage in test.app.load_plan().unwrap()["stages"].as_array().unwrap() {
+            let duration = fmt_duration(stage["duration_secs"].as_i64().unwrap());
+            let text = format!("stage {} committed in {duration}", stage["id"]);
+            assert!(entries.iter().any(|entry| entry["goal"] == "second goal" && entry["text"] == text));
+        }
     }
 
     #[test]
@@ -1782,6 +1920,14 @@ mod tests {
         assert_eq!(test.app.state.lock().unwrap().phase, "blocked");
         assert!(!test.app.queue_active.load(Ordering::SeqCst));
         assert!(!test.app.busy.load(Ordering::SeqCst));
+        let plan = test.app.load_plan().unwrap();
+        let duration = fmt_duration(plan["stages"][0]["duration_secs"].as_i64().unwrap());
+        let history = test.app.read_history();
+        let event = history.as_array().unwrap().iter().find(|entry| {
+            entry["text"].as_str().unwrap().starts_with(&format!("stage 1 blocked after {duration}:"))
+        }).expect("blocked stage duration");
+        assert_eq!(event["goal"], "first goal");
+        assert_eq!(event["stage"], 1);
     }
 
     #[test]
