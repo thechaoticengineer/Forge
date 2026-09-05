@@ -1450,6 +1450,42 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 200, json!({"ok": true}));
             }
         }
+        (tiny_http::Method::Post, "/api/self_update") => {
+            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let repo = std::env::var("FORGE_REPO").unwrap_or_else(|_| {
+                format!("{}/Projects/Forge", std::env::var("HOME").unwrap_or_default())
+            });
+            let script = PathBuf::from(&repo).join("install.sh");
+            if !script.is_file() {
+                respond(req, 400, json!({"error": format!("no install.sh in {repo}")}));
+                return;
+            }
+            // install.sh restarts this service, so a plain child process would be
+            // killed with us mid-update; a transient unit detaches it. The fixed
+            // unit name also rejects a second update while one is running.
+            let out = Command::new("systemd-run")
+                .args(["--user", "--collect", "--unit", "forge-update", "bash"])
+                .arg(&script)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    app.log_event("update",
+                        "self-update started; engine and shell will restart \
+                         (log: journalctl --user -u forge-update)");
+                    respond(req, 200, json!({"ok": true}));
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    respond(req, 500, json!({"error": format!("systemd-run failed: {err}")}));
+                }
+                Err(e) => {
+                    respond(req, 500, json!({"error": format!("systemd-run failed: {e}")}));
+                }
+            }
+        }
         _ => respond(req, 404, json!({"error": "not found"})),
     }
 }

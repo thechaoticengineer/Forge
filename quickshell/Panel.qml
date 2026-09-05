@@ -525,6 +525,11 @@ Item {
             enabled: root.engineOnline
             onClicked: root.openDiff()
           }
+          PanelButton {
+            label: "Update Forge"
+            enabled: root.engineOnline && !root.busy
+            onClicked: root.act("/api/self_update")
+          }
         }
 
         Text {
