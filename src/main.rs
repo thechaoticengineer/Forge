@@ -4,6 +4,8 @@
 //! implement (tool A) -> independent check (tool B, fresh session) ->
 //! bounded fix loop -> commit proposed message -> next stage -> push.
 //!
+//! Persistent goal queue: process goals sequentially with optional automatic approval.
+//!
 //! Serves a JSON API on 127.0.0.1:8734 for the Quickshell panel.
 
 use serde_json::{Value, json};
@@ -23,7 +25,20 @@ struct App {
     queue_lock: Mutex<()>,
     stop_requested: AtomicBool,
     busy: AtomicBool,
+    queue_active: AtomicBool,
     gh_cache: Mutex<Option<(Instant, Value, Option<String>)>>,
+}
+
+/// Each worker owns one busy claim, including while it advances the queue.
+struct WorkerGuard<'a>(&'a App);
+
+impl Drop for WorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_step(None, "");
+        self.0.state.lock().unwrap().run_started_unix = 0;
+        self.0.stop_requested.store(false, Ordering::SeqCst);
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
 }
 
 struct State {
@@ -211,6 +226,7 @@ fn default_settings() -> Value {
         "checker_model": "",
         "max_fix_rounds": 3,
         "auto_push": true,
+        "queue_auto_approve": false,
     })
 }
 
@@ -369,6 +385,9 @@ impl App {
         }
         // Keep queue reads, writes, and their events in the same project.
         let _queue_guard = self.queue_lock.lock().unwrap();
+        if self.queue_active.load(Ordering::SeqCst) {
+            return Err("queue is active".to_string());
+        }
         self.state.lock().unwrap().project = path.to_string();
         let phase = if self.load_plan().is_some() { "plan_ready" } else { "idle" };
         self.set_phase(phase);
@@ -649,15 +668,29 @@ impl App {
     // ------------------------------------------------------ orchestrator
 
     fn plan_worker(&self, goal: &str) {
+        let _worker = WorkerGuard(self);
+        self.plan_worker_inner(goal);
+    }
+
+    /// Plan without releasing the worker's busy claim.
+    fn plan_worker_inner(&self, goal: &str) -> bool {
         let prompt = PLANNER_PROMPT
             .replace("{goal}", goal)
             .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json"));
-        let result = self
-            .run_agent("planner", &self.setting("planner"), &prompt, &self.setting("planner_model"))
-            .and_then(|_| {
-                self.load_plan()
-                    .ok_or_else(|| "planner did not produce a valid plan file".to_string())
-            });
+        // A previous goal's plan must never count as the new planner's output.
+        let path = self.forge_path("plan.json");
+        let result = match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("could not remove previous plan: {e}")),
+        }
+        .and_then(|_| self.run_agent(
+            "planner", &self.setting("planner"), &prompt, &self.setting("planner_model"),
+        ))
+        .and_then(|_| {
+            self.load_plan()
+                .ok_or_else(|| "planner did not produce a valid plan file".to_string())
+        });
         match result {
             Ok(mut plan) => {
                 for st in plan["stages"].as_array_mut().unwrap() {
@@ -674,13 +707,112 @@ impl App {
                 self.save_plan(&plan);
                 self.set_phase("plan_ready");
                 self.log_event("plan", &format!("plan ready with {n} stages"));
+                true
             }
             Err(e) => {
                 self.set_phase("failed");
                 self.log_event("error", &format!("planning failed: {e}"));
+                false
             }
         }
-        self.busy.store(false, Ordering::SeqCst);
+    }
+
+    /// Caller holds queue_lock so API edits cannot overwrite worker transitions.
+    fn set_queue_status(&self, queue: &mut Value, id: u64, status: &str) {
+        if let Some(item) = queue["items"].as_array_mut().unwrap().iter_mut()
+            .find(|item| item["id"].as_u64() == Some(id))
+        {
+            item["status"] = json!(status);
+            self.save_queue(queue);
+            self.log_event("queue", &format!("goal {id}: {status}"));
+        }
+    }
+
+    /// Caller holds queue_lock and owns the busy claim.
+    fn start_queue_run(&self, queue: &mut Value, id: u64, plan: &mut Value) {
+        plan["status"] = json!("approved");
+        self.save_plan(plan);
+        self.set_queue_status(queue, id, "running");
+        let mut s = self.state.lock().unwrap();
+        s.goal = plan["goal"].as_str().unwrap_or("").to_string();
+        s.phase = "running".into();
+        s.run_started_unix = unix_timestamp();
+    }
+
+    fn run_queue_item(&self, id: u64) -> bool {
+        self.run_worker_core();
+        let _queue_guard = self.queue_lock.lock().unwrap();
+        let phase = self.state.lock().unwrap().phase.clone();
+        // A user-stopped run retains its plan for human intervention.
+        let status = match phase.as_str() {
+            "done" => "done",
+            "failed" => "failed",
+            _ => "blocked",
+        };
+        self.set_queue_status(&mut self.load_queue(), id, status);
+        if status != "done" {
+            self.queue_active.store(false, Ordering::SeqCst);
+        }
+        status == "done" && self.queue_active.load(Ordering::SeqCst)
+    }
+
+    /// Start fresh, or finish an explicitly approved item before taking the next.
+    fn queue_worker(&self, approved: Option<u64>) {
+        let _worker = WorkerGuard(self);
+        if let Some(id) = approved
+            && !self.run_queue_item(id)
+        {
+            return;
+        }
+        loop {
+            let (id, goal) = {
+                let _queue_guard = self.queue_lock.lock().unwrap();
+                if !self.queue_active.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut queue = self.load_queue();
+                let Some(item) = queue["items"].as_array().unwrap().iter()
+                    .find(|item| item["status"] == "queued")
+                else {
+                    self.queue_active.store(false, Ordering::SeqCst);
+                    self.log_event("queue", "queue complete");
+                    return;
+                };
+                let id = item["id"].as_u64().unwrap();
+                let goal = item["goal"].as_str().unwrap_or("").to_string();
+                self.set_queue_status(&mut queue, id, "planning");
+                let mut s = self.state.lock().unwrap();
+                s.goal = goal.clone();
+                s.phase = "planning".into();
+                (id, goal)
+            };
+            let planned = self.plan_worker_inner(&goal);
+            {
+                let _queue_guard = self.queue_lock.lock().unwrap();
+                let mut queue = self.load_queue();
+                if !planned {
+                    self.set_queue_status(&mut queue, id, "failed");
+                    self.queue_active.store(false, Ordering::SeqCst);
+                    return;
+                }
+                if !self.queue_active.load(Ordering::SeqCst) {
+                    self.set_queue_status(&mut queue, id, "blocked");
+                    return;
+                }
+                let auto_approve = self.state.lock().unwrap().settings["queue_auto_approve"]
+                    .as_bool().unwrap_or(false);
+                if !auto_approve {
+                    self.set_queue_status(&mut queue, id, "awaiting_approval");
+                    return;
+                }
+                let mut plan = self.load_plan().unwrap();
+                self.log_event("queue", &format!("goal {id}: automatically approved"));
+                self.start_queue_run(&mut queue, id, &mut plan);
+            }
+            if !self.run_queue_item(id) {
+                return;
+            }
+        }
     }
 
     fn stage_prompt(&self, template: &str, plan: &Value, stage: &Value) -> String {
@@ -749,6 +881,9 @@ impl App {
             let p = self.stage_prompt(CHECK_PROMPT, plan, &stage);
             self.run_agent("checker", &self.setting("checker"), &p,
                            &self.setting("checker_model"))?;
+            if self.stop_requested.load(Ordering::SeqCst) {
+                return Ok("stopped");
+            }
 
             let verdict: Option<Value> = fs::read_to_string(&verdict_path)
                 .ok()
@@ -798,6 +933,12 @@ impl App {
     }
 
     fn run_worker(&self) {
+        let _worker = WorkerGuard(self);
+        self.run_worker_core();
+    }
+
+    /// Run and record failures without releasing the worker's busy claim.
+    fn run_worker_core(&self) {
         let result = self.run_worker_inner();
         if let Err(e) = result {
             self.set_phase("failed");
@@ -805,8 +946,6 @@ impl App {
         }
         self.set_step(None, "");
         self.state.lock().unwrap().run_started_unix = 0;
-        self.stop_requested.store(false, Ordering::SeqCst);
-        self.busy.store(false, Ordering::SeqCst);
     }
 
     fn run_worker_inner(&self) -> Result<(), String> {
@@ -974,7 +1113,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let mut body_text = String::new();
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-    let busy = app.busy.load(Ordering::SeqCst);
+    let busy = app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst);
 
     match (method, path) {
         (tiny_http::Method::Get, "/api/state") => {
@@ -1002,7 +1141,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             let mut snap = snap;
             snap["plan"] = app.load_plan().unwrap_or(Value::Null);
             snap["queue"] = app.load_queue()["items"].clone();
-            snap["queue_active"] = json!(false);
+            snap["queue_active"] = json!(app.queue_active.load(Ordering::SeqCst));
             drop(_queue_guard);
             snap["history"] = app.read_history();
             snap["git_log"] = json!(app.git(&["log", "--oneline", "-12"]).unwrap_or_default());
@@ -1177,11 +1316,35 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 Err(e) => respond(req, 400, json!({"error": e})),
             }
         }
-        (tiny_http::Method::Post, "/api/plan") => {
-            let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
-            if app.acquire_busy().is_err() {
+        (tiny_http::Method::Post, "/api/queue/start") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let queue = app.load_queue();
+            if !queue["items"].as_array().unwrap().iter()
+                .any(|item| item["status"] == "queued")
+            {
+                respond(req, 400, json!({"error": "no queued goals"}));
+            } else if app.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
+                app.stop_requested.store(false, Ordering::SeqCst);
+                app.queue_active.store(true, Ordering::SeqCst);
+                app.log_event("queue", "queue started");
+                let app2 = Arc::clone(app);
+                std::thread::spawn(move || app2.queue_worker(None));
+                respond(req, 200, json!({"ok": true}));
+            }
+        }
+        (tiny_http::Method::Post, "/api/plan") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
+            if app.queue_active.load(Ordering::SeqCst) || app.acquire_busy().is_err() {
+                respond(req, 409, json!({"error": "busy"}));
+            } else {
+                app.stop_requested.store(false, Ordering::SeqCst);
                 {
                     let mut s = app.state.lock().unwrap();
                     s.goal = goal.clone();
@@ -1195,16 +1358,45 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 200, json!({"ok": true}));
             }
         }
-        (tiny_http::Method::Post, "/api/approve") => match app.load_plan() {
-            None => respond(req, 400, json!({"error": "no plan"})),
-            Some(mut plan) => {
+        (tiny_http::Method::Post, "/api/approve") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            if app.busy.load(Ordering::SeqCst) {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let Some(mut plan) = app.load_plan() else {
+                respond(req, 400, json!({"error": "no plan"}));
+                return;
+            };
+            let mut queue = app.load_queue();
+            let awaiting = queue["items"].as_array().unwrap().iter()
+                .find(|item| !matches!(item["status"].as_str(), Some("done" | "failed" | "blocked")))
+                .filter(|item| item["status"] == "awaiting_approval")
+                .and_then(|item| item["id"].as_u64());
+            if let Some(id) = awaiting {
+                if app.acquire_busy().is_err() {
+                    respond(req, 409, json!({"error": "busy"}));
+                    return;
+                }
+                app.stop_requested.store(false, Ordering::SeqCst);
+                app.queue_active.store(true, Ordering::SeqCst);
+                app.start_queue_run(&mut queue, id, &mut plan);
+                app.log_event("queue", &format!("goal {id}: approved by user"));
+                let app2 = Arc::clone(app);
+                std::thread::spawn(move || app2.queue_worker(Some(id)));
+            } else {
                 plan["status"] = json!("approved");
                 app.save_plan(&plan);
-                app.log_event("plan", "plan approved by user");
-                respond(req, 200, json!({"ok": true}));
             }
-        },
+            app.log_event("plan", "plan approved by user");
+            respond(req, 200, json!({"ok": true}));
+        }
         (tiny_http::Method::Post, "/api/run") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            if app.queue_active.load(Ordering::SeqCst) {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
             let plan = app.load_plan();
             let status = plan
                 .as_ref()
@@ -1231,12 +1423,25 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             }
         }
         (tiny_http::Method::Post, "/api/stop") => {
+            let _queue_guard = app.queue_lock.lock().unwrap();
             app.stop_requested.store(true, Ordering::SeqCst);
+            app.queue_active.store(false, Ordering::SeqCst);
+            // No worker remains to transition a plan paused for approval.
+            let mut queue = app.load_queue();
+            let awaiting: Vec<u64> = queue["items"].as_array().unwrap().iter()
+                .filter(|item| item["status"] == "awaiting_approval")
+                .filter_map(|item| item["id"].as_u64())
+                .collect();
+            for id in awaiting {
+                app.set_queue_status(&mut queue, id, "blocked");
+            }
+            app.log_event("queue", "queue stopped by user");
             app.log_event("run", "stop requested; finishing current agent session");
             respond(req, 200, json!({"ok": true}));
         }
         (tiny_http::Method::Post, "/api/reset_plan") => {
-            if busy {
+            let _queue_guard = app.queue_lock.lock().unwrap();
+            if app.busy.load(Ordering::SeqCst) || app.queue_active.load(Ordering::SeqCst) {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
                 let _ = fs::remove_file(app.forge_path("plan.json"));
@@ -1282,6 +1487,7 @@ fn main() {
         }),
         stop_requested: AtomicBool::new(false),
         busy: AtomicBool::new(false),
+        queue_active: AtomicBool::new(false),
         gh_cache: Mutex::new(None),
     });
     if app.load_plan().is_some() {
@@ -1409,6 +1615,137 @@ mod tests {
         let original = queue.clone();
         assert!(mutate_queue(&mut queue, "add", &json!({"goal": "Next"})).is_err());
         assert_eq!(queue, original);
+    }
+
+    struct QueueTest {
+        app: App,
+        path: PathBuf,
+    }
+
+    impl QueueTest {
+        fn new(auto_approve: bool) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "forge-queue-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst),
+            ));
+            fs::create_dir(&path).unwrap();
+            let mut settings = default_settings();
+            settings["planner"] = json!("mock");
+            settings["implementer"] = json!("mock");
+            settings["checker"] = json!("mock");
+            settings["auto_push"] = json!(false);
+            settings["queue_auto_approve"] = json!(auto_approve);
+            let app = App {
+                state: Mutex::new(State {
+                    project: path.display().to_string(), settings,
+                    phase: "idle".into(), goal: String::new(), current_stage: None,
+                    current_step: String::new(), run_started_unix: 0,
+                    agent_role: String::new(), agent_tool: String::new(),
+                    agent_model: String::new(), agent_started_unix: 0,
+                    agent_lines: 0, agent_last_line: String::new(),
+                }),
+                queue_lock: Mutex::new(()), stop_requested: AtomicBool::new(false),
+                busy: AtomicBool::new(false), queue_active: AtomicBool::new(false),
+                gh_cache: Mutex::new(None),
+            };
+            app.git(&["init", "-q"]).unwrap();
+            for (key, value) in [
+                ("user.name", "Forge Test"), ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"), ("core.hooksPath", "/dev/null"),
+            ] {
+                app.git(&["config", key, value]).unwrap();
+            }
+            app.git(&["commit", "--allow-empty", "-qm", "initial"]).unwrap();
+            let mut queue = json!({"items": []});
+            for goal in ["first goal", "second goal"] {
+                mutate_queue(&mut queue, "add", &json!({"goal": goal})).unwrap();
+            }
+            app.save_queue(&queue);
+            Self { app, path }
+        }
+
+        fn start(&self) {
+            self.app.acquire_busy().unwrap();
+            self.app.queue_active.store(true, Ordering::SeqCst);
+            self.app.queue_worker(None);
+        }
+
+        fn statuses(&self) -> Vec<String> {
+            self.app.load_queue()["items"].as_array().unwrap().iter()
+                .map(|item| item["status"].as_str().unwrap().to_string()).collect()
+        }
+    }
+
+    impl Drop for QueueTest {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn queue_auto_approval_commits_both_goals_and_releases_busy() {
+        let test = QueueTest::new(true);
+        test.start();
+        assert_eq!(test.statuses(), ["done", "done"]);
+        assert!(!test.app.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.busy.load(Ordering::SeqCst));
+        assert_eq!(test.app.state.lock().unwrap().phase, "done");
+        assert_eq!(test.app.state.lock().unwrap().goal, "second goal");
+        assert_eq!(test.app.git(&["log", "--format=%s", "-4"]).unwrap(),
+            "feat: line two\nfeat: line one\nfeat: line two\nfeat: line one");
+    }
+
+    #[test]
+    fn queue_manual_approval_pauses_again_after_each_goal() {
+        assert_eq!(default_settings()["queue_auto_approve"], false);
+        let test = QueueTest::new(false);
+        test.start();
+        assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
+        assert_eq!(test.app.state.lock().unwrap().phase, "plan_ready");
+        assert!(test.app.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.busy.load(Ordering::SeqCst));
+        for id in [1, 2] {
+            test.app.acquire_busy().unwrap();
+            {
+                let _queue_guard = test.app.queue_lock.lock().unwrap();
+                test.app.start_queue_run(
+                    &mut test.app.load_queue(), id, &mut test.app.load_plan().unwrap(),
+                );
+            }
+            test.app.queue_worker(Some(id));
+            assert!(!test.app.busy.load(Ordering::SeqCst));
+            if id == 1 {
+                assert_eq!(test.statuses(), ["done", "awaiting_approval"]);
+                assert_eq!(test.app.state.lock().unwrap().phase, "plan_ready");
+            }
+        }
+        assert_eq!(test.statuses(), ["done", "done"]);
+        assert!(!test.app.queue_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queue_agent_failures_halt_and_leave_remaining_goals_queued() {
+        for role in ["planner", "implementer", "checker"] {
+            let test = QueueTest::new(true);
+            test.app.state.lock().unwrap().settings[role] = json!("invalid-agent");
+            test.start();
+            assert_eq!(test.statuses(), ["failed", "queued"], "{role}");
+            assert_eq!(test.app.state.lock().unwrap().phase, "failed");
+            assert!(!test.app.queue_active.load(Ordering::SeqCst));
+            assert!(!test.app.busy.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn queue_blocked_stage_halts_and_releases_busy() {
+        let test = QueueTest::new(true);
+        // An exhausted review budget exercises the blocked-stage exit.
+        test.app.state.lock().unwrap().settings["max_fix_rounds"] = json!(-1);
+        test.start();
+        assert_eq!(test.statuses(), ["blocked", "queued"]);
+        assert_eq!(test.app.state.lock().unwrap().phase, "blocked");
+        assert!(!test.app.queue_active.load(Ordering::SeqCst));
+        assert!(!test.app.busy.load(Ordering::SeqCst));
     }
 
     #[test]
