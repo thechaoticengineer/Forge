@@ -17,6 +17,10 @@ BarWidget {
   property int totalStages: 0
   property int queuedCount: 0
   property bool queueActive: false
+  property var sessions: []
+  property int activeCount: 0
+  property int problemCount: 0
+  property int totalQueued: 0
 
   readonly property string statusGlyph: {
     if (!engineOnline) return "◇"
@@ -58,6 +62,16 @@ BarWidget {
           root.queuedCount = Array.isArray(s.queue)
             ? s.queue.filter(item => item.status === "queued").length : 0
           root.queueActive = s.queue_active === true
+          root.sessions = Array.isArray(s.sessions) ? s.sessions : []
+          root.activeCount = Array.isArray(s.sessions)
+            ? s.sessions.filter(session => session.busy || session.queue_active).length
+            : (s.busy || root.queueActive ? 1 : 0)
+          root.problemCount = Array.isArray(s.sessions)
+            ? s.sessions.filter(session => session.phase === "blocked" || session.phase === "failed").length
+            : (s.phase === "blocked" || s.phase === "failed" ? 1 : 0)
+          root.totalQueued = Array.isArray(s.sessions)
+            ? s.sessions.reduce((total, session) => total + session.queued, 0)
+            : root.queuedCount
           root.engineOnline = true
           root.phase = s.phase
         } catch (e) {
@@ -73,12 +87,15 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: (root.phase === "running" && root.totalStages > 0
+    text: (root.engineOnline && root.activeCount > 1
+      ? root.statusGlyph + " " + root.activeCount
+      : root.phase === "running" && root.totalStages > 0
       ? root.statusGlyph + " " + root.committedStages + "/" + root.totalStages
       : root.statusGlyph)
-      + (root.engineOnline && root.queuedCount > 0 ? " +" + root.queuedCount : "")
-    active: root.engineOnline && root.phase !== "idle"
-    activeColor: root.phase === "failed" || root.phase === "blocked"
+      + (root.engineOnline && root.totalQueued > 0 ? " +" + root.totalQueued : "")
+    active: root.engineOnline && (root.phase !== "idle"
+      || (root.sessions.length > 0 && (root.activeCount > 0 || root.problemCount > 0)))
+    activeColor: root.engineOnline && root.problemCount > 0
       ? (root.bar ? root.bar.urgent : Color.urgent)
       : (root.bar ? root.bar.foreground : Color.foreground)
     dimmed: !root.engineOnline
@@ -95,6 +112,11 @@ BarWidget {
         tooltip += "\ngoal: " + root.goal.slice(0, 80)
       if (root.queuedCount > 0 || root.queueActive)
         tooltip += "\nqueue: " + root.queuedCount + " waiting" + (root.queueActive ? " · active" : "")
+      for (const session of root.sessions) {
+        if (session.phase !== "idle")
+          tooltip += "\n" + session.name + ": " + session.phase
+            + (session.current_step ? " · " + session.current_step : "")
+      }
       return tooltip
     }
 
