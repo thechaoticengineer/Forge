@@ -117,6 +117,17 @@ impl App {
             .to_string()
     }
 
+    /// Point Forge at an existing local git repository and recompute phase.
+    fn set_project(&self, path: &str) -> Result<(), String> {
+        if !PathBuf::from(path).join(".git").exists() {
+            return Err(format!("{path} is not a git repository"));
+        }
+        self.state.lock().unwrap().project = path.to_string();
+        let phase = if self.load_plan().is_some() { "plan_ready" } else { "idle" };
+        self.set_phase(phase);
+        Ok(())
+    }
+
     /// Raw `gh repo list` result, cached for 60 seconds so panel polling
     /// does not spawn a gh process every request. Returns (repos, error).
     fn remote_repos_raw(&self) -> (Value, Option<String>) {
@@ -692,16 +703,77 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             let path = body["path"].as_str().unwrap_or("").trim().to_string();
             if busy {
                 respond(req, 409, json!({"error": "busy"}));
-            } else if !PathBuf::from(&path).join(".git").exists() {
-                respond(req, 400, json!({"error": format!("{path} is not a git repository")}));
             } else {
-                {
-                    let mut s = app.state.lock().unwrap();
-                    s.project = path;
+                match app.set_project(&path) {
+                    Ok(()) => respond(req, 200, json!({"ok": true})),
+                    Err(e) => respond(req, 400, json!({"error": e})),
                 }
-                let phase = if app.load_plan().is_some() { "plan_ready" } else { "idle" };
-                app.set_phase(phase);
-                respond(req, 200, json!({"ok": true}));
+            }
+        }
+        (tiny_http::Method::Post, "/api/project/select") => {
+            let path = body["path"].as_str().unwrap_or("").trim().to_string();
+            let repo = body["repo"].as_str().unwrap_or("").trim().to_string();
+            if busy {
+                respond(req, 409, json!({"error": "busy"}));
+            } else if !path.is_empty() {
+                match app.set_project(&path) {
+                    Ok(()) => respond(req, 200, json!({"ok": true})),
+                    Err(e) => respond(req, 400, json!({"error": e})),
+                }
+            } else if !repo.is_empty() {
+                let parts: Vec<&str> = repo.split('/').collect();
+                let valid = parts.len() == 2
+                    && parts.iter().all(|p| {
+                        !p.is_empty()
+                            && *p != "."
+                            && *p != ".."
+                            && p.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                            })
+                    });
+                if !valid {
+                    respond(req, 400, json!({"error": format!("invalid repo name: {repo}")}));
+                    return;
+                }
+                let name = parts[1].to_string();
+                let target = PathBuf::from(app.setting("projects_root")).join(&name);
+                if target.join(".git").exists() {
+                    match app.set_project(&target.display().to_string()) {
+                        Ok(()) => respond(req, 200, json!({"ok": true})),
+                        Err(e) => respond(req, 400, json!({"error": e})),
+                    }
+                } else {
+                    app.busy.store(true, Ordering::SeqCst);
+                    app.set_step(None, &format!("cloning {repo}"));
+                    app.log_event("git", &format!("cloning {repo} into {}", target.display()));
+                    let app2 = Arc::clone(app);
+                    std::thread::spawn(move || {
+                        let out = Command::new("gh")
+                            .args(["repo", "clone", &repo])
+                            .arg(&target)
+                            .output();
+                        match out {
+                            Ok(o) if o.status.success() => {
+                                match app2.set_project(&target.display().to_string()) {
+                                    Ok(()) => app2.log_event("git",
+                                        &format!("clone finished: {repo} -> {}", target.display())),
+                                    Err(e) => app2.log_event("error",
+                                        &format!("clone finished but selection failed: {e}")),
+                                }
+                            }
+                            Ok(o) => app2.log_event("error", &format!(
+                                "clone of {repo} failed: {}",
+                                String::from_utf8_lossy(&o.stderr).trim())),
+                            Err(e) => app2.log_event("error",
+                                &format!("failed to launch gh clone: {e}")),
+                        }
+                        app2.set_step(None, "");
+                        app2.busy.store(false, Ordering::SeqCst);
+                    });
+                    respond(req, 200, json!({"ok": true, "cloning": true}));
+                }
+            } else {
+                respond(req, 400, json!({"error": "path or repo required"}));
             }
         }
         (tiny_http::Method::Post, "/api/plan") => {
