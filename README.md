@@ -26,6 +26,26 @@ blocked and Forge stops for you. Full history of every agent session,
 verdict, and git action is visible in the panel and kept in
 `.forge/history.jsonl`.
 
+## Queue
+
+Add multiple goals from the panel's queue section, reorder them, then
+start the queue. Forge processes one goal at a time through the same
+plan → approve → run loop above.
+
+The `queue_auto_approve` setting is off by default: Forge pauses at each
+plan for your usual approval. Enable it to approve each plan automatically
+and run the queue unattended. A blocked or failed item stops the queue
+for human intervention; remaining goals stay queued.
+
+Queue state lives in `.forge/queue.json` in the project. The panel shows
+each item's status; the bar widget shows the pending count and a queue tooltip.
+
+The JSON API accepts POST requests to `/api/queue/add` with `{"goal":"…"}`,
+`/api/queue/remove` with `{"id":1}`, and `/api/queue/move` with
+`{"id":1,"dir":"up"}` (or `"down"`). `/api/queue/clear` removes pending
+goals; `/api/queue/start` starts processing. `GET /api/state` includes
+the queue and whether it is active.
+
 ## Run
 
 ```
