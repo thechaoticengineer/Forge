@@ -58,6 +58,9 @@ Item {
   function fs(px) { return Style.fontPx(px / 12) }
 
   readonly property var plan: engineState ? engineState.plan : null
+  readonly property var queue: engineState && engineState.queue ? engineState.queue : []
+  readonly property bool queueActive: engineState !== null && engineState.queue_active === true
+  readonly property bool hasQueuedGoals: queue.some(function(item) { return item.status === "queued" })
   readonly property string phase: engineState ? engineState.phase : "offline"
   readonly property bool busy: phase === "planning" || phase === "running"
     || (engineState !== null && engineState.current_step.indexOf("cloning") === 0)
@@ -418,7 +421,8 @@ Item {
           }
         }
 
-        Row {
+        Flow {
+          width: parent.width
           spacing: Style.space(8)
           PanelButton {
             label: "planner: "
@@ -440,6 +444,13 @@ Item {
               + (root.engineState && root.engineState.settings.auto_push ? "yes" : "no")
             onClicked: root.act("/api/settings", {
               auto_push: !(root.engineState && root.engineState.settings.auto_push) })
+          }
+          PanelButton {
+            label: "auto-approve: "
+              + (root.engineState && root.engineState.settings.queue_auto_approve ? "yes" : "no")
+            enabled: root.engineOnline
+            onClicked: root.act("/api/settings", {
+              queue_auto_approve: !(root.engineState && root.engineState.settings.queue_auto_approve) })
           }
         }
 
@@ -480,6 +491,14 @@ Item {
             onClicked: root.act("/api/plan", { goal: goalField.text })
           }
           PanelButton {
+            label: "Add to queue"
+            enabled: root.engineOnline && goalField.text.trim() !== ""
+            onClicked: {
+              root.act("/api/queue/add", { goal: goalField.text })
+              goalField.text = ""
+            }
+          }
+          PanelButton {
             label: "Plan is OK — approve"
             enabled: !root.busy && root.plan !== null && root.plan.status === "draft"
             onClicked: root.act("/api/approve")
@@ -493,7 +512,7 @@ Item {
           }
           PanelButton {
             label: "Stop"
-            enabled: root.phase === "running"
+            enabled: root.phase === "running" || root.queueActive
             onClicked: root.act("/api/stop")
           }
           PanelButton {
@@ -516,10 +535,119 @@ Item {
           font.pixelSize: root.fs(11)
         }
 
+        // -------------------------------------------------- queue
+        Rectangle {
+          id: queueSection
+          visible: root.queue.length > 0
+          width: parent.width
+          height: queueHeader.height + queueList.height + Style.space(24)
+          color: root.surface
+          radius: 4
+
+          Row {
+            id: queueHeader
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: Style.space(8)
+            spacing: Style.space(8)
+            Text {
+              width: parent.width - startQueueButton.width - parent.spacing
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Queue (" + root.queue.length + ")"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(12)
+              font.bold: true
+            }
+            PanelButton {
+              id: startQueueButton
+              label: "Start queue"
+              primary: true
+              enabled: root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
+              onClicked: root.act("/api/queue/start")
+            }
+          }
+
+          ListView {
+            id: queueList
+            anchors.top: queueHeader.bottom
+            anchors.topMargin: Style.space(8)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: Style.space(8)
+            height: Math.min(contentHeight, Style.space(96))
+            clip: true
+            spacing: Style.space(4)
+            model: root.queue
+            delegate: Row {
+              id: queueRow
+              required property var modelData
+              required property int index
+              readonly property bool active: modelData.status === "planning"
+                || modelData.status === "awaiting_approval" || modelData.status === "running"
+              width: queueList.width
+              height: Math.max(queueGoal.implicitHeight, queueControls.implicitHeight)
+              spacing: Style.space(8)
+              Text {
+                id: queueGlyph
+                width: root.fs(12)
+                anchors.verticalCenter: parent.verticalCenter
+                text: queueRow.active ? "●" : queueRow.modelData.status === "done" ? "✓"
+                  : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
+                    ? "!" : "·"
+                color: queueRow.active ? root.accent
+                  : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
+                    ? root.urgent : root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+                font.bold: true
+              }
+              Text {
+                id: queueGoal
+                width: Math.max(0, parent.width - queueGlyph.width - parent.spacing
+                  - (queueControls.visible ? queueControls.width + parent.spacing : 0))
+                anchors.verticalCenter: parent.verticalCenter
+                text: queueRow.modelData.goal
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                maximumLineCount: 1
+                color: queueRow.active ? root.accent : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+                font.bold: queueRow.active
+              }
+              Row {
+                id: queueControls
+                visible: queueRow.modelData.status === "queued"
+                spacing: Style.space(4)
+                PanelButton {
+                  label: "↑"
+                  enabled: root.engineOnline && root.queue.slice(0, queueRow.index)
+                    .some(function(item) { return item.status === "queued" })
+                  onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
+                }
+                PanelButton {
+                  label: "↓"
+                  enabled: root.engineOnline && root.queue.slice(queueRow.index + 1)
+                    .some(function(item) { return item.status === "queued" })
+                  onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
+                }
+                PanelButton {
+                  label: "×"
+                  enabled: root.engineOnline
+                  onClicked: root.act("/api/queue/remove", { id: queueRow.modelData.id })
+                }
+              }
+            }
+          }
+        }
+
         // ------------------------------------------------- stages
         Rectangle {
           width: parent.width
-          height: parent.height * 0.34
+          height: Math.max(Style.space(100), parent.height * 0.34
+            - (queueSection.visible ? queueSection.height + Style.space(10) : 0))
           color: root.surface
           radius: 4
           ListView {
