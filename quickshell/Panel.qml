@@ -28,6 +28,9 @@ Item {
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: Style.font.family
 
+  // Font size in design pixels; Style.fontPx takes a multiplier of the 12px base.
+  function fs(px) { return Style.fontPx(px / 12) }
+
   readonly property var plan: engineState ? engineState.plan : null
   readonly property string phase: engineState ? engineState.phase : "offline"
   readonly property bool busy: phase === "planning" || phase === "running"
@@ -173,7 +176,7 @@ Item {
             text: "FORGE"
             color: root.accent
             font.family: root.fontFamily
-            font.pixelSize: Style.fontSize(18)
+            font.pixelSize: root.fs(18)
             font.bold: true
           }
           Rectangle {
@@ -191,7 +194,7 @@ Item {
               color: root.phase === "failed" || root.phase === "blocked"
                 ? root.urgent : root.foreground
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(11)
+              font.pixelSize: root.fs(11)
             }
           }
           Text {
@@ -202,7 +205,7 @@ Item {
               : (root.engineState ? root.engineState.current_step : "")
             color: root.mutedForeground
             font.family: root.fontFamily
-            font.pixelSize: Style.fontSize(12)
+            font.pixelSize: root.fs(12)
             anchors.verticalCenter: parent.verticalCenter
           }
         }
@@ -218,7 +221,7 @@ Item {
               text: root.projectName
               color: root.foreground
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(13)
+              font.pixelSize: root.fs(13)
               font.bold: true
             }
             Text {
@@ -227,7 +230,7 @@ Item {
               color: root.mutedForeground
               elide: Text.ElideMiddle
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(10)
+              font.pixelSize: root.fs(10)
             }
           }
           PanelButton {
@@ -279,13 +282,13 @@ Item {
             wrapMode: TextEdit.Wrap
             color: root.foreground
             font.family: root.fontFamily
-            font.pixelSize: Style.fontSize(12)
+            font.pixelSize: root.fs(12)
             Text {
               visible: goalField.text === "" && !goalField.activeFocus
               text: "What should be built?"
               color: root.mutedForeground
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(12)
+              font.pixelSize: root.fs(12)
             }
           }
         }
@@ -327,7 +330,7 @@ Item {
           text: root.localError
           color: root.urgent
           font.family: root.fontFamily
-          font.pixelSize: Style.fontSize(11)
+          font.pixelSize: root.fs(11)
         }
 
         // ------------------------------------------------- stages
@@ -354,7 +357,7 @@ Item {
                   text: stageRow.modelData.id + ". " + stageRow.modelData.title
                   color: root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.fontSize(12)
+                  font.pixelSize: root.fs(12)
                   font.bold: true
                 }
                 Text {
@@ -366,14 +369,14 @@ Item {
                     : stageRow.modelData.status === "blocked" ? root.urgent
                     : root.mutedForeground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.fontSize(11)
+                  font.pixelSize: root.fs(11)
                 }
               }
               Text {
                 text: stageRow.modelData.commit
                 color: root.accent
                 font.family: root.fontFamily
-                font.pixelSize: Style.fontSize(11)
+                font.pixelSize: root.fs(11)
               }
               Text {
                 width: stageList.width
@@ -383,7 +386,7 @@ Item {
                 maximumLineCount: 3
                 elide: Text.ElideRight
                 font.family: root.fontFamily
-                font.pixelSize: Style.fontSize(11)
+                font.pixelSize: root.fs(11)
               }
             }
             Text {
@@ -391,7 +394,7 @@ Item {
               text: "no plan yet"
               color: root.mutedForeground
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(12)
+              font.pixelSize: root.fs(12)
             }
           }
         }
@@ -421,7 +424,7 @@ Item {
                 : root.mutedForeground
               wrapMode: Text.Wrap
               font.family: root.fontFamily
-              font.pixelSize: Style.fontSize(10)
+              font.pixelSize: root.fs(10)
             }
           }
         }
@@ -467,14 +470,14 @@ Item {
                   verticalAlignment: TextInput.AlignVCenter
                   color: root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.fontSize(12)
+                  font.pixelSize: root.fs(12)
                   clip: true
                   Text {
                     visible: filterField.text === "" && !filterField.activeFocus
                     text: "filter projects…"
                     color: root.mutedForeground
                     font.family: root.fontFamily
-                    font.pixelSize: Style.fontSize(12)
+                    font.pixelSize: root.fs(12)
                   }
                 }
               }
@@ -518,7 +521,7 @@ Item {
                         ? root.foreground : root.mutedForeground
                     font.family: root.fontFamily
                     font.bold: chooserRow.modelData.kind === "header"
-                    font.pixelSize: Style.fontSize(
+                    font.pixelSize: root.fs(
                       chooserRow.modelData.kind === "note" ? 10 : 12)
                   }
                   Text {
@@ -526,7 +529,7 @@ Item {
                     text: chooserRow.modelData.path || ""
                     color: root.mutedForeground
                     font.family: root.fontFamily
-                    font.pixelSize: Style.fontSize(10)
+                    font.pixelSize: root.fs(10)
                     anchors.verticalCenter: parent.verticalCenter
                   }
                   Text {
@@ -536,7 +539,7 @@ Item {
                     color: chooserRow.modelData.cloned
                       ? root.accent : root.mutedForeground
                     font.family: root.fontFamily
-                    font.pixelSize: Style.fontSize(10)
+                    font.pixelSize: root.fs(10)
                     anchors.verticalCenter: parent.verticalCenter
                   }
                 }
@@ -570,7 +573,7 @@ Item {
                   verticalAlignment: TextInput.AlignVCenter
                   color: root.foreground
                   font.family: root.fontFamily
-                  font.pixelSize: Style.fontSize(12)
+                  font.pixelSize: root.fs(12)
                   clip: true
                 }
               }
@@ -610,7 +613,7 @@ Item {
       text: button.label
       color: button.primary ? root.background : root.foreground
       font.family: root.fontFamily
-      font.pixelSize: Style.fontSize(11)
+      font.pixelSize: root.fs(11)
     }
     MouseArea {
       id: buttonArea
