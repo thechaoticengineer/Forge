@@ -15,6 +15,8 @@ BarWidget {
   property string goal: ""
   property int committedStages: 0
   property int totalStages: 0
+  property int queuedCount: 0
+  property bool queueActive: false
 
   readonly property string statusGlyph: {
     if (!engineOnline) return "◇"
@@ -53,6 +55,9 @@ BarWidget {
           const stages = s.plan ? s.plan.stages : []
           root.committedStages = stages.filter(stage => stage.status === "committed").length
           root.totalStages = stages.length
+          root.queuedCount = Array.isArray(s.queue)
+            ? s.queue.filter(item => item.status === "queued").length : 0
+          root.queueActive = s.queue_active === true
           root.engineOnline = true
           root.phase = s.phase
         } catch (e) {
@@ -68,9 +73,10 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.phase === "running" && root.totalStages > 0
+    text: (root.phase === "running" && root.totalStages > 0
       ? root.statusGlyph + " " + root.committedStages + "/" + root.totalStages
-      : root.statusGlyph
+      : root.statusGlyph)
+      + (root.engineOnline && root.queuedCount > 0 ? " +" + root.queuedCount : "")
     active: root.engineOnline && root.phase !== "idle"
     activeColor: root.phase === "failed" || root.phase === "blocked"
       ? (root.bar ? root.bar.urgent : Color.urgent)
@@ -87,6 +93,8 @@ BarWidget {
       }
       if (root.goal && root.phase !== "idle")
         tooltip += "\ngoal: " + root.goal.slice(0, 80)
+      if (root.queuedCount > 0 || root.queueActive)
+        tooltip += "\nqueue: " + root.queuedCount + " waiting" + (root.queueActive ? " · active" : "")
       return tooltip
     }
 
