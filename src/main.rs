@@ -117,6 +117,15 @@ impl App {
             .to_string()
     }
 
+    /// Atomically claim the busy flag; Err means other work is in flight.
+    /// Prevents two requests that both saw busy=false from racing to spawn.
+    fn acquire_busy(&self) -> Result<(), ()> {
+        self.busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
     /// Point Forge at an existing local git repository and recompute phase.
     fn set_project(&self, path: &str) -> Result<(), String> {
         if !PathBuf::from(path).join(".git").exists() {
@@ -641,19 +650,13 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         }
         (tiny_http::Method::Get, "/api/projects") => {
             let projects_root = app.setting("projects_root");
-            let entries = match fs::read_dir(&projects_root) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    respond(req, 200, json!({
-                        "projects_root": projects_root,
-                        "local": [],
-                        "remote": [],
-                        "error": e.to_string(),
-                    }));
-                    return;
-                }
+            let (entries, local_error) = match fs::read_dir(&projects_root) {
+                Ok(entries) => (Some(entries), None),
+                Err(e) => (None, Some(e.to_string())),
             };
             let mut local: Vec<Value> = entries
+                .into_iter()
+                .flatten()
                 .filter_map(Result::ok)
                 .filter_map(|entry| {
                     let path = entry.path();
@@ -684,6 +687,9 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             });
             if let Some(e) = remote_error {
                 resp["remote_error"] = json!(e);
+            }
+            if let Some(e) = local_error {
+                resp["error"] = json!(e);
             }
             respond(req, 200, resp);
         }
@@ -742,8 +748,9 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                         Ok(()) => respond(req, 200, json!({"ok": true})),
                         Err(e) => respond(req, 400, json!({"error": e})),
                     }
+                } else if app.acquire_busy().is_err() {
+                    respond(req, 409, json!({"error": "busy"}));
                 } else {
-                    app.busy.store(true, Ordering::SeqCst);
                     app.set_step(None, &format!("cloning {repo}"));
                     app.log_event("git", &format!("cloning {repo} into {}", target.display()));
                     let app2 = Arc::clone(app);
@@ -778,7 +785,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         }
         (tiny_http::Method::Post, "/api/plan") => {
             let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
-            if busy {
+            if app.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
                 {
@@ -786,7 +793,6 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                     s.goal = goal.clone();
                     s.phase = "planning".into();
                 }
-                app.busy.store(true, Ordering::SeqCst);
                 let mut short = goal.clone();
                 short.truncate(300);
                 app.log_event("plan", &format!("planning started for goal: {short}"));
@@ -810,10 +816,10 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 .as_ref()
                 .and_then(|p| p["status"].as_str())
                 .unwrap_or("");
-            if busy {
-                respond(req, 409, json!({"error": "busy"}));
-            } else if status != "approved" && status != "done" {
+            if status != "approved" && status != "done" {
                 respond(req, 400, json!({"error": "plan is not approved"}));
+            } else if app.acquire_busy().is_err() {
+                respond(req, 409, json!({"error": "busy"}));
             } else {
                 {
                     let mut s = app.state.lock().unwrap();
@@ -823,7 +829,6 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                     }
                 }
                 app.stop_requested.store(false, Ordering::SeqCst);
-                app.busy.store(true, Ordering::SeqCst);
                 app.log_event("run", "run started");
                 let app2 = Arc::clone(app);
                 std::thread::spawn(move || app2.run_worker());
@@ -853,6 +858,9 @@ fn main() {
     let project = std::env::args()
         .nth(1)
         .unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
+    let project = fs::canonicalize(&project)
+        .map(|p| p.display().to_string())
+        .unwrap_or(project);
     let projects_root = PathBuf::from(&project)
         .parent()
         .unwrap_or_else(|| std::path::Path::new(&project))
