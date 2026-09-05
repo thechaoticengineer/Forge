@@ -44,6 +44,11 @@ Item {
   property var projectsData: null
   property bool manualEntry: false
 
+  property bool diffOpen: false
+  property string diffText: ""
+  property bool diffPending: false
+  property string diffError: ""
+
   readonly property var agent: engineState ? engineState.agent : null
   readonly property bool agentActive: agent !== null && agent !== undefined
     && agent.role !== ""
@@ -147,6 +152,28 @@ Item {
     })
   }
 
+  function openDiff() {
+    diffText = ""
+    diffError = ""
+    diffOpen = true
+    diffList.positionViewAtBeginning()
+    refreshDiff()
+  }
+
+  function refreshDiff() {
+    if (diffPending) return
+    diffPending = true
+    api("GET", "/api/diff", null, function(resp) {
+      root.diffPending = false
+      if (resp && typeof resp.diff === "string") {
+        root.diffError = ""
+        root.diffText = resp.diff
+      } else {
+        root.diffError = "Unable to load diff"
+      }
+    })
+  }
+
   function chooserRows(data, filter) {
     if (!data) return []
     const f = filter.toLowerCase()
@@ -194,6 +221,13 @@ Item {
     repeat: true
     running: window.visible
     onTriggered: root.refresh()
+  }
+
+  Timer {
+    interval: 3000
+    repeat: true
+    running: window.visible && root.diffOpen && root.busy
+    onTriggered: root.refreshDiff()
   }
 
   Timer {
@@ -405,7 +439,8 @@ Item {
           }
         }
 
-        Row {
+        Flow {
+          width: parent.width
           spacing: Style.space(8)
           PanelButton {
             label: "Create plan"
@@ -434,6 +469,11 @@ Item {
             label: "Discard plan"
             enabled: !root.busy && root.plan !== null
             onClicked: root.act("/api/reset_plan")
+          }
+          PanelButton {
+            label: "View diff"
+            enabled: root.engineOnline
+            onClicked: root.openDiff()
           }
         }
 
@@ -674,6 +714,106 @@ Item {
               wrapMode: Text.Wrap
               font.family: root.fontFamily
               font.pixelSize: root.fs(10)
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------ diff viewer
+      Rectangle {
+        visible: root.diffOpen
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.55)
+        MouseArea { anchors.fill: parent; onClicked: root.diffOpen = false }
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.82
+          height: parent.height * 0.82
+          radius: 6
+          color: root.surface
+          border.width: 1
+          border.color: Qt.darker(root.foreground, 3)
+          MouseArea { anchors.fill: parent }
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                width: parent.width - refreshDiffButton.width - closeDiffButton.width
+                  - parent.spacing * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Uncommitted diff"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+                font.bold: true
+                elide: Text.ElideRight
+              }
+              PanelButton {
+                id: refreshDiffButton
+                label: "Refresh"
+                enabled: root.engineOnline && !root.diffPending
+                onClicked: root.refreshDiff()
+              }
+              PanelButton {
+                id: closeDiffButton
+                label: "Close"
+                onClicked: root.diffOpen = false
+              }
+            }
+
+            Text {
+              visible: root.diffError !== ""
+              width: parent.width
+              text: root.diffError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(10)
+              wrapMode: Text.WrapAnywhere
+            }
+
+            ListView {
+              id: diffList
+              width: parent.width
+              height: parent.height - y
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              model: root.diffText === "" ? [] : root.diffText.split("\n")
+
+              delegate: Text {
+                id: diffLine
+                required property string modelData
+                readonly property bool header: modelData.indexOf("@@") === 0
+                  || modelData.indexOf("diff ") === 0
+                width: diffList.width
+                text: modelData === "" ? " " : modelData
+                textFormat: Text.PlainText
+                color: header ? root.accent
+                  : modelData.indexOf("+") === 0 && modelData.indexOf("+++") !== 0
+                    ? root.accent
+                  : modelData.indexOf("-") === 0 && modelData.indexOf("---") !== 0
+                    ? root.urgent : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(10)
+                font.bold: header
+                wrapMode: Text.WrapAnywhere
+              }
+
+              Text {
+                visible: root.diffText === "" && root.diffError === ""
+                width: parent.width
+                text: root.diffPending ? "Loading diff…" : "no uncommitted changes"
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(10)
+                wrapMode: Text.WrapAnywhere
+              }
             }
           }
         }
