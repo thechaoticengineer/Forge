@@ -480,7 +480,10 @@ ACCEPTANCE CRITERIA:
 {acceptance}
 
 Implement this stage completely. Verify your work runs (build/tests/quick manual check as appropriate).
-Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory."#;
+Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
+Never kill it (no `pkill forge` or similar) and never start another instance on its port.
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
 
 const FIX_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
@@ -501,7 +504,10 @@ An independent reviewer looked at them and requests fixes:
 {issues}
 
 Address every issue (or make the code obviously correct where the reviewer was wrong).
-Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory."#;
+Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
+Never kill it (no `pkill forge` or similar) and never start another instance on its port.
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
 
 const CHECK_PROMPT: &str = r#"You are an independent reviewer in a fresh session. Another agent implemented one stage of a plan in this repository. Judge only whether the current uncommitted changes correctly implement the stage.
 
@@ -516,7 +522,10 @@ Then write your verdict as JSON to the file {verdict_path}:
 {"approved": true/false, "issues": ["specific, actionable issue", ...]}
 
 approved=true only if the acceptance criteria are met and you found no real defect.
-Do NOT fix anything yourself; do NOT modify any file except {verdict_path}."#;
+Do NOT fix anything yourself; do NOT modify any file except {verdict_path}.
+CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
+Never kill it (no `pkill forge` or similar) and never start another instance on its port.
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
 
 // ---------------------------------------------------------------- http
 
@@ -729,9 +738,13 @@ fn main() {
     if app.load_plan().is_some() {
         app.set_phase("plan_ready");
     }
-    let server = tiny_http::Server::http(("127.0.0.1", PORT)).expect("bind server");
+    let port: u16 = std::env::var("FORGE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(PORT);
+    let server = tiny_http::Server::http(("127.0.0.1", port)).expect("bind server");
     println!(
-        "Forge engine on http://127.0.0.1:{PORT}  (project: {})",
+        "Forge engine on http://127.0.0.1:{port}  (project: {})",
         app.project()
     );
     for req in server.incoming_requests() {
