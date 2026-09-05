@@ -34,6 +34,7 @@ struct State {
 
 fn default_settings() -> Value {
     json!({
+        "projects_root": "",
         "planner": "claude",
         "implementer": "codex",
         "checker": "claude",
@@ -562,6 +563,45 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 .into_iter().rev().collect();
             respond(req, 200, json!({"diff": tail}));
         }
+        (tiny_http::Method::Get, "/api/projects") => {
+            let projects_root = app.setting("projects_root");
+            let entries = match fs::read_dir(&projects_root) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    respond(req, 200, json!({
+                        "projects_root": projects_root,
+                        "local": [],
+                        "remote": [],
+                        "error": e.to_string(),
+                    }));
+                    return;
+                }
+            };
+            let mut local: Vec<Value> = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let git = path.join(".git");
+                    if !path.is_dir() || (!git.is_dir() && !git.is_file()) {
+                        return None;
+                    }
+                    Some(json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "path": path.display().to_string(),
+                    }))
+                })
+                .collect();
+            local.sort_by(|a, b| {
+                let a = a["name"].as_str().unwrap_or("");
+                let b = b["name"].as_str().unwrap_or("");
+                a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
+            });
+            respond(req, 200, json!({
+                "projects_root": projects_root,
+                "local": local,
+                "remote": [],
+            }));
+        }
         (tiny_http::Method::Post, "/api/settings") => {
             let mut s = app.state.lock().unwrap();
             if let Some(obj) = body.as_object() {
@@ -667,10 +707,17 @@ fn main() {
     let project = std::env::args()
         .nth(1)
         .unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
+    let projects_root = PathBuf::from(&project)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(&project))
+        .display()
+        .to_string();
+    let mut settings = default_settings();
+    settings["projects_root"] = json!(projects_root);
     let app = Arc::new(App {
         state: Mutex::new(State {
             project,
-            settings: default_settings(),
+            settings,
             phase: "idle".into(),
             goal: String::new(),
             current_stage: None,
