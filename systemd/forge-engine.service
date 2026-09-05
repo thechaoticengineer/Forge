@@ -1,0 +1,10 @@
+[Unit]
+Description=Forge engine
+
+[Service]
+ExecStart=%h/.local/share/forge/forge-engine %h/Projects/Forge
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
