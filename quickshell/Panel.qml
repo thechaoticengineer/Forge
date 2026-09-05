@@ -17,6 +17,7 @@ Item {
   property bool engineOnline: false
   property string apiBase: "http://127.0.0.1:8734"
   property string localError: ""
+  property int expandedStageId: -1
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id : "dev.omarchy-ai-build-orchestrator"
@@ -205,7 +206,7 @@ Item {
   Timer {
     interval: 1000
     repeat: true
-    running: window.visible && agentCard.visible
+    running: window.visible
     triggeredOnStart: true
     onTriggered: root.agentNow = Date.now() / 1000
   }
@@ -460,18 +461,53 @@ Item {
             delegate: Column {
               id: stageRow
               required property var modelData
+              readonly property bool expanded: root.expandedStageId === modelData.id
+              readonly property double elapsedSecs: modelData.status === "in_progress"
+                && typeof modelData.started_unix === "number"
+                ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
+                : typeof modelData.duration_secs === "number"
+                  ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
+              readonly property var checkerIssues: modelData.last_verdict
+                && modelData.last_verdict.issues ? modelData.last_verdict.issues : []
               width: stageList.width
               spacing: 2
-              Row {
+              TapHandler {
+                onTapped: root.expandedStageId = stageRow.expanded
+                  ? -1 : stageRow.modelData.id
+              }
+              Flow {
+                width: stageRow.width
                 spacing: Style.space(8)
-                Text {
-                  text: stageRow.modelData.id + ". " + stageRow.modelData.title
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(12)
-                  font.bold: true
+                Row {
+                  width: Math.min(implicitWidth, stageRow.width)
+                  spacing: Style.space(4)
+                  Text {
+                    id: stageGlyph
+                    text: stageRow.modelData.status === "committed" ? "✓"
+                      : stageRow.modelData.status === "in_progress" ? "●"
+                      : stageRow.modelData.status === "blocked" ? "!" : "·"
+                    color: stageRow.modelData.status === "committed"
+                      || stageRow.modelData.status === "in_progress" ? root.accent
+                      : stageRow.modelData.status === "blocked" ? root.urgent
+                      : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                    font.bold: true
+                  }
+                  Text {
+                    width: Math.min(implicitWidth,
+                      stageRow.width - stageGlyph.width - Style.space(4))
+                    text: stageRow.modelData.id + ". " + stageRow.modelData.title
+                    textFormat: Text.PlainText
+                    color: root.foreground
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                    font.bold: true
+                  }
                 }
                 Text {
+                  width: Math.min(implicitWidth, stageRow.width)
                   text: stageRow.modelData.status
                     + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
                     + (stageRow.modelData.rounds > 1
@@ -479,6 +515,27 @@ Item {
                   color: stageRow.modelData.status === "committed" ? root.accent
                     : stageRow.modelData.status === "blocked" ? root.urgent
                     : root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: text !== ""
+                  width: Math.min(implicitWidth, stageRow.width)
+                  text: root.engineState
+                    && stageRow.modelData.id === root.engineState.current_stage
+                    ? root.engineState.current_step || "" : ""
+                  textFormat: Text.PlainText
+                  color: root.accent
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: stageRow.elapsedSecs >= 0
+                  text: visible ? Math.floor(stageRow.elapsedSecs / 60) + "m "
+                    + (stageRow.elapsedSecs % 60) + "s" : ""
+                  color: root.mutedForeground
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
@@ -490,12 +547,43 @@ Item {
                 font.pixelSize: root.fs(11)
               }
               Text {
+                visible: !stageRow.expanded
                 width: stageList.width
                 text: stageRow.modelData.instructions
                 color: root.mutedForeground
                 wrapMode: Text.Wrap
                 maximumLineCount: 3
                 elide: Text.ElideRight
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              Text {
+                visible: stageRow.expanded
+                width: stageRow.width
+                text: "instructions:\n" + (stageRow.modelData.instructions || "")
+                textFormat: Text.PlainText
+                color: root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              Text {
+                visible: stageRow.expanded
+                width: stageRow.width
+                text: "acceptance criteria:\n" + (stageRow.modelData.acceptance || "")
+                textFormat: Text.PlainText
+                color: root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              Text {
+                visible: stageRow.expanded && stageRow.checkerIssues.length > 0
+                width: stageRow.width
+                text: "checker issues:\n• " + stageRow.checkerIssues.join("\n• ")
+                textFormat: Text.PlainText
+                color: root.urgent
+                wrapMode: Text.Wrap
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(11)
               }
