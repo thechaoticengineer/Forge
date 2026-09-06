@@ -612,6 +612,7 @@ Item {
             visible: root.engineState !== null && root.engineState.current_step !== ""
             width: Math.max(0, parent.width - forgeTitle.width - phaseBadge.width
               - (projectActivity.visible ? projectActivity.width + parent.spacing : 0)
+              - helpButton.width - parent.spacing
               - 2 * parent.spacing)
             elide: Text.ElideRight
             text: root.engineState && root.engineState.current_stage !== null
@@ -622,6 +623,11 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.fs(12)
             anchors.verticalCenter: parent.verticalCenter
+          }
+          PanelButton {
+            id: helpButton
+            label: "?"
+            onClicked: root.helpOpen = true
           }
         }
 
@@ -1429,6 +1435,11 @@ Item {
         color: root.mutedForeground
         font.family: root.fontFamily
         font.pixelSize: root.fs(10)
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: if (!root.helpOpen) root.helpOpen = true
+        }
       }
 
       // ------------------------------------------------ diff viewer
