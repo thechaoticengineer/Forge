@@ -103,13 +103,54 @@ The panel uses vim-inspired normal and insert modes. In normal mode, `i`
 focuses the goal for typing; clicking a text field also enters insert mode.
 `Escape` leaves the field, or closes the top overlay when already in normal mode.
 
-- `j` / `k` select stages; `gg` / `G` jump to the first / last stage.
-  `Enter`, `o`, or `Space` expands or collapses the selection.
-- `Tab` toggles Live / History; `h` / `l` select Live / History directly.
-  `Ctrl+d` / `Ctrl+u` scroll down / up half a page. `1`–`5` select the
-  All, Runs, Git, Reviews, and Errors history filters.
-- `p` plans, `a` approves, `r` runs, and `x` stops; actions are available
-  when their buttons are enabled. `d` opens the diff; `c` changes project.
+Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 
-Diff and project chooser overlays also support vim-style navigation;
-press ? in the panel for the full list.
+#### Panel (normal mode)
+
+| Key | Action |
+| --- | --- |
+| `i` | Edit the goal (insert mode) |
+| `Escape` | Leave a text field or close the top overlay |
+| `j` / `k` | Select next / previous stage |
+| `gg` / `G` | Select first / last stage |
+| `Enter` / `o` / `Space` | Expand or collapse selected stage |
+| `Tab` | Toggle Live / History |
+| `h` / `l` | Select Live / History |
+| `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
+| `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
+| `p` | Create plan from goal |
+| `a` | Approve draft plan |
+| `r` | Run approved or completed plan |
+| `x` | Stop run or active queue |
+| `d` | Open uncommitted diff |
+| `c` | Change project |
+| `?` | Open keyboard help |
+
+#### Diff viewer
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Scroll down / up |
+| `Ctrl+d` / `Ctrl+u` | Scroll half a page down / up |
+| `gg` / `G` | Jump to top / bottom |
+| `R` | Refresh diff |
+| `q` / `Escape` | Close diff |
+
+#### Project chooser
+
+These shortcuts apply in normal mode, with text-field behavior noted below.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select next / previous project |
+| `Enter` | Open selection; in filter, open first match; in path field, set path |
+| `/` / `i` | Edit project filter (insert mode) |
+| `q` / `Escape` | Close chooser (Escape leaves a text field first) |
+
+#### Keyboard help
+
+| Key | Action |
+| --- | --- |
+| `?` / `q` / `Escape` | Close help before any other overlay |
+
+Press `?` in the panel to open the same reference.
