@@ -1440,12 +1440,15 @@ Item {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.margins: Style.space(16)
-        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? or F1 for keyboard help"
+        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - click here or press ? (Shift+/) or F1 for keyboard help"
         color: root.mutedForeground
         font.family: root.fontFamily
         font.pixelSize: root.fs(10)
+        font.underline: !root.insertMode && keyboardHintMouseArea.containsMouse
         MouseArea {
+          id: keyboardHintMouseArea
           anchors.fill: parent
+          hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: if (!root.helpOpen) root.helpOpen = true
         }
