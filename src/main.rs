@@ -1,7 +1,7 @@
 //! Forge — a minimal wrapper around AI coding agents.
 //!
 //! Loop: plan (codex/claude) -> human approves -> per stage:
-//! implement (tool A) -> independent check (tool B, fresh session) ->
+//! implement (tool A) -> independent review (tool B, fresh session) ->
 //! bounded fix loop -> commit proposed message -> next stage -> push.
 //!
 //! Persistent goal queue: process goals sequentially with optional automatic approval.
@@ -264,10 +264,10 @@ fn default_settings() -> Value {
         "projects_root": "",
         "planner": "claude",
         "implementer": "codex",
-        "checker": "claude",
+        "reviewer": "claude",
         "planner_model": "",
         "implementer_model": "",
-        "checker_model": "",
+        "reviewer_model": "",
         "max_fix_rounds": 3,
         "auto_push": true,
         "queue_auto_approve": false,
@@ -795,7 +795,7 @@ impl Ctx {
                     .map_err(|e| e.to_string())?;
                 let _ = writeln!(f, "work by {role}");
             }
-            "checker" => {
+            "reviewer" => {
                 let _ = fs::write(
                     self.forge_path("verdict.json"),
                     json!({"approved": true, "issues": []}).to_string(),
@@ -981,7 +981,7 @@ impl Ctx {
             .replace("{verdict_path}", &format!("{FORGE_DIR}/verdict.json"))
     }
 
-    /// Implement + independent check + bounded fix loop for one stage.
+    /// Implement + independent review + bounded fix loop for one stage.
     fn run_one_stage(&self, plan: &mut Value, idx: usize) -> Result<&'static str, String> {
         let max_rounds = self.app.settings.lock().unwrap()["max_fix_rounds"]
             .as_i64()
@@ -1018,12 +1018,12 @@ impl Ctx {
                 return Ok("stopped");
             }
 
-            self.set_step(Some(sid), "checking");
+            self.set_step(Some(sid), "reviewing");
             let verdict_path = self.forge_path("verdict.json");
             let _ = fs::remove_file(&verdict_path);
-            let p = self.stage_prompt(CHECK_PROMPT, plan, &stage);
-            self.run_agent("checker", &self.setting("checker"), &p,
-                           &self.setting("checker_model"))?;
+            let p = self.stage_prompt(REVIEW_PROMPT, plan, &stage);
+            self.run_agent("reviewer", &self.setting("reviewer"), &p,
+                           &self.setting("reviewer_model"))?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1037,7 +1037,7 @@ impl Ctx {
                         "approved": true, "issues": [],
                     });
                     self.save_plan(plan);
-                    self.log_event("check", &format!("stage {sid} approved by checker"));
+                    self.log_event("review", &format!("stage {sid} approved by reviewer"));
                     return Ok("approved");
                 }
                 Some(v) => {
@@ -1055,7 +1055,7 @@ impl Ctx {
                     });
                     self.save_plan(plan);
                     let summary: String = list.join("; ").chars().take(1500).collect();
-                    self.log_event("check", &format!("stage {sid} rejected: {summary}"));
+                    self.log_event("review", &format!("stage {sid} rejected: {summary}"));
                     issues = Some(list);
                 }
                 None => {
@@ -1068,7 +1068,7 @@ impl Ctx {
                         "approved": false, "issues": issues.as_ref().unwrap(),
                     });
                     self.save_plan(plan);
-                    self.log_event("error", "checker produced no readable verdict; retrying stage");
+                    self.log_event("error", "reviewer produced no readable verdict; retrying stage");
                 }
             }
         }
@@ -1125,7 +1125,7 @@ impl Ctx {
                     let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked"));
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
-                        "stage {sid} blocked after {duration}: checker still rejecting after max fix rounds — needs a human"));
+                        "stage {sid} blocked after {duration}: reviewer still rejecting after max fix rounds — needs a human"));
                     return Ok(());
                 }
                 _approved => {
@@ -1223,7 +1223,7 @@ CRITICAL: the Forge engine that orchestrates you is itself running from this rep
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
 To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
 
-const CHECK_PROMPT: &str = r#"You are an independent reviewer in a fresh session. Another agent implemented one stage of a plan in this repository. Judge only whether the current uncommitted changes correctly implement the stage.
+const REVIEW_PROMPT: &str = r#"You are an independent reviewer in a fresh session. Another agent implemented one stage of a plan in this repository. Judge only whether the current uncommitted changes correctly implement the stage.
 
 STAGE: {title}
 INSTRUCTIONS GIVEN TO THE IMPLEMENTER:
@@ -1231,7 +1231,7 @@ INSTRUCTIONS GIVEN TO THE IMPLEMENTER:
 ACCEPTANCE CRITERIA:
 {acceptance}
 
-Inspect with `git status` and `git diff` (all uncommitted changes belong to this stage), read files, and run checks if useful.
+Inspect with `git status` and `git diff` (all uncommitted changes belong to this stage), read files, and run tests/builds if useful.
 Then write your verdict as JSON to the file {verdict_path}:
 {"approved": true/false, "issues": ["specific, actionable issue", ...]}
 
@@ -1853,7 +1853,7 @@ mod tests {
             let mut settings = default_settings();
             settings["planner"] = json!("mock");
             settings["implementer"] = json!("mock");
-            settings["checker"] = json!("mock");
+            settings["reviewer"] = json!("mock");
             settings["auto_push"] = json!(false);
             settings["queue_auto_approve"] = json!(auto_approve);
             let engine = engine.unwrap_or_else(|| Arc::new(App::new(&path.display().to_string(), settings)));
@@ -2069,7 +2069,7 @@ mod tests {
         test.app.acquire_busy().unwrap();
         session.state.lock().unwrap().goal = "in flight".into();
         test.app.set_phase("running");
-        test.app.set_step(Some(2), "checking");
+        test.app.set_step(Some(2), "reviewing");
         engine.set_project(&alias.display().to_string()).unwrap();
         assert!(engine.set_project(&test.path.join(FORGE_DIR).display().to_string()).is_err());
         assert_eq!(*engine.active_project.lock().unwrap(), test.app.project());
@@ -2077,7 +2077,7 @@ mod tests {
         assert_eq!(session.state.lock().unwrap().phase, "running");
         let summary = engine.session_summaries(test.app.project());
         assert_eq!(summary[0]["goal"], "in flight");
-        assert_eq!(summary[0]["current_step"], "checking");
+        assert_eq!(summary[0]["current_step"], "reviewing");
         assert_eq!(summary[0]["name"], test.path.file_name().unwrap().to_string_lossy().as_ref());
         assert!(session.busy.load(Ordering::SeqCst));
     }
@@ -2116,7 +2116,7 @@ mod tests {
         first.app.acquire_busy().unwrap();
         let _worker = WorkerGuard(&first.app.session);
         first.app.set_phase("running");
-        first.app.set_step(Some(1), "checking");
+        first.app.set_step(Some(1), "reviewing");
         first.app.session.state.lock().unwrap().goal = "first project's work".into();
         first.app.session.queue_active.store(true, Ordering::SeqCst);
         first.app.save_plan(&json!({"goal": "first project's work", "stages": []}));
@@ -2160,7 +2160,7 @@ mod tests {
         assert_eq!(state["sessions"][0]["busy"], true);
         assert_eq!(state["sessions"][0]["queued"], 2);
         assert_eq!(state["sessions"][0]["goal"], "first project's work");
-        assert_eq!(state["sessions"][0]["current_step"], "checking");
+        assert_eq!(state["sessions"][0]["current_step"], "reviewing");
         assert_eq!(state["sessions"][1]["busy"], false);
         assert_eq!(state["sessions"][1]["queued"], 0);
         fs::write(second.app.forge_path("agent.log"), "B log").unwrap();
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[test]
     fn queue_agent_failures_halt_and_leave_remaining_goals_queued() {
-        for role in ["planner", "implementer", "checker"] {
+        for role in ["planner", "implementer", "reviewer"] {
             let test = QueueTest::new(true);
             test.app.app.settings.lock().unwrap()[role] = json!("invalid-agent");
             test.start();
