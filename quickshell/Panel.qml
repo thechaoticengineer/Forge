@@ -23,6 +23,7 @@ Item {
   property string lastProject: ""
   property int projectViewRevision: 0
   property var goalDrafts: ({})
+  property bool revisePending: false
   property bool editingPlan: false
   property var editStages: []
   property string editGoal: ""
@@ -113,7 +114,8 @@ Item {
 
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
-    || filterField.activeFocus || manualField.activeFocus || editFocusedField !== null
+    || feedbackField.activeFocus || filterField.activeFocus || manualField.activeFocus
+    || editFocusedField !== null
 
   onHelpOpenChanged: {
     keyHandler.pendingKey = ""
@@ -154,6 +156,8 @@ Item {
     projectViewRevision++
     cancelPlanEdit()
     goalField.text = goalDrafts[project] || ""
+    feedbackField.text = ""
+    revisePending = false
     goalFlick.contentY = 0
     expandedStageId = -1
     selectedStageIndex = -1
@@ -212,14 +216,14 @@ Item {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
       if (xhr.status === 0) {
         root.engineOnline = false
-        if (done) done(null)
+        if (done) done(null, xhr.status)
         return
       }
       root.engineOnline = true
       let parsed = null
       try { parsed = JSON.parse(xhr.responseText) } catch (e) {}
       if (parsed && parsed.error) root.localError = parsed.error
-      if (done) done(parsed)
+      if (done) done(parsed, xhr.status)
     }
     xhr.send(body ? JSON.stringify(body) : null)
   }
@@ -260,8 +264,24 @@ Item {
 
   function act(path, body, done) {
     localError = ""
-    api("POST", path, body || {}, function(resp) {
-      root.refresh(function() { if (done) done(resp) })
+    api("POST", path, body || {}, function(resp, status) {
+      root.refresh(function() { if (done) done(resp, status) })
+    })
+  }
+
+  function revisePlan() {
+    if (!improvePlanButton.enabled) return
+    const feedback = feedbackField.text
+    const revision = projectViewRevision
+    revisePending = true
+    act("/api/plan/revise", { feedback: feedback }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      root.revisePending = false
+      if (status === 200) {
+        if (feedbackField.text === feedback) feedbackField.text = ""
+      } else if (!resp || !resp.error) {
+        root.localError = "Could not revise plan. Check the engine connection and try again."
+      }
     })
   }
 
@@ -605,6 +625,9 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
+            event.accepted = true
+          } else if (event.key === Qt.Key_I && event.modifiers === Qt.ShiftModifier) {
+            feedbackField.forceActiveFocus()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
             if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
@@ -1037,7 +1060,7 @@ Item {
             id: createPlanButton
             label: "Create plan"
             primary: true
-            enabled: !root.editingPlan && !root.busy && goalField.text.trim() !== ""
+            enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
             onClicked: root.act("/api/plan", { goal: goalField.text })
           }
           PanelButton {
@@ -1051,14 +1074,15 @@ Item {
           PanelButton {
             id: approvePlanButton
             label: "Plan is OK — approve"
-            enabled: !root.editingPlan && !root.busy && root.plan !== null && root.plan.status === "draft"
+            enabled: !root.editingPlan && !root.revisePending && !root.busy
+              && root.plan !== null && root.plan.status === "draft"
             onClicked: root.act("/api/approve")
           }
           PanelButton {
             id: runPlanButton
             label: "Start implementing"
             primary: true
-            enabled: !root.editingPlan && !root.busy && root.plan !== null
+            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
               && (root.plan.status === "approved" || root.plan.status === "done")
             onClicked: root.act("/api/run")
           }
@@ -1071,13 +1095,13 @@ Item {
             id: editPlanButton
             label: "Edit plan"
             visible: !root.editingPlan
-            enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive
+            enabled: !root.editingPlan && !root.revisePending && root.engineOnline && !root.busy && !root.queueActive
               && root.plan !== null && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
             onClicked: root.beginPlanEdit()
           }
           PanelButton {
             label: "Discard plan"
-            enabled: !root.editingPlan && !root.busy && root.plan !== null
+            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
             onClicked: root.act("/api/reset_plan")
           }
           PanelButton {
@@ -1089,6 +1113,59 @@ Item {
             label: "Update Forge"
             enabled: root.engineOnline && !root.busy
             onClicked: root.act("/api/self_update")
+          }
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+          Rectangle {
+            width: parent.width - improvePlanButton.width - parent.spacing
+            height: improvePlanButton.height
+            color: root.surface
+            radius: 4
+            border.width: 1
+            border.color: feedbackField.activeFocus
+              ? root.accent : Qt.darker(root.foreground, 3)
+            TextInput {
+              id: feedbackField
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              verticalAlignment: TextInput.AlignVCenter
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(12)
+              selectByMouse: true
+              clip: true
+              onAccepted: root.revisePlan()
+              Keys.onPressed: event => {
+                if (event.key === Qt.Key_F1) {
+                  root.helpOpen = true
+                  keyHandler.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
+              Keys.onEscapePressed: event => {
+                keyHandler.forceActiveFocus()
+                event.accepted = true
+              }
+              Text {
+                visible: feedbackField.text === "" && !feedbackField.activeFocus
+                text: "what should be improved…"
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+              }
+            }
+          }
+          PanelButton {
+            id: improvePlanButton
+            label: "Improve with AI"
+            enabled: root.engineOnline && !root.busy && !root.queueActive
+              && !root.editingPlan && !root.revisePending && root.plan !== null
+              && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
+              && feedbackField.text.trim() !== ""
+            onClicked: root.revisePlan()
           }
         }
 
@@ -2073,6 +2150,7 @@ Item {
                   model: [
                     { key: "", description: "Panel · normal mode" },
                     { key: "i", description: "Edit the goal (insert mode)" },
+                    { key: "I", description: "Edit plan feedback (insert mode); Enter improves with AI" },
                     { key: "Escape", description: "Leave a text field, close the top overlay, or cancel plan editing" },
                     { key: "j / k", description: "Select next / previous stage" },
                     { key: "gg / G", description: "Select first / last stage" },
