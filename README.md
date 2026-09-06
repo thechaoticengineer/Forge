@@ -37,6 +37,20 @@ verdict, and git action is visible in the panel and kept in
 summary, limited to 300 characters; the stage's `reviews` array keeps
 the full summary.
 
+### Refactor plans
+
+Click **Refactor plan** next to **Create plan** in the panel to have the
+planner read the code and propose a staged refactoring plan that preserves
+observable behavior. Use the goal field as an optional focus hint, or leave
+it empty for the planner to choose refactorings on its own. Edit the draft,
+revise it with AI, approve it, and run it exactly like any other plan.
+
+The JSON API accepts POST requests to `/api/plan` with
+`{"mode":"refactor","goal":"optional focus"}`. Omit `goal` or leave it blank
+to use "Refactor the codebase" as the plan goal. The `mode` field is optional;
+omitting it keeps standard goal-based planning. Unknown modes are rejected
+with HTTP 400.
+
 ### Editing the plan
 
 After the planner writes a draft, use **Edit plan** in the panel to repair
