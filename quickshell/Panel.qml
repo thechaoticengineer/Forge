@@ -24,6 +24,8 @@ Item {
   property int projectViewRevision: 0
   property var goalDrafts: ({})
   property bool revisePending: false
+  property bool chatPending: false
+  property bool chatExpanded: false
   property bool editingPlan: false
   property var editStages: []
   property string editGoal: ""
@@ -93,11 +95,13 @@ Item {
     return session.project !== root.activeProject && (session.busy || session.queue_active)
   })
   readonly property var queue: engineState && engineState.queue ? engineState.queue : []
+  readonly property var chat: engineState && engineState.chat ? engineState.chat : []
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
   readonly property bool hasQueuedGoals: queue.some(function(item) { return item.status === "queued" })
   readonly property string phase: engineState ? engineState.phase : "offline"
   // Only the displayed project's work gates its controls, never background sessions.
   readonly property bool busy: phase === "planning" || phase === "running"
+    || (engineState !== null && engineState.busy === true)
     || (engineState !== null && engineState.current_step.indexOf("cloning") === 0)
   readonly property string projectName: engineState
     ? engineState.project.split("/").filter(function(p) { return p !== "" }).pop() || "?"
@@ -114,7 +118,8 @@ Item {
 
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
-    || feedbackField.activeFocus || filterField.activeFocus || manualField.activeFocus
+    || feedbackField.activeFocus || questionField.activeFocus
+    || filterField.activeFocus || manualField.activeFocus
     || editFocusedField !== null
 
   onHelpOpenChanged: {
@@ -158,6 +163,11 @@ Item {
     goalField.text = goalDrafts[project] || ""
     feedbackField.text = ""
     revisePending = false
+    questionField.text = ""
+    chatPending = false
+    chatExpanded = false
+    chatList.followTail = true
+    chatList.readingY = 0
     goalFlick.contentY = 0
     expandedStageId = -1
     selectedStageIndex = -1
@@ -176,7 +186,10 @@ Item {
     historyList.positionViewAtBeginning()
   }
 
-  onBusyChanged: liveTab = busy
+  onBusyChanged: {
+    liveTab = busy
+    if (!busy) chatPending = false
+  }
   onAgentSessionChanged: {
     if (agentSession !== "" && agentSession !== logSession) {
       logSession = agentSession
@@ -281,6 +294,25 @@ Item {
         if (feedbackField.text === feedback) feedbackField.text = ""
       } else if (!resp || !resp.error) {
         root.localError = "Could not revise plan. Check the engine connection and try again."
+      }
+    })
+  }
+
+  function askPlanQuestion() {
+    if (!askPlanButton.enabled) return
+    const question = questionField.text
+    const revision = projectViewRevision
+    chatPending = true
+    chatExpanded = true
+    chatList.followTail = true
+    act("/api/plan/chat", { question: question }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      // act refreshes state first; keep pending until the answer finishes.
+      root.chatPending = status === 200 && root.busy
+      if (status === 200) {
+        if (questionField.text === question) questionField.text = ""
+      } else if (!resp || !resp.error) {
+        root.localError = "Could not ask about the plan. Check the engine connection and try again."
       }
     })
   }
@@ -1169,6 +1201,131 @@ Item {
           }
         }
 
+        // ------------------------------------------------ plan Q&A
+        Column {
+          id: chatSection
+          visible: root.plan !== null
+          width: parent.width
+          spacing: Style.space(6)
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+            PanelButton {
+              id: chatToggle
+              label: (root.chatExpanded ? "▾" : "▸") + " Plan Q&A"
+                + (root.chat.length > 0 ? " (" + root.chat.length + ")" : "")
+              onClicked: root.chatExpanded = !root.chatExpanded
+            }
+            Rectangle {
+              width: Math.max(0, parent.width - chatToggle.width - askPlanButton.width
+                - parent.spacing * 2)
+              height: askPlanButton.height
+              color: root.surface
+              radius: 4
+              border.width: 1
+              border.color: questionField.activeFocus
+                ? root.accent : Qt.darker(root.foreground, 3)
+              TextInput {
+                id: questionField
+                anchors.fill: parent
+                anchors.margins: Style.space(6)
+                verticalAlignment: TextInput.AlignVCenter
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+                selectByMouse: true
+                clip: true
+                onAccepted: root.askPlanQuestion()
+                Keys.onPressed: event => {
+                  if (event.key === Qt.Key_F1) {
+                    root.helpOpen = true
+                    keyHandler.forceActiveFocus()
+                    event.accepted = true
+                  }
+                }
+                Keys.onEscapePressed: event => {
+                  keyHandler.forceActiveFocus()
+                  event.accepted = true
+                }
+                Text {
+                  visible: questionField.text === "" && !questionField.activeFocus
+                  text: "ask about this plan…"
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(12)
+                }
+              }
+            }
+            PanelButton {
+              id: askPlanButton
+              label: root.chatPending ? "Asking…" : "Ask"
+              enabled: root.engineOnline && !root.busy && !root.queueActive
+                && !root.editingPlan && !root.revisePending && !root.chatPending
+                && root.plan !== null && questionField.text.trim() !== ""
+              onClicked: root.askPlanQuestion()
+            }
+          }
+
+          Rectangle {
+            visible: root.chatExpanded && root.chat.length > 0
+            width: parent.width
+            height: Math.min(chatList.contentHeight, Style.space(96)) + Style.space(16)
+            color: root.surface
+            radius: 4
+            ListView {
+              id: chatList
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              clip: true
+              spacing: Style.space(6)
+              boundsBehavior: Flickable.StopAtBounds
+              model: root.chat
+              property bool followTail: true
+              property real readingY: 0
+
+              function scrollToTail() {
+                if (followTail && !moving) positionViewAtEnd()
+              }
+              function restoreReadingPosition() {
+                // Polling replaces the array; preserve older messages while reading.
+                if (!followTail && !moving)
+                  contentY = Math.max(originY, Math.min(readingY,
+                    originY + contentHeight - height))
+              }
+              onContentYChanged: {
+                if (moving) {
+                  followTail = atYEnd
+                  readingY = contentY
+                }
+              }
+              onMovementEnded: {
+                followTail = atYEnd
+                readingY = contentY
+              }
+              onModelChanged: {
+                Qt.callLater(restoreReadingPosition)
+                Qt.callLater(scrollToTail)
+              }
+              onContentHeightChanged: Qt.callLater(scrollToTail)
+              onHeightChanged: Qt.callLater(scrollToTail)
+              onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
+
+              delegate: Text {
+                required property var modelData
+                width: chatList.width
+                text: (modelData.role === "user" ? "You: " : "Forge: ") + modelData.text
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: modelData.role === "user" ? root.accent : root.foreground
+                font.bold: modelData.role === "user"
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+              }
+            }
+          }
+        }
+
         Text {
           visible: root.localError !== ""
           text: root.localError
@@ -1321,7 +1478,8 @@ Item {
         Rectangle {
           width: parent.width
           height: Math.max(Style.space(100), parent.height * 0.34
-            - (queueSection.visible ? queueSection.height + Style.space(10) : 0))
+            - (queueSection.visible ? queueSection.height + Style.space(10) : 0)
+            - (chatSection.visible ? chatSection.height + Style.space(10) : 0))
           color: root.surface
           radius: 4
           ListView {
