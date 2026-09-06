@@ -63,6 +63,19 @@ order; omit `id` for new stages to have Forge assign one. AI feedback must
 not be blank. Both endpoints require an existing plan and reject requests
 while the project is busy or its queue is active.
 
+### Asking about the plan
+
+Type a question about the current plan into the field beside **Plan Q&A**
+in the panel, then click **Ask** or press `Enter`. The selected planner tool
+answers without modifying the plan. Expand **Plan Q&A** to read the
+conversation. Asking requires an existing plan, with Forge idle, the queue
+inactive, and plan editing closed.
+
+The JSON API accepts POST requests to `/api/plan/chat` with
+`{"question":"..."}`. Questions must not be blank. The transcript is stored
+in `.forge/chat.jsonl` and cleared when new plan generation starts (including
+an AI revision) or the plan is reset.
+
 ## Queue
 
 Add multiple goals from the panel's queue section, reorder them, then
@@ -74,12 +87,17 @@ plan for your usual approval. Enable it to approve each plan automatically
 and run the queue unattended. A blocked or failed item stops the queue
 for human intervention; remaining goals stay queued.
 
+Successfully completed goals are removed from the queue automatically.
+Failed or blocked goals stay visible until you dismiss them with their
+**×** remove button in the panel.
+
 Queue state lives in `.forge/queue.json` in the project. The panel shows
 each item's status; the bar widget shows the pending count and a queue tooltip.
 
 The JSON API accepts POST requests to `/api/queue/add` with `{"goal":"…"}`,
 `/api/queue/remove` with `{"id":1}`, and `/api/queue/move` with
-`{"id":1,"dir":"up"}` (or `"down"`). `/api/queue/clear` removes pending
+`{"id":1,"dir":"up"}` (or `"down"`). Removal accepts queued, failed, or
+blocked goals. `/api/queue/clear` removes pending
 goals; `/api/queue/start` starts processing. `GET /api/state` includes
 the queue and whether it is active.
 
