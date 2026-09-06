@@ -91,6 +91,17 @@ Item {
   property bool diffPending: false
   property string diffError: ""
 
+  onDiffOpenChanged: {
+    keyHandler.pendingKey = ""
+    keyHandler.forceActiveFocus()
+  }
+
+  onChooserOpenChanged: {
+    keyHandler.pendingKey = ""
+    if (chooserOpen) chooserList.resetSelection()
+    keyHandler.forceActiveFocus()
+  }
+
   readonly property var agent: engineState ? engineState.agent : null
   readonly property bool agentActive: agent !== null && agent !== undefined
     && agent.role !== ""
@@ -314,6 +325,8 @@ Item {
       chooserOpen = false
     } else if (row.kind === "path") {
       manualEntry = !manualEntry
+      if (manualEntry) manualField.forceActiveFocus()
+      else keyHandler.forceActiveFocus()
     }
   }
 
@@ -379,6 +392,7 @@ Item {
         anchors.fill: parent
         focus: true
         property string pendingKey: ""
+        onActiveFocusChanged: pendingKey = ""
 
         function selectStage(index) {
           const stages = root.plan && root.plan.stages ? root.plan.stages : []
@@ -402,23 +416,60 @@ Item {
           if (view === historyList) historyList.readingY = view.contentY
         }
 
+        function scrollDiff(amount) {
+          diffList.cancelFlick()
+          const top = diffList.originY
+          const bottom = top + Math.max(0, diffList.contentHeight - diffList.height)
+          diffList.contentY = Math.max(top, Math.min(bottom, diffList.contentY + amount))
+        }
+
         Keys.onPressed: event => {
           const prefix = pendingKey
           pendingKey = ""
-          if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
+          // Modal normal mode owns every key; focused text fields handle insert mode.
+          if (root.diffOpen) {
+            event.accepted = true
+            if (event.key === Qt.Key_Escape) {
+              root.diffOpen = false
+            } else if (event.modifiers === Qt.ShiftModifier) {
+              if (event.key === Qt.Key_G) {
+                diffList.cancelFlick()
+                diffList.positionViewAtEnd()
+              } else if (event.key === Qt.Key_R && !root.diffPending) {
+                root.refreshDiff()
+              }
+            } else if (event.modifiers === Qt.ControlModifier) {
+              if (event.key === Qt.Key_D || event.key === Qt.Key_U)
+                scrollDiff((event.key === Qt.Key_D ? 1 : -1) * diffList.height / 2)
+            } else if (event.modifiers === Qt.NoModifier) {
+              if (event.key === Qt.Key_Q) root.diffOpen = false
+              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+                scrollDiff(event.key === Qt.Key_J ? 40 : -40)
+              else if (event.key === Qt.Key_G) {
+                if (prefix === "g") {
+                  diffList.cancelFlick()
+                  diffList.positionViewAtBeginning()
+                } else pendingKey = "g"
+              }
+            }
+          } else if (root.chooserOpen) {
+            event.accepted = true
+            if (event.key === Qt.Key_Escape) {
+              root.chooserOpen = false
+            } else if (event.modifiers === Qt.NoModifier) {
+              if (event.key === Qt.Key_Q) root.chooserOpen = false
+              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+                chooserList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
+              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                chooserList.activateSelection()
+              else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
+                filterField.forceActiveFocus()
+            }
+          } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
-            if (root.diffOpen) root.diffOpen = false
-            else if (root.chooserOpen) root.chooserOpen = false
             event.accepted = true
-          } else if (root.diffOpen || root.chooserOpen) {
-            if (event.modifiers === Qt.NoModifier
-                && [Qt.Key_P, Qt.Key_A, Qt.Key_R, Qt.Key_X, Qt.Key_D, Qt.Key_C].includes(event.key)) {
-              if (event.key === Qt.Key_D && root.diffOpen && !root.chooserOpen)
-                root.diffOpen = false
-              event.accepted = true
-            }
           } else {
             const stages = root.plan && root.plan.stages ? root.plan.stages : []
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
@@ -1484,6 +1535,10 @@ Item {
                   ? root.accent : Qt.darker(root.foreground, 3)
                 TextInput {
                   id: filterField
+                  onAccepted: {
+                    chooserList.resetSelection()
+                    chooserList.activateSelection()
+                  }
                   Keys.onEscapePressed: event => {
                     keyHandler.forceActiveFocus()
                     event.accepted = true
@@ -1518,15 +1573,43 @@ Item {
               clip: true
               spacing: 2
               model: root.chooserRows(root.projectsData, filterField.text)
+              currentIndex: -1
+              onModelChanged: resetSelection()
+
+              function isSelectable(row) {
+                return row && (row.kind === "local" || row.kind === "remote" || row.kind === "path")
+              }
+
+              function moveSelection(direction) {
+                const rows = model || []
+                for (let index = currentIndex + direction;
+                     index >= 0 && index < rows.length; index += direction) {
+                  if (!isSelectable(rows[index])) continue
+                  currentIndex = index
+                  positionViewAtIndex(index, ListView.Contain)
+                  return
+                }
+              }
+
+              function resetSelection() {
+                currentIndex = -1
+                moveSelection(1)
+              }
+
+              function activateSelection() {
+                const row = model && model[currentIndex]
+                if (isSelectable(row)) root.chooseRow(row)
+              }
+
               delegate: Rectangle {
                 id: chooserRow
                 required property var modelData
-                readonly property bool selectable: modelData.kind === "local"
-                  || modelData.kind === "remote" || modelData.kind === "path"
+                required property int index
+                readonly property bool selectable: chooserList.isSelectable(modelData)
                 width: chooserList.width
                 height: rowText.implicitHeight + Style.space(10)
                 radius: 4
-                color: chooserRowArea.containsMouse && selectable
+                color: selectable && (chooserRowArea.containsMouse || chooserList.currentIndex === index)
                   ? Qt.darker(root.accent, 2.8) : "transparent"
 
                 Row {
@@ -1591,6 +1674,7 @@ Item {
                   ? root.accent : Qt.darker(root.foreground, 3)
                 TextInput {
                   id: manualField
+                  onAccepted: manualSetButton.clicked()
                   Keys.onEscapePressed: event => {
                     keyHandler.forceActiveFocus()
                     event.accepted = true
