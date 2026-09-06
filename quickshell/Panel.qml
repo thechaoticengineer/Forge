@@ -151,6 +151,7 @@ Item {
     closingFromHost = false
     liveTab = busy
     window.visible = true
+    keyHandler.forceActiveFocus()
     refresh()
   }
 
@@ -361,6 +362,7 @@ Item {
     minimumSize: Qt.size(560, 680)
 
     onVisibleChanged: {
+      if (visible) keyHandler.forceActiveFocus()
       if (!visible && !root.closingFromHost && root.shell
           && typeof root.shell.hide === "function")
         root.shell.hide(root.pluginId)
@@ -369,6 +371,26 @@ Item {
     Rectangle {
       anchors.fill: parent
       color: root.background
+
+      Item {
+        id: keyHandler
+        anchors.fill: parent
+        focus: true
+        property string pendingKey: ""
+
+        Keys.onPressed: event => {
+          // No multi-key sequences yet; every key clears the pending prefix.
+          pendingKey = ""
+          if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
+            goalField.forceActiveFocus()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
+            if (root.diffOpen) root.diffOpen = false
+            else if (root.chooserOpen) root.chooserOpen = false
+            event.accepted = true
+          }
+        }
+      }
 
       Column {
         anchors.fill: parent
@@ -683,6 +705,10 @@ Item {
 
             TextEdit {
               id: goalField
+              Keys.onEscapePressed: event => {
+                keyHandler.forceActiveFocus()
+                event.accepted = true
+              }
               width: goalFlick.width
               height: Math.max(contentHeight, goalFlick.height)
               wrapMode: TextEdit.Wrap
@@ -1357,6 +1383,10 @@ Item {
                   ? root.accent : Qt.darker(root.foreground, 3)
                 TextInput {
                   id: filterField
+                  Keys.onEscapePressed: event => {
+                    keyHandler.forceActiveFocus()
+                    event.accepted = true
+                  }
                   anchors.fill: parent
                   anchors.margins: Style.space(6)
                   verticalAlignment: TextInput.AlignVCenter
@@ -1460,6 +1490,10 @@ Item {
                   ? root.accent : Qt.darker(root.foreground, 3)
                 TextInput {
                   id: manualField
+                  Keys.onEscapePressed: event => {
+                    keyHandler.forceActiveFocus()
+                    event.accepted = true
+                  }
                   anchors.fill: parent
                   anchors.margins: Style.space(6)
                   verticalAlignment: TextInput.AlignVCenter
