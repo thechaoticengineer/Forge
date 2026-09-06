@@ -1262,15 +1262,18 @@ Item {
               Row {
                 id: queueControls
                 visible: queueRow.modelData.status === "queued"
+                  || queueRow.modelData.status === "failed" || queueRow.modelData.status === "blocked"
                 spacing: Style.space(4)
                 PanelButton {
                   label: "↑"
+                  visible: queueRow.modelData.status === "queued"
                   enabled: root.engineOnline && root.queue.slice(0, queueRow.index)
                     .some(function(item) { return item.status === "queued" })
                   onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
                 }
                 PanelButton {
                   label: "↓"
+                  visible: queueRow.modelData.status === "queued"
                   enabled: root.engineOnline && root.queue.slice(queueRow.index + 1)
                     .some(function(item) { return item.status === "queued" })
                   onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
