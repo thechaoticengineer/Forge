@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "author": "Project contributors",
   "license": "MIT",
-  "description": "Minimal AI build orchestrator: staged plan, independent check loop, automatic commits and push.",
+  "description": "Minimal AI build orchestrator: staged plan, independent review loop, automatic commits and push.",
   "kinds": [
     "bar-widget",
     "panel"

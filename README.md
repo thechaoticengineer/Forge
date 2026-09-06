@@ -14,14 +14,14 @@ Rust engine + Quickshell (Omarchy) panel.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
    - the **implementer** (one tool) implements the stage,
-   - an independent **checker** (the other tool, always a fresh session)
+   - an independent **reviewer** (the other tool, always a fresh session)
      reviews the uncommitted diff and writes a verdict,
-   - rejections loop back to the implementer with the checker's issues,
+   - rejections loop back to the implementer with the reviewer's issues,
      up to a bounded number of fix rounds,
    - an approved stage is committed with the proposed message.
 5. After the last stage, Forge pushes to `origin`.
 
-If the checker still rejects after the fix rounds, the stage is marked
+If the reviewer still rejects after the fix rounds, the stage is marked
 blocked and Forge stops for you. Full history of every agent session,
 verdict, and git action is visible in the panel and kept in
 `.forge/history.jsonl`.
@@ -57,5 +57,5 @@ The engine serves a JSON API on `http://127.0.0.1:8734` for the panel
 PATH, logged in.
 
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
-widget and the Forge panel: pick planner/implementer/checker, set the
+widget and the Forge panel: pick planner/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
