@@ -557,6 +557,7 @@ Item {
       Column {
         anchors.fill: parent
         anchors.margins: Style.space(16)
+        anchors.bottomMargin: Style.space(16) + keyboardHint.height + Style.space(10)
         spacing: Style.space(10)
 
         // ---------------------------------------------------- header
@@ -1298,8 +1299,7 @@ Item {
 
         Rectangle {
           width: parent.width
-          height: parent.height
-            - y - keyboardHint.height - parent.spacing  // leave room for the hint
+          height: Math.max(0, parent.height - y)
           color: root.surface
           radius: 4
           Flickable {
@@ -1417,15 +1417,18 @@ Item {
             }
           }
         }
+      }
 
-        Text {
-          id: keyboardHint
-          width: parent.width
-          text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? keyboard help"
-          color: root.mutedForeground
-          font.family: root.fontFamily
-          font.pixelSize: root.fs(10)
-        }
+      Text {
+        id: keyboardHint
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: Style.space(16)
+        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? keyboard help"
+        color: root.mutedForeground
+        font.family: root.fontFamily
+        font.pixelSize: root.fs(10)
       }
 
       // ------------------------------------------------ diff viewer
