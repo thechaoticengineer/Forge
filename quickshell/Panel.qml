@@ -92,6 +92,8 @@ Item {
   property string diffError: ""
 
   property bool helpOpen: false
+  readonly property bool insertMode: goalField.activeFocus
+    || filterField.activeFocus || manualField.activeFocus
 
   onHelpOpenChanged: {
     keyHandler.pendingKey = ""
@@ -1297,7 +1299,7 @@ Item {
         Rectangle {
           width: parent.width
           height: parent.height
-            - y  // fill the remaining space
+            - y - keyboardHint.height - parent.spacing  // leave room for the hint
           color: root.surface
           radius: 4
           Flickable {
@@ -1414,6 +1416,15 @@ Item {
               font.pixelSize: root.fs(10)
             }
           }
+        }
+
+        Text {
+          id: keyboardHint
+          width: parent.width
+          text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? keyboard help"
+          color: root.mutedForeground
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(10)
         }
       }
 
