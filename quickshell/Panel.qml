@@ -893,6 +893,9 @@ Item {
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
               readonly property var reviewerIssues: modelData.last_verdict
                 && modelData.last_verdict.issues ? modelData.last_verdict.issues : []
+              readonly property var reviewHistory: modelData.reviews || []
+              readonly property var lastReview: reviewHistory.length > 0
+                ? reviewHistory[reviewHistory.length - 1] : null
               width: stageList.width
               spacing: 2
               TapHandler {
@@ -940,6 +943,22 @@ Item {
                     : stageRow.modelData.status === "in_progress" ? root.working
                     : stageRow.modelData.status === "blocked" ? root.urgent
                     : root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: stageRow.reviewHistory.length > 0
+                  width: Math.min(implicitWidth, stageRow.width)
+                  text: stageRow.lastReview
+                    ? "review: " + (stageRow.lastReview.approved ? "approved"
+                      : (stageRow.lastReview.issues || []).length + " issue(s)")
+                      + (stageRow.reviewHistory.length > 1
+                        ? " · " + stageRow.reviewHistory.length + " rounds" : "")
+                    : ""
+                  textFormat: Text.PlainText
+                  color: stageRow.lastReview && stageRow.lastReview.approved
+                    ? root.success : root.urgent
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
@@ -1003,8 +1022,49 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(11)
               }
+              Repeater {
+                model: stageRow.reviewHistory
+                delegate: Column {
+                  id: reviewRound
+                  required property var modelData
+                  visible: stageRow.expanded
+                  width: stageRow.width
+                  spacing: 2
+                  Text {
+                    width: stageRow.width
+                    text: "review round " + reviewRound.modelData.round + " — "
+                      + (reviewRound.modelData.approved ? "approved" : "rejected")
+                    textFormat: Text.PlainText
+                    color: reviewRound.modelData.approved ? root.success : root.urgent
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Text {
+                    visible: text !== ""
+                    width: stageRow.width
+                    text: reviewRound.modelData.summary || ""
+                    textFormat: Text.PlainText
+                    color: root.mutedForeground
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Text {
+                    visible: (reviewRound.modelData.issues || []).length > 0
+                    width: stageRow.width
+                    text: "• " + (reviewRound.modelData.issues || []).join("\n• ")
+                    textFormat: Text.PlainText
+                    color: root.urgent
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                }
+              }
               Text {
-                visible: stageRow.expanded && stageRow.reviewerIssues.length > 0
+                visible: stageRow.expanded && stageRow.reviewHistory.length === 0
+                  && stageRow.reviewerIssues.length > 0
                 width: stageRow.width
                 text: "reviewer issues:\n• " + stageRow.reviewerIssues.join("\n• ")
                 textFormat: Text.PlainText
