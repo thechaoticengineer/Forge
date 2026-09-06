@@ -14,26 +14,53 @@ Rust engine + Quickshell (Omarchy) panel.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
    - the **implementer** (one tool) implements the stage,
-   - an independent **reviewer** (the other tool, always a fresh session)
+   - an independent, adversarial **reviewer** (the other tool, always a fresh session)
      reviews the uncommitted diff and writes `.forge/verdict.json`,
    - rejections loop back to the implementer with the reviewer's issues,
      up to a bounded number of fix rounds,
+   - approval with improvement notes can trigger one **polish round** and
+     another review before committing,
    - an approved stage is committed with the proposed message.
 5. After the last stage, Forge pushes to `origin`.
 
+The reviewer starts by assuming there is a defect and actively looking for
+it in the diff and surrounding code. Before approving, it must verify each
+acceptance criterion individually and independently run the project's
+available build and tests. It must record the evidence and results, including
+exact commands; if a build or test is unavailable, it must explain how it
+established that. A failed or unrun available check, or an acceptance
+criterion it could not verify, requires rejection.
+
 The reviewer's verdict has the shape
-`{"approved": bool, "summary": str, "issues": [str, ...]}`.
+`{"approved": bool, "summary": str, "issues": [str, ...], "notes": [str, ...], "checks": [str, ...]}`.
 The summary describes what the reviewer inspected and found, even on
-approval; issues are specific, actionable feedback for the implementer.
+approval. `issues` are specific, actionable blocking defects; `notes` are
+concrete non-blocking improvements; `checks` list the commands and inspections
+actually performed and their results, including each acceptance criterion.
+The reviewer must look for improvements, but may leave notes empty if it
+finds none. Forge treats an approving verdict with blocking issues as a
+rejection.
+
+The `max_fix_rounds` setting (default `3`) limits extra fixer/review rounds
+after the initial implementation and review. Alongside it,
+`apply_review_notes` (default `true`) enables one polish round per stage:
+when the reviewer approves with notes and budget remains, Forge sends those
+notes to the fixer to apply, then re-reviews. Polish uses the same
+`max_fix_rounds` budget as rejection fixes. An approval can therefore still
+lead to an improvement round before the stage's commit. Further notes do
+not trigger another polish round; if polishing is disabled or the budget
+is exhausted, approval with notes proceeds to commit. A rejection after
+polishing follows the usual fix loop within the remaining budget.
+
 Every review round is recorded in the stage's `reviews` array in
 `.forge/plan.json`, with `round` (starting at 1), `approved`, `summary`,
-`issues`, and `unix` (a Unix timestamp in seconds). Earlier feedback stays
-available through fix rounds and approval.
+`issues`, `notes`, `checks`, and `unix` (a Unix timestamp in seconds).
+Earlier feedback stays available through fix rounds, polish, and approval.
 
 If the reviewer still rejects after the fix rounds, the stage is marked
 blocked and Forge stops for you. Full history of every agent session,
 verdict, and git action is visible in the panel and kept in
-`.forge/history.jsonl`. Review approval events include the reviewer's
+`.forge/history.jsonl`. Final review approval events include the reviewer's
 summary, limited to 300 characters; the stage's `reviews` array keeps
 the full summary.
 
@@ -128,10 +155,12 @@ PATH, logged in.
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
-Each reviewed stage has a review chip showing approval or the latest issue
-count, plus the number of rounds when there is more than one. Expand a
-stage to see its full per-round review history: approved or rejected,
-the reviewer's summary, and issues, including reviews after fix rounds.
+Each reviewed stage has a review chip showing approval (or
+`approved · N notes` when notes remain) or the latest issue count, plus the
+number of rounds when there is more than one. Expand a stage to see its full
+per-round review history: approved or rejected, the reviewer's summary,
+blocking issues, non-blocking notes, and checks under `verified:`, including
+reviews after fix and polish rounds.
 
 ### Updating and troubleshooting
 
