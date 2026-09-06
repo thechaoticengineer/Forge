@@ -134,11 +134,18 @@ INSTRUCTIONS GIVEN TO THE IMPLEMENTER:
 ACCEPTANCE CRITERIA:
 {acceptance}
 
-Inspect with `git status` and `git diff` (all uncommitted changes belong to this stage), read files, and run tests/builds if useful.
-Then write your verdict as JSON to the file {verdict_path}:
-{"approved": true/false, "summary": "short feedback: what you inspected and what you found, even when approving", "issues": ["specific, actionable issue", ...]}
+Start from the assumption that the change has a defect and actively try to find one. Inspect `git status` and read the full `git diff` (all uncommitted changes belong to this stage), including staged changes and the contents of untracked files. Then read the actual code and relevant surrounding logic; do not judge correctness from the diff's appearance or trust the implementer's claims.
+Verify EACH acceptance criterion individually against the actual code and behavior. Look for regressions, missed edge cases, and incomplete requirements within this stage's scope. Record the evidence and result for each criterion in checks.
+Independently run the project's available build and tests before approving (for example, `cargo build` and `cargo test` for Rust, or the repository's own build/test commands). Approving without running available checks is forbidden. Record the exact commands and their results; if a build or test is unavailable, record how you established that.
+Also actively look for genuine small improvements to the changed code, such as clearer naming, a missed edge case worth a test, or a simplification. Distinguish non-blocking improvements from blocking, must-fix defects. Do not invent findings to fill an array.
 
-approved=true only if the acceptance criteria are met and you found no real defect.
+Then write your verdict as JSON to the file {verdict_path} with exactly these fields:
+{"approved": true/false, "summary": "short feedback: what you inspected and what you found, even when approving", "issues": ["blocking, must-fix defect", ...], "notes": ["concrete non-blocking improvement to the changed code", ...], "checks": ["verification performed and its result, e.g. 'cargo test: 52 passed'", ...]}
+
+approved=true requires EVERY acceptance criterion individually verified, EVERY check passing, and no blocking defect. If anything could not be verified, reject with a specific issue explaining what could not be verified and why. A failed or unrun available check prevents approval.
+issues MUST be empty when approved=true and MUST be non-empty when approved=false. Each issue must be specific and actionable, with evidence identifying the defect or verification gap.
+checks MUST list at least the commands and inspections actually performed and their results, including the individual acceptance-criterion verifications. Never claim a check was performed or passed without evidence.
+notes MUST be scoped to concrete non-blocking improvements to the changed code. An empty notes array is allowed only if you looked for improvements and found none. Blocking defects belong in issues, not notes.
 Always fill summary with short feedback describing what you inspected and what you found, even when approving.
 Do NOT fix anything yourself; do NOT modify any file except {verdict_path}.
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
