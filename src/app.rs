@@ -948,19 +948,20 @@ impl Ctx {
                 .and_then(|t| serde_json::from_str(&t).ok());
             let summary = verdict.as_ref()
                 .and_then(|v| v["summary"].as_str()).unwrap_or("");
-            let (approved, list) = match &verdict {
+            let string_list = |field: &str| -> Vec<String> {
+                verdict.as_ref().and_then(|v| v[field].as_array())
+                    .map(|a| a.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            let notes = string_list("notes");
+            let checks = string_list("checks");
+            let (mut approved, list) = match &verdict {
                 Some(v) => {
                     let approved = v["approved"].as_bool() == Some(true);
-                    let list: Vec<String> = v["issues"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|i| i.as_str().map(String::from))
-                                .collect()
-                        })
-                        .filter(|l: &Vec<String>| approved || !l.is_empty())
-                        .or_else(|| approved.then(Vec::new))
-                        .unwrap_or_else(|| vec!["reviewer rejected without details".into()]);
+                    let mut list = string_list("issues");
+                    if !approved && list.is_empty() {
+                        list.push("reviewer rejected without details".into());
+                    }
                     (approved, list)
                 }
                 None => (false, vec![
@@ -969,19 +970,29 @@ impl Ctx {
                         .into(),
                 ]),
             };
+            if approved && !list.is_empty() {
+                approved = false;
+                self.log_event("review", &format!(
+                    "stage {sid} contradictory verdict: approved with blocking issues; treated as a rejection"));
+            }
             let stage = &mut plan["stages"][idx];
             stage["last_verdict"] = json!({
                 "approved": approved, "summary": summary, "issues": list,
+                "notes": notes, "checks": checks,
             });
             stage.as_object_mut().unwrap().entry("reviews")
                 .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
                     "round": round + 1, "approved": approved, "summary": summary,
-                    "issues": list, "unix": unix_timestamp(),
+                    "issues": list, "notes": notes, "checks": checks, "unix": unix_timestamp(),
                 }));
             self.save_plan(plan);
 
             if approved {
-                let message = if summary.is_empty() {
+                let message = if !notes.is_empty() {
+                    let summary: String = summary.chars().take(300).collect();
+                    let suffix = if summary.is_empty() { String::new() } else { format!(": {summary}") };
+                    format!("stage {sid} approved with {} improvement notes{suffix}", notes.len())
+                } else if summary.is_empty() {
                     format!("stage {sid} approved by reviewer")
                 } else {
                     let summary: String = summary.chars().take(300).collect();
