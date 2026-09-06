@@ -631,6 +631,14 @@ impl Ctx {
         Value::Array(items.into_iter().skip(skip).collect())
     }
 
+    fn read_chat(&self) -> Value {
+        let text = fs::read_to_string(self.forge_path("chat.jsonl")).unwrap_or_default();
+        let items: Vec<Value> = text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok()).collect();
+        let skip = items.len().saturating_sub(100);
+        Value::Array(items.into_iter().skip(skip).collect())
+    }
+
     fn load_plan(&self) -> Option<Value> {
         let text = fs::read_to_string(self.forge_path("plan.json")).ok()?;
         let plan: Value = serde_json::from_str(&text).ok()?;
@@ -742,6 +750,16 @@ impl Ctx {
                 settings["mock_planner_prompt"] = json!(prompt);
                 settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
                 settings["mock_planner_had_plan"] = json!(self.forge_path("plan.json").exists());
+            }
+            #[cfg(test)]
+            if role == "chat" {
+                let mut settings = self.app.settings.lock().unwrap();
+                let state = self.session.state.lock().unwrap();
+                settings["mock_chat_prompt"] = json!(prompt);
+                settings["mock_chat_model"] = json!(model);
+                settings["mock_chat_phase"] = json!(state.phase);
+                settings["mock_chat_step"] = json!(state.current_step);
+                settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
             }
             return self.mock_agent(role);
         }
@@ -911,6 +929,20 @@ impl Ctx {
                     ],
                 }));
             }
+            "chat" => {
+                #[cfg(test)]
+                if let Some(output) = self.app.settings.lock().unwrap().get("mock_chat_output") {
+                    // Null simulates an agent exiting without writing an answer.
+                    if !output.is_null() {
+                        fs::write(self.forge_path("answer.json"),
+                            output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
+                fs::write(self.forge_path("answer.json"), json!({"answer": "mock answer"}).to_string())
+                    .map_err(|e| e.to_string())?;
+            }
             "implementer" | "fixer" => {
                 let mut f = fs::OpenOptions::new()
                     .create(true)
@@ -997,8 +1029,51 @@ impl Ctx {
         }
     }
 
+    fn chat_worker(&self, current_plan: &Value, question: &str) {
+        let _worker = WorkerGuard(&self.session);
+        self.set_step(None, "answering plan question");
+        let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
+        let history = serde_json::to_string_pretty(&self.read_chat()).unwrap();
+        // Substitute only template segments, leaving placeholders in user content literal.
+        let prompt: String = CHAT_PROMPT.split_inclusive('}').map(|part| {
+            for (key, value) in [
+                ("{current_plan}", snapshot.as_str()), ("{history}", history.as_str()),
+                ("{question}", question), ("{answer_path}", ".forge/answer.json"),
+            ] {
+                if let Some(prefix) = part.strip_suffix(key) {
+                    return format!("{prefix}{value}");
+                }
+            }
+            part.to_string()
+        }).collect();
+        let result = (|| -> Result<(), String> {
+            self.ensure_forge_dir();
+            match fs::remove_file(self.forge_path("answer.json")) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(format!("could not remove previous answer: {e}")),
+            }
+            self.run_agent("chat", &self.setting("planner"), &prompt, &self.setting("planner_model"))?;
+            let text = fs::read_to_string(self.forge_path("answer.json"))
+                .map_err(|e| format!("could not read answer file: {e}"))?;
+            let output: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("invalid answer JSON: {e}"))?;
+            let answer = output["answer"].as_str().filter(|answer| !answer.trim().is_empty())
+                .ok_or_else(|| "agent did not produce a non-empty answer string".to_string())?;
+            let user = json!({"role": "user", "text": question, "unix": unix_timestamp()});
+            let assistant = json!({"role": "assistant", "text": answer, "unix": unix_timestamp()});
+            let mut file = fs::OpenOptions::new().create(true).append(true)
+                .open(self.forge_path("chat.jsonl")).map_err(|e| e.to_string())?;
+            writeln!(file, "{user}\n{assistant}").map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            self.log_event("error", &format!("chat failed: {error}"));
+        }
+    }
+
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
         // A previous goal's plan must never count as the new planner's output.
+        let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         let path = self.forge_path("plan.json");
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -1406,6 +1481,23 @@ Apply the feedback to the remaining stages: you may rewrite, merge, split, add, 
 Rules: 2 to 8 stages total, each independently committable, ordered by dependency.
 Do NOT implement anything and do NOT modify any other file. Only write {plan_path}."#;
 
+const CHAT_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+Answer the user's question about the current plan. Explore the repository as needed to give an accurate answer.
+
+Here is the current plan JSON:
+{current_plan}
+
+Here is the prior Q&A transcript (may be empty):
+{history}
+
+Here is the user's question:
+{question}
+
+Write your answer as JSON to the file {answer_path} (create the directory if needed) with exactly this schema:
+{"answer": "..."}
+
+Do NOT implement anything. Do NOT modify the plan or any other file. Only write {answer_path}."#;
+
 const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
@@ -1514,7 +1606,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let project_endpoint = matches!(path, "/api/state" | "/api/agent_log" | "/api/diff"
-        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
         Ok(None)
@@ -1576,6 +1668,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             snap["active_project"] = json!(active_project);
             snap["sessions"] = app.session_summaries(&active_project);
             snap["history"] = ctx.read_history();
+            snap["chat"] = ctx.read_chat();
             snap["git_log"] = json!(ctx.git(&["log", "--oneline", "-12"]).unwrap_or_default());
             respond(req, 200, snap);
         }
@@ -1809,6 +1902,29 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             std::thread::spawn(move || ctx2.revise_worker(&plan, &feedback));
             respond(req, 200, json!({"ok": true}));
         }
+        (tiny_http::Method::Post, "/api/plan/chat") => {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            let question = body["question"].as_str().unwrap_or("").trim().to_string();
+            if question.is_empty() {
+                respond(req, 400, json!({"error": "question required"}));
+                return;
+            }
+            if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let Some(plan) = ctx.load_plan() else {
+                ctx.session.busy.store(false, Ordering::SeqCst);
+                respond(req, 400, json!({"error": "no plan"}));
+                return;
+            };
+            ctx.session.stop_requested.store(false, Ordering::SeqCst);
+            let short: String = question.chars().take(300).collect();
+            ctx.log_event("chat", &short);
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || ctx2.chat_worker(&plan, &question));
+            respond(req, 200, json!({"ok": true}));
+        }
         (tiny_http::Method::Post, "/api/plan/edit") => {
             let _queue_guard = ctx.session.queue_lock.lock().unwrap();
             if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
@@ -1920,6 +2036,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
                 let _ = fs::remove_file(ctx.forge_path("plan.json"));
+                let _ = fs::remove_file(ctx.forge_path("chat.jsonl"));
                 ctx.set_phase("idle");
                 ctx.log_event("plan", "plan discarded");
                 respond(req, 200, json!({"ok": true}));
@@ -2008,6 +2125,180 @@ mod tests {
     fn editable_stage(id: i64) -> Value {
         json!({"id": id, "title": "Repaired title", "instructions": "Repaired instructions",
             "acceptance": "", "commit": "feat: repair stage"})
+    }
+
+    #[test]
+    fn plan_chat_persists_transcript_and_preserves_plan_and_phase() {
+        let test = QueueTest::new(false);
+        let original = json!({"goal": "Explain {question} and {history}", "status": "draft",
+            "stages": [editable_stage(1)]});
+        test.app.save_plan(&original);
+        test.app.set_phase("plan_ready");
+        test.app.app.settings.lock().unwrap()["planner_model"] = json!("chat-model");
+        let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+        let question = format!("Explain {{answer_path}} and {{current_plan}}: {}", "界🙂".repeat(200));
+        for question in [question.as_str(), "What about {history} and {question}?"] {
+            let prior = serde_json::to_string_pretty(&test.app.read_chat()).unwrap();
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan/chat",
+                json!({"question": format!(" \t{question}\n")})), (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), before);
+            let settings = test.app.app.settings.lock().unwrap();
+            assert_eq!(settings["mock_chat_model"], "chat-model");
+            assert_eq!(settings["mock_chat_phase"], "plan_ready");
+            assert_eq!(settings["mock_chat_step"], "answering plan question");
+            assert_eq!(settings["mock_chat_busy"], true);
+            let prompt = settings["mock_chat_prompt"].as_str().unwrap();
+            assert!(prompt.contains(&serde_json::to_string_pretty(&original).unwrap()));
+            assert!(prompt.contains(&prior));
+            assert!(prompt.contains(question));
+            assert!(prompt.contains("{\"answer\": \"...\"}"));
+            assert!(prompt.contains("Only write .forge/answer.json."));
+        }
+        let chat = test.app.read_chat();
+        assert_eq!(chat.as_array().unwrap().len(), 4);
+        assert_eq!(chat[0]["role"], "user");
+        assert_eq!(chat[0]["text"], question);
+        assert_eq!(chat[1]["role"], "assistant");
+        assert_eq!(chat[1]["text"], "mock answer");
+        assert_eq!(chat[2]["text"], "What about {history} and {question}?");
+        assert_eq!(chat[3]["text"], "mock answer");
+        assert!(chat.as_array().unwrap().iter().all(|entry| entry["unix"].as_i64().unwrap() > 0));
+        let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(state["chat"], chat);
+        assert_eq!(state["phase"], "plan_ready");
+        assert_eq!(state["current_step"], "");
+        assert_eq!(state["busy"], false);
+        let history = test.app.read_history();
+        assert_eq!(history[0]["kind"], "chat");
+        assert_eq!(history[0]["text"], question.chars().take(300).collect::<String>());
+    }
+
+    #[test]
+    fn plan_chat_validates_question_before_busy_and_no_plan() {
+        let test = QueueTest::new(false);
+        let engine = &test.app.app;
+        let body = json!({"question": "Why this plan?"});
+        for busy in [false, true] {
+            test.app.session.busy.store(busy, Ordering::SeqCst);
+            for question in [Value::Null, json!(42), json!(""), json!(" \t\n\u{2003}")] {
+                assert_eq!(api_request(engine, "POST", "/api/plan/chat", json!({"question": question})),
+                    (400, json!({"error": "question required"})));
+            }
+        }
+        test.app.session.busy.store(false, Ordering::SeqCst);
+        assert_eq!(api_request(engine, "POST", "/api/plan/chat", body.clone()),
+            (400, json!({"error": "no plan"})));
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        for has_plan in [false, true] {
+            if has_plan {
+                test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]}));
+            }
+            for flag in [&test.app.session.busy, &test.app.session.queue_active] {
+                flag.store(true, Ordering::SeqCst);
+                assert_eq!(api_request(engine, "POST", "/api/plan/chat", body.clone()),
+                    (409, json!({"error": "busy"})));
+                assert!(flag.load(Ordering::SeqCst));
+                flag.store(false, Ordering::SeqCst);
+                assert!(!test.app.session.busy.load(Ordering::SeqCst));
+            }
+        }
+        assert_eq!(test.app.read_history(), json!([]));
+        assert_eq!(test.app.read_chat(), json!([]));
+    }
+
+    #[test]
+    fn plan_chat_targets_project_and_leaves_other_session_alone() {
+        let first = QueueTest::new(false);
+        let engine = &first.app.app;
+        let second = QueueTest::with_engine(false, Some(Arc::clone(engine)));
+        second.app.save_plan(&json!({"goal": "Second", "stages": [editable_stage(1)]}));
+        second.app.set_phase("blocked");
+        first.app.acquire_busy().unwrap();
+        let _worker = WorkerGuard(&first.app.session);
+        assert_eq!(api_request(engine, "POST", "/api/plan/chat",
+            json!({"project": second.app.project(), "question": "Why blocked?"})),
+            (200, json!({"ok": true})));
+        wait_for_worker(&second.app);
+        let (status, state) = api_request(engine, "GET",
+            &format!("/api/state?project={}", second.app.project()), json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(state["chat"][0]["text"], "Why blocked?");
+        assert_eq!(state["phase"], "blocked");
+        assert_eq!(first.app.read_chat(), json!([]));
+        assert_eq!(first.app.read_history(), json!([]));
+        assert!(first.app.session.busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn plan_chat_bad_output_logs_error_without_appending_or_changing_plan() {
+        for (tool, output) in [
+            ("unknown-planner", Value::Null), ("mock", Value::Null),
+            ("mock", json!("not JSON")), ("mock", json!({})),
+            ("mock", json!({"answer": 42})), ("mock", json!({"answer": " \n"})),
+        ] {
+            let test = QueueTest::new(false);
+            test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]}));
+            test.app.set_phase("plan_ready");
+            let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+            fs::write(test.app.forge_path("answer.json"), r#"{"answer":"stale answer"}"#).unwrap();
+            {
+                let mut settings = test.app.app.settings.lock().unwrap();
+                settings["planner"] = json!(tool);
+                settings["mock_chat_output"] = output;
+            }
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan/chat",
+                json!({"question": "Why?"})), (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            assert!(!test.app.forge_path("chat.jsonl").exists());
+            assert_eq!(test.app.read_chat(), json!([]));
+            assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), before);
+            let state = test.app.session.state.lock().unwrap();
+            assert_eq!(state.phase, "plan_ready");
+            assert_eq!(state.current_step, "");
+            drop(state);
+            assert!(test.app.read_history().as_array().unwrap().iter().any(|event|
+                event["kind"] == "error" && event["text"].as_str().unwrap().starts_with("chat failed: ")));
+        }
+    }
+
+    #[test]
+    fn plan_chat_state_keeps_last_100_valid_entries() {
+        let test = QueueTest::new(false);
+        test.app.ensure_forge_dir();
+        let entries: Vec<Value> = (0..105).map(|i|
+            json!({"role": "user", "text": format!("Question {i}"), "unix": i})).collect();
+        let lines = entries.iter().map(Value::to_string).collect::<Vec<_>>().join("\ninvalid\n");
+        fs::write(test.app.forge_path("chat.jsonl"), lines).unwrap();
+        let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(state["chat"], json!(&entries[5..]));
+    }
+
+    #[test]
+    fn plan_generation_and_reset_clear_chat() {
+        for reset in [false, true] {
+            let test = QueueTest::new(false);
+            test.app.save_plan(&json!({"goal": "Old goal", "stages": [editable_stage(1)]}));
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan/chat",
+                json!({"question": "Why?"})), (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            assert!(test.app.forge_path("chat.jsonl").exists());
+            if reset {
+                assert_eq!(api_request(&test.app.app, "POST", "/api/reset_plan", json!({})),
+                    (200, json!({"ok": true})));
+                assert!(test.app.load_plan().is_none());
+            } else {
+                test.app.acquire_busy().unwrap();
+                test.app.plan_worker("New goal");
+                assert_eq!(test.app.load_plan().unwrap()["goal"], "New goal");
+            }
+            assert!(!test.app.forge_path("chat.jsonl").exists());
+            let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+            assert_eq!(status, 200);
+            assert_eq!(state["chat"], json!([]));
+        }
     }
 
     #[test]
