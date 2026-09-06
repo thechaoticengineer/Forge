@@ -15,16 +15,27 @@ Rust engine + Quickshell (Omarchy) panel.
 4. Forge runs each stage automatically:
    - the **implementer** (one tool) implements the stage,
    - an independent **reviewer** (the other tool, always a fresh session)
-     reviews the uncommitted diff and writes a verdict,
+     reviews the uncommitted diff and writes `.forge/verdict.json`,
    - rejections loop back to the implementer with the reviewer's issues,
      up to a bounded number of fix rounds,
    - an approved stage is committed with the proposed message.
 5. After the last stage, Forge pushes to `origin`.
 
+The reviewer's verdict has the shape
+`{"approved": bool, "summary": str, "issues": [str, ...]}`.
+The summary describes what the reviewer inspected and found, even on
+approval; issues are specific, actionable feedback for the implementer.
+Every review round is recorded in the stage's `reviews` array in
+`.forge/plan.json`, with `round` (starting at 1), `approved`, `summary`,
+`issues`, and `unix` (a Unix timestamp in seconds). Earlier feedback stays
+available through fix rounds and approval.
+
 If the reviewer still rejects after the fix rounds, the stage is marked
 blocked and Forge stops for you. Full history of every agent session,
 verdict, and git action is visible in the panel and kept in
-`.forge/history.jsonl`.
+`.forge/history.jsonl`. Review approval events include the reviewer's
+summary, limited to 300 characters; the stage's `reviews` array keeps
+the full summary.
 
 ## Queue
 
@@ -59,3 +70,7 @@ PATH, logged in.
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
+Each reviewed stage has a review chip showing approval or the latest issue
+count, plus the number of rounds when there is more than one. Expand a
+stage to see its full per-round review history: approved or rejected,
+the reviewer's summary, and issues, including reviews after fix rounds.
