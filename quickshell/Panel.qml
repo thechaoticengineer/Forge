@@ -19,6 +19,7 @@ Item {
   property string apiBase: "http://127.0.0.1:8734"
   property string localError: ""
   property int expandedStageId: -1
+  property int selectedStageIndex: -1
   property string lastProject: ""
   property int projectViewRevision: 0
   property var goalDrafts: ({})
@@ -114,6 +115,7 @@ Item {
     goalField.text = goalDrafts[project] || ""
     goalFlick.contentY = 0
     expandedStageId = -1
+    selectedStageIndex = -1
     diffOpen = false
     diffText = ""
     diffError = ""
@@ -378,8 +380,15 @@ Item {
         focus: true
         property string pendingKey: ""
 
+        function selectStage(index) {
+          const stages = root.plan && root.plan.stages ? root.plan.stages : []
+          if (stages.length === 0) return
+          root.selectedStageIndex = Math.max(0, Math.min(index, stages.length - 1))
+          stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
+        }
+
         Keys.onPressed: event => {
-          // No multi-key sequences yet; every key clears the pending prefix.
+          const prefix = pendingKey
           pendingKey = ""
           if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
@@ -388,6 +397,29 @@ Item {
             if (root.diffOpen) root.diffOpen = false
             else if (root.chooserOpen) root.chooserOpen = false
             event.accepted = true
+          } else if (!root.diffOpen && !root.chooserOpen) {
+            const stages = root.plan && root.plan.stages ? root.plan.stages : []
+            if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
+              selectStage(stages.length - 1)
+              event.accepted = true
+            } else if (event.modifiers === Qt.NoModifier) {
+              if (event.key === Qt.Key_J || event.key === Qt.Key_K) {
+                selectStage(root.selectedStageIndex < 0 ? 0
+                  : root.selectedStageIndex + (event.key === Qt.Key_J ? 1 : -1))
+                event.accepted = true
+              } else if (event.key === Qt.Key_G) {
+                if (prefix === "g") selectStage(0)
+                else pendingKey = "g"
+                event.accepted = true
+              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                         || event.key === Qt.Key_O || event.key === Qt.Key_Space) {
+                if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
+                  const stageId = stages[root.selectedStageIndex].id
+                  root.expandedStageId = root.expandedStageId === stageId ? -1 : stageId
+                }
+                event.accepted = true
+              }
+            }
           }
         }
       }
@@ -908,9 +940,10 @@ Item {
             clip: true
             spacing: Style.space(6)
             model: root.plan ? root.plan.stages : []
-            delegate: Column {
+            delegate: Rectangle {
               id: stageRow
               required property var modelData
+              required property int index
               readonly property bool expanded: root.expandedStageId === modelData.id
               readonly property double elapsedSecs: modelData.status === "in_progress"
                 && typeof modelData.started_unix === "number"
@@ -923,181 +956,189 @@ Item {
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
               width: stageList.width
-              spacing: 2
+              height: stageContent.implicitHeight
+              radius: 3
+              color: index === root.selectedStageIndex
+                ? Qt.darker(root.accent, 2.8) : "transparent"
               TapHandler {
                 onTapped: root.expandedStageId = stageRow.expanded
                   ? -1 : stageRow.modelData.id
               }
-              Flow {
+              Column {
+                id: stageContent
                 width: stageRow.width
-                spacing: Style.space(8)
-                Row {
-                  width: Math.min(implicitWidth, stageRow.width)
-                  spacing: Style.space(4)
+                spacing: 2
+                Flow {
+                  width: stageRow.width
+                  spacing: Style.space(8)
+                  Row {
+                    width: Math.min(implicitWidth, stageRow.width)
+                    spacing: Style.space(4)
+                    Text {
+                      id: stageGlyph
+                      text: stageRow.modelData.status === "committed" ? "✓"
+                        : stageRow.modelData.status === "in_progress" ? "●"
+                        : stageRow.modelData.status === "blocked" ? "!" : "·"
+                      color: stageRow.modelData.status === "committed" ? root.success
+                        : stageRow.modelData.status === "in_progress" ? root.working
+                        : stageRow.modelData.status === "blocked" ? root.urgent
+                        : root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(12)
+                      font.bold: true
+                    }
+                    Text {
+                      width: Math.min(implicitWidth,
+                        stageRow.width - stageGlyph.width - Style.space(4))
+                      text: stageRow.modelData.id + ". " + stageRow.modelData.title
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(12)
+                      font.bold: true
+                    }
+                  }
                   Text {
-                    id: stageGlyph
-                    text: stageRow.modelData.status === "committed" ? "✓"
-                      : stageRow.modelData.status === "in_progress" ? "●"
-                      : stageRow.modelData.status === "blocked" ? "!" : "·"
+                    width: Math.min(implicitWidth, stageRow.width)
+                    text: stageRow.modelData.status
+                      + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
+                      + (stageRow.modelData.rounds > 1
+                         ? " (round " + stageRow.modelData.rounds + ")" : "")
                     color: stageRow.modelData.status === "committed" ? root.success
                       : stageRow.modelData.status === "in_progress" ? root.working
                       : stageRow.modelData.status === "blocked" ? root.urgent
                       : root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(12)
-                    font.bold: true
-                  }
-                  Text {
-                    width: Math.min(implicitWidth,
-                      stageRow.width - stageGlyph.width - Style.space(4))
-                    text: stageRow.modelData.id + ". " + stageRow.modelData.title
-                    textFormat: Text.PlainText
-                    color: root.foreground
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
-                    font.pixelSize: root.fs(12)
-                    font.bold: true
+                    font.pixelSize: root.fs(11)
                   }
-                }
-                Text {
-                  width: Math.min(implicitWidth, stageRow.width)
-                  text: stageRow.modelData.status
-                    + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
-                    + (stageRow.modelData.rounds > 1
-                       ? " (round " + stageRow.modelData.rounds + ")" : "")
-                  color: stageRow.modelData.status === "committed" ? root.success
-                    : stageRow.modelData.status === "in_progress" ? root.working
-                    : stageRow.modelData.status === "blocked" ? root.urgent
-                    : root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Text {
-                  visible: stageRow.reviewHistory.length > 0
-                  width: Math.min(implicitWidth, stageRow.width)
-                  text: stageRow.lastReview
-                    ? "review: " + (stageRow.lastReview.approved ? "approved"
-                      : (stageRow.lastReview.issues || []).length + " issue(s)")
-                      + (stageRow.reviewHistory.length > 1
-                        ? " · " + stageRow.reviewHistory.length + " rounds" : "")
-                    : ""
-                  textFormat: Text.PlainText
-                  color: stageRow.lastReview && stageRow.lastReview.approved
-                    ? root.success : root.urgent
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Text {
-                  visible: text !== ""
-                  width: Math.min(implicitWidth, stageRow.width)
-                  text: root.engineState
-                    && stageRow.modelData.id === root.engineState.current_stage
-                    ? root.engineState.current_step || "" : ""
-                  textFormat: Text.PlainText
-                  color: root.working
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Text {
-                  visible: stageRow.elapsedSecs >= 0
-                  text: visible ? Math.floor(stageRow.elapsedSecs / 60) + "m "
-                    + (stageRow.elapsedSecs % 60) + "s" : ""
-                  color: root.mutedForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-              }
-              Text {
-                text: stageRow.modelData.commit
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-                font.italic: true
-              }
-              Text {
-                visible: !stageRow.expanded
-                width: stageList.width
-                text: stageRow.modelData.instructions
-                color: root.mutedForeground
-                wrapMode: Text.Wrap
-                maximumLineCount: 3
-                elide: Text.ElideRight
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-              Text {
-                visible: stageRow.expanded
-                width: stageRow.width
-                text: "instructions:\n" + (stageRow.modelData.instructions || "")
-                textFormat: Text.PlainText
-                color: root.mutedForeground
-                wrapMode: Text.Wrap
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-              Text {
-                visible: stageRow.expanded
-                width: stageRow.width
-                text: "acceptance criteria:\n" + (stageRow.modelData.acceptance || "")
-                textFormat: Text.PlainText
-                color: root.mutedForeground
-                wrapMode: Text.Wrap
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-              Repeater {
-                model: stageRow.reviewHistory
-                delegate: Column {
-                  id: reviewRound
-                  required property var modelData
-                  visible: stageRow.expanded
-                  width: stageRow.width
-                  spacing: 2
                   Text {
-                    width: stageRow.width
-                    text: "review round " + reviewRound.modelData.round + " — "
-                      + (reviewRound.modelData.approved ? "approved" : "rejected")
+                    visible: stageRow.reviewHistory.length > 0
+                    width: Math.min(implicitWidth, stageRow.width)
+                    text: stageRow.lastReview
+                      ? "review: " + (stageRow.lastReview.approved ? "approved"
+                        : (stageRow.lastReview.issues || []).length + " issue(s)")
+                        + (stageRow.reviewHistory.length > 1
+                          ? " · " + stageRow.reviewHistory.length + " rounds" : "")
+                      : ""
                     textFormat: Text.PlainText
-                    color: reviewRound.modelData.approved ? root.success : root.urgent
+                    color: stageRow.lastReview && stageRow.lastReview.approved
+                      ? root.success : root.urgent
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
                   }
                   Text {
                     visible: text !== ""
-                    width: stageRow.width
-                    text: reviewRound.modelData.summary || ""
+                    width: Math.min(implicitWidth, stageRow.width)
+                    text: root.engineState
+                      && stageRow.modelData.id === root.engineState.current_stage
+                      ? root.engineState.current_step || "" : ""
                     textFormat: Text.PlainText
-                    color: root.mutedForeground
+                    color: root.working
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
                   }
                   Text {
-                    visible: (reviewRound.modelData.issues || []).length > 0
-                    width: stageRow.width
-                    text: "• " + (reviewRound.modelData.issues || []).join("\n• ")
-                    textFormat: Text.PlainText
-                    color: root.urgent
-                    wrapMode: Text.Wrap
+                    visible: stageRow.elapsedSecs >= 0
+                    text: visible ? Math.floor(stageRow.elapsedSecs / 60) + "m "
+                      + (stageRow.elapsedSecs % 60) + "s" : ""
+                    color: root.mutedForeground
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
                   }
                 }
-              }
-              Text {
-                visible: stageRow.expanded && stageRow.reviewHistory.length === 0
-                  && stageRow.reviewerIssues.length > 0
-                width: stageRow.width
-                text: "reviewer issues:\n• " + stageRow.reviewerIssues.join("\n• ")
-                textFormat: Text.PlainText
-                color: root.urgent
-                wrapMode: Text.Wrap
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
+                Text {
+                  text: stageRow.modelData.commit
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                  font.italic: true
+                }
+                Text {
+                  visible: !stageRow.expanded
+                  width: stageList.width
+                  text: stageRow.modelData.instructions
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  maximumLineCount: 3
+                  elide: Text.ElideRight
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: stageRow.expanded
+                  width: stageRow.width
+                  text: "instructions:\n" + (stageRow.modelData.instructions || "")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: stageRow.expanded
+                  width: stageRow.width
+                  text: "acceptance criteria:\n" + (stageRow.modelData.acceptance || "")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Repeater {
+                  model: stageRow.reviewHistory
+                  delegate: Column {
+                    id: reviewRound
+                    required property var modelData
+                    visible: stageRow.expanded
+                    width: stageRow.width
+                    spacing: 2
+                    Text {
+                      width: stageRow.width
+                      text: "review round " + reviewRound.modelData.round + " — "
+                        + (reviewRound.modelData.approved ? "approved" : "rejected")
+                      textFormat: Text.PlainText
+                      color: reviewRound.modelData.approved ? root.success : root.urgent
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      visible: text !== ""
+                      width: stageRow.width
+                      text: reviewRound.modelData.summary || ""
+                      textFormat: Text.PlainText
+                      color: root.mutedForeground
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      visible: (reviewRound.modelData.issues || []).length > 0
+                      width: stageRow.width
+                      text: "• " + (reviewRound.modelData.issues || []).join("\n• ")
+                      textFormat: Text.PlainText
+                      color: root.urgent
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                  }
+                }
+                Text {
+                  visible: stageRow.expanded && stageRow.reviewHistory.length === 0
+                    && stageRow.reviewerIssues.length > 0
+                  width: stageRow.width
+                  text: "reviewer issues:\n• " + stageRow.reviewerIssues.join("\n• ")
+                  textFormat: Text.PlainText
+                  color: root.urgent
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
               }
             }
             Text {
