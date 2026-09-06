@@ -274,6 +274,82 @@ fn default_settings() -> Value {
     })
 }
 
+/// Build a replacement only after validation, leaving the saved plan untouched on errors.
+fn edit_plan(plan: &Value, body: &Value) -> Result<Value, &'static str> {
+    let old_stages = plan["stages"].as_array().ok_or("no plan")?;
+    let incoming = body.get("plan").filter(|value| value.is_object())
+        .ok_or("plan must be an object")?;
+    let stages = incoming["stages"].as_array().filter(|stages| !stages.is_empty())
+        .ok_or("stages must be a non-empty array")?;
+    let mut submitted_ids = Vec::new();
+    for stage in stages {
+        for field in ["title", "instructions", "acceptance", "commit"] {
+            let text = stage[field].as_str().ok_or("stage content fields must be strings")?;
+            if matches!(field, "title" | "instructions") && text.trim().is_empty() {
+                return Err("stage title and instructions must not be blank");
+            }
+        }
+        if let Some(id) = stage.get("id") {
+            if submitted_ids.contains(&id) {
+                return Err("duplicate stage ids");
+            }
+            submitted_ids.push(id);
+        }
+    }
+
+    let committed: Vec<&Value> = old_stages.iter()
+        .filter(|stage| stage["status"] == "committed").collect();
+    for stage in &committed {
+        if !submitted_ids.contains(&&stage["id"]) {
+            return Err("cannot remove a committed stage");
+        }
+    }
+    // Completed work remains a prefix in its original order; editable stages may move freely.
+    for (index, stage) in committed.iter().enumerate() {
+        if stages[index].get("id") != stage.get("id") {
+            return Err("cannot reorder committed stages");
+        }
+    }
+
+    let valid_id = |stage: &Value| stage["id"].as_i64().filter(|id| *id > 0);
+    let mut next_id = old_stages.iter().filter_map(valid_id).max().unwrap_or(0);
+    let mut used_ids: Vec<i64> = stages.iter().filter_map(valid_id).collect();
+    let mut edited_stages = Vec::with_capacity(stages.len());
+    for (index, stage) in stages.iter().enumerate() {
+        if index < committed.len() {
+            edited_stages.push(committed[index].clone());
+            continue;
+        }
+        let id = match valid_id(stage) {
+            Some(id) => id,
+            None => loop {
+                next_id = next_id.checked_add(1).ok_or("stage id limit reached")?;
+                if !used_ids.contains(&next_id) {
+                    used_ids.push(next_id);
+                    break next_id;
+                }
+            },
+        };
+        // Only editable content is accepted; old reviews and execution metadata are discarded.
+        edited_stages.push(json!({
+            "id": id,
+            "title": stage["title"],
+            "instructions": stage["instructions"],
+            "acceptance": stage["acceptance"],
+            "commit": stage["commit"],
+            "status": "pending",
+            "rounds": 0,
+        }));
+    }
+    let mut edited = plan.clone();
+    if let Some(goal) = incoming["goal"].as_str().filter(|goal| !goal.trim().is_empty()) {
+        edited["goal"] = json!(goal);
+    }
+    edited["stages"] = json!(edited_stages);
+    edited["status"] = json!("draft");
+    Ok(edited)
+}
+
 fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Result<String, &'static str> {
     let items = queue["items"].as_array_mut().ok_or("invalid queue")?;
     match action {
@@ -1312,7 +1388,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let project_endpoint = matches!(path, "/api/state" | "/api/agent_log" | "/api/diff"
-        | "/api/plan" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        | "/api/plan" | "/api/plan/edit" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
         Ok(None)
@@ -1579,6 +1655,30 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 200, json!({"ok": true}));
             }
         }
+        (tiny_http::Method::Post, "/api/plan/edit") => {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let Some(plan) = ctx.load_plan() else {
+                respond(req, 400, json!({"error": "no plan"}));
+                return;
+            };
+            match edit_plan(&plan, &body) {
+                Ok(edited) => {
+                    ctx.save_plan(&edited);
+                    {
+                        let mut s = ctx.session.state.lock().unwrap();
+                        s.phase = "plan_ready".into();
+                        s.goal = edited["goal"].as_str().unwrap_or("").to_string();
+                    }
+                    ctx.log_event("plan", "plan edited by user");
+                    respond(req, 200, json!({"ok": true}));
+                }
+                Err(e) => respond(req, 400, json!({"error": e})),
+            }
+        }
         (tiny_http::Method::Post, "/api/approve") => {
             let _queue_guard = ctx.session.queue_lock.lock().unwrap();
             if ctx.session.busy.load(Ordering::SeqCst) {
@@ -1744,6 +1844,175 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editable_stage(id: i64) -> Value {
+        json!({"id": id, "title": "Repaired title", "instructions": "Repaired instructions",
+            "acceptance": "", "commit": "feat: repair stage"})
+    }
+
+    #[test]
+    fn plan_edit_resets_execution_and_preserves_or_replaces_goal() {
+        let original = json!({"goal": "Old goal", "status": "blocked", "metadata": "keep",
+            "stages": [{"id": 3, "title": "Old title", "instructions": "Old instructions",
+                "acceptance": "Old acceptance", "commit": "old", "status": "blocked",
+                "rounds": 2, "started_unix": 10, "finished_unix": 20, "duration_secs": 10,
+                "last_verdict": {"approved": false}, "reviews": [{"round": 2}], "sha": "old"}]});
+        let mut stage = original["stages"][0].clone();
+        for field in ["title", "instructions", "acceptance", "commit"] {
+            stage[field] = editable_stage(3)[field].clone();
+        }
+        let edited = edit_plan(&original, &json!({"plan": {
+            "goal": "New goal", "stages": [stage, editable_stage(9)]}})).unwrap();
+        assert_eq!(edited["goal"], "New goal");
+        assert_eq!(edited["status"], "draft");
+        assert_eq!(edited["metadata"], "keep");
+        for (stage, id) in edited["stages"].as_array().unwrap().iter().zip([3, 9]) {
+            let mut expected = editable_stage(id);
+            expected["status"] = json!("pending");
+            expected["rounds"] = json!(0);
+            assert_eq!(stage, &expected);
+        }
+        for goal in [Value::Null, json!(42), json!(" \t\n\u{2003}")] {
+            let edited = edit_plan(&original, &json!({"plan": {
+                "goal": goal, "stages": [editable_stage(3)]}})).unwrap();
+            assert_eq!(edited["goal"], "Old goal");
+        }
+        let edited = edit_plan(&original, &json!({"plan": {"stages": [editable_stage(3)]}})).unwrap();
+        assert_eq!(edited["goal"], "Old goal");
+        assert_eq!(original["status"], "blocked");
+    }
+
+    #[test]
+    fn plan_edit_preserves_committed_stages_verbatim_and_in_order() {
+        let mut first = editable_stage(2);
+        first["status"] = json!("committed");
+        first["rounds"] = json!(3);
+        first["sha"] = json!("abc123");
+        first["reviews"] = json!([{"approved": true}]);
+        first["started_unix"] = json!(10);
+        first["finished_unix"] = json!(20);
+        first["duration_secs"] = json!(10);
+        first["last_verdict"] = json!({"approved": true});
+        first["custom"] = json!({"preserve": true});
+        let mut second = first.clone();
+        second["id"] = json!(5);
+        let original = json!({"goal": "Goal", "status": "approved",
+            "stages": [first, second, editable_stage(8)]});
+        let mut submitted = editable_stage(2);
+        submitted["title"] = json!("Ignored edit to committed work");
+        let edited = edit_plan(&original, &json!({"plan": {"stages": [
+            submitted, editable_stage(5), editable_stage(8)]}})).unwrap();
+        assert_eq!(edited["stages"][0], original["stages"][0]);
+        assert_eq!(edited["stages"][1], original["stages"][1]);
+        assert_eq!(edit_plan(&original, &json!({"plan": {"stages": [editable_stage(8)]}})),
+            Err("cannot remove a committed stage"));
+        for ids in [[5, 2, 8], [2, 8, 5], [8, 2, 5]] {
+            assert_eq!(edit_plan(&original, &json!({"plan": {
+                "stages": ids.map(editable_stage)}})), Err("cannot reorder committed stages"));
+        }
+    }
+
+    #[test]
+    fn plan_edit_assigns_unique_ids_and_allows_editable_reordering_and_removal() {
+        let original = json!({"goal": "Goal", "stages": [
+            editable_stage(1), editable_stage(4), editable_stage(7)]});
+        let mut new = editable_stage(0);
+        new.as_object_mut().unwrap().remove("id");
+        let mut invalid_id = editable_stage(0);
+        invalid_id["id"] = json!("invalid");
+        let edited = edit_plan(&original, &json!({"plan": {"stages": [
+            editable_stage(7), new, editable_stage(8), editable_stage(1), invalid_id]}})).unwrap();
+        let ids: Vec<i64> = edited["stages"].as_array().unwrap().iter()
+            .map(|stage| stage["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, [7, 9, 8, 1, 10]);
+        let full = json!({"stages": [editable_stage(i64::MAX)]});
+        assert_eq!(edit_plan(&full, &json!({"plan": {"stages": [editable_stage(0)]}})),
+            Err("stage id limit reached"));
+    }
+
+    #[test]
+    fn plan_edit_invalid_bodies_leave_saved_plan_unchanged() {
+        let test = QueueTest::new(false);
+        let mut committed = editable_stage(1);
+        committed["status"] = json!("committed");
+        let original = json!({"goal": "Goal", "status": "approved", "stages": [committed]});
+        test.app.save_plan(&original);
+        test.app.session.state.lock().unwrap().goal = "Goal".into();
+        let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+        let mut bodies = vec![json!({}), json!(null), json!({"plan": null}),
+            json!({"plan": []}), json!({"plan": {}}), json!({"plan": {"stages": null}}),
+            json!({"plan": {"stages": {}}}), json!({"plan": {"stages": []}}),
+            json!({"plan": {"stages": [null]}}),
+            json!({"plan": {"stages": [editable_stage(1), editable_stage(1)]}}),
+            json!({"plan": {"stages": [editable_stage(2)]}})];
+        for field in ["title", "instructions", "acceptance", "commit"] {
+            let mut stage = editable_stage(1);
+            stage.as_object_mut().unwrap().remove(field);
+            bodies.push(json!({"plan": {"stages": [stage]}}));
+            for value in [Value::Null, json!(123), json!(false), json!([]), json!({})] {
+                let mut stage = editable_stage(1);
+                stage[field] = value;
+                bodies.push(json!({"plan": {"stages": [stage]}}));
+            }
+        }
+        for field in ["title", "instructions"] {
+            let mut stage = editable_stage(1);
+            stage[field] = json!(" \t\n\u{2003}");
+            bodies.push(json!({"plan": {"stages": [stage]}}));
+        }
+        for body in bodies {
+            assert!(edit_plan(&original, &body).is_err(), "accepted {body}");
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan/edit", body.clone()).0,
+                400, "accepted {body}");
+            assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), before);
+            assert_eq!(test.app.session.state.lock().unwrap().goal, "Goal");
+        }
+        assert_eq!(test.app.read_history(), json!([]));
+    }
+
+    #[test]
+    fn plan_edit_api_routes_projects_updates_state_and_rejects_busy_sessions() {
+        let first = QueueTest::new(false);
+        let engine = &first.app.app;
+        let second = QueueTest::with_engine(false, Some(Arc::clone(engine)));
+        let body = json!({"plan": {"goal": "Edited goal", "stages": [editable_stage(1)]}});
+        assert_eq!(api_request(engine, "POST", "/api/plan/edit", body.clone()),
+            (400, json!({"error": "no plan"})));
+        assert!(!first.app.forge_path("plan.json").exists());
+        let original = json!({"goal": "Old goal", "status": "approved", "stages": [editable_stage(1)]});
+        first.app.save_plan(&original);
+        let before = fs::read(first.app.forge_path("plan.json")).unwrap();
+        for flag in [&first.app.session.busy, &first.app.session.queue_active] {
+            flag.store(true, Ordering::SeqCst);
+            assert_eq!(api_request(engine, "POST", "/api/plan/edit", body.clone()),
+                (409, json!({"error": "busy"})));
+            assert_eq!(fs::read(first.app.forge_path("plan.json")).unwrap(), before);
+            flag.store(false, Ordering::SeqCst);
+        }
+        assert_eq!(api_request(engine, "POST", "/api/plan/edit", body.clone()),
+            (200, json!({"ok": true})));
+        let first_plan = first.app.load_plan().unwrap();
+        assert_eq!(first_plan["status"], "draft");
+        first.app.session.busy.store(true, Ordering::SeqCst);
+        second.app.save_plan(&original);
+        second.app.set_phase("blocked");
+        let mut targeted = body;
+        targeted["project"] = json!(second.app.project());
+        assert_eq!(api_request(engine, "POST", "/api/plan/edit", targeted),
+            (200, json!({"ok": true})));
+        let (status, state) = api_request(engine, "GET",
+            &format!("/api/state?project={}", second.app.project()), json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(state["phase"], "plan_ready");
+        assert_eq!(state["goal"], "Edited goal");
+        assert_eq!(state["plan"], edit_plan(&original, &json!({"plan": {
+            "goal": "Edited goal", "stages": [editable_stage(1)]}})).unwrap());
+        assert_eq!(first.app.load_plan().unwrap(), first_plan);
+        let history = second.app.read_history();
+        assert_eq!(history[0]["kind"], "plan");
+        assert_eq!(history[0]["text"], "plan edited by user");
+        assert_eq!(history[0]["goal"], "Edited goal");
+    }
 
     #[test]
     fn duration_formats_seconds_and_minutes() {
