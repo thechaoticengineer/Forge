@@ -255,7 +255,7 @@ Item {
         || (filter === "runs"
             && ["run", "stage", "plan", "queue", "update"].indexOf(entry.kind) !== -1)
         || (filter === "git" && entry.kind === "git")
-        || (filter === "checks" && entry.kind === "check")
+        || (filter === "reviews" && (entry.kind === "review" || entry.kind === "check"))
         || (filter === "errors" && entry.kind === "error")
       if (!matches) return
       if (entry.goal && entry.goal !== previousGoal)
@@ -630,9 +630,9 @@ Item {
             onClicked: root.cycleTool("implementer")
           }
           PanelButton {
-            label: "checker: "
-              + (root.engineState ? root.engineState.settings.checker : "…")
-            onClicked: root.cycleTool("checker")
+            label: "reviewer: "
+              + (root.engineState ? root.engineState.settings.reviewer : "…")
+            onClicked: root.cycleTool("reviewer")
           }
           PanelButton {
             label: "push at end: "
@@ -891,7 +891,7 @@ Item {
                 ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
                 : typeof modelData.duration_secs === "number"
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
-              readonly property var checkerIssues: modelData.last_verdict
+              readonly property var reviewerIssues: modelData.last_verdict
                 && modelData.last_verdict.issues ? modelData.last_verdict.issues : []
               width: stageList.width
               spacing: 2
@@ -1004,9 +1004,9 @@ Item {
                 font.pixelSize: root.fs(11)
               }
               Text {
-                visible: stageRow.expanded && stageRow.checkerIssues.length > 0
+                visible: stageRow.expanded && stageRow.reviewerIssues.length > 0
                 width: stageRow.width
-                text: "checker issues:\n• " + stageRow.checkerIssues.join("\n• ")
+                text: "reviewer issues:\n• " + stageRow.reviewerIssues.join("\n• ")
                 textFormat: Text.PlainText
                 color: root.urgent
                 wrapMode: Text.Wrap
@@ -1088,7 +1088,7 @@ Item {
             anchors.margins: Style.space(8)
             spacing: Style.space(4)
             Repeater {
-              model: ["all", "runs", "git", "checks", "errors"]
+              model: ["all", "runs", "git", "reviews", "errors"]
               delegate: PanelButton {
                 required property string modelData
                 label: modelData
@@ -1152,7 +1152,7 @@ Item {
               color: separator ? root.accent
                 : event.kind === "error" ? root.urgent
                 : event.kind === "git" ? root.success
-                : event.kind === "check" ? root.working
+                : (event.kind === "review" || event.kind === "check") ? root.working
                 : root.mutedForeground
               wrapMode: Text.Wrap
               font.family: root.fontFamily
