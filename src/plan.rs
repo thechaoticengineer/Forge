@@ -11,6 +11,7 @@ pub(crate) fn default_settings() -> Value {
         "implementer_model": "",
         "reviewer_model": "",
         "max_fix_rounds": 3,
+        "apply_review_notes": true,
         "auto_push": true,
         "queue_auto_approve": false,
     })

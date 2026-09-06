@@ -901,8 +901,12 @@ impl Ctx {
         let max_rounds = self.app.settings.lock().unwrap()["max_fix_rounds"]
             .as_i64()
             .unwrap_or(3);
+        let apply_review_notes = self.app.settings.lock().unwrap()["apply_review_notes"]
+            .as_bool()
+            .unwrap_or(true);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
         let mut issues: Option<Vec<String>> = None;
+        let mut polished = false;
 
         for round in 0..=max_rounds {
             if self.session.stop_requested.load(Ordering::SeqCst) {
@@ -988,6 +992,14 @@ impl Ctx {
             self.save_plan(plan);
 
             if approved {
+                if apply_review_notes && !notes.is_empty() && !polished && round < max_rounds {
+                    self.log_event("review", &format!(
+                        "stage {sid} approved with {} notes — running polish round", notes.len()));
+                    issues = Some(notes.iter()
+                        .map(|note| format!("non-blocking improvement: {note}")).collect());
+                    polished = true;
+                    continue;
+                }
                 let message = if !notes.is_empty() {
                     let summary: String = summary.chars().take(300).collect();
                     let suffix = if summary.is_empty() { String::new() } else { format!(": {summary}") };

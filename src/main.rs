@@ -1326,6 +1326,7 @@ mod tests {
     fn approving_review_persists_notes_and_checks() {
         for summary in ["Verified the implementation.", ""] {
             let test = QueueTest::new(true);
+            test.app.app.settings.lock().unwrap()["apply_review_notes"] = json!(false);
             let notes = json!(["Clarify the output.", "Simplify the helper."]);
             let checks = json!(["Inspected mock.txt.", "Verified the appended line."]);
             test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([
@@ -1355,6 +1356,108 @@ mod tests {
                     && entry["text"] == format!("stage 1 approved with 2 improvement notes{suffix}")));
             assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
                 "work by implementer\nwork by implementer\n");
+        }
+    }
+
+    #[test]
+    fn approving_review_notes_runs_one_polish_round() {
+        assert_eq!(default_settings()["apply_review_notes"], true);
+        for absent_setting in [false, true] {
+            for remaining_notes in [json!([]), json!(["Another optional improvement."])] {
+                let test = QueueTest::new(true);
+                let notes = json!(["Clarify the output.", "Simplify the helper."]);
+                {
+                    let mut settings = test.app.app.settings.lock().unwrap();
+                    if absent_setting {
+                        settings.as_object_mut().unwrap().remove("apply_review_notes");
+                    }
+                    settings["mock_verdicts"] = json!([
+                        {"approved": true, "issues": [], "notes": notes},
+                        {"approved": true, "issues": [], "notes": remaining_notes},
+                    ]);
+                }
+                test.app.mock_agent("planner").unwrap();
+                test.app.run_worker();
+                let plan = test.app.load_plan().unwrap();
+                let stage = &plan["stages"][0];
+                assert_eq!(stage["status"], "committed");
+                assert_eq!(stage["rounds"], 2);
+                let reviews = stage["reviews"].as_array().unwrap();
+                assert_eq!(reviews.len(), 2);
+                for (i, review) in reviews.iter().enumerate() {
+                    assert_eq!(review["round"], i + 1);
+                    assert_eq!(review["approved"], true);
+                    assert_eq!(review["issues"], json!([]));
+                }
+                assert_eq!(reviews[0]["notes"], notes);
+                assert_eq!(reviews[1]["notes"], remaining_notes);
+                assert_eq!(stage["last_verdict"]["notes"], remaining_notes);
+                let committed_file = format!("{}:mock.txt", stage["sha"].as_str().unwrap());
+                assert_eq!(test.app.git(&["show", &committed_file]).unwrap(),
+                    "work by implementer\nwork by fixer");
+                assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
+                    "work by implementer\nwork by fixer\nwork by implementer\n");
+                let history = test.app.read_history();
+                let polish_events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
+                    entry["kind"] == "review"
+                        && entry["text"] == "stage 1 approved with 2 notes — running polish round"
+                ).collect();
+                assert_eq!(polish_events.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_review_notes_commits_without_polishing() {
+        let test = QueueTest::new(true);
+        let notes = json!(["Clarify the output."]);
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["apply_review_notes"] = json!(false);
+            settings["mock_verdicts"] = json!([
+                {"approved": true, "issues": [], "notes": notes},
+            ]);
+        }
+        test.app.mock_agent("planner").unwrap();
+        test.app.run_worker();
+        let plan = test.app.load_plan().unwrap();
+        let stage = &plan["stages"][0];
+        assert_eq!(stage["status"], "committed");
+        assert_eq!(stage["rounds"], 1);
+        assert_eq!(stage["reviews"].as_array().unwrap().len(), 1);
+        assert_eq!(stage["last_verdict"]["notes"], notes);
+        assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
+            "work by implementer\nwork by implementer\n");
+    }
+
+    #[test]
+    fn exhausted_fix_budget_skips_polishing() {
+        for max_rounds in [0, 1] {
+            let test = QueueTest::new(true);
+            let notes = json!(["Clarify the output."]);
+            let mut verdicts = Vec::new();
+            if max_rounds == 1 {
+                verdicts.push(json!({"approved": false, "issues": ["Add the missing line."]}));
+            }
+            verdicts.push(json!({"approved": true, "issues": [], "notes": notes}));
+            {
+                let mut settings = test.app.app.settings.lock().unwrap();
+                settings["max_fix_rounds"] = json!(max_rounds);
+                settings["mock_verdicts"] = json!(verdicts);
+            }
+            test.app.mock_agent("planner").unwrap();
+            test.app.run_worker();
+            let plan = test.app.load_plan().unwrap();
+            let stage = &plan["stages"][0];
+            assert_eq!(stage["status"], "committed");
+            assert_eq!(stage["rounds"], max_rounds + 1);
+            assert_eq!(stage["reviews"].as_array().unwrap().len(), max_rounds + 1);
+            assert_eq!(stage["last_verdict"]["notes"], notes);
+            let fixer_line = if max_rounds == 1 { "work by fixer\n" } else { "" };
+            assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
+                format!("work by implementer\n{fixer_line}work by implementer\n"));
+            assert!(!test.app.read_history().as_array().unwrap().iter().any(|entry|
+                entry["text"].as_str().unwrap().contains("running polish round")));
         }
     }
 
