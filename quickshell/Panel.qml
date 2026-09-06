@@ -387,6 +387,21 @@ Item {
           stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
         }
 
+        function scrollOutput(direction) {
+          const view = root.liveTab ? liveOutput : historyList
+          view.cancelFlick()
+          view.followTail = false
+          const top = view.originY
+          const bottom = top + Math.max(0, view.contentHeight - view.height)
+          view.contentY = Math.max(top, Math.min(bottom,
+            view.contentY + direction * view.height / 2))
+          if (direction > 0 && view.contentY >= bottom) {
+            view.followTail = true
+            view.scrollToTail()
+          }
+          if (view === historyList) historyList.readingY = view.contentY
+        }
+
         Keys.onPressed: event => {
           const prefix = pendingKey
           pendingKey = ""
@@ -402,8 +417,22 @@ Item {
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
               selectStage(stages.length - 1)
               event.accepted = true
+            } else if (event.modifiers === Qt.ControlModifier
+                       && (event.key === Qt.Key_D || event.key === Qt.Key_U)) {
+              scrollOutput(event.key === Qt.Key_D ? 1 : -1)
+              event.accepted = true
             } else if (event.modifiers === Qt.NoModifier) {
-              if (event.key === Qt.Key_J || event.key === Qt.Key_K) {
+              if (event.key === Qt.Key_Tab) {
+                root.liveTab = !root.liveTab
+                event.accepted = true
+              } else if (event.key === Qt.Key_H || event.key === Qt.Key_L) {
+                root.liveTab = event.key === Qt.Key_H
+                event.accepted = true
+              } else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_5) {
+                root.liveTab = false
+                root.historyFilter = ["all", "runs", "git", "reviews", "errors"][event.key - Qt.Key_1]
+                event.accepted = true
+              } else if (event.key === Qt.Key_J || event.key === Qt.Key_K) {
                 selectStage(root.selectedStageIndex < 0 ? 0
                   : root.selectedStageIndex + (event.key === Qt.Key_J ? 1 : -1))
                 event.accepted = true
