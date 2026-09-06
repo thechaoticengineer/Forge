@@ -435,8 +435,10 @@ Item {
         Keys.onPressed: event => {
           const prefix = pendingKey
           pendingKey = ""
-          const question = event.key === Qt.Key_Question
-            && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)
+          const question = (event.key === Qt.Key_Question
+            && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier))
+            || (event.key === Qt.Key_Slash && event.modifiers === Qt.ShiftModifier)
+            || (event.key === Qt.Key_F1 && event.modifiers === Qt.NoModifier)
           // Modal normal mode owns every key; focused text fields handle insert mode.
           if (root.helpOpen) {
             event.accepted = true
@@ -874,6 +876,13 @@ Item {
 
             TextEdit {
               id: goalField
+              Keys.onPressed: event => {
+                if (event.key === Qt.Key_F1) {
+                  root.helpOpen = true
+                  keyHandler.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
               Keys.onEscapePressed: event => {
                 keyHandler.forceActiveFocus()
                 event.accepted = true
@@ -1431,7 +1440,7 @@ Item {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.margins: Style.space(16)
-        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? keyboard help"
+        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - ? or F1 for keyboard help"
         color: root.mutedForeground
         font.family: root.fontFamily
         font.pixelSize: root.fs(10)
@@ -1581,6 +1590,13 @@ Item {
                     chooserList.resetSelection()
                     chooserList.activateSelection()
                   }
+                  Keys.onPressed: event => {
+                    if (event.key === Qt.Key_F1) {
+                      root.helpOpen = true
+                      keyHandler.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
                   Keys.onEscapePressed: event => {
                     keyHandler.forceActiveFocus()
                     event.accepted = true
@@ -1717,6 +1733,13 @@ Item {
                 TextInput {
                   id: manualField
                   onAccepted: manualSetButton.clicked()
+                  Keys.onPressed: event => {
+                    if (event.key === Qt.Key_F1) {
+                      root.helpOpen = true
+                      keyHandler.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
                   Keys.onEscapePressed: event => {
                     keyHandler.forceActiveFocus()
                     event.accepted = true
@@ -1823,7 +1846,7 @@ Item {
                     { key: "x", description: "Stop run or active queue" },
                     { key: "d", description: "Open uncommitted diff" },
                     { key: "c", description: "Change project" },
-                    { key: "?", description: "Open keyboard help" },
+                    { key: "? / F1", description: "Open keyboard help" },
                     { key: "", description: "Diff viewer" },
                     { key: "j / k", description: "Scroll down / up" },
                     { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },
@@ -1836,7 +1859,7 @@ Item {
                     { key: "/ / i", description: "Edit project filter (insert mode)" },
                     { key: "q / Escape", description: "Close chooser (Escape leaves a text field first)" },
                     { key: "", description: "Keyboard help" },
-                    { key: "? / q / Escape", description: "Close help before any other overlay" }
+                    { key: "? / F1 / q / Escape", description: "Close help before any other overlay" }
                   ]
 
                   delegate: Row {
@@ -1874,7 +1897,7 @@ Item {
             Text {
               id: helpFooter
               width: parent.width
-              text: "Scroll for more · Uppercase keys use Shift · ? / q / Escape closes help"
+              text: "Scroll for more · Uppercase keys use Shift · ? / F1 / q / Escape closes help"
               wrapMode: Text.Wrap
               color: root.mutedForeground
               font.family: root.fontFamily
