@@ -628,7 +628,7 @@ Item {
           }
           PanelButton {
             id: helpButton
-            label: "?"
+            label: "? Help"
             onClicked: root.helpOpen = true
           }
         }
