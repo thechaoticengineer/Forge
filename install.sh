@@ -45,11 +45,46 @@ echo "==> Installing plugin files"
   rsync -a "$repo/quickshell/" "$staging_dir/new/quickshell/"
   rsync -a "$repo/manifest.json" "$staging_dir/new/manifest.json"
 
+  plugin_new=true
+  plugin_changed=true
+  manifest_changed=false
+  if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
+    plugin_new=false
+    if diff -rq "$staging_dir/new" "$plugin_dir" >/dev/null; then
+      plugin_changed=false
+    else
+      diff_status=$?
+      # A comparison error must not be mistaken for changed files.
+      if (( diff_status != 1 )); then
+        exit "$diff_status"
+      fi
+    fi
+    if ! cmp -s "$staging_dir/new/manifest.json" "$plugin_dir/manifest.json"; then
+      manifest_changed=true
+    fi
+  fi
+
+  if [[ "$plugin_changed" == false ]]; then
+    # Keep the installed tree in place so even a swap cannot trigger a reload.
+    echo "==> Plugin unchanged; not restarting shell"
+    exit 0
+  fi
+
   # Renames expose a complete snapshot, with a brief gap on re-install.
   if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
     mv -T "$plugin_dir" "$staging_dir/old"
   fi
   mv -T "$staging_dir/new" "$plugin_dir"
+
+  if [[ "$plugin_new" == true || "$manifest_changed" == true ]]; then
+    # Give any watcher-triggered QML reload time to settle before requesting
+    # the restart needed for plugin discovery or manifest changes.
+    sleep 2
+    echo "==> Restarting shell (new plugin or manifest changed)"
+    omarchy restart shell
+  else
+    echo "==> Plugin files updated; shell will hot-reload the plugin"
+  fi
 )
 
 echo "==> Installing systemd user service"
@@ -60,9 +95,6 @@ cp "$repo/systemd/forge-engine.service" "$unit_dir/forge-engine.service"
 systemctl --user stop forge-engine.service 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable --now forge-engine.service
-
-echo "==> Restarting shell"
-omarchy restart shell
 
 echo "==> Done"
 systemctl --user --no-pager --lines=0 status forge-engine.service || true
