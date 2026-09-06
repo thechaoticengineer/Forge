@@ -705,6 +705,13 @@ impl Ctx {
 
     fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<(), String> {
         if tool == "mock" {
+            #[cfg(test)]
+            if role == "planner" {
+                let mut settings = self.app.settings.lock().unwrap();
+                settings["mock_planner_prompt"] = json!(prompt);
+                settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
+                settings["mock_planner_had_plan"] = json!(self.forge_path("plan.json").exists());
+            }
             return self.mock_agent(role);
         }
         let mut cmd = match tool {
@@ -850,6 +857,16 @@ impl Ctx {
     fn mock_agent(&self, role: &str) -> Result<(), String> {
         match role {
             "planner" => {
+                #[cfg(test)]
+                if let Some(output) = self.app.settings.lock().unwrap().get("mock_plan_output") {
+                    // Null simulates an agent exiting successfully without writing a plan.
+                    if !output.is_null() {
+                        fs::write(self.forge_path("plan.json"),
+                            output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
                 let goal = self.session.state.lock().unwrap().goal.clone();
                 self.save_plan(&json!({
                     "goal": goal, "status": "draft",
@@ -908,44 +925,90 @@ impl Ctx {
         let prompt = PLANNER_PROMPT
             .replace("{goal}", goal)
             .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json"));
-        // A previous goal's plan must never count as the new planner's output.
-        let path = self.forge_path("plan.json");
-        let result = match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("could not remove previous plan: {e}")),
-        }
-        .and_then(|_| self.run_agent(
-            "planner", &self.setting("planner"), &prompt, &self.setting("planner_model"),
-        ))
-        .and_then(|_| {
-            self.load_plan()
-                .ok_or_else(|| "planner did not produce a valid plan file".to_string())
-        });
-        match result {
-            Ok(mut plan) => {
-                for st in plan["stages"].as_array_mut().unwrap() {
-                    if st.get("status").and_then(Value::as_str).is_none() {
-                        st["status"] = json!("pending");
-                    }
-                    if st.get("rounds").is_none() {
-                        st["rounds"] = json!(0);
-                    }
-                }
-                plan["goal"] = json!(goal);
-                plan["status"] = json!("draft");
-                let n = plan["stages"].as_array().unwrap().len();
-                self.save_plan(&plan);
-                self.set_phase("plan_ready");
-                self.log_event("plan", &format!("plan ready with {n} stages"));
-                true
-            }
+        match self.generate_plan(&prompt)
+            .and_then(|plan| self.finalize_plan(plan, goal, &[], "ready"))
+        {
+            Ok(()) => true,
             Err(e) => {
                 self.set_phase("failed");
                 self.log_event("error", &format!("planning failed: {e}"));
                 false
             }
         }
+    }
+
+    fn revise_worker(&self, current_plan: &Value, feedback: &str) {
+        let _worker = WorkerGuard(&self.session);
+        let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
+        let goal = current_plan["goal"].as_str().unwrap_or("");
+        let committed: Vec<Value> = current_plan["stages"].as_array().unwrap().iter()
+            .filter(|stage| stage["status"] == "committed").cloned().collect();
+        // Substitute template segments once so placeholders in user content stay literal.
+        let prompt: String = REVISE_PROMPT.split_inclusive('}').map(|part| {
+            for (key, value) in [
+                ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
+                ("{goal}", goal), ("{plan_path}", ".forge/plan.json"),
+            ] {
+                if let Some(prefix) = part.strip_suffix(key) {
+                    return format!("{prefix}{value}");
+                }
+            }
+            part.to_string()
+        }).collect();
+        let result = self.generate_plan(&prompt)
+            .and_then(|plan| self.finalize_plan(plan, goal, &committed, "revised"));
+        if let Err(mut error) = result {
+            if let Err(e) = fs::write(self.forge_path("plan.json"), snapshot) {
+                error.push_str(&format!("; could not restore previous plan: {e}"));
+            }
+            self.set_phase("plan_ready");
+            self.log_event("error", &format!("revision failed: {error}"));
+        }
+    }
+
+    fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
+        // A previous goal's plan must never count as the new planner's output.
+        let path = self.forge_path("plan.json");
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("could not remove previous plan: {e}")),
+        }
+        .and_then(|_| self.run_agent(
+            "planner", &self.setting("planner"), prompt, &self.setting("planner_model"),
+        ))
+        .and_then(|_| {
+            self.load_plan()
+                .ok_or_else(|| "planner did not produce a valid plan file".to_string())
+        })
+    }
+
+    fn finalize_plan(&self, mut plan: Value, goal: &str, committed: &[Value], action: &str)
+        -> Result<(), String>
+    {
+        let stages = plan["stages"].as_array_mut().unwrap();
+        for stage in stages.iter_mut() {
+            if !stage.is_object() {
+                return Err("planner produced a stage that is not an object".into());
+            }
+            if stage.get("status").and_then(Value::as_str).is_none() {
+                stage["status"] = json!("pending");
+            }
+            if stage.get("rounds").is_none() {
+                stage["rounds"] = json!(0);
+            }
+        }
+        // Restore originals even if the agent edited, reordered, duplicated or dropped them.
+        stages.retain(|stage| !committed.iter().any(|original| original["id"] == stage["id"]));
+        stages.splice(0..0, committed.iter().cloned());
+        let n = stages.len();
+        plan["goal"] = json!(goal);
+        plan["status"] = json!("draft");
+        fs::write(self.forge_path("plan.json"), serde_json::to_string_pretty(&plan).unwrap())
+            .map_err(|e| format!("could not save plan: {e}"))?;
+        self.set_phase("plan_ready");
+        self.log_event("plan", &format!("plan {action} with {n} stages"));
+        Ok(())
     }
 
     /// Caller holds queue_lock so API edits cannot overwrite worker transitions.
@@ -1280,6 +1343,32 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
 Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
 
+const REVISE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+You are revising an existing draft plan for this repository.
+
+Here is the current plan JSON:
+{current_plan}
+
+Here is the user's feedback about what is wrong or should be improved:
+{feedback}
+
+Keep the same overall goal:
+{goal}
+
+Rewrite the plan and write it as JSON to the file {plan_path} (create the directory if needed) with exactly this schema:
+{"goal": "...", "status": "draft", "stages": [
+  {"id": 1, "title": "short title",
+   "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
+   "acceptance": "concrete acceptance criteria",
+   "commit": "proposed conventional commit message",
+   "status": "pending", "rounds": 0}
+]}
+
+Stages whose status is "committed" are already done and MUST be kept exactly as-is at the start of the plan, in their original relative order (same id, title, instructions, acceptance, commit, status, rounds).
+Apply the feedback to the remaining stages: you may rewrite, merge, split, add, remove, or reorder them.
+Rules: 2 to 8 stages total, each independently committable, ordered by dependency.
+Do NOT implement anything and do NOT modify any other file. Only write {plan_path}."#;
+
 const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
@@ -1388,7 +1477,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let project_endpoint = matches!(path, "/api/state" | "/api/agent_log" | "/api/diff"
-        | "/api/plan" | "/api/plan/edit" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
         Ok(None)
@@ -1655,6 +1744,34 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 respond(req, 200, json!({"ok": true}));
             }
         }
+        (tiny_http::Method::Post, "/api/plan/revise") => {
+            let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+            let feedback = body["feedback"].as_str().unwrap_or("").trim().to_string();
+            if feedback.is_empty() {
+                respond(req, 400, json!({"error": "feedback required"}));
+                return;
+            }
+            if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+                respond(req, 409, json!({"error": "busy"}));
+                return;
+            }
+            let Some(plan) = ctx.load_plan() else {
+                ctx.session.busy.store(false, Ordering::SeqCst);
+                respond(req, 400, json!({"error": "no plan"}));
+                return;
+            };
+            ctx.session.stop_requested.store(false, Ordering::SeqCst);
+            {
+                let mut s = ctx.session.state.lock().unwrap();
+                s.goal = plan["goal"].as_str().unwrap_or("").to_string();
+                s.phase = "planning".into();
+            }
+            let short: String = feedback.chars().take(300).collect();
+            ctx.log_event("plan", &format!("revision started: {short}"));
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || ctx2.revise_worker(&plan, &feedback));
+            respond(req, 200, json!({"ok": true}));
+        }
         (tiny_http::Method::Post, "/api/plan/edit") => {
             let _queue_guard = ctx.session.queue_lock.lock().unwrap();
             if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
@@ -1848,6 +1965,157 @@ mod tests {
     fn editable_stage(id: i64) -> Value {
         json!({"id": id, "title": "Repaired title", "instructions": "Repaired instructions",
             "acceptance": "", "commit": "feat: repair stage"})
+    }
+
+    #[test]
+    fn plan_revise_api_preserves_committed_work_and_passes_feedback_to_planner() {
+        let test = QueueTest::new(false);
+        let mut committed = editable_stage(1);
+        committed["status"] = json!("committed");
+        committed["rounds"] = json!(3);
+        committed["sha"] = json!("abc123");
+        committed["reviews"] = json!([{"approved": true}]);
+        let original = json!({"goal": "Original {feedback} goal", "status": "draft",
+            "stages": [committed, {"id": 2, "status": "pending"}]});
+        test.app.save_plan(&original);
+        let feedback = format!("Improve {{goal}} and {{plan_path}}: {}", "界🙂".repeat(200));
+        assert_eq!(api_request(&test.app.app, "POST", "/api/plan/revise",
+            json!({"feedback": format!(" \t{feedback}\n")})), (200, json!({"ok": true})));
+        wait_for_worker(&test.app);
+        let plan = test.app.load_plan().unwrap();
+        assert_eq!(plan["stages"][0], original["stages"][0]);
+        assert_eq!(plan["stages"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["goal"], original["goal"]);
+        assert_eq!(plan["status"], "draft");
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+        let settings = test.app.app.settings.lock().unwrap();
+        assert_eq!(settings["mock_planner_phase"], "planning");
+        assert_eq!(settings["mock_planner_had_plan"], false);
+        let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+        assert!(prompt.contains(&serde_json::to_string_pretty(&original).unwrap()));
+        assert!(prompt.contains(&feedback));
+        assert!(prompt.contains("Keep the same overall goal:\nOriginal {feedback} goal"));
+        assert!(prompt.contains("Only write .forge/plan.json."));
+        let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
+            .split_once("\n\nRules:").unwrap().0;
+        assert!(prompt.contains(schema));
+        let history = test.app.read_history();
+        assert_eq!(history[0]["kind"], "plan");
+        assert_eq!(history[0]["text"], format!("revision started: {}",
+            feedback.chars().take(300).collect::<String>()));
+        assert_eq!(history[1]["text"], "plan revised with 2 stages");
+    }
+
+    #[test]
+    fn plan_revise_restores_dropped_and_changed_committed_stages_in_original_order() {
+        let test = QueueTest::new(false);
+        let mut first = editable_stage(9);
+        first["status"] = json!("committed");
+        let mut second = editable_stage(1);
+        second["status"] = json!("committed");
+        second["rounds"] = json!(2);
+        let original = json!({"goal": "Goal", "status": "approved",
+            "stages": [first, second, editable_stage(2)]});
+        test.app.save_plan(&original);
+        test.app.acquire_busy().unwrap();
+        test.app.revise_worker(&original, "Split the remaining work");
+        let plan = test.app.load_plan().unwrap();
+        assert_eq!(&plan["stages"].as_array().unwrap()[..2],
+            &original["stages"].as_array().unwrap()[..2]);
+        assert_eq!(plan["stages"].as_array().unwrap().len(), 3);
+        assert_eq!(plan["stages"][2]["id"], 2);
+        assert_eq!(plan["status"], "draft");
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn plan_revise_failure_restores_original_file_and_reports_error() {
+        for (tool, output) in [
+            ("unknown-planner", Value::Null),
+            ("mock", Value::Null),
+            ("mock", json!("not valid JSON")),
+            ("mock", json!({"goal": "Unusable", "stages": {}})),
+            ("mock", json!({"stages": [42]})),
+        ] {
+            let test = QueueTest::new(false);
+            let original = json!({"goal": "Keep this goal", "status": "draft",
+                "stages": [editable_stage(1), editable_stage(2)]});
+            test.app.save_plan(&original);
+            let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+            {
+                let mut settings = test.app.app.settings.lock().unwrap();
+                settings["planner"] = json!(tool);
+                settings["mock_plan_output"] = output;
+            }
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan/revise",
+                json!({"feedback": "Improve the plan"})), (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), before);
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+            assert!(test.app.read_history().as_array().unwrap().iter().any(|event|
+                event["kind"] == "error" && event["text"].as_str().unwrap().starts_with("revision failed: ")));
+        }
+    }
+
+    #[test]
+    fn plan_revise_api_validates_input_busy_flags_and_project_routing() {
+        let first = QueueTest::new(false);
+        let engine = &first.app.app;
+        let second = QueueTest::with_engine(false, Some(Arc::clone(engine)));
+        for feedback in [Value::Null, json!(42), json!(""), json!(" \t\n\u{2003}")] {
+            assert_eq!(api_request(engine, "POST", "/api/plan/revise", json!({"feedback": feedback})),
+                (400, json!({"error": "feedback required"})));
+        }
+        let body = json!({"feedback": "Improve the plan"});
+        assert_eq!(api_request(engine, "POST", "/api/plan/revise", body.clone()),
+            (400, json!({"error": "no plan"})));
+        assert!(!first.app.session.busy.load(Ordering::SeqCst));
+        let original = json!({"goal": "Goal", "status": "draft", "stages": [editable_stage(1)]});
+        first.app.save_plan(&original);
+        for flag in [&first.app.session.busy, &first.app.session.queue_active] {
+            flag.store(true, Ordering::SeqCst);
+            assert_eq!(api_request(engine, "POST", "/api/plan/revise", body.clone()),
+                (409, json!({"error": "busy"})));
+            assert_eq!(first.app.load_plan().unwrap(), original);
+            flag.store(false, Ordering::SeqCst);
+        }
+        assert_eq!(first.app.read_history(), json!([]));
+        first.app.acquire_busy().unwrap();
+        let _worker = WorkerGuard(&first.app.session);
+        second.app.save_plan(&original);
+        let mut targeted = body;
+        targeted["project"] = json!(second.app.project());
+        assert_eq!(api_request(engine, "POST", "/api/plan/revise", targeted),
+            (200, json!({"ok": true})));
+        wait_for_worker(&second.app);
+        assert_eq!(second.app.session.state.lock().unwrap().phase, "plan_ready");
+        assert_eq!(first.app.load_plan().unwrap(), original);
+    }
+
+    #[test]
+    fn planning_and_revision_share_normalization() {
+        for revision in [false, true] {
+            let test = QueueTest::new(false);
+            let original = json!({"goal": "Original goal", "stages": [editable_stage(1)]});
+            test.app.save_plan(&original);
+            test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!({
+                "goal": "Wrong goal", "status": "approved", "stages": [editable_stage(2), editable_stage(3)]});
+            test.app.acquire_busy().unwrap();
+            if revision {
+                test.app.revise_worker(&original, "Improve the plan");
+            } else {
+                test.app.plan_worker("Original goal");
+            }
+            let plan = test.app.load_plan().unwrap();
+            assert_eq!(plan["goal"], "Original goal");
+            assert_eq!(plan["status"], "draft");
+            for stage in plan["stages"].as_array().unwrap() {
+                assert_eq!(stage["status"], "pending");
+                assert_eq!(stage["rounds"], 0);
+            }
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+        }
     }
 
     #[test]
