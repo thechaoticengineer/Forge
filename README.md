@@ -37,6 +37,32 @@ verdict, and git action is visible in the panel and kept in
 summary, limited to 300 characters; the stage's `reviews` array keeps
 the full summary.
 
+### Editing the plan
+
+After the planner writes a draft, use **Edit plan** in the panel to repair
+it by hand: edit each stage's title, instructions, acceptance criteria,
+and proposed commit message, or add, remove, and reorder stages. Committed
+stages are locked. Click **Save** to keep your changes or **Cancel** to
+discard them.
+
+To ask AI for changes, type feedback into the field beside **Improve with
+AI**, then click the button or press `Enter`. Forge re-runs the planner
+against the current plan and your feedback, keeping the same overall goal.
+A failed AI revision keeps the previous plan.
+
+Saving manual edits or completing an AI revision produces a new draft that
+needs your approval again before running. Both paths preserve committed
+stages. You can also edit or revise an approved or completed plan while
+Forge is idle and the queue is inactive.
+
+The JSON API accepts POST requests to `/api/plan/edit` with
+`{"plan":{"goal":"…","stages":[{"id":1,"title":"…","instructions":"…","acceptance":"…","commit":"…"}]}}`
+and `/api/plan/revise` with `{"feedback":"…"}`. For manual edits, submit the
+complete stage list, keeping committed stages at the start in their original
+order; omit `id` for new stages to have Forge assign one. AI feedback must
+not be blank. Both endpoints require an existing plan and reject requests
+while the project is busy or its queue is active.
+
 ## Queue
 
 Add multiple goals from the panel's queue section, reorder them, then
@@ -122,15 +148,17 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | Key | Action |
 | --- | --- |
 | `i` | Edit the goal (insert mode) |
-| `Escape` | Leave a text field or close the top overlay |
+| `I` | Edit plan feedback (insert mode); Enter improves with AI |
+| `Escape` | Leave a text field, close the top overlay, or cancel plan editing |
 | `j` / `k` | Select next / previous stage |
 | `gg` / `G` | Select first / last stage |
-| `Enter` / `o` / `Space` | Expand or collapse selected stage |
+| `Enter` / `o` / `Space` | Expand or collapse selected stage; focus its title when editing |
 | `Tab` | Toggle Live / History |
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `p` | Create plan from goal |
+| `e` | Edit plan stages by hand |
 | `a` | Approve draft plan |
 | `r` | Run approved or completed plan |
 | `x` | Stop run or active queue |
