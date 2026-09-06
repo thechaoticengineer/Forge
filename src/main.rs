@@ -756,28 +756,8 @@ impl Ctx {
 
     // ---------------------------------------------------------- agents
 
-    fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<(), String> {
-        if tool == "mock" {
-            #[cfg(test)]
-            if role == "planner" {
-                let mut settings = self.app.settings.lock().unwrap();
-                settings["mock_planner_prompt"] = json!(prompt);
-                settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
-                settings["mock_planner_had_plan"] = json!(self.forge_path("plan.json").exists());
-            }
-            #[cfg(test)]
-            if role == "chat" {
-                let mut settings = self.app.settings.lock().unwrap();
-                let state = self.session.state.lock().unwrap();
-                settings["mock_chat_prompt"] = json!(prompt);
-                settings["mock_chat_model"] = json!(model);
-                settings["mock_chat_phase"] = json!(state.phase);
-                settings["mock_chat_step"] = json!(state.current_step);
-                settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
-            }
-            return self.mock_agent(role);
-        }
-        let mut cmd = match tool {
+    fn agent_command(tool: &str, prompt: &str, model: &str) -> Result<Command, String> {
+        let cmd = match tool {
             "claude" => {
                 let mut c = Command::new("claude");
                 c.args([
@@ -804,33 +784,56 @@ impl Ctx {
             }
             other => return Err(format!("unknown tool {other}")),
         };
-        self.log_event("agent", &format!("[{role}] starting {tool} session"));
-        let log = match fs::OpenOptions::new()
+        Ok(cmd)
+    }
+
+    fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<fs::File>>, String> {
+        fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(self.forge_path("agent.log"))
-        {
-            Ok(mut file) => {
-                if let Err(e) = writeln!(
+            .and_then(|mut file| {
+                writeln!(
                     file,
                     "=== [{role}] {tool} ({model}) started {} ===",
                     clock_hms()
-                )
-                .and_then(|_| file.flush())
-                {
-                    let message = format!("failed to initialize agent log: {e}");
-                    self.log_event("error", &format!("[{role}] {message}"));
-                    return Err(message);
-                }
-                Arc::new(Mutex::new(file))
+                )?;
+                file.flush()?;
+                Ok(Arc::new(Mutex::new(file)))
+            })
+            .map_err(|e| self.agent_error(role, format!("failed to initialize agent log: {e}")))
+    }
+
+    fn agent_error(&self, role: &str, message: String) -> String {
+        self.log_event("error", &format!("[{role}] {message}"));
+        message
+    }
+
+    fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<(), String> {
+        if tool == "mock" {
+            #[cfg(test)]
+            if role == "planner" {
+                let mut settings = self.app.settings.lock().unwrap();
+                settings["mock_planner_prompt"] = json!(prompt);
+                settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
+                settings["mock_planner_had_plan"] = json!(self.forge_path("plan.json").exists());
             }
-            Err(e) => {
-                let message = format!("failed to initialize agent log: {e}");
-                self.log_event("error", &format!("[{role}] {message}"));
-                return Err(message);
+            #[cfg(test)]
+            if role == "chat" {
+                let mut settings = self.app.settings.lock().unwrap();
+                let state = self.session.state.lock().unwrap();
+                settings["mock_chat_prompt"] = json!(prompt);
+                settings["mock_chat_model"] = json!(model);
+                settings["mock_chat_phase"] = json!(state.phase);
+                settings["mock_chat_step"] = json!(state.current_step);
+                settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
             }
-        };
+            return self.mock_agent(role);
+        }
+        let mut cmd = Self::agent_command(tool, prompt, model)?;
+        self.log_event("agent", &format!("[{role}] starting {tool} session"));
+        let log = self.open_agent_log(role, tool, model)?;
 
         {
             let mut s = self.session.state.lock().unwrap();
@@ -851,9 +854,7 @@ impl Ctx {
             Ok(child) => child,
             Err(e) => {
                 self.clear_agent_activity();
-                let message = format!("failed to launch {tool}: {e}");
-                self.log_event("error", &format!("[{role}] {message}"));
-                return Err(message);
+                return Err(self.agent_error(role, format!("failed to launch {tool}: {e}")));
             }
         };
         let stdout = child.stdout.take().expect("piped stdout");
@@ -875,23 +876,21 @@ impl Ctx {
         let tail = match stdout_result {
             Ok(tail) => tail,
             Err(e) => {
-                self.log_event("error", &format!("[{role}] {tool} output failed: {e}"));
+                self.agent_error(role, format!("{tool} output failed: {e}"));
                 return Err(e);
             }
         };
         let etail = match stderr_result {
             Ok(tail) => tail,
             Err(e) => {
-                self.log_event("error", &format!("[{role}] {tool} output failed: {e}"));
+                self.agent_error(role, format!("{tool} output failed: {e}"));
                 return Err(e);
             }
         };
         let status = match status_result {
             Ok(status) => status,
             Err(e) => {
-                let message = format!("failed to wait for {tool}: {e}");
-                self.log_event("error", &format!("[{role}] {message}"));
-                return Err(message);
+                return Err(self.agent_error(role, format!("failed to wait for {tool}: {e}")));
             }
         };
 
