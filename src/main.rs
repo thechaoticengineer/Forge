@@ -1694,7 +1694,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
             match out {
                 Ok(o) if o.status.success() => {
                     ctx.log_event("update",
-                        "self-update started; engine restarts, shell hot-reloads the plugin \
+                        "self-update started; engine restarts, changed plugin files hot-reload in the shell \
                          (log: journalctl --user -u forge-update)");
                     respond(req, 200, json!({"ok": true}));
                 }

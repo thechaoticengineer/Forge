@@ -80,11 +80,12 @@ the reviewer's summary, and issues, including reviews after fix rounds.
 Run `./install.sh` to install the current working tree. The panel's **Update
 Forge** button posts to `/api/self_update`, which runs the same script in a
 transient `forge-update` systemd user unit so it survives the engine restart.
-The script builds the release binary, validates the plugin, installs changed
-plugin files through an atomic staging-directory swap, and restarts
-`forge-engine.service`. Unchanged plugin files stay in place; code changes
-hot-reload in the shell. A new plugin or changed manifest requires a shell
-restart, after a short delay to let hot reload settle.
+The script builds the release binary, validates the plugin, and restarts
+`forge-engine.service`. For an existing plugin with an unchanged manifest,
+changed plugin files are replaced in place one file at a time via atomic rename
+so the running shell hot-reloads them. Unchanged files stay in place. Only a
+brand-new plugin or a manifest change triggers `omarchy restart shell`, after
+a short delay to let hot reload settle.
 
 If an update misbehaves, check the update log, engine log, and shell crashes:
 
@@ -94,8 +95,15 @@ journalctl --user -u forge-engine
 coredumpctl list /usr/bin/quickshell
 ```
 
-The 2026-09-06 crash came from an in-place plugin copy racing a shell restart;
-keep the staged swap and avoid restarting the shell for ordinary code updates.
+If the panel does not reflect an installed update, compare the shell start time
+from `ps -o lstart= -p $(pgrep -x quickshell)` with the update time in
+`journalctl --user -u forge-update`. If the shell predates the update, run
+`omarchy restart shell` manually to recover from a stale shell.
+
+The 2026-09-06 crash came from an in-place plugin copy racing a shell restart.
+The directory swap introduced afterward broke watcher-based hot reload; per-file
+atomic rename now replaces that swap for ordinary plugin updates, which do not
+restart the shell.
 
 ### Keyboard
 
