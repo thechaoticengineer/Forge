@@ -111,6 +111,9 @@ The panel uses vim-inspired normal and insert modes. In normal mode, `i`
 focuses the goal for typing; clicking a text field also enters insert mode.
 `Escape` leaves the field, or closes the top overlay when already in normal mode.
 
+Open keyboard help with the `?` button in the panel header or by clicking the
+mode hint at the bottom of the panel.
+
 Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 
 #### Panel (normal mode)
@@ -132,7 +135,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `x` | Stop run or active queue |
 | `d` | Open uncommitted diff |
 | `c` | Change project |
-| `?` | Open keyboard help |
+| `?` / `F1` | Open keyboard help |
 
 #### Diff viewer
 
@@ -159,6 +162,6 @@ These shortcuts apply in normal mode, with text-field behavior noted below.
 
 | Key | Action |
 | --- | --- |
-| `?` / `q` / `Escape` | Close help before any other overlay |
+| `?` / `F1` / `q` / `Escape` | Close help before any other overlay |
 
-Press `?` in the panel to open the same reference.
+Press `?` (`Shift+Slash`) or `F1` in the panel to open the same reference.
