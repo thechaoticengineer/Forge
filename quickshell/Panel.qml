@@ -1510,6 +1510,8 @@ Item {
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
               readonly property var reviewerIssues: modelData.last_verdict
                 && modelData.last_verdict.issues ? modelData.last_verdict.issues : []
+              readonly property var reviewerNotes: modelData.last_verdict
+                && modelData.last_verdict.notes ? modelData.last_verdict.notes : []
               readonly property var reviewHistory: modelData.reviews || []
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
@@ -1579,6 +1581,8 @@ Item {
                     width: Math.min(implicitWidth, stageRow.width)
                     text: stageRow.lastReview
                       ? "review: " + (stageRow.lastReview.approved ? "approved"
+                        + (stageRow.reviewerNotes.length > 0
+                          ? " · " + stageRow.reviewerNotes.length + " notes" : "")
                         : (stageRow.lastReview.issues || []).length + " issue(s)")
                         + (stageRow.reviewHistory.length > 1
                           ? " · " + stageRow.reviewHistory.length + " rounds" : "")
@@ -1683,6 +1687,26 @@ Item {
                       text: "• " + (reviewRound.modelData.issues || []).join("\n• ")
                       textFormat: Text.PlainText
                       color: root.urgent
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      visible: (reviewRound.modelData.notes || []).length > 0
+                      width: stageRow.width
+                      text: "notes:\n• " + (reviewRound.modelData.notes || []).join("\n• ")
+                      textFormat: Text.PlainText
+                      color: root.mutedForeground
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      visible: (reviewRound.modelData.checks || []).length > 0
+                      width: stageRow.width
+                      text: "verified: " + (reviewRound.modelData.checks || []).join("; ")
+                      textFormat: Text.PlainText
+                      color: root.mutedForeground
                       wrapMode: Text.Wrap
                       font.family: root.fontFamily
                       font.pixelSize: root.fs(11)
