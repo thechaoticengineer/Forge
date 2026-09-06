@@ -23,6 +23,26 @@ Item {
   property string lastProject: ""
   property int projectViewRevision: 0
   property var goalDrafts: ({})
+  property bool editingPlan: false
+  property var editStages: []
+  property string editGoal: ""
+  property string editProject: ""
+  property int editRevision: 0
+  property int editSession: 0
+  property bool editPending: false
+  property var editFocusedField: null
+  property int stateRequestSerial: 0
+  property int stateResponseSerial: 0
+  readonly property var displayedStages: editingPlan ? editStages
+    : plan && plan.stages ? plan.stages : []
+  readonly property bool editValid: {
+    // Field changes must update validation without replacing the ListView model.
+    const revision = editRevision
+    return editStages.length > 0 && editStages.every(function(stage) {
+      return stage.status === "committed"
+        || (stage.title.trim() !== "" && stage.instructions.trim() !== "")
+    })
+  }
 
   readonly property string pluginId: manifest && manifest.id
     ? manifest.id : "dev.omarchy-ai-build-orchestrator"
@@ -93,7 +113,7 @@ Item {
 
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
-    || filterField.activeFocus || manualField.activeFocus
+    || filterField.activeFocus || manualField.activeFocus || editFocusedField !== null
 
   onHelpOpenChanged: {
     keyHandler.pendingKey = ""
@@ -132,6 +152,7 @@ Item {
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
     projectViewRevision++
+    cancelPlanEdit()
     goalField.text = goalDrafts[project] || ""
     goalFlick.contentY = 0
     expandedStageId = -1
@@ -203,9 +224,15 @@ Item {
     xhr.send(body ? JSON.stringify(body) : null)
   }
 
-  function refresh() {
+  function refresh(done) {
+    const serial = ++stateRequestSerial
     api("GET", "/api/state", null, function(resp) {
-      if (resp) root.engineState = resp
+      // A poll started before a save must not overwrite its refreshed snapshot.
+      if (resp && serial > root.stateResponseSerial) {
+        root.stateResponseSerial = serial
+        root.engineState = resp
+      }
+      if (done) done()
     })
   }
 
@@ -231,9 +258,99 @@ Item {
     })
   }
 
-  function act(path, body) {
+  function act(path, body, done) {
     localError = ""
-    api("POST", path, body || {}, function() { root.refresh() })
+    api("POST", path, body || {}, function(resp) {
+      root.refresh(function() { if (done) done(resp) })
+    })
+  }
+
+  function beginPlanEdit() {
+    if (!editPlanButton.enabled) return
+    editStages = JSON.parse(JSON.stringify(plan.stages))
+    editGoal = plan.goal || ""
+    editProject = lastProject
+    editSession++
+    editingPlan = true
+    localError = ""
+    keyHandler.forceActiveFocus()
+    keyHandler.selectStage(selectedStageIndex < 0 ? 0 : selectedStageIndex)
+  }
+
+  function cancelPlanEdit() {
+    if (editingPlan) keyHandler.forceActiveFocus()
+    editingPlan = false
+    editPending = false
+    editFocusedField = null
+    editStages = []
+    editGoal = ""
+    editProject = ""
+    editSession++
+    selectedStageIndex = Math.min(selectedStageIndex, displayedStages.length - 1)
+  }
+
+  function changeStageField(index, field, value) {
+    if (!editingPlan || editPending || !editStages[index]
+        || editStages[index].status === "committed") return
+    editStages[index][field] = value
+    editRevision++
+  }
+
+  function editableNeighbor(index, direction) {
+    for (let target = index + direction; target >= 0 && target < editStages.length;
+         target += direction) {
+      if (editStages[target].status !== "committed") return target
+    }
+    return -1
+  }
+
+  function moveEditStage(index, direction) {
+    if (editPending || editStages[index].status === "committed") return
+    const target = editableNeighbor(index, direction)
+    if (target < 0) return
+    keyHandler.forceActiveFocus()
+    const stages = editStages.slice()
+    const stage = stages[index]
+    stages[index] = stages[target]
+    stages[target] = stage
+    editStages = stages
+    keyHandler.selectStage(target)
+  }
+
+  function deleteEditStage(index) {
+    if (editPending || editStages[index].status === "committed") return
+    keyHandler.forceActiveFocus()
+    const stages = editStages.slice()
+    stages.splice(index, 1)
+    editStages = stages
+    selectedStageIndex = -1
+    keyHandler.selectStage(Math.min(index, stages.length - 1))
+  }
+
+  function addEditStage() {
+    if (editPending) return
+    keyHandler.forceActiveFocus()
+    editStages = editStages.concat([{ title: "", instructions: "", acceptance: "", commit: "" }])
+    keyHandler.selectStage(editStages.length - 1)
+  }
+
+  function savePlanEdit() {
+    if (!savePlanButton.enabled) return
+    keyHandler.forceActiveFocus()
+    const session = editSession
+    const stages = editStages.map(function(stage) {
+      const content = { title: stage.title, instructions: stage.instructions,
+        acceptance: stage.acceptance, commit: stage.commit }
+      if (stage.id !== undefined) content.id = stage.id
+      return content
+    })
+    editPending = true
+    act("/api/plan/edit", { project: editProject, plan: { goal: editGoal, stages: stages } }, function(resp) {
+      if (session !== root.editSession) return
+      root.editPending = false
+      if (resp && resp.ok) root.cancelPlanEdit()
+      else if (!resp || !resp.error) root.localError = "Could not save plan. Check the engine connection and try again."
+    })
   }
 
   function openChooser() {
@@ -404,7 +521,7 @@ Item {
         onActiveFocusChanged: pendingKey = ""
 
         function selectStage(index) {
-          const stages = root.plan && root.plan.stages ? root.plan.stages : []
+          const stages = root.displayedStages
           if (stages.length === 0) return
           root.selectedStageIndex = Math.max(0, Math.min(index, stages.length - 1))
           stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
@@ -490,9 +607,10 @@ Item {
             goalField.forceActiveFocus()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
+            if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
             event.accepted = true
           } else {
-            const stages = root.plan && root.plan.stages ? root.plan.stages : []
+            const stages = root.displayedStages
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
               selectStage(stages.length - 1)
               event.accepted = true
@@ -503,17 +621,19 @@ Item {
             } else if (event.modifiers === Qt.NoModifier) {
               // Keep action guards identical to their PanelButton.enabled bindings.
               if (event.key === Qt.Key_P) {
-                if (!root.busy && goalField.text.trim() !== "")
+                if (createPlanButton.enabled)
                   root.act("/api/plan", { goal: goalField.text })
                 event.accepted = true
               } else if (event.key === Qt.Key_A) {
-                if (!root.busy && root.plan !== null && root.plan.status === "draft")
+                if (approvePlanButton.enabled)
                   root.act("/api/approve")
                 event.accepted = true
               } else if (event.key === Qt.Key_R) {
-                if (!root.busy && root.plan !== null
-                    && (root.plan.status === "approved" || root.plan.status === "done"))
+                if (runPlanButton.enabled)
                   root.act("/api/run")
+                event.accepted = true
+              } else if (event.key === Qt.Key_E) {
+                if (editPlanButton.enabled) root.beginPlanEdit()
                 event.accepted = true
               } else if (event.key === Qt.Key_X) {
                 if (root.phase === "running" || root.queueActive)
@@ -546,8 +666,13 @@ Item {
               } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
                          || event.key === Qt.Key_O || event.key === Qt.Key_Space) {
                 if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
-                  const stageId = stages[root.selectedStageIndex].id
-                  root.expandedStageId = root.expandedStageId === stageId ? -1 : stageId
+                  const row = stageList.itemAtIndex(root.selectedStageIndex)
+                  if (root.editingPlan && stages[root.selectedStageIndex].status !== "committed") {
+                    if (row) row.focusEditor()
+                  } else {
+                    const stageId = stages[root.selectedStageIndex].id
+                    root.expandedStageId = root.expandedStageId === stageId ? -1 : stageId
+                  }
                 }
                 event.accepted = true
               }
@@ -909,9 +1034,10 @@ Item {
           width: parent.width
           spacing: Style.space(8)
           PanelButton {
+            id: createPlanButton
             label: "Create plan"
             primary: true
-            enabled: !root.busy && goalField.text.trim() !== ""
+            enabled: !root.editingPlan && !root.busy && goalField.text.trim() !== ""
             onClicked: root.act("/api/plan", { goal: goalField.text })
           }
           PanelButton {
@@ -923,14 +1049,16 @@ Item {
             }
           }
           PanelButton {
+            id: approvePlanButton
             label: "Plan is OK — approve"
-            enabled: !root.busy && root.plan !== null && root.plan.status === "draft"
+            enabled: !root.editingPlan && !root.busy && root.plan !== null && root.plan.status === "draft"
             onClicked: root.act("/api/approve")
           }
           PanelButton {
+            id: runPlanButton
             label: "Start implementing"
             primary: true
-            enabled: !root.busy && root.plan !== null
+            enabled: !root.editingPlan && !root.busy && root.plan !== null
               && (root.plan.status === "approved" || root.plan.status === "done")
             onClicked: root.act("/api/run")
           }
@@ -940,8 +1068,16 @@ Item {
             onClicked: root.act("/api/stop")
           }
           PanelButton {
+            id: editPlanButton
+            label: "Edit plan"
+            visible: !root.editingPlan
+            enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive
+              && root.plan !== null && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
+            onClicked: root.beginPlanEdit()
+          }
+          PanelButton {
             label: "Discard plan"
-            enabled: !root.busy && root.plan !== null
+            enabled: !root.editingPlan && !root.busy && root.plan !== null
             onClicked: root.act("/api/reset_plan")
           }
           PanelButton {
@@ -993,7 +1129,7 @@ Item {
               id: startQueueButton
               label: "Start queue"
               primary: true
-              enabled: root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
+              enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
               onClicked: root.act("/api/queue/start")
             }
           }
@@ -1073,6 +1209,35 @@ Item {
         }
 
         // ------------------------------------------------- stages
+        Flow {
+          visible: root.editingPlan
+          width: parent.width
+          spacing: Style.space(8)
+          PanelButton {
+            label: "Add stage"
+            enabled: !root.editPending
+            onClicked: root.addEditStage()
+          }
+          PanelButton {
+            id: savePlanButton
+            label: root.editPending ? "Saving…" : "Save"
+            primary: true
+            enabled: root.editingPlan && root.editValid && !root.editPending
+              && root.engineOnline && !root.busy && !root.queueActive
+            onClicked: root.savePlanEdit()
+          }
+          PanelButton {
+            label: "Cancel"
+            enabled: !root.editPending
+            onClicked: root.cancelPlanEdit()
+          }
+          Text {
+            text: "Editing plan · title and instructions required"
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(11)
+          }
+        }
         Rectangle {
           width: parent.width
           height: Math.max(Style.space(100), parent.height * 0.34
@@ -1085,12 +1250,16 @@ Item {
             anchors.margins: Style.space(8)
             clip: true
             spacing: Style.space(6)
-            model: root.plan ? root.plan.stages : []
+            model: root.displayedStages
             delegate: Rectangle {
               id: stageRow
               required property var modelData
               required property int index
               readonly property bool expanded: root.expandedStageId === modelData.id
+              readonly property bool editable: root.editingPlan && modelData.status !== "committed"
+              function focusEditor() {
+                if (stageEditor.item && !root.editPending) stageEditor.item.focusTitle()
+              }
               readonly property double elapsedSecs: modelData.status === "in_progress"
                 && typeof modelData.started_unix === "number"
                 ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
@@ -1102,16 +1271,18 @@ Item {
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
               width: stageList.width
-              height: stageContent.implicitHeight
+              height: editable ? stageEditor.height : stageContent.implicitHeight
               radius: 3
               color: index === root.selectedStageIndex
                 ? Qt.darker(root.accent, 2.8) : "transparent"
               TapHandler {
+                enabled: !stageRow.editable
                 onTapped: root.expandedStageId = stageRow.expanded
                   ? -1 : stageRow.modelData.id
               }
               Column {
                 id: stageContent
+                visible: !stageRow.editable
                 width: stageRow.width
                 spacing: 2
                 Flow {
@@ -1147,7 +1318,8 @@ Item {
                   }
                   Text {
                     width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.modelData.status
+                    text: root.editingPlan && stageRow.modelData.status === "committed"
+                      ? "committed — locked" : stageRow.modelData.status
                       + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
                       + (stageRow.modelData.rounds > 1
                          ? " (round " + stageRow.modelData.rounds + ")" : "")
@@ -1286,9 +1458,75 @@ Item {
                   font.pixelSize: root.fs(11)
                 }
               }
+              Loader {
+                id: stageEditor
+                active: stageRow.editable
+                width: stageRow.width
+                sourceComponent: Column {
+                  width: stageEditor.width
+                  spacing: Style.space(6)
+                  function focusTitle() { titleEditor.focusField() }
+                  Flow {
+                    width: parent.width
+                    spacing: Style.space(8)
+                    Text {
+                      text: stageRow.modelData.id === undefined ? "New stage"
+                        : "Stage " + stageRow.modelData.id
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(12)
+                      font.bold: true
+                    }
+                    PanelButton {
+                      label: "↑ Up"
+                      enabled: !root.editPending && root.editableNeighbor(stageRow.index, -1) >= 0
+                      onClicked: root.moveEditStage(stageRow.index, -1)
+                    }
+                    PanelButton {
+                      label: "↓ Down"
+                      enabled: !root.editPending && root.editableNeighbor(stageRow.index, 1) >= 0
+                      onClicked: root.moveEditStage(stageRow.index, 1)
+                    }
+                    PanelButton {
+                      label: "Delete"
+                      enabled: !root.editPending
+                      labelColor: root.urgent
+                      onClicked: root.deleteEditStage(stageRow.index)
+                    }
+                  }
+                  PlanEditField {
+                    id: titleEditor
+                    width: parent.width
+                    label: "Title"
+                    value: stageRow.modelData.title
+                    onEdited: value => root.changeStageField(stageRow.index, "title", value)
+                  }
+                  PlanEditField {
+                    width: parent.width
+                    label: "Instructions"
+                    value: stageRow.modelData.instructions
+                    multiline: true
+                    onEdited: value => root.changeStageField(stageRow.index, "instructions", value)
+                  }
+                  PlanEditField {
+                    width: parent.width
+                    label: "Acceptance"
+                    value: stageRow.modelData.acceptance
+                    multiline: true
+                    onEdited: value => root.changeStageField(stageRow.index, "acceptance", value)
+                  }
+                  PlanEditField {
+                    width: parent.width
+                    label: "Commit"
+                    value: stageRow.modelData.commit
+                    onEdited: value => root.changeStageField(stageRow.index, "commit", value)
+                  }
+                  Item { width: 1; height: Style.space(6) }
+                }
+              }
             }
             Text {
-              visible: root.plan === null
+              visible: !root.editingPlan && root.plan === null
               text: "no plan yet"
               color: root.mutedForeground
               font.family: root.fontFamily
@@ -1835,15 +2073,16 @@ Item {
                   model: [
                     { key: "", description: "Panel · normal mode" },
                     { key: "i", description: "Edit the goal (insert mode)" },
-                    { key: "Escape", description: "Leave a text field or close the top overlay" },
+                    { key: "Escape", description: "Leave a text field, close the top overlay, or cancel plan editing" },
                     { key: "j / k", description: "Select next / previous stage" },
                     { key: "gg / G", description: "Select first / last stage" },
-                    { key: "Enter / o / Space", description: "Expand or collapse selected stage" },
+                    { key: "Enter / o / Space", description: "Expand or collapse selected stage; focus its title when editing" },
                     { key: "Tab", description: "Toggle Live / History" },
                     { key: "h / l", description: "Select Live / History" },
                     { key: "Ctrl+d / Ctrl+u", description: "Scroll Live / History half a page down / up" },
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
                     { key: "p", description: "Create plan from goal" },
+                    { key: "e", description: "Edit plan stages by hand" },
                     { key: "a", description: "Approve draft plan" },
                     { key: "r", description: "Run approved or completed plan" },
                     { key: "x", description: "Stop run or active queue" },
@@ -1906,6 +2145,93 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: root.fs(10)
             }
+          }
+        }
+      }
+    }
+  }
+
+  component PlanEditField: Column {
+    id: editField
+    required property string label
+    required property string value
+    property bool multiline: false
+    signal edited(string value)
+    spacing: Style.space(3)
+    enabled: !root.editPending
+
+    function focusField() { field.forceActiveFocus() }
+
+    Text {
+      text: editField.label
+      color: root.mutedForeground
+      font.family: root.fontFamily
+      font.pixelSize: root.fs(11)
+    }
+    Rectangle {
+      width: parent.width
+      height: Math.min(Math.max(Style.space(editField.multiline ? 48 : 26),
+        field.contentHeight + Style.space(12)), Style.space(editField.multiline ? 96 : 26))
+      color: root.background
+      radius: 4
+      border.width: 1
+      border.color: field.activeFocus ? root.accent : Qt.darker(root.foreground, 3)
+      Flickable {
+        id: fieldFlick
+        anchors.fill: parent
+        anchors.margins: Style.space(6)
+        clip: true
+        contentWidth: field.width
+        contentHeight: field.height
+        flickableDirection: Flickable.VerticalFlick
+        boundsBehavior: Flickable.StopAtBounds
+
+        function ensureCursorVisible() {
+          if (!field.activeFocus) return
+          const cursor = field.cursorRectangle
+          if (contentY > cursor.y) contentY = cursor.y
+          else if (contentY + height < cursor.y + cursor.height)
+            contentY = cursor.y + cursor.height - height
+          contentY = Math.max(0, Math.min(contentY, contentHeight - height))
+          // Keep the active field visible even when its stage exceeds the viewport.
+          const top = editField.mapToItem(stageList.contentItem, 0, 0).y
+          if (top < stageList.contentY) stageList.contentY = top
+          else if (top + editField.height > stageList.contentY + stageList.height)
+            stageList.contentY = top + editField.height - stageList.height
+        }
+        onHeightChanged: Qt.callLater(ensureCursorVisible)
+        TextEdit {
+          id: field
+          width: fieldFlick.width
+          height: Math.max(contentHeight, fieldFlick.height)
+          text: editField.value
+          textFormat: TextEdit.PlainText
+          wrapMode: TextEdit.Wrap
+          selectByMouse: true
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(12)
+          onTextChanged: if (activeFocus) editField.edited(text)
+          onActiveFocusChanged: {
+            if (activeFocus) {
+              root.editFocusedField = field
+              fieldFlick.ensureCursorVisible()
+            } else if (root.editFocusedField === field) root.editFocusedField = null
+          }
+          onCursorRectangleChanged: fieldFlick.ensureCursorVisible()
+          Keys.onPressed: event => {
+            if (event.key === Qt.Key_F1) {
+              root.helpOpen = true
+              keyHandler.forceActiveFocus()
+              event.accepted = true
+            } else if (!editField.multiline
+                       && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
+              event.accepted = true
+            }
+          }
+          Keys.onEscapePressed: event => {
+            keyHandler.forceActiveFocus()
+            event.accepted = true
           }
         }
       }
