@@ -107,11 +107,13 @@ Run `./install.sh` to install the current working tree. The panel's **Update
 Forge** button posts to `/api/self_update`, which runs the same script in a
 transient `forge-update` systemd user unit so it survives the engine restart.
 The script builds the release binary, validates the plugin, and restarts
-`forge-engine.service`. For an existing plugin with an unchanged manifest,
-changed plugin files are replaced in place one file at a time via atomic rename
-so the running shell hot-reloads them. Unchanged files stay in place. Only a
-brand-new plugin or a manifest change triggers `omarchy restart shell`, after
-a short delay to let hot reload settle.
+`forge-engine.service`. When any plugin file changed, the installed plugin
+tree is swapped atomically and `omarchy restart shell` runs after a short
+settling delay, so the panel always shows the new UI; an unchanged plugin
+is left in place and the shell keeps running. Before the engine restarts,
+the update leaves an `update-pending` marker in the project's `.forge/`
+directory; the restarted engine turns it into a "self-update finished"
+event in the panel's feed, so a completed update is visible there.
 
 If an update misbehaves, check the update log, engine log, and shell crashes:
 
@@ -127,9 +129,9 @@ from `ps -o lstart= -p $(pgrep -x quickshell)` with the update time in
 `omarchy restart shell` manually to recover from a stale shell.
 
 The 2026-09-06 crash came from an in-place plugin copy racing a shell restart.
-The directory swap introduced afterward broke watcher-based hot reload; per-file
-atomic rename now replaces that swap for ordinary plugin updates, which do not
-restart the shell.
+The directory swap introduced afterward broke watcher-based hot reload, and
+per-file atomic renames turned out not to refresh an already loaded panel
+either, so plugin updates now always swap the tree and restart the shell.
 
 ### Keyboard
 

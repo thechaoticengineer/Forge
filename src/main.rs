@@ -421,6 +421,18 @@ impl App {
         let plan = fs::read_to_string(PathBuf::from(&project).join(FORGE_DIR).join("plan.json"))
             .ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .filter(|plan| plan.get("stages").is_some_and(Value::is_array));
+        // A pending self-update marker means install.sh restarted the engine
+        // since this project last had a session; surface the completion in
+        // its feed. A stale marker (update never restarted us) is discarded.
+        let marker = PathBuf::from(&project).join(FORGE_DIR).join("update-pending");
+        if let Ok(text) = fs::read_to_string(&marker) {
+            let _ = fs::remove_file(&marker);
+            let requested = text.trim().parse::<i64>().unwrap_or(0);
+            if unix_timestamp() - requested <= 900 {
+                log_project_event(&project, "update",
+                    "self-update finished; engine restarted on the new build");
+            }
+        }
         let session = Arc::new(Session {
             state: Mutex::new(State {
                 phase: if plan.is_some() { "plan_ready" } else { "idle" }.into(),
@@ -551,6 +563,22 @@ impl App {
         (Value::Array(remote), err)
     }
 
+}
+
+/// Append a history event for a project without a live session; used for
+/// events that must outlive an engine restart, like self-update completion.
+fn log_project_event(project: &str, kind: &str, text: &str) {
+    let dir = PathBuf::from(project).join(FORGE_DIR);
+    let _ = fs::create_dir_all(&dir);
+    let entry = json!({"t": clock_hms(), "unix": unix_timestamp(), "kind": kind, "text": text});
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("history.jsonl"))
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+    println!("[{kind}] {text}");
 }
 
 impl Ctx {
@@ -1910,9 +1938,15 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 .output();
             match out {
                 Ok(o) if o.status.success() => {
+                    // The confirmation event has to outlive the engine restart
+                    // install.sh performs, so leave a marker that the next boot
+                    // turns into a "self-update finished" feed event.
+                    ctx.ensure_forge_dir();
+                    let _ = fs::write(ctx.forge_path("update-pending"),
+                        unix_timestamp().to_string());
                     ctx.log_event("update",
-                        "self-update started; engine restarts, changed plugin files hot-reload in the shell \
-                         (log: journalctl --user -u forge-update)");
+                        "self-update started; the engine restarts and the shell reloads the plugin \
+                         if it changed (log: journalctl --user -u forge-update)");
                     respond(req, 200, json!({"ok": true}));
                 }
                 Ok(o) => {
@@ -2489,6 +2523,34 @@ mod tests {
         assert_eq!(entries[2]["text"], "active event");
         assert!(entries[3].get("goal").is_none());
         assert_eq!(entries[3]["stage"], 3);
+    }
+
+    #[test]
+    fn update_pending_marker_logs_finished_event_once_on_next_engine_start() {
+        let test = QueueTest::new(false);
+        let project = test.path.display().to_string();
+        let marker = test.path.join(FORGE_DIR).join("update-pending");
+        let update_events = |engine: &Arc<App>| {
+            engine.context(&project).read_history().as_array().unwrap().iter()
+                .filter(|e| e["kind"] == "update").cloned().collect::<Vec<_>>()
+        };
+
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, unix_timestamp().to_string()).unwrap();
+        // A fresh App is a restarted engine: its first session for the project
+        // consumes the marker and records the completion.
+        let engine = Arc::new(App::new(&project, default_settings()));
+        let events = update_events(&engine);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["text"], "self-update finished; engine restarted on the new build");
+        assert!(!marker.exists());
+
+        // A stale marker (the update never restarted the engine) is discarded
+        // without logging a bogus completion.
+        fs::write(&marker, (unix_timestamp() - 3600).to_string()).unwrap();
+        let engine = Arc::new(App::new(&project, default_settings()));
+        assert_eq!(update_events(&engine).len(), 1);
+        assert!(!marker.exists());
     }
 
     #[test]

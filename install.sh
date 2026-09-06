@@ -26,11 +26,7 @@ echo "==> Installing plugin files"
   # Keep temporary trees on the same filesystem, hidden from plugin discovery.
   # The wrapper has no manifest; only the completed new tree becomes a plugin.
   staging_dir="$(mktemp -d "${plugin_dir%/*}/.forge.staging.XXXXXX")"
-  temp_file=""
   cleanup_plugin_install() {
-    if [[ -n "$temp_file" ]]; then
-      rm -f -- "$temp_file"
-    fi
     if [[ -e "$staging_dir/old" || -L "$staging_dir/old" ]] &&
       [[ ! -e "$plugin_dir" && ! -L "$plugin_dir" ]]; then
       if ! mv -T "$staging_dir/old" "$plugin_dir"; then
@@ -49,11 +45,8 @@ echo "==> Installing plugin files"
   rsync -a "$repo/quickshell/" "$staging_dir/new/quickshell/"
   rsync -a "$repo/manifest.json" "$staging_dir/new/manifest.json"
 
-  plugin_new=true
   plugin_changed=true
-  manifest_changed=false
   if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
-    plugin_new=false
     if diff -rq "$staging_dir/new" "$plugin_dir" >/dev/null; then
       plugin_changed=false
     else
@@ -63,9 +56,6 @@ echo "==> Installing plugin files"
         exit "$diff_status"
       fi
     fi
-    if ! cmp -s "$staging_dir/new/manifest.json" "$plugin_dir/manifest.json"; then
-      manifest_changed=true
-    fi
   fi
 
   if [[ "$plugin_changed" == false ]]; then
@@ -74,53 +64,18 @@ echo "==> Installing plugin files"
     exit 0
   fi
 
-  if [[ "$plugin_new" == true || "$manifest_changed" == true ]]; then
-    # Discovery and manifest changes need a restart, so replace the whole tree.
-    if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
-      mv -T "$plugin_dir" "$staging_dir/old"
-    fi
-    mv -T "$staging_dir/new" "$plugin_dir"
-
-    # Give any watcher-triggered QML reload time to settle before requesting
-    # the restart needed for plugin discovery or manifest changes.
-    sleep 2
-    echo "==> Restarting shell (new plugin or manifest changed)"
-    omarchy restart shell
-  else
-    echo "==> Updating plugin files in place for shell hot-reload; not restarting shell"
-    # Remove obsolete entries and incompatible types, children before parents.
-    while IFS= read -r -d '' installed; do
-      staged="$staging_dir/new/${installed#"$plugin_dir/"}"
-      if [[ ! -e "$staged" && ! -L "$staged" ]] ||
-        { [[ -d "$installed" && ! -L "$installed" ]] &&
-          [[ ! -d "$staged" || -L "$staged" ]]; } ||
-        { [[ -d "$staged" && ! -L "$staged" ]] &&
-          [[ ! -d "$installed" || -L "$installed" ]]; }; then
-        rm -rf -- "$installed"
-      fi
-    done < <(find "$plugin_dir/" -mindepth 1 -depth -print0)
-
-    # Preserve directories and unchanged files. Atomic saves in each target's
-    # directory notify the shell's file watchers, unlike a whole-tree swap.
-    while IFS= read -r -d '' staged; do
-      installed="$plugin_dir/${staged#"$staging_dir/new/"}"
-      if [[ -d "$staged" && ! -L "$staged" ]]; then
-        mkdir -p -- "$installed"
-        continue
-      fi
-      if [[ -L "$staged" && -L "$installed" ]]; then
-        [[ "$(readlink -- "$staged")" == "$(readlink -- "$installed")" ]] && continue
-      elif [[ ! -L "$staged" && ! -L "$installed" ]] && cmp -s "$staged" "$installed"; then
-        continue
-      fi
-      mkdir -p -- "${installed%/*}"
-      temp_file="$(mktemp "${installed%/*}/.${installed##*/}.new.XXXXXX")"
-      cp -a -- "$staged" "$temp_file"
-      mv -fT -- "$temp_file" "$installed"
-      temp_file=""
-    done < <(find "$staging_dir/new" -mindepth 1 -print0)
-    echo "==> Plugin updated with per-file atomic replacements"
+  # Replace the whole tree and restart the shell. In-place file updates rely
+  # on the shell's QML hot-reload, which has proven unreliable for an already
+  # loaded panel; a restart is the only way to guarantee the new UI shows up.
+  if [[ -e "$plugin_dir" || -L "$plugin_dir" ]]; then
+    mv -T "$plugin_dir" "$staging_dir/old"
   fi
+  mv -T "$staging_dir/new" "$plugin_dir"
+
+  # Give any watcher-triggered QML reload time to settle before the restart.
+  sleep 2
+  echo "==> Restarting shell to load the updated plugin"
+  omarchy restart shell
 )
 
 echo "==> Installing systemd user service"
