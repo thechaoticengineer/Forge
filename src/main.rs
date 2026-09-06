@@ -796,9 +796,23 @@ impl Ctx {
                 let _ = writeln!(f, "work by {role}");
             }
             "reviewer" => {
+                #[cfg(test)]
+                if let Some(verdicts) = self.app.settings.lock().unwrap()["mock_verdicts"].as_array_mut()
+                    && !verdicts.is_empty()
+                {
+                    let verdict = verdicts.remove(0);
+                    return fs::write(
+                        self.forge_path("verdict.json"),
+                        verdict.as_str().map(String::from).unwrap_or_else(|| verdict.to_string()),
+                    ).map_err(|e| e.to_string());
+                }
                 let _ = fs::write(
                     self.forge_path("verdict.json"),
-                    json!({"approved": true, "issues": []}).to_string(),
+                    json!({
+                        "approved": true,
+                        "summary": "Inspected the mock implementation; no issues found.",
+                        "issues": [],
+                    }).to_string(),
                 );
             }
             _ => {}
@@ -1031,16 +1045,11 @@ impl Ctx {
             let verdict: Option<Value> = fs::read_to_string(&verdict_path)
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok());
-            match verdict {
-                Some(v) if v["approved"].as_bool() == Some(true) => {
-                    plan["stages"][idx]["last_verdict"] = json!({
-                        "approved": true, "issues": [],
-                    });
-                    self.save_plan(plan);
-                    self.log_event("review", &format!("stage {sid} approved by reviewer"));
-                    return Ok("approved");
-                }
+            let summary = verdict.as_ref()
+                .and_then(|v| v["summary"].as_str()).unwrap_or("");
+            let (approved, list) = match &verdict {
                 Some(v) => {
+                    let approved = v["approved"].as_bool() == Some(true);
                     let list: Vec<String> = v["issues"]
                         .as_array()
                         .map(|a| {
@@ -1048,29 +1057,45 @@ impl Ctx {
                                 .filter_map(|i| i.as_str().map(String::from))
                                 .collect()
                         })
-                        .filter(|l: &Vec<String>| !l.is_empty())
+                        .filter(|l: &Vec<String>| approved || !l.is_empty())
+                        .or_else(|| approved.then(Vec::new))
                         .unwrap_or_else(|| vec!["reviewer rejected without details".into()]);
-                    plan["stages"][idx]["last_verdict"] = json!({
-                        "approved": false, "issues": list,
-                    });
-                    self.save_plan(plan);
-                    let summary: String = list.join("; ").chars().take(1500).collect();
-                    self.log_event("review", &format!("stage {sid} rejected: {summary}"));
-                    issues = Some(list);
+                    (approved, list)
                 }
-                None => {
-                    issues = Some(vec![
-                        "The previous review session failed to produce a verdict. \
-                         Re-verify the implementation end to end."
-                            .into(),
-                    ]);
-                    plan["stages"][idx]["last_verdict"] = json!({
-                        "approved": false, "issues": issues.as_ref().unwrap(),
-                    });
-                    self.save_plan(plan);
-                    self.log_event("error", "reviewer produced no readable verdict; retrying stage");
-                }
+                None => (false, vec![
+                    "The previous review session failed to produce a verdict. \
+                     Re-verify the implementation end to end."
+                        .into(),
+                ]),
+            };
+            let stage = &mut plan["stages"][idx];
+            stage["last_verdict"] = json!({
+                "approved": approved, "summary": summary, "issues": list,
+            });
+            stage.as_object_mut().unwrap().entry("reviews")
+                .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+                    "round": round + 1, "approved": approved, "summary": summary,
+                    "issues": list, "unix": unix_timestamp(),
+                }));
+            self.save_plan(plan);
+
+            if approved {
+                let message = if summary.is_empty() {
+                    format!("stage {sid} approved by reviewer")
+                } else {
+                    let summary: String = summary.chars().take(300).collect();
+                    format!("stage {sid} approved: {summary}")
+                };
+                self.log_event("review", &message);
+                return Ok("approved");
             }
+            if verdict.is_none() {
+                self.log_event("error", "reviewer produced no readable verdict; retrying stage");
+            } else {
+                let summary: String = list.join("; ").chars().take(1500).collect();
+                self.log_event("review", &format!("stage {sid} rejected: {summary}"));
+            }
+            issues = Some(list);
         }
         Ok("exhausted")
     }
@@ -1233,9 +1258,10 @@ ACCEPTANCE CRITERIA:
 
 Inspect with `git status` and `git diff` (all uncommitted changes belong to this stage), read files, and run tests/builds if useful.
 Then write your verdict as JSON to the file {verdict_path}:
-{"approved": true/false, "issues": ["specific, actionable issue", ...]}
+{"approved": true/false, "summary": "short feedback: what you inspected and what you found, even when approving", "issues": ["specific, actionable issue", ...]}
 
 approved=true only if the acceptance criteria are met and you found no real defect.
+Always fill summary with short feedback describing what you inspected and what you found, even when approving.
 Do NOT fix anything yourself; do NOT modify any file except {verdict_path}.
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
@@ -2003,6 +2029,19 @@ mod tests {
             let duration = fmt_duration(stage["duration_secs"].as_i64().unwrap());
             let text = format!("stage {} committed in {duration}", stage["id"]);
             assert!(entries.iter().any(|entry| entry["goal"] == "second goal" && entry["text"] == text));
+            let reviews = stage["reviews"].as_array().unwrap();
+            assert_eq!(reviews.len(), 1);
+            assert_eq!(reviews[0]["round"], 1);
+            assert_eq!(reviews[0]["approved"], true);
+            assert_eq!(reviews[0]["issues"], json!([]));
+            assert!(reviews[0]["unix"].as_i64().unwrap() > 0);
+            let summary = reviews[0]["summary"].as_str().unwrap();
+            assert!(!summary.is_empty());
+            assert_eq!(stage["last_verdict"], json!({
+                "approved": true, "summary": summary, "issues": [],
+            }));
+            assert!(entries.iter().any(|entry| entry["kind"] == "review"
+                && entry["text"] == format!("stage {} approved: {summary}", stage["id"])));
         }
     }
 
@@ -2237,6 +2276,97 @@ mod tests {
         }).expect("blocked stage duration");
         assert_eq!(event["goal"], "first goal");
         assert_eq!(event["stage"], 1);
+    }
+
+    #[test]
+    fn review_history_preserves_rejections_after_fix_and_approval() {
+        let test = QueueTest::new(true);
+        let summary = "界🙂".repeat(200);
+        test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([
+            {"approved": false, "summary": "Inspected output; a line is missing.",
+             "issues": ["Add the missing line.", 42]},
+            {"approved": true, "summary": summary, "issues": []},
+        ]);
+        test.app.mock_agent("planner").unwrap();
+        test.app.run_worker();
+        let plan = test.app.load_plan().unwrap();
+        let stage = &plan["stages"][0];
+        assert_eq!(stage["status"], "committed");
+        let reviews = stage["reviews"].as_array().unwrap();
+        assert_eq!(reviews.len(), 2);
+        for (i, review) in reviews.iter().enumerate() {
+            assert_eq!(review["round"], i + 1);
+            assert_eq!(review["approved"], i == 1);
+            assert!(review["unix"].as_i64().unwrap() > 0);
+        }
+        assert_eq!(reviews[0]["summary"], "Inspected output; a line is missing.");
+        assert_eq!(reviews[0]["issues"], json!(["Add the missing line."]));
+        assert_eq!(reviews[1]["summary"], summary);
+        assert_eq!(reviews[1]["issues"], json!([]));
+        assert_eq!(stage["last_verdict"], json!({
+            "approved": true, "summary": summary, "issues": [],
+        }));
+        let history = test.app.read_history();
+        let events: Vec<_> = history.as_array().unwrap().iter()
+            .filter(|entry| entry["kind"] == "review" && entry["stage"] == 1).collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["text"], "stage 1 rejected: Add the missing line.");
+        assert_eq!(events[1]["text"], format!("stage 1 approved: {}", "界🙂".repeat(150)));
+        assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
+            "work by implementer\nwork by fixer\nwork by implementer\n");
+    }
+
+    #[test]
+    fn review_history_accumulates_after_exhaustion_and_resume() {
+        let test = QueueTest::new(true);
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["max_fix_rounds"] = json!(1);
+            settings["mock_verdicts"] = json!([
+                {"approved": false, "issues": []},
+                "not readable JSON",
+                {"approved": true, "issues": []},
+            ]);
+        }
+        test.app.mock_agent("planner").unwrap();
+        test.app.run_worker();
+        let blocked = test.app.load_plan().unwrap();
+        assert_eq!(blocked["stages"][0]["status"], "blocked");
+        let previous = blocked["stages"][0]["reviews"].as_array().unwrap();
+        assert_eq!(previous.len(), 2);
+        for (i, review) in previous.iter().enumerate() {
+            assert_eq!(review["round"], i + 1);
+            assert_eq!(review["approved"], false);
+            assert_eq!(review["summary"], "");
+            assert!(review["unix"].as_i64().unwrap() > 0);
+        }
+        assert_eq!(previous[0]["issues"], json!(["reviewer rejected without details"]));
+        let missing_verdict_issues = json!([
+            "The previous review session failed to produce a verdict. Re-verify the implementation end to end."
+        ]);
+        assert_eq!(previous[1]["issues"], missing_verdict_issues);
+        assert_eq!(blocked["stages"][0]["last_verdict"], json!({
+            "approved": false, "summary": "", "issues": missing_verdict_issues,
+        }));
+
+        test.app.run_worker();
+        let resumed = test.app.load_plan().unwrap();
+        let stage = &resumed["stages"][0];
+        assert_eq!(stage["status"], "committed");
+        let reviews = stage["reviews"].as_array().unwrap();
+        assert_eq!(reviews.len(), 3);
+        assert_eq!(&reviews[..2], previous.as_slice());
+        // Round numbers are local to the attempt; earlier attempts stay intact.
+        assert_eq!(reviews[2]["round"], 1);
+        assert_eq!(reviews[2]["approved"], true);
+        assert_eq!(reviews[2]["summary"], "");
+        assert_eq!(reviews[2]["issues"], json!([]));
+        assert!(reviews[2]["unix"].as_i64().unwrap() > 0);
+        assert_eq!(stage["last_verdict"], json!({
+            "approved": true, "summary": "", "issues": [],
+        }));
+        assert!(test.app.read_history().as_array().unwrap().iter().any(|entry|
+            entry["kind"] == "review" && entry["text"] == "stage 1 approved by reviewer"));
     }
 
     #[test]
