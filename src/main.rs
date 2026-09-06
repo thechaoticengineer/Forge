@@ -21,6 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const PORT: u16 = 8734;
 const FORGE_DIR: &str = ".forge";
 
+enum PlanMode {
+    Standard,
+    Refactor { focus: String },
+}
+
 struct App {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     active_project: Mutex<String>,
@@ -978,16 +983,27 @@ impl Ctx {
 
     // ------------------------------------------------------ orchestrator
 
-    fn plan_worker(&self, goal: &str) {
+    fn plan_worker(&self, goal: &str, mode: &PlanMode) {
         let _worker = WorkerGuard(&self.session);
-        self.plan_worker_inner(goal);
+        self.plan_worker_inner(goal, mode);
     }
 
     /// Plan without releasing the worker's busy claim.
-    fn plan_worker_inner(&self, goal: &str) -> bool {
-        let prompt = PLANNER_PROMPT
-            .replace("{goal}", goal)
-            .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json"));
+    fn plan_worker_inner(&self, goal: &str, mode: &PlanMode) -> bool {
+        let prompt = match mode {
+            PlanMode::Standard => PLANNER_PROMPT
+                .replace("{goal}", goal)
+                .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json")),
+            // Substitute template segments once so placeholders in user focus stay literal.
+            PlanMode::Refactor { focus } => REFACTOR_PROMPT.split_inclusive('}').map(|part| {
+                for (key, value) in [("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan.json")] {
+                    if let Some(prefix) = part.strip_suffix(key) {
+                        return format!("{prefix}{value}");
+                    }
+                }
+                part.to_string()
+            }).collect(),
+        };
         match self.generate_plan(&prompt)
             .and_then(|plan| self.finalize_plan(plan, goal, &[], "ready"))
         {
@@ -1194,7 +1210,7 @@ impl Ctx {
                 self.set_queue_status(&mut queue, id, "planning");
                 (id, goal)
             };
-            let planned = self.plan_worker_inner(&goal);
+            let planned = self.plan_worker_inner(&goal, &PlanMode::Standard);
             {
                 let _queue_guard = self.session.queue_lock.lock().unwrap();
                 let mut queue = self.load_queue();
@@ -1453,6 +1469,27 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 ]}
 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
+Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
+
+const REFACTOR_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+Explore this repository and read the code. Identify concrete refactoring opportunities:
+duplication, dead code, overly long functions, unclear naming, and poor module structure.
+Produce a staged refactoring plan WITHOUT changing observable behavior.
+
+USER FOCUS (may be empty — if empty, choose the most valuable refactorings yourself):
+{focus}
+
+Write the plan as JSON to the file {plan_path} (create the directory if needed) with exactly this schema:
+{"goal": "...", "status": "draft", "stages": [
+  {"id": 1, "title": "short title",
+   "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
+   "acceptance": "concrete acceptance criteria",
+   "commit": "proposed conventional commit message",
+   "status": "pending", "rounds": 0}
+]}
+
+Rules: 2 to 8 stages, each independently committable, ordered by dependency.
+Every stage's acceptance criteria must require that observable behavior is preserved and builds/tests still pass.
 Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
 
 const REVISE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
@@ -1857,7 +1894,21 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         }
         (tiny_http::Method::Post, "/api/plan") => {
             let _queue_guard = ctx.session.queue_lock.lock().unwrap();
-            let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
+            let focus = body["goal"].as_str().unwrap_or("").trim().to_string();
+            let mode = match body.get("mode") {
+                None => PlanMode::Standard,
+                Some(Value::String(mode)) if mode.is_empty() || mode == "standard" => PlanMode::Standard,
+                Some(Value::String(mode)) if mode == "refactor" => PlanMode::Refactor { focus: focus.clone() },
+                _ => {
+                    respond(req, 400, json!({"error": "unknown mode"}));
+                    return;
+                }
+            };
+            let goal = match &mode {
+                PlanMode::Standard => focus,
+                PlanMode::Refactor { focus } if focus.is_empty() => "Refactor the codebase".into(),
+                PlanMode::Refactor { focus } => format!("Refactor the codebase — focus: {focus}"),
+            };
             if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
                 respond(req, 409, json!({"error": "busy"}));
             } else {
@@ -1870,7 +1921,7 @@ fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
                 let short: String = goal.chars().take(300).collect();
                 ctx.log_event("plan", &format!("planning started for goal: {short}"));
                 let ctx2 = ctx.clone();
-                std::thread::spawn(move || ctx2.plan_worker(&goal));
+                std::thread::spawn(move || ctx2.plan_worker(&goal, &mode));
                 respond(req, 200, json!({"ok": true}));
             }
         }
@@ -2128,6 +2179,120 @@ mod tests {
     }
 
     #[test]
+    fn plan_refactor_without_focus_replaces_plan_and_exposes_draft_in_state() {
+        for body in [json!({"mode": "refactor"}), json!({"mode": "refactor", "goal": " \t\n\u{2003}"})] {
+            let test = QueueTest::new(false);
+            test.app.save_plan(&json!({"goal": "Old goal", "status": "approved",
+                "stages": [editable_stage(9)]}));
+            test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!({
+                "goal": "Planner's goal", "status": "approved", "stages": [editable_stage(1)]});
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan", body),
+                (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+            assert_eq!(status, 200);
+            assert_eq!(state["goal"], "Refactor the codebase");
+            assert_eq!(state["phase"], "plan_ready");
+            assert_eq!(state["plan"], test.app.load_plan().unwrap());
+            assert_eq!(state["plan"]["goal"], "Refactor the codebase");
+            assert_eq!(state["plan"]["status"], "draft");
+            assert_eq!(state["plan"]["stages"][0]["id"], 1);
+            assert_eq!(state["plan"]["stages"][0]["status"], "pending");
+            assert_eq!(state["plan"]["stages"][0]["rounds"], 0);
+            let settings = test.app.app.settings.lock().unwrap();
+            assert_eq!(settings["mock_planner_phase"], "planning");
+            assert_eq!(settings["mock_planner_had_plan"], false);
+            let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+            assert!(prompt.contains("Explore this repository and read the code."));
+            assert!(prompt.contains("duplication, dead code, overly long functions, unclear naming, and poor module structure."));
+            assert!(prompt.contains("WITHOUT changing observable behavior."));
+            assert!(prompt.contains("USER FOCUS (may be empty — if empty, choose the most valuable refactorings yourself):\n\n\nWrite"));
+            assert!(prompt.contains("Rules: 2 to 8 stages, each independently committable, ordered by dependency."));
+            assert!(prompt.contains("Every stage's acceptance criteria must require that observable behavior is preserved and builds/tests still pass."));
+            assert!(prompt.ends_with("Do NOT implement anything, do not modify any other file. Only write .forge/plan.json."));
+            let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
+                .split_once("\n\nRules:").unwrap().0;
+            assert!(prompt.contains(schema));
+            assert_eq!(test.app.read_history()[0]["text"],
+                "planning started for goal: Refactor the codebase");
+        }
+    }
+
+    #[test]
+    fn plan_refactor_trims_focus_and_keeps_user_placeholders_literal() {
+        for focus in ["split main.rs into modules", "Keep {plan_path}, {focus}, {goal}, and {nested: {}} literal 界🙂"] {
+            let test = QueueTest::new(false);
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan",
+                json!({"mode": "refactor", "goal": format!(" \t{focus}\n")})),
+                (200, json!({"ok": true})));
+            wait_for_worker(&test.app);
+            let goal = format!("Refactor the codebase — focus: {focus}");
+            let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+            assert_eq!(status, 200);
+            assert_eq!(state["goal"], goal);
+            assert_eq!(state["plan"]["goal"], goal);
+            assert_eq!(state["plan"]["status"], "draft");
+            let settings = test.app.app.settings.lock().unwrap();
+            let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+            assert!(prompt.contains(&format!("yourself):\n{focus}\n\nWrite")));
+            assert!(prompt.ends_with("Only write .forge/plan.json."));
+            assert_eq!(test.app.read_history()[0]["text"], format!("planning started for goal: {goal}"));
+        }
+    }
+
+    #[test]
+    fn plan_api_rejects_unknown_modes_without_starting_planning() {
+        let test = QueueTest::new(false);
+        let original = json!({"goal": "Original goal", "status": "draft", "stages": [editable_stage(1)]});
+        test.app.save_plan(&original);
+        test.app.set_phase("plan_ready");
+        for mode in [json!("nonsense"), json!("REFACTOR"), json!(" refactor "), json!(null), json!(42), json!(false)] {
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"mode": mode})),
+                (400, json!({"error": "unknown mode"})));
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+            assert_eq!(test.app.load_plan().unwrap(), original);
+            assert_eq!(test.app.read_history(), json!([]));
+            assert!(test.app.app.settings.lock().unwrap().get("mock_planner_prompt").is_none());
+        }
+    }
+
+    #[test]
+    fn plan_refactor_respects_busy_and_queue_guards() {
+        let test = QueueTest::new(false);
+        for flag in [&test.app.session.busy, &test.app.session.queue_active] {
+            flag.store(true, Ordering::SeqCst);
+            assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"mode": "refactor"})),
+                (409, json!({"error": "busy"})));
+            flag.store(false, Ordering::SeqCst);
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
+            assert!(test.app.load_plan().is_none());
+            assert_eq!(test.app.read_history(), json!([]));
+            assert!(test.app.app.settings.lock().unwrap().get("mock_planner_prompt").is_none());
+        }
+    }
+
+    #[test]
+    fn plan_api_standard_modes_preserve_existing_goal_and_prompt_behavior() {
+        for mode in [None, Some(""), Some("standard")] {
+            for goal in [None, Some(" \tAdd a feature\n")] {
+                let test = QueueTest::new(false);
+                let mut body = json!({});
+                if let Some(mode) = mode { body["mode"] = json!(mode); }
+                if let Some(goal) = goal { body["goal"] = json!(goal); }
+                assert_eq!(api_request(&test.app.app, "POST", "/api/plan", body),
+                    (200, json!({"ok": true})));
+                wait_for_worker(&test.app);
+                let goal = goal.unwrap_or("").trim();
+                assert_eq!(test.app.load_plan().unwrap()["goal"], goal);
+                assert_eq!(test.app.load_plan().unwrap()["status"], "draft");
+                assert_eq!(test.app.app.settings.lock().unwrap()["mock_planner_prompt"],
+                    PLANNER_PROMPT.replace("{goal}", goal).replace("{plan_path}", ".forge/plan.json"));
+            }
+        }
+    }
+
+    #[test]
     fn plan_chat_persists_transcript_and_preserves_plan_and_phase() {
         let test = QueueTest::new(false);
         let original = json!({"goal": "Explain {question} and {history}", "status": "draft",
@@ -2291,7 +2456,7 @@ mod tests {
                 assert!(test.app.load_plan().is_none());
             } else {
                 test.app.acquire_busy().unwrap();
-                test.app.plan_worker("New goal");
+                test.app.plan_worker("New goal", &PlanMode::Standard);
                 assert_eq!(test.app.load_plan().unwrap()["goal"], "New goal");
             }
             assert!(!test.app.forge_path("chat.jsonl").exists());
@@ -2439,7 +2604,7 @@ mod tests {
             if revision {
                 test.app.revise_worker(&original, "Improve the plan");
             } else {
-                test.app.plan_worker("Original goal");
+                test.app.plan_worker("Original goal", &PlanMode::Standard);
             }
             let plan = test.app.load_plan().unwrap();
             assert_eq!(plan["goal"], "Original goal");
