@@ -412,7 +412,14 @@ Item {
             if (root.diffOpen) root.diffOpen = false
             else if (root.chooserOpen) root.chooserOpen = false
             event.accepted = true
-          } else if (!root.diffOpen && !root.chooserOpen) {
+          } else if (root.diffOpen || root.chooserOpen) {
+            if (event.modifiers === Qt.NoModifier
+                && [Qt.Key_P, Qt.Key_A, Qt.Key_R, Qt.Key_X, Qt.Key_D, Qt.Key_C].includes(event.key)) {
+              if (event.key === Qt.Key_D && root.diffOpen && !root.chooserOpen)
+                root.diffOpen = false
+              event.accepted = true
+            }
+          } else {
             const stages = root.plan && root.plan.stages ? root.plan.stages : []
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
               selectStage(stages.length - 1)
@@ -422,7 +429,31 @@ Item {
               scrollOutput(event.key === Qt.Key_D ? 1 : -1)
               event.accepted = true
             } else if (event.modifiers === Qt.NoModifier) {
-              if (event.key === Qt.Key_Tab) {
+              // Keep action guards identical to their PanelButton.enabled bindings.
+              if (event.key === Qt.Key_P) {
+                if (!root.busy && goalField.text.trim() !== "")
+                  root.act("/api/plan", { goal: goalField.text })
+                event.accepted = true
+              } else if (event.key === Qt.Key_A) {
+                if (!root.busy && root.plan !== null && root.plan.status === "draft")
+                  root.act("/api/approve")
+                event.accepted = true
+              } else if (event.key === Qt.Key_R) {
+                if (!root.busy && root.plan !== null
+                    && (root.plan.status === "approved" || root.plan.status === "done"))
+                  root.act("/api/run")
+                event.accepted = true
+              } else if (event.key === Qt.Key_X) {
+                if (root.phase === "running" || root.queueActive)
+                  root.act("/api/stop")
+                event.accepted = true
+              } else if (event.key === Qt.Key_D) {
+                if (root.engineOnline) root.openDiff()
+                event.accepted = true
+              } else if (event.key === Qt.Key_C) {
+                if (root.engineOnline) root.openChooser()
+                event.accepted = true
+              } else if (event.key === Qt.Key_Tab) {
                 root.liveTab = !root.liveTab
                 event.accepted = true
               } else if (event.key === Qt.Key_H || event.key === Qt.Key_L) {
