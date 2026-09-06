@@ -127,6 +127,18 @@ fn last_chars(text: &str, limit: usize) -> String {
     text.chars().skip(count.saturating_sub(limit)).collect()
 }
 
+/// Substitute template segments once so placeholders in user content stay literal.
+fn fill_template(template: &str, pairs: &[(&str, &str)]) -> String {
+    template.split_inclusive('}').map(|part| {
+        for &(key, value) in pairs {
+            if let Some(prefix) = part.strip_suffix(key) {
+                return format!("{prefix}{value}");
+            }
+        }
+        part.to_string()
+    }).collect()
+}
+
 #[derive(Default)]
 struct ClaudeActivity {
     lines: Vec<String>,
@@ -994,15 +1006,9 @@ impl Ctx {
             PlanMode::Standard => PLANNER_PROMPT
                 .replace("{goal}", goal)
                 .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json")),
-            // Substitute template segments once so placeholders in user focus stay literal.
-            PlanMode::Refactor { focus } => REFACTOR_PROMPT.split_inclusive('}').map(|part| {
-                for (key, value) in [("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan.json")] {
-                    if let Some(prefix) = part.strip_suffix(key) {
-                        return format!("{prefix}{value}");
-                    }
-                }
-                part.to_string()
-            }).collect(),
+            PlanMode::Refactor { focus } => fill_template(REFACTOR_PROMPT, &[
+                ("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan.json"),
+            ]),
         };
         match self.generate_plan(&prompt)
             .and_then(|plan| self.finalize_plan(plan, goal, &[], "ready"))
@@ -1022,18 +1028,10 @@ impl Ctx {
         let goal = current_plan["goal"].as_str().unwrap_or("");
         let committed: Vec<Value> = current_plan["stages"].as_array().unwrap().iter()
             .filter(|stage| stage["status"] == "committed").cloned().collect();
-        // Substitute template segments once so placeholders in user content stay literal.
-        let prompt: String = REVISE_PROMPT.split_inclusive('}').map(|part| {
-            for (key, value) in [
-                ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
-                ("{goal}", goal), ("{plan_path}", ".forge/plan.json"),
-            ] {
-                if let Some(prefix) = part.strip_suffix(key) {
-                    return format!("{prefix}{value}");
-                }
-            }
-            part.to_string()
-        }).collect();
+        let prompt = fill_template(REVISE_PROMPT, &[
+            ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
+            ("{goal}", goal), ("{plan_path}", ".forge/plan.json"),
+        ]);
         let result = self.generate_plan(&prompt)
             .and_then(|plan| self.finalize_plan(plan, goal, &committed, "revised"));
         if let Err(mut error) = result {
@@ -1050,18 +1048,10 @@ impl Ctx {
         self.set_step(None, "answering plan question");
         let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
         let history = serde_json::to_string_pretty(&self.read_chat()).unwrap();
-        // Substitute only template segments, leaving placeholders in user content literal.
-        let prompt: String = CHAT_PROMPT.split_inclusive('}').map(|part| {
-            for (key, value) in [
-                ("{current_plan}", snapshot.as_str()), ("{history}", history.as_str()),
-                ("{question}", question), ("{answer_path}", ".forge/answer.json"),
-            ] {
-                if let Some(prefix) = part.strip_suffix(key) {
-                    return format!("{prefix}{value}");
-                }
-            }
-            part.to_string()
-        }).collect();
+        let prompt = fill_template(CHAT_PROMPT, &[
+            ("{current_plan}", snapshot.as_str()), ("{history}", history.as_str()),
+            ("{question}", question), ("{answer_path}", ".forge/answer.json"),
+        ]);
         let result = (|| -> Result<(), String> {
             self.ensure_forge_dir();
             match fs::remove_file(self.forge_path("answer.json")) {
