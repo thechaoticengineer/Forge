@@ -1849,7 +1849,7 @@ Item {
                     { key: "x", description: "Stop run or active queue" },
                     { key: "d", description: "Open uncommitted diff" },
                     { key: "c", description: "Change project" },
-                    { key: "? / F1", description: "Open keyboard help" },
+                    { key: "? (Shift+/) / F1", description: "Open keyboard help" },
                     { key: "", description: "Diff viewer" },
                     { key: "j / k", description: "Scroll down / up" },
                     { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },
@@ -1862,7 +1862,7 @@ Item {
                     { key: "/ / i", description: "Edit project filter (insert mode)" },
                     { key: "q / Escape", description: "Close chooser (Escape leaves a text field first)" },
                     { key: "", description: "Keyboard help" },
-                    { key: "? / F1 / q / Escape", description: "Close help before any other overlay" }
+                    { key: "? (Shift+/) / F1 / q / Escape", description: "Close help before any other overlay" }
                   ]
 
                   delegate: Row {
@@ -1900,7 +1900,7 @@ Item {
             Text {
               id: helpFooter
               width: parent.width
-              text: "Scroll for more · Uppercase keys use Shift · ? / F1 / q / Escape closes help"
+              text: "Scroll for more · Uppercase keys use Shift · ? (Shift+/) / F1 / q / Escape closes help"
               wrapMode: Text.Wrap
               color: root.mutedForeground
               font.family: root.fontFamily
