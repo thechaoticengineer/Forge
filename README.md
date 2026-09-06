@@ -74,3 +74,20 @@ Each reviewed stage has a review chip showing approval or the latest issue
 count, plus the number of rounds when there is more than one. Expand a
 stage to see its full per-round review history: approved or rejected,
 the reviewer's summary, and issues, including reviews after fix rounds.
+
+### Keyboard
+
+The panel uses vim-inspired normal and insert modes. In normal mode, `i`
+focuses the goal for typing; clicking a text field also enters insert mode.
+`Escape` leaves the field, or closes the top overlay when already in normal mode.
+
+- `j` / `k` select stages; `gg` / `G` jump to the first / last stage.
+  `Enter`, `o`, or `Space` expands or collapses the selection.
+- `Tab` toggles Live / History; `h` / `l` select Live / History directly.
+  `Ctrl+d` / `Ctrl+u` scroll down / up half a page. `1`–`5` select the
+  All, Runs, Git, Reviews, and Errors history filters.
+- `p` plans, `a` approves, `r` runs, and `x` stops; actions are available
+  when their buttons are enabled. `d` opens the diff; `c` changes project.
+
+Diff and project chooser overlays also support vim-style navigation;
+press ? in the panel for the full list.

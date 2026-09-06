@@ -91,6 +91,13 @@ Item {
   property bool diffPending: false
   property string diffError: ""
 
+  property bool helpOpen: false
+
+  onHelpOpenChanged: {
+    keyHandler.pendingKey = ""
+    keyHandler.forceActiveFocus()
+  }
+
   onDiffOpenChanged: {
     keyHandler.pendingKey = ""
     keyHandler.forceActiveFocus()
@@ -426,8 +433,15 @@ Item {
         Keys.onPressed: event => {
           const prefix = pendingKey
           pendingKey = ""
+          const question = event.key === Qt.Key_Question
+            && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)
           // Modal normal mode owns every key; focused text fields handle insert mode.
-          if (root.diffOpen) {
+          if (root.helpOpen) {
+            event.accepted = true
+            if (question || event.key === Qt.Key_Escape
+                || (event.key === Qt.Key_Q && event.modifiers === Qt.NoModifier))
+              root.helpOpen = false
+          } else if (root.diffOpen) {
             event.accepted = true
             if (event.key === Qt.Key_Escape) {
               root.diffOpen = false
@@ -465,6 +479,9 @@ Item {
               else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
                 filterField.forceActiveFocus()
             }
+          } else if (question) {
+            root.helpOpen = true
+            event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
             event.accepted = true
@@ -1696,6 +1713,147 @@ Item {
                   root.chooserOpen = false
                 }
               }
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------ keyboard help
+      Rectangle {
+        visible: root.helpOpen
+        anchors.fill: parent
+        z: 10
+        color: Qt.rgba(0, 0, 0, 0.55)
+        MouseArea {
+          anchors.fill: parent
+          onClicked: root.helpOpen = false
+          onWheel: wheel => { wheel.accepted = true }
+        }
+
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.92
+          height: parent.height * 0.9
+          radius: 6
+          color: root.surface
+          border.width: 1
+          border.color: Qt.darker(root.foreground, 3)
+          MouseArea {
+            anchors.fill: parent
+            onWheel: wheel => { wheel.accepted = true }
+          }
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Text {
+              text: "Keyboard · :help"
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(16)
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              text: "Normal mode uses shortcuts. Focus a text field for insert mode; Escape returns to normal. Actions follow the buttons’ enabled state."
+              wrapMode: Text.Wrap
+              color: root.mutedForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(11)
+            }
+
+            Flickable {
+              id: helpList
+              width: parent.width
+              height: parent.height - y - helpFooter.height - parent.spacing
+              contentWidth: width
+              contentHeight: helpRows.height
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              onVisibleChanged: if (visible) contentY = 0
+
+              Column {
+                id: helpRows
+                width: helpList.width
+                spacing: Style.space(5)
+
+                Repeater {
+                  model: [
+                    { key: "", description: "Panel · normal mode" },
+                    { key: "i", description: "Edit the goal (insert mode)" },
+                    { key: "Escape", description: "Leave a text field or close the top overlay" },
+                    { key: "j / k", description: "Select next / previous stage" },
+                    { key: "gg / G", description: "Select first / last stage" },
+                    { key: "Enter / o / Space", description: "Expand or collapse selected stage" },
+                    { key: "Tab", description: "Toggle Live / History" },
+                    { key: "h / l", description: "Select Live / History" },
+                    { key: "Ctrl+d / Ctrl+u", description: "Scroll Live / History half a page down / up" },
+                    { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
+                    { key: "p", description: "Create plan from goal" },
+                    { key: "a", description: "Approve draft plan" },
+                    { key: "r", description: "Run approved or completed plan" },
+                    { key: "x", description: "Stop run or active queue" },
+                    { key: "d", description: "Open uncommitted diff" },
+                    { key: "c", description: "Change project" },
+                    { key: "?", description: "Open keyboard help" },
+                    { key: "", description: "Diff viewer" },
+                    { key: "j / k", description: "Scroll down / up" },
+                    { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },
+                    { key: "gg / G", description: "Jump to top / bottom" },
+                    { key: "R", description: "Refresh diff" },
+                    { key: "q / Escape", description: "Close diff" },
+                    { key: "", description: "Project chooser · normal mode" },
+                    { key: "j / k", description: "Select next / previous project" },
+                    { key: "Enter", description: "Open selection; in filter, open first match; in path field, set path" },
+                    { key: "/ / i", description: "Edit project filter (insert mode)" },
+                    { key: "q / Escape", description: "Close chooser (Escape leaves a text field first)" },
+                    { key: "", description: "Keyboard help" },
+                    { key: "? / q / Escape", description: "Close help before any other overlay" }
+                  ]
+
+                  delegate: Row {
+                    id: helpRow
+                    required property var modelData
+                    readonly property bool heading: modelData.key === ""
+                    width: helpRows.width
+                    spacing: Style.space(10)
+
+                    Text {
+                      visible: !helpRow.heading
+                      width: helpRows.width * 0.36
+                      text: helpRow.modelData.key
+                      wrapMode: Text.Wrap
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      width: helpRow.heading ? helpRows.width
+                        : helpRows.width * 0.64 - helpRow.spacing
+                      topPadding: helpRow.heading ? Style.space(6) : 0
+                      text: helpRow.modelData.description
+                      wrapMode: Text.Wrap
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                      font.bold: helpRow.heading
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              id: helpFooter
+              width: parent.width
+              text: "Scroll for more · Uppercase keys use Shift · ? / q / Escape closes help"
+              wrapMode: Text.Wrap
+              color: root.mutedForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(10)
             }
           }
         }
