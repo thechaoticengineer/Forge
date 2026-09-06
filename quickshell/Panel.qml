@@ -1076,7 +1076,7 @@ Item {
               onCursorRectangleChanged: goalFlick.ensureCursorVisible()
               Text {
                 visible: goalField.text === "" && !goalField.activeFocus
-                text: "What should be built?"
+                text: "Describe a goal, or leave empty and press Refactor plan for suggestions"
                 color: root.mutedForeground
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(12)
@@ -1094,6 +1094,11 @@ Item {
             primary: true
             enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
             onClicked: root.act("/api/plan", { goal: goalField.text })
+          }
+          PanelButton {
+            label: "Refactor plan"
+            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.engineOnline
+            onClicked: root.act("/api/plan", { mode: "refactor", goal: goalField.text })
           }
           PanelButton {
             label: "Add to queue"
