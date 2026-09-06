@@ -372,7 +372,10 @@ fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Result<String,
             let id = body["id"].as_u64().ok_or("id required")?;
             let idx = items.iter().position(|item| item["id"].as_u64() == Some(id))
                 .ok_or("queue item not found")?;
-            if items[idx]["status"] != "queued" {
+            if items[idx]["status"] != "queued"
+                && !(action == "remove"
+                    && matches!(items[idx]["status"].as_str(), Some("failed" | "blocked")))
+            {
                 return Err("item is not queued");
             }
             if action == "remove" {
@@ -1071,8 +1074,14 @@ impl Ctx {
             "failed" => "failed",
             _ => "blocked",
         };
-        self.set_queue_status(&mut self.load_queue(), id, status);
-        if status != "done" {
+        let mut queue = self.load_queue();
+        if status == "done" {
+            queue["items"].as_array_mut().unwrap()
+                .retain(|item| item["id"].as_u64() != Some(id));
+            self.save_queue(&queue);
+            self.log_event("queue", &format!("goal {id}: done — removed from queue"));
+        } else {
+            self.set_queue_status(&mut queue, id, status);
             self.session.queue_active.store(false, Ordering::SeqCst);
         }
         status == "done" && self.session.queue_active.load(Ordering::SeqCst)
@@ -2599,8 +2608,13 @@ mod tests {
     #[test]
     fn queue_auto_approval_commits_both_goals_and_releases_busy() {
         let test = QueueTest::new(true);
-        test.start();
-        assert_eq!(test.statuses(), ["done", "done"]);
+        assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})),
+            (200, json!({"ok": true})));
+        wait_for_worker(&test.app);
+        let queue: Value = serde_json::from_str(
+            &fs::read_to_string(test.app.forge_path("queue.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(queue["items"], json!([]));
         assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
         assert!(!test.app.session.busy.load(Ordering::SeqCst));
         assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
@@ -2614,6 +2628,8 @@ mod tests {
         for (id, goal) in [(1, "first goal"), (2, "second goal")] {
             let events: Vec<_> = entries.iter().filter(|entry| entry["goal"] == goal).collect();
             assert!(events.iter().any(|entry| entry["text"] == format!("goal {id}: planning")));
+            assert!(events.iter().any(|entry| entry["kind"] == "queue"
+                && entry["text"] == format!("goal {id}: done — removed from queue")));
             for sid in [1, 2] {
                 for prefix in [format!("stage {sid} started:"), format!("stage {sid} committed in ")] {
                     let event = events.iter().find(|entry| entry["text"].as_str().unwrap().starts_with(&prefix))
@@ -2656,6 +2672,10 @@ mod tests {
             item["goal"] = json!(format!("other project goal {}", item["id"]));
         }
         second.app.save_queue(&queue);
+        let goals: Vec<Vec<Value>> = [&first, &second].iter().map(|test| {
+            test.app.load_queue()["items"].as_array().unwrap().iter()
+                .map(|item| item["goal"].clone()).collect()
+        }).collect();
         for test in [&first, &second] {
             test.app.acquire_busy().unwrap();
             test.app.session.queue_active.store(true, Ordering::SeqCst);
@@ -2679,18 +2699,16 @@ mod tests {
                 });
             }
         });
-        for test in [&first, &second] {
-            assert_eq!(test.statuses(), ["done", "done"]);
+        for (test, goals) in [&first, &second].iter().zip(&goals) {
+            assert!(test.statuses().is_empty());
             assert!(!test.app.session.busy.load(Ordering::SeqCst));
             assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
             assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
             assert_eq!(test.app.git(&["rev-list", "--count", "HEAD"]).unwrap(), "5");
             assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap().lines().count(), 4);
-            let goal = test.app.load_queue()["items"][1]["goal"].clone();
-            assert_eq!(test.app.load_plan().unwrap()["goal"], goal);
+            assert_eq!(test.app.load_plan().unwrap()["goal"], goals[1]);
             assert!(test.app.read_history().as_array().unwrap().iter().all(|entry| {
-                test.app.load_queue()["items"].as_array().unwrap().iter()
-                    .any(|item| item["goal"] == entry["goal"])
+                goals.contains(&entry["goal"])
             }));
         }
         assert!(!engine.any_busy());
@@ -2747,6 +2765,41 @@ mod tests {
     }
 
     #[test]
+    fn queue_remove_api_allows_queued_failed_and_blocked_items_only() {
+        let test = QueueTest::new(false);
+        for status in ["queued", "failed", "blocked", "planning", "awaiting_approval", "running"] {
+            let queue = json!({"items": [
+                {"id": 1, "goal": "first goal", "status": status},
+                {"id": 2, "goal": "second goal", "status": "queued"},
+            ]});
+            test.app.save_queue(&queue);
+            let response = api_request(&test.app.app, "POST", "/api/queue/remove", json!({"id": 1}));
+            if matches!(status, "queued" | "failed" | "blocked") {
+                assert_eq!(response, (200, json!({"ok": true})), "{status}");
+                assert_eq!(test.app.load_queue(), json!({"items": [queue["items"][1]]}), "{status}");
+            } else {
+                assert_eq!(response, (400, json!({"error": "item is not queued"})), "{status}");
+                assert_eq!(test.app.load_queue(), queue, "{status}");
+            }
+        }
+    }
+
+    #[test]
+    fn queue_move_api_rejects_all_nonqueued_states() {
+        let test = QueueTest::new(false);
+        for status in ["failed", "blocked", "planning", "awaiting_approval", "running", "done"] {
+            let queue = json!({"items": [
+                {"id": 1, "goal": "first goal", "status": status},
+                {"id": 2, "goal": "second goal", "status": "queued"},
+            ]});
+            test.app.save_queue(&queue);
+            assert_eq!(api_request(&test.app.app, "POST", "/api/queue/move", json!({"id": 1, "dir": "down"})),
+                (400, json!({"error": "item is not queued"})), "{status}");
+            assert_eq!(test.app.load_queue(), queue, "{status}");
+        }
+    }
+
+    #[test]
     fn api_routes_projects_while_another_session_is_busy() {
         let first = QueueTest::new(true);
         let engine = &first.app.app;
@@ -2780,7 +2833,7 @@ mod tests {
         assert_eq!(second.app.load_plan().unwrap()["goal"], "explicit target");
         assert_eq!(post("/api/queue/start", target.clone()), 200);
         wait_for_worker(&second.app);
-        assert_eq!(second.statuses(), ["done", "done"]);
+        assert!(second.statuses().is_empty());
         assert_eq!(first.statuses(), ["queued", "queued"]);
 
         // Decode project paths independently of other query parameters.
@@ -2836,11 +2889,12 @@ mod tests {
             test.app.queue_worker(Some(id));
             assert!(!test.app.session.busy.load(Ordering::SeqCst));
             if id == 1 {
-                assert_eq!(test.statuses(), ["done", "awaiting_approval"]);
+                assert_eq!(test.statuses(), ["awaiting_approval"]);
+                assert_eq!(test.app.load_queue()["items"][0]["id"], 2);
                 assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
             }
         }
-        assert_eq!(test.statuses(), ["done", "done"]);
+        assert!(test.statuses().is_empty());
         assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
     }
 
