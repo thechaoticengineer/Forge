@@ -591,10 +591,14 @@ fn log_project_event(project: &str, kind: &str, text: &str) {
     let dir = PathBuf::from(project).join(FORGE_DIR);
     let _ = fs::create_dir_all(&dir);
     let entry = json!({"t": clock_hms(), "unix": unix_timestamp(), "kind": kind, "text": text});
+    append_history_event(project, &entry, kind, text);
+}
+
+fn append_history_event(project: &str, entry: &Value, kind: &str, text: &str) {
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("history.jsonl"))
+        .open(PathBuf::from(project).join(FORGE_DIR).join("history.jsonl"))
     {
         let _ = writeln!(f, "{entry}");
     }
@@ -628,32 +632,33 @@ impl Ctx {
                 entry["stage"] = json!(stage);
             }
         }
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.forge_path("history.jsonl"))
-        {
-            let _ = writeln!(f, "{entry}");
-        }
-        println!("[{kind}] {text}");
+        append_history_event(self.project(), &entry, kind, text);
     }
 
-    fn read_history(&self) -> Value {
-        let text = fs::read_to_string(self.forge_path("history.jsonl")).unwrap_or_default();
+    fn read_jsonl_tail(&self, name: &str, keep: usize) -> Value {
+        let text = fs::read_to_string(self.forge_path(name)).unwrap_or_default();
         let items: Vec<Value> = text
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
-        let skip = items.len().saturating_sub(400);
+        let skip = items.len().saturating_sub(keep);
         Value::Array(items.into_iter().skip(skip).collect())
     }
 
+    fn read_history(&self) -> Value {
+        self.read_jsonl_tail("history.jsonl", 400)
+    }
+
     fn read_chat(&self) -> Value {
-        let text = fs::read_to_string(self.forge_path("chat.jsonl")).unwrap_or_default();
-        let items: Vec<Value> = text.lines()
-            .filter_map(|line| serde_json::from_str(line).ok()).collect();
-        let skip = items.len().saturating_sub(100);
-        Value::Array(items.into_iter().skip(skip).collect())
+        self.read_jsonl_tail("chat.jsonl", 100)
+    }
+
+    fn save_json(&self, name: &str, value: &Value) {
+        self.ensure_forge_dir();
+        let _ = fs::write(
+            self.forge_path(name),
+            serde_json::to_string_pretty(value).unwrap(),
+        );
     }
 
     fn load_plan(&self) -> Option<Value> {
@@ -664,11 +669,7 @@ impl Ctx {
     }
 
     fn save_plan(&self, plan: &Value) {
-        self.ensure_forge_dir();
-        let _ = fs::write(
-            self.forge_path("plan.json"),
-            serde_json::to_string_pretty(plan).unwrap(),
-        );
+        self.save_json("plan.json", plan);
     }
 
     fn load_queue(&self) -> Value {
@@ -680,11 +681,7 @@ impl Ctx {
     }
 
     fn save_queue(&self, queue: &Value) {
-        self.ensure_forge_dir();
-        let _ = fs::write(
-            self.forge_path("queue.json"),
-            serde_json::to_string_pretty(queue).unwrap(),
-        );
+        self.save_json("queue.json", queue);
     }
 
     fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> i64 {
@@ -840,10 +837,7 @@ impl Ctx {
             s.agent_role = role.to_string();
             s.agent_tool = tool.to_string();
             s.agent_model = model.to_string();
-            s.agent_started_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            s.agent_started_unix = unix_timestamp();
             s.agent_lines = 0;
             s.agent_last_line.clear();
         }
