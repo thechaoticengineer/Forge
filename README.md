@@ -75,6 +75,28 @@ count, plus the number of rounds when there is more than one. Expand a
 stage to see its full per-round review history: approved or rejected,
 the reviewer's summary, and issues, including reviews after fix rounds.
 
+### Updating and troubleshooting
+
+Run `./install.sh` to install the current working tree. The panel's **Update
+Forge** button posts to `/api/self_update`, which runs the same script in a
+transient `forge-update` systemd user unit so it survives the engine restart.
+The script builds the release binary, validates the plugin, installs changed
+plugin files through an atomic staging-directory swap, and restarts
+`forge-engine.service`. Unchanged plugin files stay in place; code changes
+hot-reload in the shell. A new plugin or changed manifest requires a shell
+restart, after a short delay to let hot reload settle.
+
+If an update misbehaves, check the update log, engine log, and shell crashes:
+
+```sh
+journalctl --user -u forge-update
+journalctl --user -u forge-engine
+coredumpctl list /usr/bin/quickshell
+```
+
+The 2026-09-06 crash came from an in-place plugin copy racing a shell restart;
+keep the staged swap and avoid restarting the shell for ordinary code updates.
+
 ### Keyboard
 
 The panel uses vim-inspired normal and insert modes. In normal mode, `i`
