@@ -117,6 +117,60 @@ The JSON API accepts POST requests to `/api/plan/chat` with
 in `.forge/chat.jsonl` and cleared when new plan generation starts (including
 an AI revision) or the plan is reset.
 
+### Token usage and run reports
+
+Forge tracks token usage from each agent invocation when the CLI supplies it.
+Claude Code's `stream-json` `result` event provides input, output, and cache
+counts in `usage`, plus per-model detail in `modelUsage`. Forge folds
+`cache_creation_input_tokens` and `cache_read_input_tokens` into
+`input_tokens`, without storing separate cache counts; `total_tokens` is
+input plus output. It uses `modelUsage` to select the model with the largest
+token count and attributes the entire invocation's total to that model.
+The full per-model breakdown is not retained.
+
+Codex's `tokens used` output supplies only `total_tokens`; its stored input
+and output counts are zero. When usage has no model, Forge uses the configured
+model for the call if known.
+
+Usage is accumulated in `.forge/plan.json`:
+
+- Each stage's `usage` includes implementation, review, fix, and polish
+  calls; the plan's top-level `usage` holds the run's accumulated stage totals.
+- Top-level `planner_usage` records planning usage separately; it is not
+  included in `usage`.
+- Each usage map is keyed by tool (`claude` or `codex`). Each tool entry has
+  `input_tokens`, `output_tokens`, `total_tokens`, `calls`, and `models`
+  (a map from model name to attributed total tokens).
+
+Stage usage is saved after each successful call with nonzero usage and
+retained when resuming a plan. Missing or zero usage does not add a call
+to the totals. Failed agent invocations are not accumulated. Plan Q&A
+calls log reported usage on completion but do not add it to plan totals.
+
+Each completed run appends one JSON object for its goal to
+`.forge/reports.jsonl`, keeping reports available after the current plan is
+replaced. Each line has:
+
+- `unix`: completion time as a Unix timestamp in seconds.
+- `goal`: the plan's goal text.
+- `duration_secs`: elapsed seconds for the finishing run attempt, excluding
+  planning and earlier attempts if the plan was resumed.
+- `stages`: the number of stages in the plan.
+- `commits`: an array of stage commits, each with `sha`, `message` (the
+  stage's `commit` text, or `forge: stage` if `commit` is missing or is not
+  a string), and `title` (the stage title). Stages without a recorded SHA
+  are omitted.
+- `usage` and `planner_usage`: copies of the plan's token totals by tool and
+  model, included when present.
+
+`GET /api/state` returns the last 100 reports for the project under `reports`
+(an empty array when none exist). In the panel, open **History** and select
+**reports** to see completed tasks with their duration, commit count, and
+token totals per tool. Expand a task to see commit SHAs and messages, input/output/total
+counts, call counts, model totals, and separate planner usage. The reports
+filter appears once reports exist. The plan header and expanded stage rows
+also show token summaries when available.
+
 ## Queue
 
 Add multiple goals from the panel's queue section, reorder them, then
@@ -220,6 +274,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
+| `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
 | `e` | Edit plan stages by hand |
 | `a` | Approve draft plan |
