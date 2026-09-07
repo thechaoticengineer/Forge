@@ -514,6 +514,7 @@ impl Ctx {
         let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
             let stderr_reader = scope.spawn(|| {
                 stream_agent_output(stderr, &stderr_log, &self.session.state, 1500, false)
+                    .map(|(tail, _)| tail)
             });
             let stdout_result = stream_agent_output(stdout, &log, &self.session.state, 600, tool == "claude");
             let status_result = child.wait();
@@ -525,7 +526,7 @@ impl Ctx {
         self.clear_agent_activity();
 
         let tail = match stdout_result {
-            Ok(tail) => tail,
+            Ok((tail, _usage)) => tail,
             Err(e) => {
                 self.agent_error(role, format!("{tool} output failed: {e}"));
                 return Err(e);

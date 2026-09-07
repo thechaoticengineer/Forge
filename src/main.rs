@@ -1692,7 +1692,7 @@ mod tests {
             agent_lines: 0,
             agent_last_line: String::new(),
         });
-        let tail = stream_agent_output(input.as_bytes(), &log, &state, 600, claude).unwrap();
+        let (tail, _) = stream_agent_output(input.as_bytes(), &log, &state, 600, claude).unwrap();
         let output = String::from_utf8(log.lock().unwrap().clone()).unwrap();
         (tail, output, state.into_inner().unwrap())
     }
