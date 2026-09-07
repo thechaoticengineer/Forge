@@ -526,6 +526,12 @@ impl Ctx {
                 settings["mock_chat_step"] = json!(state.current_step);
                 settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
             }
+            #[cfg(test)]
+            if role == "fixer" {
+                let mut settings = self.app.settings.lock().unwrap();
+                settings.as_object_mut().unwrap().entry("mock_fixer_prompts")
+                    .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(prompt));
+            }
             self.mock_agent(role)?;
             let usage = self.app.settings.lock().unwrap().get("mock_usage")
                 .filter(|usage| usage.is_object()).map(|usage| AgentUsage {
@@ -978,12 +984,8 @@ impl Ctx {
         let max_rounds = self.app.settings.lock().unwrap()["max_fix_rounds"]
             .as_i64()
             .unwrap_or(3);
-        let apply_review_notes = self.app.settings.lock().unwrap()["apply_review_notes"]
-            .as_bool()
-            .unwrap_or(true);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
         let mut issues: Option<Vec<String>> = None;
-        let mut polished = false;
 
         for round in 0..=max_rounds {
             if self.session.stop_requested.load(Ordering::SeqCst) {
@@ -1040,11 +1042,13 @@ impl Ctx {
             };
             let notes = string_list("notes");
             let checks = string_list("checks");
-            let (mut approved, list) = match &verdict {
+            let (approved, list) = match &verdict {
                 Some(v) => {
-                    let approved = v["approved"].as_bool() == Some(true);
                     let mut list = string_list("issues");
-                    if !approved && list.is_empty() {
+                    // Legacy notes are requested edits too, regardless of the incoming decision.
+                    let approved = v["approved"].as_bool() == Some(true)
+                        && list.is_empty() && notes.is_empty();
+                    if !approved && list.is_empty() && notes.is_empty() {
                         list.push("reviewer rejected without details".into());
                     }
                     (approved, list)
@@ -1055,10 +1059,12 @@ impl Ctx {
                         .into(),
                 ]),
             };
-            if approved && !list.is_empty() {
-                approved = false;
-                self.log_event("review", &format!(
-                    "stage {sid} contradictory verdict: approved with blocking issues; treated as a rejection"));
+            // Preserve the original fields in history; send each request to the fixer once.
+            let mut requests = Vec::new();
+            for request in list.iter().chain(&notes) {
+                if !requests.contains(request) {
+                    requests.push(request.clone());
+                }
             }
             let stage = &mut plan["stages"][idx];
             stage["last_verdict"] = json!({
@@ -1073,19 +1079,7 @@ impl Ctx {
             self.save_plan(plan);
 
             if approved {
-                if apply_review_notes && !notes.is_empty() && !polished && round < max_rounds {
-                    self.log_event("review", &format!(
-                        "stage {sid} approved with {} notes — running polish round", notes.len()));
-                    issues = Some(notes.iter()
-                        .map(|note| format!("non-blocking improvement: {note}")).collect());
-                    polished = true;
-                    continue;
-                }
-                let message = if !notes.is_empty() {
-                    let summary: String = summary.chars().take(300).collect();
-                    let suffix = if summary.is_empty() { String::new() } else { format!(": {summary}") };
-                    format!("stage {sid} approved with {} improvement notes{suffix}", notes.len())
-                } else if summary.is_empty() {
+                let message = if summary.is_empty() {
                     format!("stage {sid} approved by reviewer")
                 } else {
                     let summary: String = summary.chars().take(300).collect();
@@ -1097,10 +1091,10 @@ impl Ctx {
             if verdict.is_none() {
                 self.log_event("error", "reviewer produced no readable verdict; retrying stage");
             } else {
-                let summary: String = list.join("; ").chars().take(1500).collect();
-                self.log_event("review", &format!("stage {sid} rejected: {summary}"));
+                let summary: String = requests.join("; ").chars().take(1500).collect();
+                self.log_event("review", &format!("stage {sid} changes requested: {summary}"));
             }
-            issues = Some(list);
+            issues = Some(requests);
         }
         Ok("exhausted")
     }
