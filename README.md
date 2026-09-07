@@ -478,7 +478,9 @@ Press `?` (`Shift+/`) or `F1` in the panel to open the same reference.
 
 ### Model catalogue and explicit fallback policy
 
-Forge schedules one application-owned model refresh at engine startup. Both
+Forge schedules one application-owned model refresh at engine startup, then
+repeats discovery every `discovery_refresh_minutes` (default 360, range
+5–10080) on an engine-side timer — the panel never polls for this. Both
 providers are probed concurrently; project sessions share that work. Startup,
 project workers and `/api/state` never wait for discovery. The panel shows
 provider status, sanitized refresh/cache errors, configured provenance and
@@ -556,6 +558,56 @@ counts and status rather than the full registry/model arrays. Save the policy
 with `POST /api/settings` and a `model_catalogue` object. Policy changes during
 refresh return 409; invalid changes return 400 without partially updating other
 settings. Scope/bridge changes schedule a refresh automatically.
+
+### Official metadata refresh (bounded research)
+
+A separate metadata service enriches the catalogue with routing-relevant facts
+from official documents only. It is a small deterministic HTTP path, not a
+research agent, and never issues generation requests or paid model calls.
+Runtime discovery (evidence), configured policy (user intent) and official
+metadata (facts) stay separate: official pages never grant runtime
+availability, and cache-only or failed research never prevents explicitly
+configured tiers from routing.
+
+Sources are limited to an enforceable HTTPS allowlist —
+`developers.openai.com`, `platform.openai.com`, `learn.chatgpt.com`,
+`code.claude.com` and `platform.claude.com` — with every redirect hop
+revalidated; off-allowlist URLs, ports, credentials and non-HTTPS schemes are
+rejected. Two documented source adapters are fetched, one index document per
+provider (`developers.openai.com/codex/models.json` and
+`platform.claude.com/docs/models.json`), expected to contain
+`{"models":[{"id", "context_window", "max_output_tokens", "reasoning",
+"lifecycle", "pricing"}]}`. Document content is data, never instructions.
+Unsupported documents and models absent from their source get negative-cache
+entries with exponential backoff (1 h doubling, capped at 24 h) instead of
+arbitrary browsing or fabricated facts. Fields a source does not provide are
+recorded as explicitly unknown — including quality comparisons, which are
+never inferred; configured tiers and relative preferences still route.
+
+Research is selective: only new, retargeted or materially changed models
+(tracked by a discovery fingerprint), newly missing routing fields, or records
+past `metadata_ttl_hours` (default 168, range 1–8760) trigger requests, and a
+fresh unchanged startup makes none. Identical source requests are coalesced,
+conditional revalidation (`ETag`/`Last-Modified`) is used where available, and
+transfers are bounded (2 MiB, timeouts, one retry). The engine refreshes
+metadata every `metadata_refresh_minutes` (default 1440, range 15–10080);
+`metadata_research: false` keeps the store cache-only. Refresh never alters
+in-flight model selections, and a `304 Not Modified` bumps only the
+verification time — timestamp changes are never treated as material.
+
+Each record stores its source URL, verification time, content fingerprint,
+provenance (`official`) and explicit unknowns; last-known-good records survive
+fetch failures and are kept for audit (flagged `removed`) when discovery drops
+a model. Unknown costs stay null. A reported rate is stored only complete —
+currency, unit, billing basis, source date and the explicit `api_list_rate`
+label — and is never turned into an inferred CLI subscription charge;
+`relative_cost_preference` is user policy, not a measured rate. When official
+metadata contradicts discovery (e.g. reasoning support), the conflict is
+surfaced and discovered native support wins. The store lives beside the
+discovery cache at `$XDG_CACHE_HOME/forge/models/v1/metadata.json`. Freshness,
+provenance, unknown pricing, negative-cache and retry/error details appear in
+the panel's catalogue view and under `metadata` in `GET /api/models` and
+`/api/state`; `POST /api/models/metadata/refresh` starts a pass manually.
 
 Availability caches use atomic, versioned JSON under
 `$XDG_CACHE_HOME/forge/models/v1/` (default `~/.cache/forge/models/v1/`). Partitions

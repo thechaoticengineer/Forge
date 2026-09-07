@@ -10,6 +10,7 @@
 
 mod catalogue;
 mod catalogue_process;
+mod metadata;
 mod agent;
 mod architecture;
 mod review_history;
@@ -50,6 +51,16 @@ fn main() {
     *app.model_policy_error.lock().unwrap() = loaded.err();
     let app = Arc::new(app);
     app.refresh_catalogue();
+    {
+        // Engine-side periodic discovery/metadata refresh; no panel polling.
+        let app = Arc::clone(&app);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                app.scheduler_tick(crate::util::unix_timestamp());
+            }
+        });
+    }
     let port: u16 = std::env::var("FORGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1680,6 +1691,65 @@ mod tests {
         app.catalogue.observe(&Policy::from_settings(&app.settings.lock().unwrap()).unwrap(),Provider::Codex,"exact-id",Err(Failure::new(FailureKind::Auth)));
         let (_,option)=api_request(&app,"GET","/api/models?provider=codex&model=exact-id",json!({}));
         assert_eq!(option["availability"],"unavailable"); assert_eq!(option["eligible"],false);
+    }
+
+    #[test]
+    fn metadata_api_reports_freshness_and_never_blocks_configured_routing() {
+        use crate::catalogue::{Catalogue, Discovery, Policy, Probe, Provider, Failure, FailureKind};
+        use crate::catalogue_process::Budget;
+        use crate::metadata::{Clock, Fetch, FetchRequest, FetchResponse, Service};
+        struct Offline;
+        impl Fetch for Offline {
+            fn fetch(&self, _: &FetchRequest) -> Result<FetchResponse, String> { Err("offline".into()) }
+        }
+        struct FixedClock;
+        impl Clock for FixedClock {
+            fn now_unix(&self) -> i64 { 1_000 }
+        }
+        struct NoDiscovery;
+        impl Discovery for NoDiscovery {
+            fn probe(&self, _: Provider, _: &Policy, _: Budget) -> Probe {
+                Probe { cli_version: None, result: Err(Failure::new(FailureKind::Unsupported)) }
+            }
+        }
+        let test = QueueTest::new(false);
+        let mut app = App::new(test.app.project(), default_settings());
+        app.catalogue = Catalogue::new(Arc::new(NoDiscovery), test.path.join("cache"), Duration::from_secs(2));
+        app.metadata = Service::new(Arc::new(Offline), Arc::new(FixedClock), test.path.join("metadata.json"));
+        let app = Arc::new(app);
+        let mut policy = json!(Policy::default());
+        policy["policy_revision"] = json!("2");
+        policy["entries"] = json!([{"provider":"codex","model":"exact-id","tier":"strong","relative_cost_preference":1}]);
+        assert_eq!(api_request(&app, "POST", "/api/settings", json!({"model_catalogue": policy})).0, 200);
+        // A configured-only model triggers research; the offline source fails
+        // into backoff state without blocking anything.
+        assert_eq!(api_request(&app, "POST", "/api/models/metadata/refresh", json!({})).1["started"], true);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.metadata.running() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (_, state) = api_request(&app, "GET", "/api/state", json!({}));
+        let meta = &state["model_catalogue"]["metadata"];
+        assert_eq!(meta["records"], 0);
+        assert_eq!(meta["source_errors"], 1);
+        assert_eq!(meta["last_requests"], 1);
+        assert_eq!(meta["provenance"], "official");
+        let (_, details) = api_request(&app, "GET", "/api/models", json!({}));
+        assert_eq!(details["metadata"]["sources"][0]["error"], "offline");
+        assert!(details["metadata"]["sources"][0]["next_attempt_unix"].as_i64().unwrap() > 1_000);
+        // Deferred/failed research never prevents configured tiers from
+        // routing, and configured cost preference is never shown as a price.
+        assert_eq!(details["options"][0]["eligible"], true);
+        assert_eq!(details["options"][0]["availability"], "configured_unverified");
+        assert!(details["options"][0]["pricing"].is_null());
+        // Research off means cache-only; routing is still unaffected.
+        policy["policy_revision"] = json!("3");
+        policy["metadata_research"] = json!(false);
+        assert_eq!(api_request(&app, "POST", "/api/settings", json!({"model_catalogue": policy})).0, 200);
+        assert_eq!(api_request(&app, "POST", "/api/models/metadata/refresh", json!({})).1["started"], false);
+        let (_, details) = api_request(&app, "GET", "/api/models", json!({}));
+        assert_eq!(details["options"][0]["eligible"], true);
     }
 
     fn wait_for_worker(ctx: &Ctx) {

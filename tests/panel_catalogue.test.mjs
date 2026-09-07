@@ -24,6 +24,34 @@ test('configured options disclose unverified availability, revision and errors',
   assert.doesNotMatch(text,/\$/);
 });
 
+test('metadata rows show provenance, freshness, labelled API rates and unknown pricing', () => {
+  const priced = context.catalogueMetadataText({provider:'codex',model:'m',provenance:'official',verified_unix:1788220800,
+    pricing:{label:'api_list_rate',input:1.25,output:10,currency:'USD',unit:'per_million_tokens',basis:'api_list_rate',as_of:'2026-09-01'},
+    conflicts:[{field:'supports_reasoning'}]});
+  assert.match(priced,/official/); assert.match(priced,/verified 2026-09-01/);
+  assert.match(priced,/api_list_rate 1\.25\/10 USD per_million_tokens/);
+  assert.match(priced,/basis api_list_rate/); assert.match(priced,/as of 2026-09-01/);
+  assert.match(priced,/discovered native support wins/);
+  assert.doesNotMatch(priced,/subscription/);
+  const unknown = context.catalogueMetadataText({provider:'claude',model:'n',provenance:'official',
+    verified_unix:1788220800,pricing:null,removed:true,conflicts:[]});
+  assert.match(unknown,/pricing unknown/); assert.match(unknown,/removed \(retained for audit\)/);
+  assert.doesNotMatch(unknown,/\$/);
+});
+test('metadata summary and sources surface retry/error state and quiet freshness', () => {
+  assert.equal(context.catalogueMetadataSummaryText(null),'Official metadata pending');
+  const quiet = context.catalogueMetadataSummaryText({records:2,unknown_pricing:1,negative:0,
+    source_errors:0,refreshing:false,last_refresh_unix:1788220800,last_requests:0});
+  assert.match(quiet,/2 records/); assert.match(quiet,/1 unknown pricing/); assert.match(quiet,/0 requests/);
+  const bad = context.catalogueMetadataSummaryText({records:2,unknown_pricing:2,negative:1,
+    source_errors:1,refreshing:false,last_refresh_unix:1788220800,last_requests:1,store_error:'metadata store is corrupt'});
+  assert.match(bad,/1 source errors/); assert.match(bad,/metadata store is corrupt/);
+  const source = context.catalogueMetadataSourceText({url:'https://developers.openai.com/codex/models.json',
+    error:'http status 503',failures:2,next_attempt_unix:1788220800});
+  assert.match(source,/error: http status 503/); assert.match(source,/failures 2/); assert.match(source,/next attempt 2026-09-01/);
+  assert.match(context.catalogueMetadataSourceText({url:'u',checked_unix:1788220800}),/ok · checked 2026-09-01/);
+});
+
 test('model settings load full policy and submit JSON; invalid edits stay local', () => {
   const policy = {policy_revision:'2',entries:[{provider:'codex',model:'test-model',tier:'basic',relative_cost_preference:1}]};
   const calls = [];

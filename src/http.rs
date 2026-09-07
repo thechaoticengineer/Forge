@@ -94,6 +94,8 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Post, "/api/models/cancel") => {
             app.catalogue.cancel(); (202, json!({"ok":true}))
         },
+        (tiny_http::Method::Post, "/api/models/metadata/refresh") =>
+            (202, json!({"ok":true,"started":app.refresh_metadata()})),
         (tiny_http::Method::Get, "/api/state") => api_state(app, &ctx, &active_project),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(&ctx, query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(&ctx),
@@ -145,6 +147,7 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     if let Ok(policy) = crate::catalogue::Policy::from_settings(&snap["settings"]) {
         snap["model_catalogue"] = app.catalogue.summary(&policy);
         snap["model_catalogue"]["policy_error"] = json!(*app.model_policy_error.lock().unwrap());
+        snap["model_catalogue"]["metadata"] = app.metadata.summary();
         // Full registry options belong to the read-only details endpoint.
         snap["settings"]["model_catalogue"]["entries"] = json!([]);
     }
@@ -271,6 +274,9 @@ fn api_models(app: &App, query: &str) -> (u32, Value) {
         } else {
             let mut details = app.catalogue.details(&policy);
             details["policy"] = json!(policy);
+            details["metadata"] = app
+                .metadata
+                .details(&app.catalogue.metadata_snapshot(&policy));
             Ok(details)
         }
     })();

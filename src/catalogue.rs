@@ -68,6 +68,29 @@ pub(crate) struct Policy {
     pub claude_scope: String,
     pub claude_bridge: String,
     pub entries: Vec<Entry>,
+    /// Periodic application refresh intervals and the official-metadata TTL.
+    /// `metadata_research: false` keeps the service cache-only; configured
+    /// tiers route either way.
+    #[serde(default = "default_discovery_minutes")]
+    pub discovery_refresh_minutes: u64,
+    #[serde(default = "default_metadata_minutes")]
+    pub metadata_refresh_minutes: u64,
+    #[serde(default = "default_metadata_ttl_hours")]
+    pub metadata_ttl_hours: u64,
+    #[serde(default = "default_metadata_research")]
+    pub metadata_research: bool,
+}
+fn default_discovery_minutes() -> u64 {
+    360
+}
+fn default_metadata_minutes() -> u64 {
+    1440
+}
+fn default_metadata_ttl_hours() -> u64 {
+    168
+}
+fn default_metadata_research() -> bool {
+    true
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -77,10 +100,14 @@ impl Default for Policy {
             claude_scope: "default".into(),
             claude_bridge: String::new(),
             entries: vec![],
+            discovery_refresh_minutes: default_discovery_minutes(),
+            metadata_refresh_minutes: default_metadata_minutes(),
+            metadata_ttl_hours: default_metadata_ttl_hours(),
+            metadata_research: default_metadata_research(),
         }
     }
 }
-fn identifier(s: &str) -> bool {
+pub(crate) fn identifier(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 200
         && s.chars()
@@ -107,6 +134,15 @@ impl Policy {
         }
         if p.entries.len() > 64 {
             return Err("model registry is limited to 64 entries".into());
+        }
+        if !(5..=10080).contains(&p.discovery_refresh_minutes)
+            || !(15..=10080).contains(&p.metadata_refresh_minutes)
+            || !(1..=8760).contains(&p.metadata_ttl_hours)
+        {
+            return Err(
+                "refresh intervals out of range (discovery 5-10080m, metadata 15-10080m, ttl 1-8760h)"
+                    .into(),
+            );
         }
         let mut keys = BTreeSet::new();
         for e in &p.entries {
@@ -227,7 +263,7 @@ fn strings(v: &Value) -> Option<Vec<String>> {
     v.as_array()
         .map(|a| a.iter().take(64).filter_map(text).collect())
 }
-fn normalize(provider: Provider, rows: &Value) -> Result<Vec<Model>, Failure> {
+pub(crate) fn normalize(provider: Provider, rows: &Value) -> Result<Vec<Model>, Failure> {
     let rows = rows
         .as_array()
         .filter(|a| a.len() <= MAX_MODELS)
@@ -965,6 +1001,60 @@ impl Catalogue {
             _ => {}
         }
     }
+    /// Discovery evidence for metadata research: canonical model IDs with a
+    /// fingerprint that changes on retargeting or material capability changes,
+    /// plus native reasoning support so discovered facts can win conflicts.
+    /// Configured-only entries are included so cache-only research still
+    /// covers explicitly configured tiers.
+    pub fn metadata_snapshot(&self, policy: &Policy) -> Vec<crate::metadata::Snapshot> {
+        let state = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        let mut known: BTreeSet<(Provider, String)> = BTreeSet::new();
+        for (provider, s) in &state.providers {
+            if s.scope != scope(*provider, policy) {
+                continue;
+            }
+            for m in &s.models {
+                let canonical = m.resolved_id.clone().unwrap_or_else(|| m.id.clone());
+                for id in std::iter::once(&m.id)
+                    .chain(m.aliases.iter())
+                    .chain(m.resolved_id.iter())
+                {
+                    known.insert((*provider, id.clone()));
+                }
+                if out.iter().any(|s: &crate::metadata::Snapshot| {
+                    s.provider == *provider && s.model == canonical
+                }) {
+                    continue;
+                }
+                let mut material = format!(
+                    "{}|{:?}|{:?}|{:?}|{:?}",
+                    m.id, m.resolved_id, m.aliases, m.supported_efforts, m.default_effort
+                );
+                for (k, v) in &m.capabilities {
+                    material.push_str(&format!("|{k}={v}"));
+                }
+                out.push(crate::metadata::Snapshot {
+                    provider: *provider,
+                    model: canonical,
+                    discovery_fingerprint: crate::metadata::fingerprint(material.as_bytes()),
+                    discovered_reasoning: m.supported_efforts.as_ref().map(|e| !e.is_empty()),
+                });
+            }
+        }
+        for e in &policy.entries {
+            if !known.contains(&(e.provider, e.model.clone())) {
+                out.push(crate::metadata::Snapshot {
+                    provider: e.provider,
+                    model: e.model.clone(),
+                    discovery_fingerprint: "configured-only".into(),
+                    discovered_reasoning: None,
+                });
+                known.insert((e.provider, e.model.clone()));
+            }
+        }
+        out
+    }
     pub fn select(&self, policy: &Policy, provider: Provider, model: &str, effort: &str) -> Value {
         let state = self.state.lock().unwrap();
         let entry = policy
@@ -1138,7 +1228,7 @@ pub(crate) fn save_policy(path: &Path, policy: &Policy) -> Result<(), String> {
 fn write_cache(path: &Path, cache: &Cache) -> Result<(), String> {
     write_atomic_json(path, &json!(cache))
 }
-fn write_atomic_json(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_atomic_json(path: &Path, value: &Value) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap();

@@ -151,6 +151,43 @@ Item {
       + " · configured revision " + option.policy_revision
       + (option.error ? " · " + option.error : "")
   }
+  function catalogueStamp(unix) {
+    return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z"
+  }
+  // Official metadata is descriptive only: freshness/provenance for routing
+  // context. Pricing appears only as a labelled API list rate, never as an
+  // inferred subscription charge or a configured preference.
+  function catalogueMetadataText(record) {
+    const pricing = record.pricing
+      ? record.pricing.label + " " + record.pricing.input + "/" + record.pricing.output
+        + " " + record.pricing.currency + " " + record.pricing.unit
+        + " · basis " + record.pricing.basis + " · as of " + record.pricing.as_of
+      : "pricing unknown"
+    return record.provider + "/" + record.model + " · " + record.provenance
+      + " · verified " + catalogueStamp(record.verified_unix)
+      + (record.removed ? " · removed (retained for audit)" : "")
+      + (record.conflicts && record.conflicts.length
+        ? " · conflict: discovered native support wins" : "")
+      + " · " + pricing
+  }
+  function catalogueMetadataSourceText(source) {
+    return source.url + (source.error
+      ? " · error: " + source.error + " · failures " + source.failures
+        + " · next attempt " + catalogueStamp(source.next_attempt_unix)
+      : source.checked_unix ? " · ok · checked " + catalogueStamp(source.checked_unix) : "")
+  }
+  function catalogueMetadataSummaryText(meta) {
+    if (!meta) return "Official metadata pending"
+    return "Official metadata: " + meta.records + " records · "
+      + meta.unknown_pricing + " unknown pricing · " + meta.negative + " negative-cached"
+      + (meta.source_errors ? " · " + meta.source_errors + " source errors" : "")
+      + (meta.refreshing ? " · refreshing…"
+        : meta.last_refresh_unix
+          ? " · checked " + catalogueStamp(meta.last_refresh_unix)
+            + " (" + meta.last_requests + " requests)"
+          : " · no research yet")
+      + (meta.store_error ? " · " + meta.store_error : "")
+  }
 
   function openCatalogue() {
     api("GET", "/api/models", null, function(resp, status) {
@@ -1319,6 +1356,17 @@ Item {
               font.pixelSize: root.fs(11)
             }
           }
+          Text {
+            width: parent.width
+            visible: !!root.catalogue
+            text: root.catalogueMetadataSummaryText(root.catalogue ? root.catalogue.metadata : null)
+            color: root.catalogue && root.catalogue.metadata
+              && (root.catalogue.metadata.source_errors || root.catalogue.metadata.store_error)
+              ? root.urgent : root.mutedForeground
+            wrapMode: Text.Wrap
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(11)
+          }
 
         }
 
@@ -2472,7 +2520,7 @@ Item {
                 spacing: Style.space(6)
                 Text {
                   width: parent.width
-                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Use provider_default when effort support is unknown."
+                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Use provider_default when effort support is unknown. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
                   wrapMode: Text.Wrap
                   color: root.mutedForeground
                   font.family: root.fontFamily
@@ -2519,6 +2567,63 @@ Item {
                     color: modelData.eligible ? root.foreground : root.urgent
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
+                  }
+                }
+                Row {
+                  spacing: Style.space(8)
+                  PanelButton {
+                    label: "Refresh official metadata"
+                    enabled: root.engineOnline
+                    onClicked: root.act("/api/models/metadata/refresh", {})
+                  }
+                }
+                Text {
+                  width: parent.width
+                  visible: !!root.catalogueDetails && !!root.catalogueDetails.metadata
+                  text: "Official metadata (allowlisted sources only; never grants availability):"
+                  wrapMode: Text.Wrap
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Repeater {
+                  model: root.catalogueDetails && root.catalogueDetails.metadata
+                    ? root.catalogueDetails.metadata.records : []
+                  delegate: Text {
+                    required property var modelData
+                    width: parent.width
+                    text: root.catalogueMetadataText(modelData)
+                    wrapMode: Text.Wrap
+                    color: modelData.removed ? root.mutedForeground : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                }
+                Repeater {
+                  model: root.catalogueDetails && root.catalogueDetails.metadata
+                    ? root.catalogueDetails.metadata.sources : []
+                  delegate: Text {
+                    required property var modelData
+                    width: parent.width
+                    text: root.catalogueMetadataSourceText(modelData)
+                    wrapMode: Text.Wrap
+                    color: modelData.error ? root.urgent : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(10)
+                  }
+                }
+                Repeater {
+                  model: root.catalogueDetails && root.catalogueDetails.metadata
+                    ? root.catalogueDetails.metadata.negative : []
+                  delegate: Text {
+                    required property var modelData
+                    width: parent.width
+                    text: modelData.provider + "/" + modelData.model + " · not in official source · attempts "
+                      + modelData.attempts + " · retry after " + root.catalogueStamp(modelData.next_attempt_unix)
+                    wrapMode: Text.Wrap
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(10)
                   }
                 }
                 Text {

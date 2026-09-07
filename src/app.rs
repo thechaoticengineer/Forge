@@ -20,6 +20,8 @@ pub(crate) enum PlanMode {
 
 pub(crate) struct App {
     pub(crate) catalogue: crate::catalogue::Catalogue,
+    pub(crate) metadata: crate::metadata::Service,
+    pub(crate) scheduler: crate::metadata::Scheduler,
     pub(crate) model_policy_path: Option<PathBuf>,
     pub(crate) model_policy_error: Mutex<Option<String>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -81,6 +83,8 @@ impl App {
     pub(crate) fn new(project: &str, settings: Value) -> Self {
         let app = Self {
             catalogue: crate::catalogue::Catalogue::default(),
+            metadata: crate::metadata::Service::default(),
+            scheduler: crate::metadata::Scheduler::new(unix_timestamp()),
             model_policy_path: None,
             model_policy_error: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
@@ -96,6 +100,41 @@ impl App {
         let settings = self.settings.lock().unwrap();
         let policy = crate::catalogue::Policy::from_settings(&settings);
         policy.is_ok_and(|policy| self.catalogue.refresh(policy))
+    }
+
+    pub(crate) fn refresh_metadata(&self) -> bool {
+        let policy = {
+            let settings = self.settings.lock().unwrap();
+            crate::catalogue::Policy::from_settings(&settings)
+        };
+        let Ok(policy) = policy else { return false };
+        if !policy.metadata_research {
+            return false;
+        }
+        let snapshots = self.catalogue.metadata_snapshot(&policy);
+        self.metadata.refresh(&policy, snapshots)
+    }
+
+    /// Application-owned periodic refresh; the panel never polls for this.
+    /// Metadata waits for discovery so it works from current snapshots.
+    pub(crate) fn scheduler_tick(&self, now: i64) {
+        let policy = {
+            let settings = self.settings.lock().unwrap();
+            crate::catalogue::Policy::from_settings(&settings)
+        };
+        let Ok(policy) = policy else { return };
+        let (discovery, metadata) = self.scheduler.due(now, &policy);
+        if discovery {
+            self.scheduler.mark_discovery(now);
+            self.catalogue.refresh(policy.clone());
+        }
+        if metadata && !self.catalogue.running() && !self.metadata.running() {
+            self.scheduler.mark_metadata(now);
+            if policy.metadata_research {
+                let snapshots = self.catalogue.metadata_snapshot(&policy);
+                self.metadata.refresh(&policy, snapshots);
+            }
+        }
     }
 
     pub(crate) fn session(&self, project: &str) -> Arc<Session> {
