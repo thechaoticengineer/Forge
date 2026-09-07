@@ -99,6 +99,12 @@ Item {
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
   readonly property bool hasQueuedGoals: queue.some(function(item) { return item.status === "queued" })
   readonly property string phase: engineState ? engineState.phase : "offline"
+  readonly property string currentActivity: {
+    const stage = plan && plan.stages ? plan.stages.find(function(stage) {
+      return engineState && stage.id === engineState.current_stage
+    }) : null
+    return stage ? stageActivity(stage) : ""
+  }
   // Only the displayed project's work gates its controls, never background sessions.
   readonly property bool busy: phase === "planning" || phase === "running"
     || (engineState !== null && engineState.busy === true)
@@ -497,6 +503,62 @@ Item {
 
   function reportKey(report, index) {
     return JSON.stringify([report.unix, report.goal, index])
+  }
+
+  function reviewStrings(values) {
+    const strings = []
+    // Nested ListView data may be a QML sequence rather than a JS Array.
+    if (values && typeof values !== "string" && typeof values.length === "number") {
+      for (let i = 0; i < values.length; i++) {
+        if (typeof values[i] === "string") strings.push(values[i])
+      }
+    }
+    return strings
+  }
+
+  function stageReviews(stage) {
+    const entries = []
+    const saved = stage.reviews || []
+    for (let i = 0; i < saved.length; i++) {
+      if (saved[i] && typeof saved[i] === "object")
+        entries.push({ verdict: saved[i], round: saved[i].round })
+    }
+    if (entries.length === 0 && stage.last_verdict) {
+      // A live round describes current work, not the older fallback verdict.
+      // Wrap records for display only; never fill in or rewrite saved history.
+      entries.push({ verdict: stage.last_verdict, round: stage.last_verdict.round
+        || (stage.status !== "in_progress" ? stage.rounds : null) })
+    }
+    return entries
+  }
+
+  function reviewDecision(verdict) {
+    const requests = reviewStrings(verdict.issues).concat(reviewStrings(verdict.notes))
+      .filter(function(request, index, all) { return all.indexOf(request) === index })
+    const clean = verdict.approved === true && requests.length === 0
+    const label = clean ? "approved"
+      : verdict.approved === true ? "legacy approval with change requests" : "changes requested"
+    return { clean: clean, label: label + (clean ? "" : " · " + requests.length
+      + (requests.length === 1 ? " request" : " requests")) }
+  }
+
+  function reviewRoundLabel(entry) {
+    const round = nonNegativeInt(entry.round)
+    return round !== null && round > 0 ? "round " + round : "round unknown"
+  }
+
+  function reviewTimestamp(verdict) {
+    const unix = nonNegativeInt(verdict.unix)
+    return unix === null ? "" : new Date(unix * 1000).toISOString()
+  }
+
+  function stageActivity(stage) {
+    if (!engineState || !busy || stage.status !== "in_progress"
+        || stage.id !== engineState.current_stage) return ""
+    const step = engineState.current_step || ""
+    if (!step) return ""
+    const activity = step.indexOf("fixing") === 0 ? "fixing for review" : step
+    return "now: " + activity + " · " + reviewRoundLabel({ round: stage.rounds })
   }
 
   function reportTime(report, now) {
@@ -912,7 +974,7 @@ Item {
             elide: Text.ElideRight
             text: root.engineState && root.engineState.current_stage !== null
               ? "stage " + root.engineState.current_stage + ": "
-                + root.engineState.current_step
+                + (root.currentActivity || root.engineState.current_step)
               : (root.engineState ? root.engineState.current_step : "")
             color: root.mutedForeground
             font.family: root.fontFamily
@@ -984,7 +1046,7 @@ Item {
                 id: workingStep
                 visible: root.phase !== "planning" && text !== ""
                 width: Math.min(implicitWidth, parent.width * 0.4)
-                text: root.engineState ? root.engineState.current_step : ""
+                text: root.currentActivity || (root.engineState ? root.engineState.current_step : "")
                 textFormat: Text.PlainText
                 color: root.working
                 elide: Text.ElideRight
@@ -1624,13 +1686,12 @@ Item {
                 ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
                 : typeof modelData.duration_secs === "number"
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
-              readonly property var reviewerIssues: modelData.last_verdict
-                && modelData.last_verdict.issues ? modelData.last_verdict.issues : []
-              readonly property var reviewerNotes: modelData.last_verdict
-                && modelData.last_verdict.notes ? modelData.last_verdict.notes : []
-              readonly property var reviewHistory: modelData.reviews || []
+              readonly property var reviewHistory: root.stageReviews(modelData)
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
+              readonly property var lastDecision: lastReview
+                ? root.reviewDecision(lastReview.verdict) : null
+              readonly property string activity: root.stageActivity(modelData)
               width: stageList.width
               height: editable ? stageEditor.height : stageContent.implicitHeight
               radius: 3
@@ -1680,10 +1741,9 @@ Item {
                   Text {
                     width: Math.min(implicitWidth, stageRow.width)
                     text: root.editingPlan && stageRow.modelData.status === "committed"
-                      ? "committed — locked" : stageRow.modelData.status
+                      ? "committed — locked" : stageRow.modelData.status === "blocked"
+                      ? "blocked · review budget exhausted" : stageRow.modelData.status
                       + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
-                      + (stageRow.modelData.rounds > 1
-                         ? " (round " + stageRow.modelData.rounds + ")" : "")
                     color: stageRow.modelData.status === "committed" ? root.success
                       : stageRow.modelData.status === "in_progress" ? root.working
                       : stageRow.modelData.status === "blocked" ? root.urgent
@@ -1693,31 +1753,26 @@ Item {
                     font.pixelSize: root.fs(11)
                   }
                   Text {
-                    visible: stageRow.reviewHistory.length > 0
+                    visible: text !== ""
                     width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.lastReview
-                      ? "review: " + (stageRow.lastReview.approved ? "approved"
-                        + (stageRow.reviewerNotes.length > 0
-                          ? " · " + stageRow.reviewerNotes.length + " notes" : "")
-                        : (stageRow.lastReview.issues || []).length + " issue(s)")
-                        + (stageRow.reviewHistory.length > 1
-                          ? " · " + stageRow.reviewHistory.length + " rounds" : "")
-                      : ""
+                    text: stageRow.activity
                     textFormat: Text.PlainText
-                    color: stageRow.lastReview && stageRow.lastReview.approved
-                      ? root.success : root.urgent
+                    color: root.working
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
+                    font.bold: true
                   }
                   Text {
-                    visible: text !== ""
+                    visible: stageRow.reviewHistory.length > 0
                     width: Math.min(implicitWidth, stageRow.width)
-                    text: root.engineState
-                      && stageRow.modelData.id === root.engineState.current_stage
-                      ? root.engineState.current_step || "" : ""
+                    text: stageRow.lastReview
+                      ? "last completed review · " + root.reviewRoundLabel(stageRow.lastReview)
+                        + ": " + stageRow.lastDecision.label
+                      : ""
                     textFormat: Text.PlainText
-                    color: root.working
+                    color: stageRow.lastDecision && stageRow.lastDecision.clean
+                      ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
@@ -1774,15 +1829,20 @@ Item {
                   delegate: Column {
                     id: reviewRound
                     required property var modelData
+                    readonly property var verdict: modelData.verdict
+                    readonly property var decision: root.reviewDecision(verdict)
+                    readonly property var issues: root.reviewStrings(verdict.issues)
+                    readonly property var notes: root.reviewStrings(verdict.notes)
+                    readonly property var checks: root.reviewStrings(verdict.checks)
                     visible: stageRow.expanded
                     width: stageRow.width
                     spacing: 2
                     Text {
                       width: stageRow.width
-                      text: "review round " + reviewRound.modelData.round + " — "
-                        + (reviewRound.modelData.approved ? "approved" : "rejected")
+                      text: "review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
+                        + reviewRound.decision.label
                       textFormat: Text.PlainText
-                      color: reviewRound.modelData.approved ? root.success : root.urgent
+                      color: reviewRound.decision.clean ? root.success : root.urgent
                       wrapMode: Text.Wrap
                       font.family: root.fontFamily
                       font.pixelSize: root.fs(11)
@@ -1790,7 +1850,7 @@ Item {
                     Text {
                       visible: text !== ""
                       width: stageRow.width
-                      text: reviewRound.modelData.summary || ""
+                      text: root.reviewTimestamp(reviewRound.verdict)
                       textFormat: Text.PlainText
                       color: root.mutedForeground
                       wrapMode: Text.Wrap
@@ -1798,9 +1858,19 @@ Item {
                       font.pixelSize: root.fs(11)
                     }
                     Text {
-                      visible: (reviewRound.modelData.issues || []).length > 0
+                      visible: text !== ""
                       width: stageRow.width
-                      text: "• " + (reviewRound.modelData.issues || []).join("\n• ")
+                      text: reviewRound.verdict.summary || ""
+                      textFormat: Text.PlainText
+                      color: root.mutedForeground
+                      wrapMode: Text.Wrap
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                    }
+                    Text {
+                      visible: reviewRound.issues.length > 0
+                      width: stageRow.width
+                      text: "change requests:\n• " + reviewRound.issues.join("\n• ")
                       textFormat: Text.PlainText
                       color: root.urgent
                       wrapMode: Text.Wrap
@@ -1808,9 +1878,9 @@ Item {
                       font.pixelSize: root.fs(11)
                     }
                     Text {
-                      visible: (reviewRound.modelData.notes || []).length > 0
+                      visible: reviewRound.notes.length > 0
                       width: stageRow.width
-                      text: "notes:\n• " + (reviewRound.modelData.notes || []).join("\n• ")
+                      text: "legacy notes (change requests):\n• " + reviewRound.notes.join("\n• ")
                       textFormat: Text.PlainText
                       color: root.mutedForeground
                       wrapMode: Text.Wrap
@@ -1818,9 +1888,9 @@ Item {
                       font.pixelSize: root.fs(11)
                     }
                     Text {
-                      visible: (reviewRound.modelData.checks || []).length > 0
+                      visible: reviewRound.checks.length > 0
                       width: stageRow.width
-                      text: "verified: " + (reviewRound.modelData.checks || []).join("; ")
+                      text: "verified: " + reviewRound.checks.join("; ")
                       textFormat: Text.PlainText
                       color: root.mutedForeground
                       wrapMode: Text.Wrap
@@ -1828,17 +1898,6 @@ Item {
                       font.pixelSize: root.fs(11)
                     }
                   }
-                }
-                Text {
-                  visible: stageRow.expanded && stageRow.reviewHistory.length === 0
-                    && stageRow.reviewerIssues.length > 0
-                  width: stageRow.width
-                  text: "reviewer issues:\n• " + stageRow.reviewerIssues.join("\n• ")
-                  textFormat: Text.PlainText
-                  color: root.urgent
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
                 }
                 Text {
                   visible: stageRow.expanded && text !== ""

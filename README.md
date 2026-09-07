@@ -16,11 +16,13 @@ Rust engine + Quickshell (Omarchy) panel.
    - the **implementer** (one tool) implements the stage,
    - an independent, adversarial **reviewer** (the other tool, always a fresh session)
      reviews the uncommitted diff and writes `.forge/verdict.json`,
-   - rejections loop back to the implementer with the reviewer's issues,
-     up to a bounded number of fix rounds,
-   - approval with improvement notes can trigger one **polish round** and
-     another review before committing,
-   - an approved stage is committed with the proposed message.
+   - **changes requested** loop back to the implementer with all requested
+     edits, up to a bounded number of fix rounds,
+   - every fix gets another independent review in a fresh session, with the
+     previous findings supplied for verification,
+   - a **clean approval** ends the loop and the stage is committed with the
+     proposed message; remaining requests after the budget is exhausted block
+     the stage.
 5. After the last stage, Forge pushes to `origin`.
 
 The reviewer starts by assuming there is a defect and actively looking for
@@ -29,35 +31,49 @@ acceptance criterion individually and independently run the project's
 available build and tests. It must record the evidence and results, including
 exact commands; if a build or test is unavailable, it must explain how it
 established that. A failed or unrun available check, or an acceptance
-criterion it could not verify, requires rejection.
+criterion it could not verify, requires changes requested.
 
 The reviewer's verdict has the shape
 `{"approved": bool, "summary": str, "issues": [str, ...], "notes": [str, ...], "checks": [str, ...]}`.
 The summary describes what the reviewer inspected and found, even on
-approval. `issues` are specific, actionable blocking defects; `notes` are
-concrete non-blocking improvements; `checks` list the commands and inspections
-actually performed and their results, including each acceptance criterion.
-The reviewer must look for improvements, but may leave notes empty if it
-finds none. Forge treats an approving verdict with blocking issues as a
-rejection.
+approval. `issues` contain every specific, actionable requested edit, including
+in-scope improvements; `checks` list the commands and inspections actually
+performed and their results, including each acceptance criterion. New verdicts
+must leave `notes` empty; the field remains for compatibility. `approved: true`
+requires both `issues` and `notes` to be empty and all acceptance criteria and
+checks verified. Requested edits require `approved: false` with actionable
+issues. Forge normalizes any verdict containing issues or legacy notes to
+changes requested, even if the reviewer supplied `approved: true`. Missing or
+unreadable verdicts and negative verdicts without findings produce a change
+request explaining the review failure.
 
 The `max_fix_rounds` setting (default `3`) limits extra fixer/review rounds
-after the initial implementation and review. Alongside it,
-`apply_review_notes` (default `true`) enables one polish round per stage:
-when the reviewer approves with notes and budget remains, Forge sends those
-notes to the fixer to apply, then re-reviews. Polish uses the same
-`max_fix_rounds` budget as rejection fixes. An approval can therefore still
-lead to an improvement round before the stage's commit. Further notes do
-not trigger another polish round; if polishing is disabled or the budget
-is exhausted, approval with notes proceeds to commit. A rejection after
-polishing follows the usual fix loop within the remaining budget.
+after the initial implementation and review: by default, at most four reviews
+per stage attempt. A second round is conditional on findings; a clean first
+review proceeds directly to commit. Each subsequent round must independently
+verify the previous requests and inspect the current implementation for
+remaining or newly discovered in-scope defects. Reviewers must not repeat
+resolved requests without evidence or invent findings merely because this is
+a later round. Every remaining request requires another fix and review while
+budget remains; exhausted requests block, including on the initial review
+when `max_fix_rounds` is `0`. A clean approval on any round ends the loop.
+
+Legacy settings containing `apply_review_notes` still load, but its value is
+ignored and it is no longer a default setting. Neither `false` nor exhausted
+budget allows notes to bypass the clean-approval requirement. There is no
+approval-triggered polishing step.
 
 Every review round is recorded in the stage's `reviews` array in
 `.forge/plan.json`, with `round` (starting at 1), `approved`, `summary`,
 `issues`, `notes`, `checks`, and `unix` (a Unix timestamp in seconds).
-Earlier feedback stays available through fix rounds, polish, and approval.
+The latest normalized verdict is also stored as `last_verdict`. Earlier
+feedback stays available through every fix and the final approval; completed
+entries are not rewritten. Round numbering restarts at 1 when a stage is
+retried in a new attempt, while earlier history remains intact. Older saved
+approvals with issues or notes remain historical records and are displayed
+with explicit legacy wording, without changing saved plans or approvals.
 
-If the reviewer still rejects after the fix rounds, the stage is marked
+If the reviewer still requests changes after the fix rounds, the stage is marked
 blocked and Forge stops for you. Full history of every agent session,
 verdict, and git action is visible in the panel and kept in
 `.forge/history.jsonl`. Final review approval events include the reviewer's
@@ -134,7 +150,7 @@ model for the call if known.
 
 Usage is accumulated in `.forge/plan.json`:
 
-- Each stage's `usage` includes implementation, review, fix, and polish
+- Each stage's `usage` includes implementation, review, and fix
   calls; the plan's top-level `usage` holds the run's accumulated stage totals.
 - Top-level `planner_usage` records planning usage separately; it is not
   included in `usage`.
@@ -209,12 +225,24 @@ PATH, logged in.
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
-Each reviewed stage has a review chip showing approval (or
-`approved · N notes` when notes remain) or the latest issue count, plus the
-number of rounds when there is more than one. Expand a stage to see its full
-per-round review history: approved or rejected, the reviewer's summary,
-blocking issues, non-blocking notes, and checks under `verified:`, including
-reviews after fix and polish rounds.
+Each reviewed stage has a **last completed review** chip showing its own
+round and decision: `changes requested · N requests` or a clean `approved`.
+Request counts combine issues and legacy notes, counting identical requests
+once. Current activity appears separately in bold, for example
+`now: reviewing · round 2` or `now: fixing for review · round 2`, so round one's
+decision cannot be mistaken for approval of work under review. An older clean
+decision is muted during current activity. Budget exhaustion displays
+`blocked · review budget exhausted` alongside the last decision.
+
+Expand a stage to see each review's recorded round, decision, full summary,
+change requests, legacy notes, checks under `verified:`, and timestamp (UTC).
+Earlier requests remain visible after final approval. A saved `approved: true`
+record containing issues or notes displays `legacy approval with change
+requests` and its request count, without a success color; all feedback remains
+available for inspection. Plans with only `last_verdict` use the same fallback
+record for both the chip and expanded feedback. Missing notes, checks, or
+history are supported; unavailable timestamps are omitted and unknown review
+rounds are labeled `round unknown`, rather than borrowing the active round.
 
 ### Updating and troubleshooting
 
