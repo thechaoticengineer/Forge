@@ -475,3 +475,144 @@ These shortcuts apply in normal mode, with text-field behavior noted below.
 | `?` (`Shift+/`) / `F1` / `q` / `Escape` | Close help before any other overlay |
 
 Press `?` (`Shift+/`) or `F1` in the panel to open the same reference.
+
+### Model catalogue and explicit fallback policy
+
+Forge schedules one application-owned model refresh at engine startup. Both
+providers are probed concurrently; project sessions share that work. Startup,
+project workers and `/api/state` never wait for discovery. The panel shows
+provider status, sanitized refresh/cache errors, configured provenance and
+revision, and the last execution's availability evidence. **Refresh models**
+starts another asynchronous refresh; **Cancel refresh** cancels discovery only.
+
+Discovery states distinguish `discovered`, `cached_stale`,
+`unsupported_discovery`, `discovery_failed`, `pending` and `unavailable`.
+Configured selection options independently carry `configured_unverified` when
+availability cannot be verified. An absent discovery mechanism is not proof
+that a model is unavailable. Exact registry entries and existing explicit role
+model settings can run with unverified availability, using provider-default
+reasoning. The run state and history retain that qualification until successful
+execution supplies evidence. Missing executables, observed authentication
+failures, rejected models and previously discovered models that were removed
+block selection. A transient refresh failure cannot clear an observed blocker.
+Successful discovery can establish availability again after a discovery failure.
+Execution-auth and model/effort rejections stay blocked within their configuration
+scope even if a later catalogue lists the option. After correcting authentication
+or provider configuration, change the scope identifier to request new evidence.
+
+Use **Model settings & options** to edit the JSON policy. The policy is saved
+atomically to `$XDG_CONFIG_HOME/forge/model-policy.json` (default
+`~/.config/forge/model-policy.json`) and loaded at engine startup. An invalid
+file is reported in the panel; Forge uses an empty registry. Set a new
+`policy_revision` whenever changing the policy. For example, replace
+`your-exact-model-id` with an ID from your CLI or your explicit configuration:
+
+```json
+{
+  "policy_revision": "2",
+  "codex_scope": "default",
+  "claude_scope": "default",
+  "claude_bridge": "",
+  "entries": [
+    {
+      "provider": "codex",
+      "model": "your-exact-model-id",
+      "tier": "strong",
+      "suitability": ["critical contracts"],
+      "limits": {},
+      "relative_cost_preference": 2,
+      "effort": "provider_default"
+    }
+  ]
+}
+```
+
+The registry has at most 64 unique provider/model entries. `tier` is `basic`,
+`standard` or `strong`; these are **configured user policy**, not provider claims
+or rankings inferred from prices. Optional suitability text and numeric limits
+also have configured provenance. `relative_cost_preference` is nullable, ranges
+from 0 to 1000, and lower means preferred; it is not a monetary amount. Prices
+remain null. No current model IDs or capability rankings are built into Forge.
+This stage exposes selection inputs and validates existing explicit role
+settings; it does not yet assign models to plan stages.
+
+`provider_default` emits no native effort override. A specific effort must be
+advertised for that model by fresh discovery and supported by the adapter;
+unknown/unsupported efforts are rejected without emitting arguments. An empty
+or missing supported-effort list never licenses a guessed setting. If refresh
+fails while a configured non-default effort is present, use `provider_default`
+or restore discovery. Discovery never sends a generation prompt, requests new
+credentials, reads credential files, scrapes interactive pickers, or treats an
+Anthropic API model list as Claude Code subscription access.
+
+Read-only details are at `GET /api/models`: normalized IDs, aliases/resolved IDs,
+defaults, native efforts, known capabilities, nullable pricing, catalogue diffs,
+and configured options with their eligibility and provenance. To inspect one
+selection input, use
+`GET /api/models?provider=codex&model=your-exact-model-id&effort=provider_default`.
+`POST /api/models/refresh` returns 202 with `started: false` when joining existing
+work; `POST /api/models/cancel` also returns immediately. `/api/state` contains
+counts and status rather than the full registry/model arrays. Save the policy
+with `POST /api/settings` and a `model_catalogue` object. Policy changes during
+refresh return 409; invalid changes return 400 without partially updating other
+settings. Scope/bridge changes schedule a refresh automatically.
+
+Availability caches use atomic, versioned JSON under
+`$XDG_CACHE_HOME/forge/models/v1/` (default `~/.cache/forge/models/v1/`). Partitions
+include the provider, explicit scope, executable search path, provider config
+location and non-credential endpoint/backend configuration. They retain CLI
+version, last successful refresh, added/removed IDs, alias retargeting and
+capability/default/effort changes. Refresh failures preserve the last good file;
+corrupt or mismatched caches are ignored and reported. Removed IDs remain
+recorded across restarts. Discovery uses the user's home directory, independently
+of the active project; change the relevant scope identifier after switching
+accounts or user configuration in place. Project-specific CLI overrides are not
+authoritative catalogue evidence. Every probe has a 15-second total budget,
+page/output limits, stderr draining, cancellation, and cleanup of its own child
+process group. No periodic metadata research is implemented in this stage.
+
+### Optional Claude discovery bridge
+
+Codex discovery was checked against installed **codex-cli 0.153.2**, its locally
+exported `generate-json-schema` protocol, and the official
+[Codex App Server documentation](https://developers.openai.com/codex/app-server).
+The adapter performs `initialize`, `initialized`, an optional `account/read`
+check, then paginated `model/list` with hidden entries included. Interleaved
+notifications and unknown optional metadata are tolerated; no thread or turn is
+started.
+
+Claude Code **2.1.261** has no supported `claude models` command. The optional
+bridge uses the official
+[TypeScript Agent SDK initialization API](https://code.claude.com/docs/en/agent-sdk/typescript),
+verified against the publisher's **0.3.261** package types and implementation.
+It awaits `supportedModels()` with an input stream that never yields a message,
+then closes the SDK query. It selects the existing `claude` executable and its
+existing CLI authentication, disables persistence/tools/MCP execution for the
+probe, and emits no account data. Models returned by initialization describe
+CLI options; actual execution remains the evidence of successful access.
+
+The bridge is optional and is not installed by `install.sh`. It needs Node.js
+18+ on the engine's PATH and the pinned SDK dependency. To install it manually:
+
+```sh
+cd bridges/claude-models
+npm install --omit=optional
+```
+
+Set `claude_bridge` to the absolute path of `bridges/claude-models/bridge.mjs`
+(and change `policy_revision`). The SDK's bundled CLI is unnecessary: Forge
+uses the existing `claude` executable. Protocol v1 deliberately accepts only
+SDK 0.3.261 / Claude Code 2.1.261; a different version requires rechecking the
+SDK/CLI schema and updating the bridge and fixtures. Missing Node, bridge or
+SDK, or an unsupported version reports unsupported discovery. It never falls
+back to an API-key request or a generation turn. Without the bridge, explicit
+Claude entries continue to work with unverified availability and provider-default
+effort.
+
+`cargo test` uses fake discovery/process protocols and isolated temporary
+caches, including HTTP responsiveness tests. The optional bridge's no-prompt
+contract and panel controls can be tested without installing its SDK:
+
+```sh
+node --test bridges/claude-models/discovery.test.mjs tests/panel_catalogue.test.mjs
+```

@@ -8,6 +8,8 @@
 //!
 //! Serves a JSON API on 127.0.0.1:8734 for the Quickshell panel.
 
+mod catalogue;
+mod catalogue_process;
 mod agent;
 mod architecture;
 mod review_history;
@@ -40,7 +42,14 @@ fn main() {
         .to_string();
     let mut settings = default_settings();
     settings["projects_root"] = json!(projects_root);
-    let app = Arc::new(App::new(&project, settings));
+    let policy_path = crate::catalogue::policy_path();
+    let loaded = crate::catalogue::load_policy(&policy_path);
+    if let Ok(Some(policy)) = &loaded { settings["model_catalogue"] = json!(policy); }
+    let mut app = App::new(&project, settings);
+    app.model_policy_path = Some(policy_path);
+    *app.model_policy_error.lock().unwrap() = loaded.err();
+    let app = Arc::new(app);
+    app.refresh_catalogue();
     let port: u16 = std::env::var("FORGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1611,6 +1620,68 @@ mod tests {
         })
     }
 
+    #[test]
+    fn catalogue_api_is_responsive_shared_and_settings_are_atomic() {
+        use crate::catalogue::{Catalogue, Discovery, Provider, Policy, Probe, Failure, FailureKind};
+        use crate::catalogue_process::Budget;
+        use std::sync::atomic::AtomicUsize;
+        struct Slow(AtomicUsize);
+        impl Discovery for Slow {
+            fn probe(&self, _: Provider, _: &Policy, budget: Budget) -> Probe {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    if let Err(error) = budget.check() { return Probe { cli_version: Some("fixture 1".into()), result: Err(error) }; }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let first = QueueTest::new(false);
+        let slow = Arc::new(Slow(AtomicUsize::new(0)));
+        let mut app = App::new(first.app.project(), default_settings());
+        app.catalogue = Catalogue::new(slow.clone(), first.path.join("cache"), Duration::from_secs(10));
+        app.model_policy_path = Some(first.path.join("model-policy.json"));
+        let app = Arc::new(app);
+        let (code, state) = api_request(&app, "GET", "/api/state", json!({}));
+        assert_eq!(code, 200); assert_eq!(state["model_catalogue"]["providers"][0]["status"], "pending");
+        assert_eq!(slow.0.load(Ordering::SeqCst), 0); // App::new does not run processes.
+        let mut policy = json!(Policy::default()); policy["policy_revision"] = json!("2");
+        policy["entries"] = json!([{"provider":"codex","model":"exact-id","tier":"basic","relative_cost_preference":1}]);
+        assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":policy})).0,200);
+        assert_eq!(crate::catalogue::load_policy(app.model_policy_path.as_ref().unwrap()).unwrap().unwrap().policy_revision,"2");
+        assert_eq!(api_request(&app,"POST","/api/models/refresh",json!({})).0,202);
+        let second = QueueTest::with_engine(false, Some(app.clone()));
+        let start = Instant::now();
+        for project in [first.app.project(), second.app.project()] {
+            let (code,state)=api_request(&app,"GET",&format!("/api/state?project={project}"),json!({}));
+            assert_eq!(code,200); assert_eq!(state["model_catalogue"]["refreshing"],true);
+            assert!(state["model_catalogue"].to_string().len()<3000);
+            assert_eq!(state["settings"]["model_catalogue"]["entries"],json!([]));
+        }
+        assert!(start.elapsed()<Duration::from_secs(1));
+        assert_eq!(api_request(&app,"POST","/api/models/refresh",json!({})).1["started"],false);
+        let (_,details)=api_request(&app,"GET","/api/models",json!({}));
+        assert_eq!(details["options"][0]["availability"],"configured_unverified");
+        assert_eq!(details["options"][0]["provenance"],"configured"); assert!(details["options"][0]["pricing"].is_null());
+        let (_,option)=api_request(&app,"GET","/api/models?provider=codex&model=exact-id&effort=high",json!({}));
+        assert_eq!(option["eligible"],false);
+        assert_eq!(api_request(&app,"GET","/api/models?provider=bogus&model=x",json!({})).0,400);
+        assert_eq!(api_request(&app,"POST","/api/models",json!({})).0,404);
+        let mut changed=policy.clone(); changed["policy_revision"]=json!("3");
+        assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":changed})).0,409);
+        assert_eq!(api_request(&app,"POST","/api/models/cancel",json!({})).0,202);
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while app.catalogue.running() { assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(slow.0.load(Ordering::SeqCst),2);
+        let mut invalid=policy.clone(); invalid["entries"][0]["tier"]=json!("magic");
+        assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":invalid,"auto_push":false})).0,400);
+        assert_eq!(app.settings.lock().unwrap()["auto_push"],true);
+        let mut invalid=changed.clone(); invalid["entries"][0]["effort"]=json!("high");
+        assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":invalid})).0,400);
+        app.catalogue.observe(&Policy::from_settings(&app.settings.lock().unwrap()).unwrap(),Provider::Codex,"exact-id",Err(Failure::new(FailureKind::Auth)));
+        let (_,option)=api_request(&app,"GET","/api/models?provider=codex&model=exact-id",json!({}));
+        assert_eq!(option["availability"],"unavailable"); assert_eq!(option["eligible"],false);
+    }
+
     fn wait_for_worker(ctx: &Ctx) {
         let started = Instant::now();
         while ctx.session.busy.load(Ordering::SeqCst) {
@@ -2429,6 +2500,7 @@ mod tests {
             agent_role: String::new(),
             agent_tool: String::new(),
             agent_model: String::new(),
+            model_selection: Value::Null,
             agent_started_unix: 0,
             agent_lines: 0,
             agent_last_line: String::new(),

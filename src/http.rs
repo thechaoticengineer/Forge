@@ -88,6 +88,12 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let (code, response) = match (method, path) {
         (tiny_http::Method::Get, "/api/architecture/reviews") => api_architecture_reviews(&ctx, query),
         (tiny_http::Method::Get, "/api/architecture/history") => api_architecture_history(&ctx, query),
+        (tiny_http::Method::Get, "/api/models") => api_models(app, query),
+        (tiny_http::Method::Post, "/api/models/refresh") =>
+            (202, json!({"ok":true,"started":app.refresh_catalogue()})),
+        (tiny_http::Method::Post, "/api/models/cancel") => {
+            app.catalogue.cancel(); (202, json!({"ok":true}))
+        },
         (tiny_http::Method::Get, "/api/state") => api_state(app, &ctx, &active_project),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(&ctx, query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(&ctx),
@@ -123,6 +129,7 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
             "current_stage": s.current_stage,
             "current_step": s.current_step,
             "run_started_unix": s.run_started_unix,
+            "model_selection": s.model_selection,
             "agent": {
                 "role": s.agent_role,
                 "tool": s.agent_tool,
@@ -135,6 +142,12 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     };
     let mut snap = snap;
     snap["settings"] = app.settings.lock().unwrap().clone();
+    if let Ok(policy) = crate::catalogue::Policy::from_settings(&snap["settings"]) {
+        snap["model_catalogue"] = app.catalogue.summary(&policy);
+        snap["model_catalogue"]["policy_error"] = json!(*app.model_policy_error.lock().unwrap());
+        // Full registry options belong to the read-only details endpoint.
+        snap["settings"]["model_catalogue"]["entries"] = json!([]);
+    }
     snap["busy"] = json!(ctx.session.busy.load(Ordering::SeqCst));
     {
         let _guard = ctx.session.persistence_lock.lock().unwrap();
@@ -244,16 +257,65 @@ fn api_projects(app: &App) -> (u32, Value) {
     (200, resp)
 }
 
+fn api_models(app: &App, query: &str) -> (u32, Value) {
+    let policy = match crate::catalogue::Policy::from_settings(&app.settings.lock().unwrap()) {
+        Ok(p) => p, Err(e) => return (400, json!({"error":e})),
+    };
+    let result = (|| -> Result<Value, String> {
+        let model = query_value(query, "model")?;
+        if let Some(model) = model {
+            let p = query_value(query, "provider")?.ok_or("provider required")?;
+            let provider = crate::catalogue::Provider::parse(&p).ok_or("invalid provider")?;
+            let effort = query_value(query, "effort")?.unwrap_or_else(|| "provider_default".into());
+            Ok(app.catalogue.select(&policy, provider, &model, &effort))
+        } else {
+            let mut details = app.catalogue.details(&policy);
+            details["policy"] = json!(policy);
+            Ok(details)
+        }
+    })();
+    match result { Ok(v) => (200,v), Err(e) => (400,json!({"error":e})) }
+}
+
 fn api_settings(app: &App, body: &Value) -> (u32, Value) {
+    let Some(obj) = body.as_object() else { return (400,json!({"error":"settings must be an object"})); };
     let mut settings = app.settings.lock().unwrap();
-    if let Some(obj) = body.as_object() {
-        for (k, v) in obj {
-            if settings.get(k).is_some() {
-                settings[k] = v.clone();
+    let mut candidate = settings.clone();
+    for (k,v) in obj { if candidate.get(k).is_some() { candidate[k] = v.clone(); } }
+    let policy = match crate::catalogue::Policy::from_settings(&candidate) {
+        Ok(p) => p, Err(e) => return (400,json!({"error":e})),
+    };
+    if candidate["model_catalogue"] != settings["model_catalogue"] && app.catalogue.running() {
+        return (409,json!({"error":"cancel or finish the catalogue refresh before changing its policy"}));
+    }
+    if candidate["model_catalogue"] != settings["model_catalogue"]
+        && candidate["model_catalogue"]["policy_revision"] == settings["model_catalogue"]["policy_revision"] {
+        return (400,json!({"error":"increment policy_revision when changing the model catalogue policy"}));
+    }
+    // Validate effort overrides against known provider evidence before accepting policy.
+    if candidate["model_catalogue"] != settings["model_catalogue"] {
+        for e in &policy.entries {
+            if e.effort != "provider_default" {
+                let option = app.catalogue.select(&policy, e.provider, &e.model, &e.effort);
+                if option["eligible"] != true { return (400,json!({"error":option["error"]})); }
             }
         }
     }
+    let refresh = candidate["model_catalogue"]["codex_scope"] != settings["model_catalogue"]["codex_scope"]
+        || candidate["model_catalogue"]["claude_scope"] != settings["model_catalogue"]["claude_scope"]
+        || candidate["model_catalogue"]["claude_bridge"] != settings["model_catalogue"]["claude_bridge"];
+    if candidate["model_catalogue"] != settings["model_catalogue"] {
+        if let Some(path) = &app.model_policy_path {
+            if let Err(error) = crate::catalogue::save_policy(path, &policy) {
+                *app.model_policy_error.lock().unwrap() = Some(error.clone());
+                return (500,json!({"error":error}));
+            }
+        }
+        *app.model_policy_error.lock().unwrap() = None;
+    }
+    *settings = candidate;
     drop(settings);
+    if refresh { app.catalogue.refresh(policy); }
     (200, json!({"ok": true}))
 }
 

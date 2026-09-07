@@ -123,10 +123,56 @@ Item {
   property bool diffPending: false
   property string diffError: ""
 
+  property var catalogueDetails: null
+  property bool catalogueOpen: false
+  property string catalogueDraft: ""
+  property bool catalogueWasRefreshing: false
+  readonly property var catalogue: engineState && engineState.model_catalogue ? engineState.model_catalogue : null
+  onCatalogueChanged: {
+    const refreshing = !!catalogue && catalogue.refreshing
+    if (catalogueWasRefreshing && !refreshing && catalogueOpen) {
+      api("GET", "/api/models", null, function(resp, status) {
+        if (status === 200 && resp) root.catalogueDetails = resp
+      })
+    }
+    catalogueWasRefreshing = refreshing
+  }
+
+  function catalogueProviderText(provider) {
+    return provider.provider + ": " + provider.status + " · " + provider.model_count + " models"
+      + (provider.cached_stale ? " · cached/stale" : "")
+      + (provider.blocker ? " · " + provider.blocker.message
+        : provider.error ? " · " + provider.error.message : "")
+      + (provider.cache_error ? " · " + provider.cache_error : "")
+  }
+  function catalogueOptionText(option) {
+    return option.provider + "/" + option.model + " · " + option.tier
+      + " · " + option.availability + " · " + option.effort
+      + " · configured revision " + option.policy_revision
+      + (option.error ? " · " + option.error : "")
+  }
+
+  function openCatalogue() {
+    api("GET", "/api/models", null, function(resp, status) {
+      if (status !== 200 || !resp) return
+      root.catalogueDetails = resp
+      root.catalogueDraft = JSON.stringify(resp.policy, null, 2)
+      root.catalogueOpen = true
+    })
+  }
+  function saveCatalogue() {
+    let policy
+    try { policy = JSON.parse(catalogueEditor.text) }
+    catch (e) { root.localError = "Model policy must be valid JSON: " + e; return }
+    act("/api/settings", { model_catalogue: policy }, function(resp, status) {
+      if (status === 200) root.openCatalogue()
+    })
+  }
+
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
     || feedbackField.activeFocus || questionField.activeFocus
-    || filterField.activeFocus || manualField.activeFocus
+    || filterField.activeFocus || manualField.activeFocus || catalogueEditor.activeFocus
     || editFocusedField !== null
 
   onHelpOpenChanged: {
@@ -774,6 +820,11 @@ Item {
             || (event.key === Qt.Key_Slash && event.modifiers === Qt.ShiftModifier)
             || (event.key === Qt.Key_F1 && event.modifiers === Qt.NoModifier)
           // Modal normal mode owns every key; focused text fields handle insert mode.
+          if (root.catalogueOpen) {
+            event.accepted = true
+            if (event.key === Qt.Key_Escape) root.catalogueOpen = false
+            return
+          }
           if (root.helpOpen) {
             event.accepted = true
             if (question || event.key === Qt.Key_Escape
@@ -1204,6 +1255,71 @@ Item {
             onClicked: root.act("/api/settings", {
               queue_auto_approve: !(root.engineState && root.engineState.settings.queue_auto_approve) })
           }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+          Flow {
+            width: parent.width
+            spacing: Style.space(8)
+            PanelButton {
+              label: root.catalogue && root.catalogue.refreshing ? "Models: refreshing…" : "Refresh models"
+              enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
+              onClicked: root.act("/api/models/refresh", {})
+            }
+            PanelButton {
+              label: "Cancel refresh"
+              visible: !!root.catalogue && root.catalogue.refreshing
+              onClicked: root.act("/api/models/cancel", {})
+            }
+            PanelButton {
+              label: root.catalogueOpen ? "Close model settings" : "Model settings & options"
+              onClicked: { if (root.catalogueOpen) root.catalogueOpen = false; else root.openCatalogue() }
+            }
+          }
+          Text {
+            width: parent.width
+            text: root.catalogue ? "Model tiers: configured user policy · revision " + root.catalogue.policy_revision
+              + " · " + root.catalogue.configured_count + " explicit entries" : "Model catalogue pending"
+            color: root.mutedForeground
+            wrapMode: Text.Wrap
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(11)
+          }
+          Text {
+            width: parent.width
+            visible: !!root.catalogue && !!root.catalogue.policy_error
+            text: root.catalogue && root.catalogue.policy_error ? root.catalogue.policy_error : ""
+            color: root.urgent
+            wrapMode: Text.Wrap
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(11)
+          }
+          Text {
+            width: parent.width
+            visible: !!root.engineState && !!root.engineState.model_selection
+            text: visible ? "Last model: " + root.engineState.model_selection.provider + "/"
+              + (root.engineState.model_selection.model || "provider default") + " · "
+              + root.engineState.model_selection.availability : ""
+            color: root.mutedForeground
+            wrapMode: Text.Wrap
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(11)
+          }
+          Repeater {
+            model: root.catalogue ? root.catalogue.providers : []
+            delegate: Text {
+              required property var modelData
+              width: parent.width
+              text: root.catalogueProviderText(modelData)
+              color: modelData.status === "unavailable" ? root.urgent : root.mutedForeground
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(11)
+            }
+          }
+
         }
 
         // ---------------------------------------------------- goal
@@ -2321,6 +2437,101 @@ Item {
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
           onClicked: if (!root.helpOpen) root.helpOpen = true
+        }
+      }
+
+      // ------------------------------------------- model policy and options
+      Rectangle {
+        visible: root.catalogueOpen
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.55)
+        MouseArea { anchors.fill: parent; onClicked: root.catalogueOpen = false }
+        Rectangle {
+          anchors.centerIn: parent
+          width: parent.width * 0.9
+          height: parent.height * 0.85
+          color: root.surface
+          radius: 6
+          MouseArea { anchors.fill: parent }
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+            PanelButton {
+              label: "Close model settings"
+              onClicked: root.catalogueOpen = false
+            }
+            Flickable {
+              width: parent.width
+              height: parent.height - y
+              contentHeight: catalogueSettings.height
+              clip: true
+              Column {
+                id: catalogueSettings
+                width: parent.width
+                spacing: Style.space(6)
+                Text {
+                  width: parent.width
+                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Use provider_default when effort support is unknown."
+                  wrapMode: Text.Wrap
+                  color: root.mutedForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Rectangle {
+                  width: parent.width
+                  height: Style.space(180)
+                  color: root.surface
+                  border.width: 1
+                  border.color: catalogueEditor.activeFocus ? root.accent : root.mutedForeground
+                  Flickable {
+                    anchors.fill: parent
+                    anchors.margins: Style.space(6)
+                    contentHeight: catalogueEditor.height
+                    clip: true
+                    TextEdit {
+                      id: catalogueEditor
+                      width: parent.width
+                      height: Math.max(contentHeight, parent.height)
+                      text: root.catalogueDraft
+                      textFormat: TextEdit.PlainText
+                      wrapMode: TextEdit.Wrap
+                      selectByMouse: true
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(11)
+                      Keys.onEscapePressed: keyHandler.forceActiveFocus()
+                    }
+                  }
+                }
+                PanelButton {
+                  label: "Save model policy"
+                  enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
+                  onClicked: root.saveCatalogue()
+                }
+                Repeater {
+                  model: root.catalogueDetails ? root.catalogueDetails.options : []
+                  delegate: Text {
+                    required property var modelData
+                    width: parent.width
+                    text: root.catalogueOptionText(modelData)
+                    wrapMode: Text.Wrap
+                    color: modelData.eligible ? root.foreground : root.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                }
+                Text {
+                  width: parent.width
+                  text: "Full discovered IDs, aliases, efforts, capabilities and changes: GET /api/models"
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+              }
+            }
+          }
         }
       }
 

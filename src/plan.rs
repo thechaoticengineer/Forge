@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 pub(crate) fn default_settings() -> Value {
     json!({
         "projects_root": "",
+        "model_catalogue": crate::catalogue::Policy::default(),
         "planner": "claude",
         "implementer": "codex",
         "reviewer": "claude",

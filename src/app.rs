@@ -19,6 +19,9 @@ pub(crate) enum PlanMode {
 }
 
 pub(crate) struct App {
+    pub(crate) catalogue: crate::catalogue::Catalogue,
+    pub(crate) model_policy_path: Option<PathBuf>,
+    pub(crate) model_policy_error: Mutex<Option<String>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     pub(crate) active_project: Mutex<String>,
     pub(crate) settings: Mutex<Value>,
@@ -68,6 +71,7 @@ pub(crate) struct State {
     pub(crate) agent_role: String,
     pub(crate) agent_tool: String,
     pub(crate) agent_model: String,
+    pub(crate) model_selection: Value,
     pub(crate) agent_started_unix: i64,
     pub(crate) agent_lines: i64,
     pub(crate) agent_last_line: String,
@@ -76,6 +80,9 @@ pub(crate) struct State {
 impl App {
     pub(crate) fn new(project: &str, settings: Value) -> Self {
         let app = Self {
+            catalogue: crate::catalogue::Catalogue::default(),
+            model_policy_path: None,
+            model_policy_error: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             active_project: Mutex::new(canonical_project(project)),
             settings: Mutex::new(settings),
@@ -83,6 +90,12 @@ impl App {
         };
         app.active_session();
         app
+    }
+
+    pub(crate) fn refresh_catalogue(&self) -> bool {
+        let settings = self.settings.lock().unwrap();
+        let policy = crate::catalogue::Policy::from_settings(&settings);
+        policy.is_ok_and(|policy| self.catalogue.refresh(policy))
     }
 
     pub(crate) fn session(&self, project: &str) -> Arc<Session> {
@@ -660,7 +673,19 @@ impl Ctx {
             }
             return Ok(usage);
         }
+        let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
+        let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+        let mut selection = self.app.catalogue.execution_input(&policy, provider, model);
+        self.session.state.lock().unwrap().model_selection = selection.clone();
+        if selection["eligible"] != true {
+            return Err(self.agent_error(role, selection["error"].as_str().unwrap_or("model unavailable").into()));
+        }
+        let requested_model = model.to_string();
         let mut cmd = Self::agent_command(tool, prompt, model)?;
+        for arg in selection["native_effort_args"].as_array().into_iter().flatten().filter_map(Value::as_str) { cmd.arg(arg); }
+        self.log_event("model", &format!("[{role}] {tool}/{} · {} · policy {} · effort {}",
+            if model.is_empty() { "provider default" } else { model }, selection["availability"].as_str().unwrap_or("unverified"),
+            policy.policy_revision, selection["effort"].as_str().unwrap_or("provider_default")));
         self.log_event("agent", &format!("[{role}] starting {tool} session"));
         let log = self.open_agent_log(role, tool, model)?;
 
@@ -682,6 +707,15 @@ impl Ctx {
         let mut child = match child {
             Ok(child) => child,
             Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.app.catalogue.observe(&policy, provider, &requested_model,
+                        Err(crate::catalogue::Failure::new(crate::catalogue::FailureKind::MissingExecutable)));
+                    selection["availability"] = json!("unavailable");
+                    selection["availability_unverified"] = json!(false);
+                    selection["eligible"] = json!(false);
+                }
+                selection["execution_status"] = json!("failed_to_launch");
+                self.session.state.lock().unwrap().model_selection = selection;
                 self.clear_agent_activity();
                 return Err(self.agent_error(role, format!("failed to launch {tool}: {e}")));
             }
@@ -726,9 +760,30 @@ impl Ctx {
         };
 
         if !status.success() {
+            let diagnostic = format!("{etail}\n{tail}").to_lowercase();
+            if selection["effort"] != "provider_default" && diagnostic.contains("effort")
+                && ["unsupported", "invalid value", "unknown option", "not supported"].iter().any(|s| diagnostic.contains(s)) {
+                self.app.catalogue.reject_effort(&policy, provider, &requested_model, selection["effort"].as_str().unwrap());
+                selection["eligible"] = json!(false);
+                selection["error"] = json!("native effort rejected during execution");
+            }
+            let observed = if crate::catalogue::auth_error(&diagnostic) { Some(crate::catalogue::FailureKind::Auth) }
+                else if diagnostic.contains("model_not_found") || diagnostic.contains("model is not available") { Some(crate::catalogue::FailureKind::Rejected) }
+                else { None };
+            if let Some(kind) = observed {
+                self.app.catalogue.observe(&policy, provider, &requested_model, Err(crate::catalogue::Failure::new(kind)));
+                selection["availability"] = json!("unavailable"); selection["availability_unverified"] = json!(false); selection["eligible"] = json!(false);
+            }
+            selection["execution_status"] = json!("failed");
+            self.session.state.lock().unwrap().model_selection = selection;
             self.log_event("error", &format!("[{role}] {tool} failed: {etail}"));
             return Err(format!("{tool} exited with {status}: {etail}"));
         }
+        self.app.catalogue.observe(&policy, provider, &requested_model, Ok(()));
+        selection["availability"] = json!("execution_verified"); selection["availability_unverified"] = json!(false);
+        selection["execution_status"] = json!("succeeded");
+        self.session.state.lock().unwrap().model_selection = selection;
+        self.log_event("model", &format!("[{role}] {tool}/{} availability verified by successful execution", requested_model));
         if let Some(usage) = &mut usage
             && usage.model.is_empty()
         {
