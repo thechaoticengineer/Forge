@@ -533,12 +533,17 @@ Item {
   }
 
   function reviewDecision(verdict) {
-    const requests = reviewStrings(verdict.issues).concat(reviewStrings(verdict.notes))
+    const issues = reviewStrings(verdict.issues)
+    const notes = reviewStrings(verdict.notes)
+    const requests = issues.concat(notes)
       .filter(function(request, index, all) { return all.indexOf(request) === index })
-    const clean = verdict.approved === true && requests.length === 0
+    const clean = verdict.approved === true && issues.length === 0 && notes.length === 0
+    const optionalNotes = verdict.approved === true && issues.length === 0 && notes.length > 0
     const label = clean ? "approved"
+      : optionalNotes ? "approved with optional notes"
       : verdict.approved === true ? "legacy approval with change requests" : "changes requested"
-    return { clean: clean, label: label + (clean ? "" : " · " + requests.length
+    return { clean: clean, optionalNotes: optionalNotes,
+      label: label + (clean || optionalNotes ? "" : " · " + requests.length
       + (requests.length === 1 ? " request" : " requests")) }
   }
 
@@ -1771,7 +1776,8 @@ Item {
                         + ": " + stageRow.lastDecision.label
                       : ""
                     textFormat: Text.PlainText
-                    color: stageRow.lastDecision && stageRow.lastDecision.clean
+                    color: stageRow.lastDecision && stageRow.lastDecision.optionalNotes ? root.working
+                      : stageRow.lastDecision && stageRow.lastDecision.clean
                       ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
                     wrapMode: Text.Wrap
                     font.family: root.fontFamily
@@ -1842,7 +1848,9 @@ Item {
                       text: "review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
                         + reviewRound.decision.label
                       textFormat: Text.PlainText
-                      color: reviewRound.decision.clean ? root.success : root.urgent
+                      color: reviewRound.decision.optionalNotes ? root.working
+                        : reviewRound.decision.clean
+                          ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
                       wrapMode: Text.Wrap
                       font.family: root.fontFamily
                       font.pixelSize: root.fs(11)
@@ -1880,9 +1888,10 @@ Item {
                     Text {
                       visible: reviewRound.notes.length > 0
                       width: stageRow.width
-                      text: "legacy notes (change requests):\n• " + reviewRound.notes.join("\n• ")
+                      text: (reviewRound.decision.optionalNotes ? "optional notes:" : "legacy notes (change requests):")
+                        + "\n• " + reviewRound.notes.join("\n• ")
                       textFormat: Text.PlainText
-                      color: root.mutedForeground
+                      color: reviewRound.decision.optionalNotes ? root.working : root.mutedForeground
                       wrapMode: Text.Wrap
                       font.family: root.fontFamily
                       font.pixelSize: root.fs(11)
