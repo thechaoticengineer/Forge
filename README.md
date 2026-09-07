@@ -69,9 +69,14 @@ Every review round is recorded in the stage's `reviews` array in
 The latest normalized verdict is also stored as `last_verdict`. Earlier
 feedback stays available through every fix and the final approval; completed
 entries are not rewritten. Round numbering restarts at 1 when a stage is
-retried in a new attempt, while earlier history remains intact. Older saved
-approvals with issues or notes remain historical records and are displayed
-with explicit legacy wording, without changing saved plans or approvals.
+retried in a new attempt, while earlier history remains intact. Saved
+`approved: true` records with no issues and nonempty notes display amber
+`approved with optional notes` in both stage summaries and review history,
+with the feedback labeled `optional notes`. Saved approvals containing issues
+retain the red `legacy approval with change requests` display. This historical
+rendering does not rewrite saved records or change the current reviewer
+contract: new approvals require empty issues and notes, and incoming legacy
+notes still normalize to changes requested.
 
 If the reviewer still requests changes after the fix rounds, the stage is marked
 blocked and Forge stops for you. Full history of every agent session,
@@ -226,23 +231,32 @@ The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
 Each reviewed stage has a **last completed review** chip showing its own
-round and decision: `changes requested · N requests` or a clean `approved`.
-Request counts combine issues and legacy notes, counting identical requests
-once. Current activity appears separately in bold, for example
+round and decision: a clean `approved`, amber `approved with optional notes`
+for saved `approved: true` records with no issues and nonempty notes, or a red
+change-request decision. Saved approvals containing issues display
+`legacy approval with change requests`; rejections display `changes requested`.
+Only decisions displayed as change requests have a request-count suffix
+(`· N requests`): counts combine issues and legacy notes, counting identical
+requests once. Historical optional-note approvals have no request-count
+suffix. Current activity appears separately in bold, for example
 `now: reviewing · round 2` or `now: fixing for review · round 2`, so round one's
 decision cannot be mistaken for approval of work under review. An older clean
 decision is muted during current activity. Budget exhaustion displays
 `blocked · review budget exhausted` alongside the last decision.
 
 Expand a stage to see each review's recorded round, decision, full summary,
-change requests, legacy notes, checks under `verified:`, and timestamp (UTC).
-Earlier requests remain visible after final approval. A saved `approved: true`
-record containing issues or notes displays `legacy approval with change
-requests` and its request count, without a success color; all feedback remains
-available for inspection. Plans with only `last_verdict` use the same fallback
-record for both the chip and expanded feedback. Missing notes, checks, or
-history are supported; unavailable timestamps are omitted and unknown review
-rounds are labeled `round unknown`, rather than borrowing the active round.
+change requests, notes, checks under `verified:`, and timestamp (UTC).
+Earlier requests remain visible after final approval. Expanded history uses
+the same decisions, colors, and request counts as the chip: historical
+notes-only approvals display amber `approved with optional notes`, with their
+feedback labeled `optional notes`. Saved approvals containing issues retain
+the red `legacy approval with change requests` label and request count;
+notes on change-request decisions are labeled `legacy notes (change requests)`.
+All feedback remains available for inspection. Plans with only `last_verdict`
+use the same fallback record for both the chip and expanded feedback. Missing
+notes, checks, or history are supported; unavailable timestamps are omitted and
+unknown review rounds are labeled `round unknown`, rather than borrowing the
+active round.
 
 ### Updating and troubleshooting
 
