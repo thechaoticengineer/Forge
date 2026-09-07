@@ -304,6 +304,10 @@ impl Ctx {
         self.read_jsonl_tail("chat.jsonl", 100)
     }
 
+    pub(crate) fn read_reports(&self) -> Value {
+        self.read_jsonl_tail("reports.jsonl", 100)
+    }
+
     fn save_json(&self, name: &str, value: &Value) {
         self.ensure_forge_dir();
         let _ = fs::write(
@@ -1179,8 +1183,39 @@ impl Ctx {
         }
         self.set_phase("done");
         let started = self.session.state.lock().unwrap().run_started_unix;
-        let duration = fmt_duration(if started > 0 { unix_timestamp() - started } else { 0 });
-        self.log_event("run", &format!("all stages committed — run complete in {duration}"));
+        let now = unix_timestamp();
+        let duration_secs = if started > 0 { (now - started).max(0) } else { 0 };
+        let commits: Vec<Value> = plan["stages"].as_array().unwrap().iter()
+            .filter_map(|stage| stage.get("sha").map(|sha| json!({
+                "sha": sha, "message": stage["commit"].as_str().unwrap_or("forge: stage"),
+                "title": stage["title"],
+            })))
+            .collect();
+        let mut report = json!({
+            "unix": now, "goal": plan["goal"], "duration_secs": duration_secs,
+            "stages": count, "commits": commits,
+        });
+        for key in ["usage", "planner_usage"] {
+            if let Some(usage) = plan.get(key) {
+                report[key] = usage.clone();
+            }
+        }
+        self.ensure_forge_dir();
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true).append(true).open(self.forge_path("reports.jsonl"))
+        {
+            let _ = writeln!(f, "{report}");
+        }
+        let duration = fmt_duration(duration_secs);
+        let mut text = format!("all stages committed — run complete in {duration}");
+        if let Some(usage) = plan["usage"].as_object().filter(|usage| !usage.is_empty()) {
+            let tokens = usage.iter().map(|(tool, usage)| {
+                format!("{tool}: {} tokens", usage["total_tokens"].as_i64().unwrap_or(0))
+            }).collect::<Vec<_>>().join(", ");
+            let noun = if commits.len() == 1 { "commit" } else { "commits" };
+            text.push_str(&format!(" — {} {noun} — {tokens}", commits.len()));
+        }
+        self.log_event("run", &text);
         Ok(())
     }
 }

@@ -142,6 +142,7 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     snap["sessions"] = app.session_summaries(active_project);
     snap["history"] = ctx.read_history();
     snap["chat"] = ctx.read_chat();
+    snap["reports"] = ctx.read_reports();
     snap["git_log"] = json!(ctx.git(&["log", "--oneline", "-12"]).unwrap_or_default());
     (200, snap)
 }
