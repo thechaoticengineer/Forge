@@ -147,6 +147,16 @@ Item {
   property double agentNow: Date.now() / 1000
   property bool liveTab: false
   property string historyFilter: "all"
+  readonly property var reports: engineState && Array.isArray(engineState.reports)
+    ? engineState.reports.filter(function(report) { return report && typeof report === "object" })
+      .sort(function(a, b) { return (b.unix || 0) - (a.unix || 0) }) : []
+  readonly property bool hasReports: reports.length > 0
+  readonly property bool reportsVisible: !liveTab && historyFilter === "reports"
+  property string selectedReportKey: ""
+  property string expandedReportKey: ""
+  onReportsChanged: {
+    if (reports.length === 0 && historyFilter === "reports") historyFilter = "all"
+  }
   property string agentLog: ""
   property double agentLogOffset: 0
   property string logSession: ""
@@ -184,6 +194,10 @@ Item {
     liveTab = busy
     historyFilter = "all"
     historyList.positionViewAtBeginning()
+    selectedReportKey = ""
+    expandedReportKey = ""
+    reportList.readingY = 0
+    reportList.positionViewAtBeginning()
   }
 
   onBusyChanged: {
@@ -438,6 +452,80 @@ Item {
     })
   }
 
+  function nonNegativeInt(value) {
+    return typeof value === "number" && isFinite(value) && value >= 0
+      ? Math.floor(value) : null
+  }
+
+  function formatTokens(value) {
+    const count = nonNegativeInt(value)
+    if (count === null) return "—"
+    if (count >= 1000000) return (count / 1000000).toFixed(1) + "M"
+    if (count >= 1000) return (count / 1000).toFixed(1) + "k"
+    return String(count)
+  }
+
+  function usageTools(usage) {
+    return usage && typeof usage === "object" ? Object.keys(usage).sort().filter(function(tool) {
+      return usage[tool] && typeof usage[tool] === "object"
+    }) : []
+  }
+
+  function usageSummary(usage) {
+    return usageTools(usage).map(function(tool) {
+      return tool + " " + formatTokens(usage[tool].total_tokens) + " tok"
+    }).join(" · ")
+  }
+
+  function modelSummary(models) {
+    return models && typeof models === "object" ? Object.keys(models).sort().map(function(model) {
+      return model + " " + formatTokens(models[model])
+    }).join(" · ") : ""
+  }
+
+  function usageBreakdown(usage) {
+    return usageTools(usage).map(function(tool) {
+      const item = usage[tool]
+      const models = modelSummary(item.models)
+      // Keep exact counts in details; only the summary and model list are compact.
+      function exact(value) { const count = nonNegativeInt(value); return count === null ? "—" : String(count) }
+      return tool + ": input " + exact(item.input_tokens) + " · output " + exact(item.output_tokens)
+        + " · total " + exact(item.total_tokens) + " tok · calls " + exact(item.calls)
+        + (models ? "\nmodels: " + models : "")
+    }).join("\n")
+  }
+
+  function reportKey(report, index) {
+    return JSON.stringify([report.unix, report.goal, index])
+  }
+
+  function reportTime(report, now) {
+    if (typeof report.unix !== "number" || !isFinite(report.unix)) return "—"
+    const seconds = Math.max(0, Math.floor(now - report.unix))
+    if (seconds < 60) return "just now"
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m ago"
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago"
+    return Math.floor(seconds / 86400) + "d ago"
+  }
+
+  function reportDuration(seconds) {
+    const count = nonNegativeInt(seconds)
+    return count === null ? "—" : Math.floor(count / 60) + "m " + (count % 60) + "s"
+  }
+
+  function reportCommits(commits) {
+    const lines = []
+    // ListView can expose nested arrays as QML sequences, for which isArray is false.
+    if (commits && typeof commits.length === "number") {
+      for (let i = 0; i < commits.length; i++) {
+        const commit = commits[i]
+        if (!commit || !(commit.sha || commit.message || commit.title)) continue
+        lines.push(((commit.sha || "—") + " " + (commit.message || commit.title || "")).trim())
+      }
+    }
+    return lines.join("\n")
+  }
+
   function historyRows(history, filter) {
     const rows = []
     const entries = history || []
@@ -579,19 +667,28 @@ Item {
           stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
         }
 
+        function selectReport(index) {
+          if (root.reports.length === 0) return
+          const selected = Math.max(0, Math.min(index, root.reports.length - 1))
+          root.selectedReportKey = root.reportKey(root.reports[selected], selected)
+          reportList.positionViewAtIndex(selected, ListView.Contain)
+          reportList.readingY = reportList.contentY
+        }
+
         function scrollOutput(direction) {
-          const view = root.liveTab ? liveOutput : historyList
+          const view = root.liveTab ? liveOutput : root.reportsVisible ? reportList : historyList
           view.cancelFlick()
-          view.followTail = false
+          if (view !== reportList) view.followTail = false
           const top = view.originY
           const bottom = top + Math.max(0, view.contentHeight - view.height)
           view.contentY = Math.max(top, Math.min(bottom,
             view.contentY + direction * view.height / 2))
-          if (direction > 0 && view.contentY >= bottom) {
+          if (view !== reportList && direction > 0 && view.contentY >= bottom) {
             view.followTail = true
             view.scrollToTail()
           }
           if (view === historyList) historyList.readingY = view.contentY
+          if (view === reportList) reportList.readingY = view.contentY
         }
 
         function scrollDiff(amount) {
@@ -667,7 +764,8 @@ Item {
           } else {
             const stages = root.displayedStages
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
-              selectStage(stages.length - 1)
+              if (root.reportsVisible) selectReport(root.reports.length - 1)
+              else selectStage(stages.length - 1)
               event.accepted = true
             } else if (event.modifiers === Qt.ControlModifier
                        && (event.key === Qt.Key_D || event.key === Qt.Key_U)) {
@@ -706,21 +804,36 @@ Item {
               } else if (event.key === Qt.Key_H || event.key === Qt.Key_L) {
                 root.liveTab = event.key === Qt.Key_H
                 event.accepted = true
-              } else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_5) {
+              } else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_6) {
                 root.liveTab = false
-                root.historyFilter = ["all", "runs", "git", "reviews", "errors"][event.key - Qt.Key_1]
+                if (event.key !== Qt.Key_6 || root.hasReports)
+                  root.historyFilter = ["all", "runs", "git", "reviews", "errors", "reports"][event.key - Qt.Key_1]
                 event.accepted = true
               } else if (event.key === Qt.Key_J || event.key === Qt.Key_K) {
-                selectStage(root.selectedStageIndex < 0 ? 0
-                  : root.selectedStageIndex + (event.key === Qt.Key_J ? 1 : -1))
+                if (root.reportsVisible) {
+                  const selected = root.reports.findIndex(function(report, index) {
+                    return root.reportKey(report, index) === root.selectedReportKey
+                  })
+                  selectReport(selected < 0 ? 0 : selected + (event.key === Qt.Key_J ? 1 : -1))
+                } else selectStage(root.selectedStageIndex < 0 ? 0
+                    : root.selectedStageIndex + (event.key === Qt.Key_J ? 1 : -1))
                 event.accepted = true
               } else if (event.key === Qt.Key_G) {
-                if (prefix === "g") selectStage(0)
+                if (prefix === "g") {
+                  if (root.reportsVisible) selectReport(0)
+                  else selectStage(0)
+                }
                 else pendingKey = "g"
                 event.accepted = true
               } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
                          || event.key === Qt.Key_O || event.key === Qt.Key_Space) {
-                if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
+                if (root.reportsVisible) {
+                  if (!root.reports.some(function(report, index) {
+                    return root.reportKey(report, index) === root.selectedReportKey
+                  })) selectReport(0)
+                  root.expandedReportKey = root.expandedReportKey === root.selectedReportKey
+                    ? "" : root.selectedReportKey
+                } else if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
                   const row = stageList.itemAtIndex(root.selectedStageIndex)
                   if (root.editingPlan && stages[root.selectedStageIndex].status !== "committed") {
                     if (row) row.focusEditor()
@@ -880,6 +993,7 @@ Item {
               }
             }
             Text {
+              readonly property string planUsage: root.usageSummary(root.plan ? root.plan.usage : null)
               visible: root.phase !== "planning"
                 || (root.engineState !== null && root.engineState.run_started_unix > 0)
               width: parent.width
@@ -889,9 +1003,11 @@ Item {
                   ? (root.phase !== "planning" ? " · " : "")
                     + "run " + Math.floor(agentCard.runSeconds / 60) + "m "
                     + (agentCard.runSeconds % 60) + "s" : "")
+                + (planUsage ? " · " + planUsage : "")
               textFormat: Text.PlainText
               color: root.mutedForeground
-              elide: Text.ElideRight
+              wrapMode: planUsage ? Text.Wrap : Text.NoWrap
+              elide: planUsage ? Text.ElideNone : Text.ElideRight
               font.family: root.fontFamily
               font.pixelSize: root.fs(11)
             }
@@ -1724,6 +1840,16 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
+                Text {
+                  visible: stageRow.expanded && text !== ""
+                  width: stageRow.width
+                  text: root.usageSummary(stageRow.modelData.usage)
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
               }
               Loader {
                 id: stageEditor
@@ -1865,7 +1991,9 @@ Item {
             anchors.margins: Style.space(8)
             spacing: Style.space(4)
             Repeater {
-              model: ["all", "runs", "git", "reviews", "errors"]
+              model: root.hasReports
+                ? ["all", "runs", "git", "reviews", "errors", "reports"]
+                : ["all", "runs", "git", "reviews", "errors"]
               delegate: PanelButton {
                 required property string modelData
                 label: modelData
@@ -1876,7 +2004,7 @@ Item {
           }
           ListView {
             id: historyList
-            visible: !root.liveTab
+            visible: !root.liveTab && !root.reportsVisible
             anchors.top: historyFilters.bottom
             anchors.bottom: parent.bottom
             anchors.left: parent.left
@@ -1934,6 +2062,122 @@ Item {
               wrapMode: Text.Wrap
               font.family: root.fontFamily
               font.pixelSize: root.fs(10)
+            }
+          }
+          ListView {
+            id: reportList
+            visible: root.reportsVisible
+            anchors.top: historyFilters.bottom
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: Style.space(8)
+            clip: true
+            spacing: Style.space(6)
+            boundsBehavior: Flickable.StopAtBounds
+            model: root.reports
+            property real readingY: 0
+
+            function restoreReadingPosition() {
+              if (!moving) contentY = Math.max(originY, Math.min(readingY,
+                originY + Math.max(0, contentHeight - height)))
+            }
+            onContentYChanged: if (moving) readingY = contentY
+            onMovementEnded: readingY = contentY
+            onModelChanged: Qt.callLater(restoreReadingPosition)
+            onHeightChanged: Qt.callLater(restoreReadingPosition)
+            onVisibleChanged: if (visible) Qt.callLater(restoreReadingPosition)
+
+            delegate: Rectangle {
+              id: reportRow
+              required property var modelData
+              required property int index
+              readonly property string key: root.reportKey(modelData, index)
+              readonly property bool expanded: root.expandedReportKey === key
+              readonly property int commitCount: modelData.commits && typeof modelData.commits.length === "number"
+                ? modelData.commits.length : 0
+              width: reportList.width
+              height: reportContent.implicitHeight + Style.space(8)
+              radius: 3
+              color: key === root.selectedReportKey ? Qt.darker(root.accent, 2.8) : "transparent"
+              TapHandler {
+                onTapped: {
+                  keyHandler.forceActiveFocus()
+                  root.selectedReportKey = reportRow.key
+                  root.expandedReportKey = reportRow.expanded ? "" : reportRow.key
+                }
+              }
+              Column {
+                id: reportContent
+                x: Style.space(4)
+                y: Style.space(4)
+                width: parent.width - Style.space(8)
+                spacing: Style.space(4)
+                Text {
+                  width: parent.width
+                  text: (reportRow.expanded ? "▾ " : "▸ ") + (reportRow.modelData.goal || "Untitled task")
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  elide: Text.ElideRight
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  width: parent.width
+                  text: root.reportTime(reportRow.modelData, root.agentNow)
+                    + " · " + root.reportDuration(reportRow.modelData.duration_secs)
+                    + " · " + reportRow.commitCount + (reportRow.commitCount === 1 ? " commit" : " commits")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+                Text {
+                  visible: text !== ""
+                  width: parent.width
+                  text: root.usageSummary(reportRow.modelData.usage)
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+                Text {
+                  visible: reportRow.expanded
+                  width: parent.width
+                  text: "goal: " + (reportRow.modelData.goal || "Untitled task")
+                    + "\ncommits:\n" + (root.reportCommits(reportRow.modelData.commits) || "No commits")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+                Text {
+                  visible: reportRow.expanded && text !== ""
+                  width: parent.width
+                  text: root.usageBreakdown(reportRow.modelData.usage)
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+                Text {
+                  visible: reportRow.expanded && text !== ""
+                  width: parent.width
+                  text: {
+                    const usage = root.usageBreakdown(reportRow.modelData.planner_usage)
+                    return usage ? "planner usage:\n" + usage : ""
+                  }
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+              }
             }
           }
         }
@@ -2342,13 +2586,14 @@ Item {
                     { key: "i", description: "Edit the goal (insert mode)" },
                     { key: "I", description: "Edit plan feedback (insert mode); Enter improves with AI" },
                     { key: "Escape", description: "Leave a text field, close the top overlay, or cancel plan editing" },
-                    { key: "j / k", description: "Select next / previous stage" },
-                    { key: "gg / G", description: "Select first / last stage" },
-                    { key: "Enter / o / Space", description: "Expand or collapse selected stage; focus its title when editing" },
+                    { key: "j / k", description: "Select next / previous stage (report in Reports)" },
+                    { key: "gg / G", description: "Select first / last stage (report in Reports)" },
+                    { key: "Enter / o / Space", description: "Expand or collapse selected stage or report; focus stage title when editing" },
                     { key: "Tab", description: "Toggle Live / History" },
                     { key: "h / l", description: "Select Live / History" },
                     { key: "Ctrl+d / Ctrl+u", description: "Scroll Live / History half a page down / up" },
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
+                    { key: "6", description: "History: Reports (when available)" },
                     { key: "p", description: "Create plan from goal" },
                     { key: "e", description: "Edit plan stages by hand" },
                     { key: "a", description: "Approve draft plan" },
