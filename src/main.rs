@@ -1735,6 +1735,112 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_prompts_use_only_the_latest_stage_feedback_verbatim() {
+        for new_second_round_request in [false, true] {
+            let test = QueueTest::new(true);
+            let markers = "{goal} {plan_overview} {sid} {title} {instructions} {acceptance} {forge_dir} {verdict_path} {issues} {review_context}";
+            let issue = format!("Fix Unicode 界🙂 output.\nKeep these literals: {markers}");
+            let note = format!("Legacy request: preserve indentation.\n  Zażółć gęślą {markers}");
+            let summary = format!("Reviewed the output.\nRésumé 界🙂 {markers}");
+            let check = format!("cargo test: failed\nDetails 界🙂 {markers}");
+            let latest = format!("New defect: handle empty input.\nEvidence 界🙂 {markers}");
+            let latest_summary = "Previous output requests resolved; empty input still fails.";
+            let latest_check = "cargo test empty_input: failed";
+            let foreign = "OTHER STAGE FEEDBACK MUST STAY LOCAL";
+            let clean = json!({"approved": true, "summary": "Verified all criteria and fixes.",
+                "issues": [], "notes": [], "checks": ["cargo build: passed", "cargo test: passed"]});
+            let mut verdicts = vec![json!({
+                // Contradictory approval and duplicate legacy notes must be normalized.
+                "approved": true, "summary": summary, "issues": [issue, null, issue],
+                "notes": [issue, note, 42], "checks": [check, false],
+            })];
+            if new_second_round_request {
+                verdicts.push(json!({"approved": false, "summary": latest_summary,
+                    "issues": [latest], "checks": [latest_check]}));
+            }
+            verdicts.push(clean.clone());
+            verdicts.push(clean);
+            let fixes = if new_second_round_request { 2 } else { 1 };
+            {
+                let mut settings = test.app.app.settings.lock().unwrap();
+                settings["max_fix_rounds"] = json!(fixes);
+                settings["mock_verdicts"] = json!(verdicts);
+                settings["mock_reviewer_prompts"] = json!([]);
+            }
+            test.app.mock_agent("planner").unwrap();
+            let mut plan = test.app.load_plan().unwrap();
+            plan["goal"] = json!(format!("Goal with literal {markers}"));
+            plan["stages"][0]["title"] = json!("Title with literal {instructions}");
+            plan["stages"][0]["instructions"] = json!("Instructions with literal {acceptance}");
+            plan["stages"][0]["acceptance"] = json!("Criteria with literal {verdict_path}");
+            let other_verdict = json!({"approved": false, "summary": foreign,
+                "issues": [foreign], "notes": [], "checks": [foreign]});
+            plan["stages"][1]["last_verdict"] = other_verdict.clone();
+            plan["stages"][1]["reviews"] = json!([other_verdict]);
+            test.app.save_plan(&plan);
+            test.app.run_worker();
+
+            let plan = test.app.load_plan().unwrap();
+            let stage = &plan["stages"][0];
+            assert_eq!(stage["status"], "committed");
+            assert_eq!(stage["rounds"], fixes + 1);
+            assert_eq!(stage["reviews"].as_array().unwrap().len(), fixes + 1);
+            assert_eq!(test.app.git(&["show", &format!("{}:mock.txt", stage["sha"].as_str().unwrap())]).unwrap(),
+                format!("work by implementer\n{}", "work by fixer\n".repeat(fixes)).trim_end());
+            assert_eq!(plan["stages"][1]["reviews"][0], other_verdict);
+
+            let settings = test.app.app.settings.lock().unwrap();
+            let reviews = settings["mock_reviewer_prompts"].as_array().unwrap();
+            let fixers = settings["mock_fixer_prompts"].as_array().unwrap();
+            assert_eq!(reviews.len(), fixes + 2); // Includes the next stage's initial review.
+            assert_eq!(fixers.len(), fixes);
+            let initial = reviews[0].as_str().unwrap();
+            assert!(initial.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
+            assert!(initial.contains("No previous review findings for this stage."));
+            assert!(!initial.contains("BEGIN PREVIOUS REVIEW CONTEXT"));
+            for prompt in reviews[..fixes + 1].iter().chain(fixers) {
+                let prompt = prompt.as_str().unwrap();
+                assert!(!prompt.contains(foreign));
+                assert!(prompt.contains("Title with literal {instructions}"));
+                assert!(prompt.contains("Instructions with literal {acceptance}"));
+                assert!(prompt.contains("Criteria with literal {verdict_path}"));
+            }
+            let preceding = format!(
+                "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{summary}\nOutstanding change requests (including legacy notes):\n- {issue}\n- {note}\nPrevious checks (must be verified again):\n- {check}\nEND PREVIOUS REVIEW CONTEXT\n"
+            );
+            for prompt in [&reviews[1], &fixers[0]] {
+                let prompt = prompt.as_str().unwrap();
+                assert!(prompt.contains("REVIEW ROUND: 2 (current attempt) — Re-review."));
+                assert!(prompt.contains("immediately preceding review in this attempt"));
+                assert!(prompt.contains(&preceding));
+                assert_eq!(prompt.matches(&issue).count(), 1);
+                assert_eq!(prompt.matches(&note).count(), 1);
+            }
+            assert!(fixers[0].as_str().unwrap().contains(&format!("Goal with literal {markers}")));
+            if new_second_round_request {
+                let preceding = format!(
+                    "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{latest_summary}\nOutstanding change requests (including legacy notes):\n- {latest}\nPrevious checks (must be verified again):\n- {latest_check}\nEND PREVIOUS REVIEW CONTEXT\n"
+                );
+                for prompt in [&reviews[2], &fixers[1]] {
+                    let prompt = prompt.as_str().unwrap();
+                    assert!(prompt.contains("REVIEW ROUND: 3 (current attempt) — Re-review."));
+                    assert!(prompt.contains(&preceding));
+                    for old_feedback in [&issue, &note, &summary, &check] {
+                        assert!(!prompt.contains(old_feedback));
+                    }
+                }
+                assert_eq!(stage["reviews"][1]["approved"], false);
+            }
+            let next_stage = reviews.last().unwrap().as_str().unwrap();
+            assert!(next_stage.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
+            assert!(next_stage.contains(foreign));
+            for feedback in [&issue, &note, &summary, &check, &latest] {
+                assert!(!next_stage.contains(feedback));
+            }
+        }
+    }
+
+    #[test]
     fn unresolved_requests_exhaust_budget_without_commit_or_later_stage() {
         for legacy_setting in [None, Some(true), Some(false)] {
             for field in ["issues", "notes"] {
@@ -1846,12 +1952,21 @@ mod tests {
     #[test]
     fn review_history_accumulates_after_exhaustion_and_resume() {
         let test = QueueTest::new(true);
+        let resumed_rejection = json!({
+            "approved": false,
+            "summary": "The resumed implementation still misses an output line.",
+            "issues": ["Add the missing output line."],
+            "notes": [],
+            "checks": ["Compared the resumed output with the acceptance criteria."],
+        });
         {
             let mut settings = test.app.app.settings.lock().unwrap();
             settings["max_fix_rounds"] = json!(1);
+            settings["mock_reviewer_prompts"] = json!([]);
             settings["mock_verdicts"] = json!([
                 {"approved": false, "issues": []},
                 "not readable JSON",
+                resumed_rejection,
                 {"approved": true, "issues": []},
             ]);
         }
@@ -1880,20 +1995,58 @@ mod tests {
         let resumed = test.app.load_plan().unwrap();
         let stage = &resumed["stages"][0];
         assert_eq!(stage["status"], "committed");
+        assert_eq!(stage["rounds"], 2);
         let reviews = stage["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 3);
+        assert_eq!(reviews.len(), 4);
         assert_eq!(&reviews[..2], previous.as_slice());
         // Round numbers are local to the attempt; earlier attempts stay intact.
         assert_eq!(reviews[2]["round"], 1);
-        assert_eq!(reviews[2]["approved"], true);
-        assert_eq!(reviews[2]["summary"], "");
-        assert_eq!(reviews[2]["issues"], json!([]));
+        for field in ["approved", "summary", "issues", "notes", "checks"] {
+            assert_eq!(reviews[2][field], resumed_rejection[field]);
+        }
         assert!(reviews[2]["unix"].as_i64().unwrap() > 0);
+        assert_eq!(reviews[3]["round"], 2);
+        assert_eq!(reviews[3]["approved"], true);
+        assert_eq!(reviews[3]["summary"], "");
+        assert_eq!(reviews[3]["issues"], json!([]));
+        assert!(reviews[3]["unix"].as_i64().unwrap() > 0);
         assert_eq!(stage["last_verdict"], json!({
             "approved": true, "summary": "", "issues": [], "notes": [], "checks": [],
         }));
         assert!(test.app.read_history().as_array().unwrap().iter().any(|entry|
             entry["kind"] == "review" && entry["text"] == "stage 1 approved by reviewer"));
+        let settings = test.app.app.settings.lock().unwrap();
+        let prompts = settings["mock_reviewer_prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 5); // Four reviews of this stage, then the next stage.
+        assert!(prompts[0].as_str().unwrap().contains("No previous review findings for this stage."));
+        assert!(prompts[1].as_str().unwrap().contains("- reviewer rejected without details\n"));
+        let resumed_prompt = prompts[2].as_str().unwrap();
+        assert!(resumed_prompt.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
+        assert!(resumed_prompt.contains("from this stage's previous attempt"));
+        assert!(resumed_prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
+        assert!(!resumed_prompt.contains("reviewer rejected without details"));
+        let fixers = settings["mock_fixer_prompts"].as_array().unwrap();
+        assert_eq!(fixers.len(), 2); // One fix per attempt.
+        let preceding = format!(
+            "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{}\nOutstanding change requests (including legacy notes):\n- {}\nPrevious checks (must be verified again):\n- {}\nEND PREVIOUS REVIEW CONTEXT\n",
+            resumed_rejection["summary"].as_str().unwrap(),
+            resumed_rejection["issues"][0].as_str().unwrap(),
+            resumed_rejection["checks"][0].as_str().unwrap(),
+        );
+        for prompt in [&prompts[3], &fixers[1]] {
+            let prompt = prompt.as_str().unwrap();
+            assert!(prompt.contains("REVIEW ROUND: 2 (current attempt) — Re-review."));
+            assert!(prompt.contains("immediately preceding review in this attempt"));
+            assert!(prompt.contains(&preceding));
+            assert!(!prompt.contains("from this stage's previous attempt"));
+            assert!(!prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
+            assert!(!prompt.contains("reviewer rejected without details"));
+        }
+        let next_stage_prompt = prompts[4].as_str().unwrap();
+        assert!(next_stage_prompt.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
+        assert!(next_stage_prompt.contains("No previous review findings for this stage."));
+        assert!(!next_stage_prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
+        assert!(!next_stage_prompt.contains(resumed_rejection["issues"][0].as_str().unwrap()));
     }
 
     #[test]

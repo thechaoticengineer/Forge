@@ -527,10 +527,14 @@ impl Ctx {
                 settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
             }
             #[cfg(test)]
-            if role == "fixer" {
+            if role == "fixer" || role == "reviewer" {
                 let mut settings = self.app.settings.lock().unwrap();
-                settings.as_object_mut().unwrap().entry("mock_fixer_prompts")
-                    .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(prompt));
+                // Reviewer capture is opt-in to keep unrelated API test settings small.
+                let key = format!("mock_{role}_prompts");
+                if role == "fixer" || settings.get(&key).is_some() {
+                    settings.as_object_mut().unwrap().entry(key)
+                        .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(prompt));
+                }
             }
             self.mock_agent(role)?;
             let usage = self.app.settings.lock().unwrap().get("mock_usage")
@@ -956,6 +960,53 @@ impl Ctx {
         }
     }
 
+    /// The saved verdict keeps legacy fields; both agents get the same effective requests.
+    fn review_requests(verdict: &Value) -> Vec<String> {
+        let mut requests = Vec::new();
+        for field in ["issues", "notes"] {
+            for request in verdict[field].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if !requests.iter().any(|existing| existing == request) {
+                    requests.push(request.to_string());
+                }
+            }
+        }
+        requests
+    }
+
+    fn stage_review_context(stage: &Value) -> String {
+        let round = stage["rounds"].as_i64().unwrap_or(1);
+        let kind = if round == 1 { "Initial review" } else { "Re-review" };
+        let mut context = format!("REVIEW ROUND: {round} (current attempt) — {kind}.\n");
+        let Some(verdict) = stage.get("last_verdict").filter(|v| v.is_object()) else {
+            context.push_str("No previous review findings for this stage.\n");
+            return context;
+        };
+        if round == 1 {
+            context.push_str("The feedback below is from this stage's previous attempt; current-attempt numbering restarts at 1.\n");
+        } else {
+            context.push_str("The feedback below is from the immediately preceding review in this attempt.\n");
+        }
+        let requests = Self::review_requests(verdict);
+        let decision = if verdict["approved"] == true && requests.is_empty() {
+            "approved"
+        } else {
+            "changes requested"
+        };
+        context.push_str(&format!(
+            "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: {decision}\nSummary:\n{}\nOutstanding change requests (including legacy notes):\n",
+            verdict["summary"].as_str().unwrap_or(""),
+        ));
+        for request in requests {
+            context.push_str(&format!("- {request}\n"));
+        }
+        context.push_str("Previous checks (must be verified again):\n");
+        for check in verdict["checks"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            context.push_str(&format!("- {check}\n"));
+        }
+        context.push_str("END PREVIOUS REVIEW CONTEXT\n");
+        context
+    }
+
     fn stage_prompt(&self, template: &str, plan: &Value, stage: &Value) -> String {
         let overview: String = plan["stages"]
             .as_array()
@@ -968,15 +1019,17 @@ impl Ctx {
                 )
             })
             .collect();
-        template
-            .replace("{goal}", plan["goal"].as_str().unwrap_or(""))
-            .replace("{plan_overview}", &overview)
-            .replace("{sid}", &stage["id"].to_string())
-            .replace("{title}", stage["title"].as_str().unwrap_or(""))
-            .replace("{instructions}", stage["instructions"].as_str().unwrap_or(""))
-            .replace("{acceptance}", stage["acceptance"].as_str().unwrap_or(""))
-            .replace("{forge_dir}", FORGE_DIR)
-            .replace("{verdict_path}", &format!("{FORGE_DIR}/verdict.json"))
+        fill_template(template, &[
+            ("{goal}", plan["goal"].as_str().unwrap_or("")),
+            ("{plan_overview}", &overview),
+            ("{sid}", &stage["id"].to_string()),
+            ("{title}", stage["title"].as_str().unwrap_or("")),
+            ("{instructions}", stage["instructions"].as_str().unwrap_or("")),
+            ("{acceptance}", stage["acceptance"].as_str().unwrap_or("")),
+            ("{forge_dir}", FORGE_DIR),
+            ("{verdict_path}", &format!("{FORGE_DIR}/verdict.json")),
+            ("{review_context}", &Self::stage_review_context(stage)),
+        ])
     }
 
     /// Implement + independent review + bounded fix loop for one stage.
@@ -985,7 +1038,6 @@ impl Ctx {
             .as_i64()
             .unwrap_or(3);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
-        let mut issues: Option<Vec<String>> = None;
 
         for round in 0..=max_rounds {
             if self.session.stop_requested.load(Ordering::SeqCst) {
@@ -996,19 +1048,16 @@ impl Ctx {
 
             let stage = plan["stages"][idx].clone();
             let implementer = self.setting("implementer");
-            let usage = match &issues {
-                None => {
+            let usage = match round {
+                0 => {
                     self.set_step(Some(sid), "implementing");
                     let p = self.stage_prompt(IMPLEMENT_PROMPT, plan, &stage);
                     self.run_agent("implementer", &implementer, &p,
                                    &self.setting("implementer_model"))?
                 }
-                Some(list) => {
+                _ => {
                     self.set_step(Some(sid), &format!("fixing (round {round})"));
-                    let joined: String = list.iter().map(|i| format!("- {i}\n")).collect();
-                    let p = self
-                        .stage_prompt(FIX_PROMPT, plan, &stage)
-                        .replace("{issues}", &joined);
+                    let p = self.stage_prompt(FIX_PROMPT, plan, &stage);
                     self.run_agent("fixer", &implementer, &p,
                                    &self.setting("implementer_model"))?
                 }
@@ -1059,18 +1108,12 @@ impl Ctx {
                         .into(),
                 ]),
             };
-            // Preserve the original fields in history; send each request to the fixer once.
-            let mut requests = Vec::new();
-            for request in list.iter().chain(&notes) {
-                if !requests.contains(request) {
-                    requests.push(request.clone());
-                }
-            }
             let stage = &mut plan["stages"][idx];
             stage["last_verdict"] = json!({
                 "approved": approved, "summary": summary, "issues": list,
                 "notes": notes, "checks": checks,
             });
+            let requests = Self::review_requests(&stage["last_verdict"]);
             stage.as_object_mut().unwrap().entry("reviews")
                 .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
                     "round": round + 1, "approved": approved, "summary": summary,
@@ -1094,7 +1137,6 @@ impl Ctx {
                 let summary: String = requests.join("; ").chars().take(1500).collect();
                 self.log_event("review", &format!("stage {sid} changes requested: {summary}"));
             }
-            issues = Some(requests);
         }
         Ok("exhausted")
     }
