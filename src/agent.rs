@@ -5,7 +5,6 @@ use std::io::{BufRead as _, BufReader};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default, Clone, Debug)]
-#[allow(dead_code)] // Consumed by usage accumulation in the next stage.
 pub(crate) struct AgentUsage {
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
@@ -14,7 +13,6 @@ pub(crate) struct AgentUsage {
 }
 
 impl AgentUsage {
-    #[allow(dead_code)] // Consumed by usage accumulation in the next stage.
     pub(crate) fn is_empty(&self) -> bool {
         self.total_tokens == 0
     }

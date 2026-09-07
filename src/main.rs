@@ -851,6 +851,108 @@ mod tests {
     }
 
     #[test]
+    fn queue_run_accumulates_planner_stage_and_run_usage() {
+        let test = QueueTest::new(true);
+        let mut queue = test.app.load_queue();
+        queue["items"].as_array_mut().unwrap().truncate(1);
+        test.app.save_queue(&queue);
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["mock_usage"] = json!({
+                "input": 100, "output": 25, "total": 125, "model": "test-model",
+            });
+            settings["mock_verdicts"] = json!([
+                {"approved": false, "issues": ["Fix the first stage."]},
+                {"approved": true, "issues": []},
+            ]);
+        }
+        test.start();
+        assert!(test.statuses().is_empty());
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+        let plan = test.app.load_plan().unwrap();
+        let expected = |calls: i64| json!({"mock": {
+            "input_tokens": 100 * calls, "output_tokens": 25 * calls,
+            "total_tokens": 125 * calls, "calls": calls,
+            "models": {"test-model": 125 * calls},
+        }});
+        assert_eq!(plan["planner_usage"], expected(1));
+        assert_eq!(plan["stages"][0]["status"], "committed");
+        assert_eq!(plan["stages"][0]["rounds"], 2);
+        assert_eq!(plan["stages"][0]["usage"], expected(4));
+        assert_eq!(plan["stages"][1]["status"], "committed");
+        assert_eq!(plan["stages"][1]["usage"], expected(2));
+        assert_eq!(plan["usage"], expected(6));
+        let history = test.app.read_history();
+        for role in ["planner", "implementer", "fixer", "reviewer"] {
+            assert!(history.as_array().unwrap().iter().any(|event|
+                event["kind"] == "agent"
+                && event["text"] == format!("[{role}] mock finished (125 tokens)")));
+        }
+        // Running a completed plan again must not count the calls twice.
+        test.app.run_worker();
+        assert_eq!(test.app.load_plan().unwrap(), plan);
+    }
+
+    #[test]
+    fn queue_run_omits_usage_when_tokens_are_absent_or_zero() {
+        for usage in [None, Some(json!({
+            "input": 0, "output": 0, "total": 0, "model": "test-model",
+        }))] {
+            let test = QueueTest::new(true);
+            if let Some(usage) = usage {
+                test.app.app.settings.lock().unwrap()["mock_usage"] = usage;
+            }
+            test.start();
+            assert!(test.statuses().is_empty());
+            assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+            let plan = test.app.load_plan().unwrap();
+            assert!(plan.get("usage").is_none());
+            assert!(plan.get("planner_usage").is_none());
+            for stage in plan["stages"].as_array().unwrap() {
+                assert_eq!(stage["status"], "committed");
+                assert!(stage.get("usage").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn resumed_run_keeps_usage_and_tracks_each_invocations_model() {
+        let test = QueueTest::new(true);
+        test.app.mock_agent("planner").unwrap();
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["mock_usage"] = json!({"total": 10});
+            settings["max_fix_rounds"] = json!(0);
+            settings["implementer_model"] = json!("configured-model");
+            settings["reviewer_model"] = json!("");
+            settings["mock_verdicts"] = json!([
+                {"approved": false, "issues": ["Try again."]},
+            ]);
+        }
+        test.app.run_worker();
+        let blocked = test.app.load_plan().unwrap();
+        assert_eq!(blocked["stages"][0]["status"], "blocked");
+        assert_eq!(blocked["usage"]["mock"], json!({
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 20, "calls": 2,
+            "models": {"configured-model": 10},
+        }));
+        assert_eq!(blocked["stages"][0]["usage"], blocked["usage"]);
+        assert!(blocked["stages"][1].get("usage").is_none());
+        test.app.app.settings.lock().unwrap()["mock_usage"]["model"] = json!("reported-model");
+        test.app.run_worker();
+        let plan = test.app.load_plan().unwrap();
+        assert_eq!(plan["status"], "done");
+        assert_eq!(plan["stages"][0]["usage"]["mock"], json!({
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 40, "calls": 4,
+            "models": {"configured-model": 10, "reported-model": 20},
+        }));
+        assert_eq!(plan["usage"]["mock"], json!({
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 60, "calls": 6,
+            "models": {"configured-model": 10, "reported-model": 40},
+        }));
+    }
+
+    #[test]
     fn history_entries_include_timestamp_and_only_available_context() {
         let test = QueueTest::new(true);
         let before = unix_timestamp();

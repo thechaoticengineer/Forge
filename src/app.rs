@@ -1,4 +1,4 @@
-use crate::agent::stream_agent_output;
+use crate::agent::{AgentUsage, stream_agent_output};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
@@ -323,6 +323,46 @@ impl Ctx {
         self.save_json("plan.json", plan);
     }
 
+    fn add_usage(parent: &mut Value, key: &str, tool: &str, usage: &AgentUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        if !parent.is_object() {
+            *parent = json!({});
+        }
+        let target = &mut parent[key];
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let totals = &mut target[tool];
+        if !totals.is_object() {
+            *totals = json!({});
+        }
+        for (field, amount) in [
+            ("input_tokens", usage.input_tokens),
+            ("output_tokens", usage.output_tokens),
+            ("total_tokens", usage.total_tokens),
+            ("calls", 1),
+        ] {
+            totals[field] = json!(totals[field].as_i64().unwrap_or(0) + amount);
+        }
+        if !totals["models"].is_object() {
+            totals["models"] = json!({});
+        }
+        if !usage.model.is_empty() {
+            let model_total = &mut totals["models"][&usage.model];
+            *model_total = json!(model_total.as_i64().unwrap_or(0) + usage.total_tokens);
+        }
+    }
+
+    fn record_stage_usage(&self, plan: &mut Value, idx: usize, tool: &str, usage: Option<AgentUsage>) {
+        if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+            Self::add_usage(&mut plan["stages"][idx], "usage", tool, &usage);
+            Self::add_usage(plan, "usage", tool, &usage);
+            self.save_plan(plan);
+        }
+    }
+
     pub(crate) fn load_queue(&self) -> Value {
         fs::read_to_string(self.forge_path("queue.json"))
             .ok()
@@ -461,7 +501,9 @@ impl Ctx {
         message
     }
 
-    fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<(), String> {
+    fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str)
+        -> Result<Option<AgentUsage>, String>
+    {
         if tool == "mock" {
             #[cfg(test)]
             if role == "planner" {
@@ -480,7 +522,19 @@ impl Ctx {
                 settings["mock_chat_step"] = json!(state.current_step);
                 settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
             }
-            return self.mock_agent(role);
+            self.mock_agent(role)?;
+            let usage = self.app.settings.lock().unwrap().get("mock_usage")
+                .filter(|usage| usage.is_object()).map(|usage| AgentUsage {
+                    input_tokens: usage["input"].as_i64().unwrap_or(0),
+                    output_tokens: usage["output"].as_i64().unwrap_or(0),
+                    total_tokens: usage["total"].as_i64().unwrap_or(0),
+                    model: usage["model"].as_str().filter(|model| !model.is_empty())
+                        .unwrap_or(model).to_string(),
+                });
+            if usage.is_some() {
+                self.log_agent_finished(role, tool, "", usage.as_ref());
+            }
+            return Ok(usage);
         }
         let mut cmd = Self::agent_command(tool, prompt, model)?;
         self.log_event("agent", &format!("[{role}] starting {tool} session"));
@@ -523,10 +577,11 @@ impl Ctx {
                 .unwrap_or_else(|_| Err("agent stderr reader panicked".to_string()));
             (stdout_result, stderr_result, status_result)
         });
+        let model = self.session.state.lock().unwrap().agent_model.clone();
         self.clear_agent_activity();
 
-        let tail = match stdout_result {
-            Ok((tail, _usage)) => tail,
+        let (tail, mut usage) = match stdout_result {
+            Ok(result) => result,
             Err(e) => {
                 self.agent_error(role, format!("{tool} output failed: {e}"));
                 return Err(e);
@@ -550,8 +605,20 @@ impl Ctx {
             self.log_event("error", &format!("[{role}] {tool} failed: {etail}"));
             return Err(format!("{tool} exited with {status}: {etail}"));
         }
-        self.log_event("agent", &format!("[{role}] {tool} finished: {tail}"));
-        Ok(())
+        if let Some(usage) = &mut usage
+            && usage.model.is_empty()
+        {
+            usage.model = model;
+        }
+        self.log_agent_finished(role, tool, &tail, usage.as_ref());
+        Ok(usage)
+    }
+
+    fn log_agent_finished(&self, role: &str, tool: &str, tail: &str, usage: Option<&AgentUsage>) {
+        let tokens = usage.map(|usage| format!(" ({} tokens)", usage.total_tokens))
+            .unwrap_or_default();
+        let tail = if tail.is_empty() { String::new() } else { format!(": {tail}") };
+        self.log_event("agent", &format!("[{role}] {tool} finished{tokens}{tail}"));
     }
 
     fn clear_agent_activity(&self) {
@@ -723,6 +790,7 @@ impl Ctx {
     }
 
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
+        let tool = self.setting("planner");
         // A previous goal's plan must never count as the new planner's output.
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         let path = self.forge_path("plan.json");
@@ -732,11 +800,15 @@ impl Ctx {
             Err(e) => Err(format!("could not remove previous plan: {e}")),
         }
         .and_then(|_| self.run_agent(
-            "planner", &self.setting("planner"), prompt, &self.setting("planner_model"),
+            "planner", &tool, prompt, &self.setting("planner_model"),
         ))
-        .and_then(|_| {
-            self.load_plan()
-                .ok_or_else(|| "planner did not produce a valid plan file".to_string())
+        .and_then(|usage| {
+            let mut plan = self.load_plan()
+                .ok_or_else(|| "planner did not produce a valid plan file".to_string())?;
+            if let Some(usage) = usage {
+                Self::add_usage(&mut plan, "planner_usage", &tool, &usage);
+            }
+            Ok(plan)
         })
     }
 
@@ -917,12 +989,13 @@ impl Ctx {
             self.save_plan(plan);
 
             let stage = plan["stages"][idx].clone();
-            match &issues {
+            let implementer = self.setting("implementer");
+            let usage = match &issues {
                 None => {
                     self.set_step(Some(sid), "implementing");
                     let p = self.stage_prompt(IMPLEMENT_PROMPT, plan, &stage);
-                    self.run_agent("implementer", &self.setting("implementer"), &p,
-                                   &self.setting("implementer_model"))?;
+                    self.run_agent("implementer", &implementer, &p,
+                                   &self.setting("implementer_model"))?
                 }
                 Some(list) => {
                     self.set_step(Some(sid), &format!("fixing (round {round})"));
@@ -930,10 +1003,11 @@ impl Ctx {
                     let p = self
                         .stage_prompt(FIX_PROMPT, plan, &stage)
                         .replace("{issues}", &joined);
-                    self.run_agent("fixer", &self.setting("implementer"), &p,
-                                   &self.setting("implementer_model"))?;
+                    self.run_agent("fixer", &implementer, &p,
+                                   &self.setting("implementer_model"))?
                 }
-            }
+            };
+            self.record_stage_usage(plan, idx, &implementer, usage);
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -942,8 +1016,10 @@ impl Ctx {
             let verdict_path = self.forge_path("verdict.json");
             let _ = fs::remove_file(&verdict_path);
             let p = self.stage_prompt(REVIEW_PROMPT, plan, &stage);
-            self.run_agent("reviewer", &self.setting("reviewer"), &p,
-                           &self.setting("reviewer_model"))?;
+            let reviewer = self.setting("reviewer");
+            let usage = self.run_agent("reviewer", &reviewer, &p,
+                                       &self.setting("reviewer_model"))?;
+            self.record_stage_usage(plan, idx, &reviewer, usage);
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1106,5 +1182,40 @@ impl Ctx {
         let duration = fmt_duration(if started > 0 { unix_timestamp() - started } else { 0 });
         self.log_event("run", &format!("all stages committed — run complete in {duration}"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_accumulates_separate_tools_and_models_and_skips_empty_values() {
+        let mut target = Value::Null;
+        Ctx::add_usage(&mut target, "usage", "codex", &AgentUsage::default());
+        assert!(target.is_null());
+        target = json!({"goal": "Test goal"});
+        Ctx::add_usage(&mut target, "usage", "codex", &AgentUsage::default());
+        assert_eq!(target, json!({"goal": "Test goal"}));
+        let mut usage = AgentUsage {
+            input_tokens: 80, output_tokens: 20, total_tokens: 100, model: "model-a".into(),
+        };
+        Ctx::add_usage(&mut target, "usage", "codex", &usage);
+        Ctx::add_usage(&mut target, "usage", "codex", &usage);
+        usage.model = "model-b".into();
+        Ctx::add_usage(&mut target, "usage", "codex", &usage);
+        usage.model.clear();
+        Ctx::add_usage(&mut target, "usage", "claude", &usage);
+        Ctx::add_usage(&mut target, "usage", "unused", &AgentUsage::default());
+        Ctx::add_usage(&mut target, "planner_usage", "codex", &AgentUsage::default());
+        assert_eq!(target, json!({
+            "goal": "Test goal",
+            "usage": {
+                "codex": {"input_tokens": 240, "output_tokens": 60, "total_tokens": 300,
+                    "calls": 3, "models": {"model-a": 200, "model-b": 100}},
+                "claude": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100,
+                    "calls": 1, "models": {}},
+            },
+        }));
     }
 }
