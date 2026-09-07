@@ -85,6 +85,7 @@ Item {
   function fs(px) { return Style.fontPx(px / 12) }
 
   readonly property var plan: engineState ? engineState.plan : null
+  readonly property var architecture: engineState && engineState.architecture ? engineState.architecture : null
   readonly property var sessions: engineState && engineState.sessions ? engineState.sessions : []
   readonly property string activeProject: engineState
     ? engineState.active_project || engineState.project : ""
@@ -1389,6 +1390,45 @@ Item {
           }
         }
 
+        Column {
+          visible: root.plan !== null || (root.architecture && root.architecture.context_status === "error")
+          width: parent.width
+          spacing: Style.space(4)
+          Text {
+            width: parent.width
+            text: "Architecture · revision "
+              + (root.architecture && root.architecture.revision ? root.architecture.revision : "legacy")
+              + " · context " + (root.architecture ? root.architecture.context_status : "legacy")
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
+            wrapMode: Text.Wrap
+          }
+          Text {
+            width: parent.width
+            visible: text !== ""
+            text: root.engineState && root.engineState.persistence_error
+              ? root.engineState.persistence_error
+              : root.architecture && root.architecture.error ? root.architecture.error : ""
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
+            wrapMode: Text.Wrap
+          }
+          Repeater {
+            model: root.architecture && root.architecture.recent_decisions ? root.architecture.recent_decisions : []
+            delegate: Text {
+              required property var modelData
+              width: parent.width
+              text: modelData.id + " · " + modelData.status + " · " + modelData.summary
+              color: root.mutedForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(12)
+              wrapMode: Text.Wrap
+            }
+          }
+        }
+
         // ------------------------------------------------ plan Q&A
         Column {
           id: chatSection
@@ -1774,9 +1814,11 @@ Item {
                     text: stageRow.lastReview
                       ? "last completed review · " + root.reviewRoundLabel(stageRow.lastReview)
                         + ": " + stageRow.lastDecision.label
+                        + (stageRow.modelData.last_verdict_valid === false ? " · obsolete for current work" : "")
                       : ""
                     textFormat: Text.PlainText
-                    color: stageRow.lastDecision && stageRow.lastDecision.optionalNotes ? root.working
+                    color: stageRow.modelData.last_verdict_valid === false ? root.mutedForeground
+                      : stageRow.lastDecision && stageRow.lastDecision.optionalNotes ? root.working
                       : stageRow.lastDecision && stageRow.lastDecision.clean
                       ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
                     wrapMode: Text.Wrap
@@ -1824,6 +1866,17 @@ Item {
                   visible: stageRow.expanded
                   width: stageRow.width
                   text: "acceptance criteria:\n" + (stageRow.modelData.acceptance || "")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
+                  visible: stageRow.expanded && stageRow.modelData.reviews_truncated === true
+                  width: stageRow.width
+                  text: "Recent review previews · showing " + stageRow.reviewHistory.length
+                    + " of " + (stageRow.modelData.review_count || 0) + " reviews"
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap

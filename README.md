@@ -9,6 +9,7 @@ Rust engine + Quickshell (Omarchy) panel.
 
 1. Point Forge at a git repository and describe a goal.
 2. A planner agent (Claude Code or Codex) writes a staged plan to
+   `.forge/plan-candidate.json`; Forge validates and publishes it to
    `.forge/plan.json` — each stage has instructions, acceptance criteria,
    and a proposed commit message.
 3. You mark the plan OK in the panel.
@@ -124,6 +125,126 @@ complete stage list, keeping committed stages at the start in their original
 order; omit `id` for new stages to have Forge assign one. AI feedback must
 not be blank. Both endpoints require an existing plan and reject requests
 while the project is busy or its queue is active.
+
+### Plan identity and architectural records
+
+Plans now carry `contract_version: 1`, a project-local `plan_id`, and a
+monotonic `revision` starting at 1. Manual edits and AI revisions retain the
+identity and advance its revision; execution updates retain the revision.
+Replacement plans, including successive queue goals, get fresh identities.
+Discarding a plan archives it; the next plan also gets a fresh identity.
+Every stage execution attempt has an `attempt_id`; review `round` numbering
+still restarts at 1 for each attempt. New review history includes its role,
+attempt identity, and plan revision.
+
+Legacy plans remain readable without a write on startup or `/api/state`.
+Their first mutation lazily imports them, retaining unknown metadata, usage,
+reviews, and verdicts. Committed stages retain exactly the same JSON
+values through edits and revisions. Other stages reconcile by stable IDs,
+retain their history and usage, and mark obsolete `last_verdict_valid`,
+`context_valid`, guidance, and agreements false. Removed stages remain in the
+immutable historical snapshots. `stage_id_high_water` prevents recycling their
+IDs. New stages may omit `id`.
+
+Stages may specify `depends_on: [stage_id, ...]`, referring only to earlier
+stages; `[]` explicitly declares independence. Without this field, all preceding
+stages are dependencies. Relevant inputs are the goal, stage content, and
+these dependency IDs and their transitive input descriptions. Content or goal
+changes invalidate affected work and its transitive dependants. An unrelated edit or a reorder consistent with explicit
+dependencies retains an unchanged stage's agreements. Editing a draft still
+requires human approval again.
+
+Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
+
+- `events.jsonl`: serialized append-only committed events for decisions,
+  guidance, model proposals/agreements/selections/invalidations, and role-tagged
+  reviews. Event envelopes include version, ID, plan, revision, timestamp, and
+  checkpoint reference. Imported legacy details remain in immutable review files.
+- `checkpoints/<checkpoint-id>.json`: immutable bundles containing the exact
+  published plan and a bounded architecture checkpoint. The checkpoint holds
+  the exact provider session and provider checkpoint reference, context summary,
+  up to eight recent decision summaries, current guidance/agreements, and review
+  policy with its rationale. Architecture checkpoint data is limited to 64 KiB;
+  execution loads restore the original review arrays and historical metadata.
+- `reviews/<file-id>.jsonl` and `.idx`: immutable review arrays and binary
+  little-endian u64 record offsets. The plan's `architecture.review_history`
+  manifest binds stage IDs to exact files, counts, byte lengths, and at most eight
+  previews. On disk, a stage's reviews use `{"$forge_reviews":"<file-id>"}`;
+  execution and editing hydrate them back to the original JSON arrays. Unchanged
+  arrays reuse files, and removed stages retain their manifest entries.
+- `archived.json`: the last published plan reference, written before replacement
+  or discard so its committed history remains addressable.
+
+`src/contracts.rs` defines version-one provider-neutral invocation/result,
+catalogue, decision, guidance, model-selection, and review records. Decisions
+have stable IDs, rationale, alternatives/tradeoffs, status/supersession, stage,
+revision, and timestamps. Model records distinguish proposals, agreements, and
+effective provider/model/native effort; retain both participants' reasons,
+capability-policy/catalogue provenance, availability verification state, trigger,
+and superseded agreement. These are storage contracts only. Model discovery,
+architect invocation, routing, and dual review gates are **inactive** in this
+stage. The existing independent review path remains in use; the panel reports
+architecture context as `inactive` until later lifecycle work is implemented.
+
+Publication uses an explicit commit protocol under a per-project persistence
+mutex (one engine writer per project):
+
+1. Keep the authoritative `plan.json` in place while a planner writes its
+   separate candidate. Validate/reconcile the candidate before publishing.
+2. Append and sync a versioned event. Write, sync, and read back any new review
+   files/indexes, then write, sync, and read back an immutable checkpoint bundle. Sync parent directories as well. The proposed plan records
+   the checkpoint ID and exact committed byte range in the event log.
+3. Validate nested checkpoint contracts against the plan, the review files, and
+   the persisted bundle/event linkage, then atomically publish `plan.json`. This
+   rename is the single transaction publication boundary;
+   independent snapshot renames are preparation, not additional commits.
+
+On restart, only the checkpoint and event prefix named by `plan.json` are
+current. A crash before publication keeps the old plan/context; a crash after
+publication selects the complete new plan/context/review references. Unreferenced
+snapshots, review files, and temp files are ignored. Before another append, only the uncommitted event suffix is
+truncated; committed bytes and checkpoint files are retained. A reported sync
+failure after rename restores a checked rollback link to the old publication.
+If storage also prevents rollback, the error explicitly reports an uncertain
+outcome and retains the rollback file for recovery. Malformed, unsupported,
+truncated, or mismatched authoritative records fail closed and surface through
+API state; Forge does not silently pick an arbitrary checkpoint.
+
+Session references require `resume_policy: "fork_from_checkpoint"`: a later
+provider adapter must fork/recover from the exact saved provider checkpoint,
+never resume its mutable latest tail. Revision publication marks existing
+session context `needs_recovery`; a failed revision cannot publish its provider
+turns as valid architecture context. Providers without checkpoint-fork support
+must start a fresh session from the bounded checkpoint in the later session
+implementation.
+
+`GET /api/state` adds a bounded `architecture` summary (identity, revision,
+checkpoint/event position, context status, at most 2,000 summary characters and
+eight decisions of at most 240 summary characters) and `persistence_error`.
+The panel displays revision, context status, and recent decisions read-only.
+Stage review arrays in state contain at most eight previews (at most 4 KiB each),
+with `review_count` and `reviews_truncated` when abbreviated. Complete review
+arrays are not read during polling of indexed publications. The first read of
+an unchanged legacy file scans it once and caches only a bounded state view;
+state reads do not migrate it. Its next mutation writes indexed review files
+without changing any historical record. Existing inline snapshots remain readable.
+
+`GET /api/architecture/reviews?stage_id=1&cursor=0&limit=20` returns complete review
+records with a record-number `next_cursor` and total `count`. Pages contain at
+most 100 records and normally at most 256 KiB; a single larger legacy record is
+returned intact on its own page. Use the returned `checkpoint` on subsequent
+requests to pin a snapshot while execution continues. Removed-stage reviews are
+still addressable by stage ID. `plan_id` selects an archived plan and `project`
+selects its project without switching the active project. Before migration,
+review pagination reads the legacy inline array.
+
+`GET /api/architecture/history?cursor=0&limit=20` pages committed events; follow
+`next_cursor` until null. Cursors are byte offsets at event boundaries. Pages
+are capped at 100 events and 256 KiB, with each event capped at 64 KiB. Add
+`plan_id=<archived-id>` to inspect a replaced/discarded plan, and the usual
+`project` query parameter for another project. State never reads the full
+architecture log. Existing feed/chat/report tail reads are capped at 2 MiB.
+All these artefacts remain inside the existing `.forge` commit exclusion.
 
 ### Asking about the plan
 
@@ -244,7 +365,7 @@ decision cannot be mistaken for approval of work under review. An older clean
 decision is muted during current activity. Budget exhaustion displays
 `blocked · review budget exhausted` alongside the last decision.
 
-Expand a stage to see each review's recorded round, decision, full summary,
+Expand a stage to see recent review previews with recorded round, decision, summary,
 change requests, notes, checks under `verified:`, and timestamp (UTC).
 Earlier requests remain visible after final approval. Expanded history uses
 the same decisions, colors, and request counts as the chip: historical
@@ -252,7 +373,7 @@ notes-only approvals display amber `approved with optional notes`, with their
 feedback labeled `optional notes`. Saved approvals containing issues retain
 the red `legacy approval with change requests` label and request count;
 notes on change-request decisions are labeled `legacy notes (change requests)`.
-All feedback remains available for inspection. Plans with only `last_verdict`
+All feedback remains available through the paginated review history API. Plans with only `last_verdict`
 use the same fallback record for both the chip and expanded feedback. Missing
 notes, checks, or history are supported; unavailable timestamps are omitted and
 unknown review rounds are labeled `round unknown`, rather than borrowing the

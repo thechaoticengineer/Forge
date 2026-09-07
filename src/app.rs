@@ -4,7 +4,7 @@ use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, uni
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +28,9 @@ pub(crate) struct App {
 pub(crate) struct Session {
     pub(crate) state: Mutex<State>,
     pub(crate) queue_lock: Mutex<()>,
+    pub(crate) persistence_lock: Mutex<()>,
+    pub(crate) persistence_error: Mutex<Option<String>>,
+    pub(crate) legacy_state_cache: Mutex<Option<(String, Value)>>,
     pub(crate) stop_requested: AtomicBool,
     pub(crate) busy: AtomicBool,
     pub(crate) queue_active: AtomicBool,
@@ -89,9 +92,9 @@ impl App {
         }
         // Read persisted state before taking the map lock. No session state
         // or queue lock may be held while the sessions map is locked.
-        let plan = fs::read_to_string(PathBuf::from(&project).join(FORGE_DIR).join("plan.json"))
-            .ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .filter(|plan| plan.get("stages").is_some_and(Value::is_array));
+        let loaded = crate::architecture::Store::new(PathBuf::from(&project).join(FORGE_DIR)).load_raw();
+        let persistence_error = loaded.as_ref().err().cloned();
+        let plan = loaded.ok().flatten();
         // A pending self-update marker means install.sh restarted the engine
         // since this project last had a session; surface the completion in
         // its feed. A stale marker (update never restarted us) is discarded.
@@ -106,12 +109,15 @@ impl App {
         }
         let session = Arc::new(Session {
             state: Mutex::new(State {
-                phase: if plan.is_some() { "plan_ready" } else { "idle" }.into(),
+                phase: if persistence_error.is_some() { "failed" } else if plan.is_some() { "plan_ready" } else { "idle" }.into(),
                 goal: plan.as_ref().and_then(|plan| plan["goal"].as_str())
                     .unwrap_or("").to_string(),
                 ..State::default()
             }),
             queue_lock: Mutex::new(()),
+            persistence_lock: Mutex::new(()),
+            persistence_error: Mutex::new(persistence_error),
+            legacy_state_cache: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
             busy: AtomicBool::new(false),
             queue_active: AtomicBool::new(false),
@@ -287,7 +293,18 @@ impl Ctx {
     }
 
     fn read_jsonl_tail(&self, name: &str, keep: usize) -> Value {
-        let text = fs::read_to_string(self.forge_path(name)).unwrap_or_default();
+        let text = (|| -> std::io::Result<String> {
+            let mut file = fs::File::open(self.forge_path(name))?;
+            let size = file.metadata()?.len();
+            let start = size.saturating_sub(2 * 1024 * 1024);
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new(); file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
+            if start > 0 {
+                let boundary = bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |p| p + 1);
+                bytes.drain(..boundary);
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })().unwrap_or_default();
         let items: Vec<Value> = text
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
@@ -316,15 +333,107 @@ impl Ctx {
         );
     }
 
-    pub(crate) fn load_plan(&self) -> Option<Value> {
-        let text = fs::read_to_string(self.forge_path("plan.json")).ok()?;
-        let plan: Value = serde_json::from_str(&text).ok()?;
-        plan.get("stages")?.as_array()?;
-        Some(plan)
+    pub(crate) fn architecture_store(&self) -> crate::architecture::Store {
+        crate::architecture::Store::new(self.forge_path(""))
     }
 
-    pub(crate) fn save_plan(&self, plan: &Value) {
-        self.save_json("plan.json", plan);
+    pub(crate) fn load_plan(&self) -> Option<Value> {
+        let _guard = self.session.persistence_lock.lock().unwrap();
+        match self.architecture_store().load() {
+            Ok(plan) => plan,
+            Err(error) => {
+                *self.session.persistence_error.lock().unwrap() = Some(error);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn save_plan(&self, plan: &Value) -> Result<(), String> {
+        self.publish_plan(plan, false).map(|_| ())
+    }
+
+    pub(crate) fn publish_plan(&self, plan: &Value, replacement: bool) -> Result<Value, String> {
+        let _guard = self.session.persistence_lock.lock().unwrap();
+        let result = (|| {
+            let store = self.architecture_store();
+            let mut old = store.load()?;
+            if let Some(legacy) = old.as_ref().filter(|p| p.get("architecture").is_none()) {
+                old = Some(store.publish(legacy.clone(), crate::architecture::checkpoint_default(),
+                    json!({"kind": "legacy_import"}))?);
+            }
+            let mut next = plan.clone();
+            // Import legacy metadata on first mutation, never on a read.
+            let same = !replacement && old.as_ref().is_some_and(|p|
+                next["plan_id"].is_null() || next["plan_id"] == p["plan_id"]);
+            if !replacement && old.is_some() && !same { return Err("plan identity does not match the active project plan".into()); }
+            let mut cp = crate::architecture::checkpoint_default();
+            let mut invalidations = Vec::new();
+            if same {
+                let old = old.as_ref().unwrap();
+                if old.get("architecture").is_some() {
+                    cp = store.checkpoint(old)?;
+                    for key in ["plan_id", "contract_version", "architecture"] { next[key] = old[key].clone(); }
+                    if next["revision"].is_null() { next["revision"] = old["revision"].clone(); }
+                }
+                let affected = crate::plan::affected_stages(old, &next).map_err(str::to_owned)?;
+                if !affected.is_empty() && next["revision"] == old["revision"] {
+                    next["revision"] = json!(old["revision"].as_u64().unwrap().checked_add(1).ok_or("revision limit reached")?);
+                }
+                if next["revision"] != old["revision"] {
+                    // Never resume the mutable tail of a session after a revision.
+                    if !cp["session"].is_null() { cp["context_status"] = json!("needs_recovery"); }
+                    for key in ["guidance", "agreements"] {
+                        if let Some(records) = cp[key].as_object_mut() {
+                            for (id, record) in records {
+                                let valid = next["stages"].as_array().unwrap().iter().any(|s|
+                                    s["id"].to_string() == *id && !affected.contains(&s["id"]));
+                                if !valid && record.is_object() {
+                                    let trigger = if old["goal"] != next["goal"] { "goal_changed" }
+                                        else if !next["stages"].as_array().unwrap().iter().any(|s| s["id"].to_string() == *id) { "stage_removed" }
+                                        else { "stage_or_dependency_changed" };
+                                    invalidations.push(json!({"kind": key, "stage_id": id, "record_id": record["id"],
+                                        "trigger": trigger, "previous_revision": old["revision"], "revision": next["revision"]}));
+                                    record["valid"] = json!(false);
+                                    record["invalidation_trigger"] = json!(trigger);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for key in ["plan_id", "revision", "architecture", "contract_version"] { next.as_object_mut().ok_or("invalid plan")?.remove(key); }
+            }
+            let kind = if replacement { "plan_created" } else if old.as_ref().is_some_and(|p| p.get("architecture").is_none()) { "legacy_import" } else { "plan_saved" };
+            let mut reviews = Vec::new();
+            let mut removed = Vec::new();
+            if let Some(old) = old.as_ref().filter(|_| same) {
+                for stage in old["stages"].as_array().unwrap() {
+                    if !next["stages"].as_array().unwrap().iter().any(|s| s["id"] == stage["id"]) {
+                        removed.push(stage["id"].clone());
+                    }
+                }
+            }
+            for stage in next["stages"].as_array().ok_or("invalid stages")? {
+                let count = old.as_ref().filter(|_| same).and_then(|p| p["stages"].as_array())
+                    .and_then(|stages| stages.iter().find(|s| s["id"] == stage["id"]))
+                    .and_then(|s| s["reviews"].as_array()).map_or(0, Vec::len);
+                for review in stage["reviews"].as_array().into_iter().flatten().skip(count) {
+                    let mut record = review.clone();
+                    if record.is_object() {
+                        record["version"] = json!(crate::architecture::VERSION);
+                        record["id"] = json!(crate::architecture::identity());
+                        record["policy"] = cp["review_policy"].clone();
+                        record["stage_id"] = stage["id"].clone();
+                        if record["role"].is_null() { record["role"] = json!("reviewer"); }
+                        reviews.push(record);
+                    }
+                }
+            }
+            if old.as_ref() == Some(&next) { return Ok(next); }
+            store.publish(next, cp, json!({"kind": kind, "reviews": reviews, "removed_stage_ids": removed, "invalidations": invalidations}))
+        })();
+        *self.session.persistence_error.lock().unwrap() = result.as_ref().err().cloned();
+        result
     }
 
     fn add_usage(parent: &mut Value, key: &str, tool: &str, usage: &AgentUsage) {
@@ -359,12 +468,13 @@ impl Ctx {
         }
     }
 
-    fn record_stage_usage(&self, plan: &mut Value, idx: usize, tool: &str, usage: Option<AgentUsage>) {
+    fn record_stage_usage(&self, plan: &mut Value, idx: usize, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
         if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
             Self::add_usage(&mut plan["stages"][idx], "usage", tool, &usage);
             Self::add_usage(plan, "usage", tool, &usage);
-            self.save_plan(plan);
+            self.save_plan(plan)?;
         }
+        Ok(())
     }
 
     pub(crate) fn load_queue(&self) -> Value {
@@ -379,15 +489,15 @@ impl Ctx {
         self.save_json("queue.json", queue);
     }
 
-    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> i64 {
+    fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> Result<i64, String> {
         let stage = &mut plan["stages"][idx];
         let finished = unix_timestamp();
         let started = stage["started_unix"].as_i64().unwrap_or(finished);
         stage["status"] = json!(status);
         stage["finished_unix"] = json!(finished);
         stage["duration_secs"] = json!(finished - started);
-        self.save_plan(plan);
-        finished - started
+        self.save_plan(plan)?;
+        Ok(finished - started)
     }
 
     pub(crate) fn set_phase(&self, phase: &str) {
@@ -514,7 +624,7 @@ impl Ctx {
                 let mut settings = self.app.settings.lock().unwrap();
                 settings["mock_planner_prompt"] = json!(prompt);
                 settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
-                settings["mock_planner_had_plan"] = json!(self.forge_path("plan.json").exists());
+                settings["mock_planner_had_plan"] = json!(self.forge_path("plan-candidate.json").exists());
             }
             #[cfg(test)]
             if role == "chat" {
@@ -653,14 +763,14 @@ impl Ctx {
                 if let Some(output) = self.app.settings.lock().unwrap().get("mock_plan_output") {
                     // Null simulates an agent exiting successfully without writing a plan.
                     if !output.is_null() {
-                        fs::write(self.forge_path("plan.json"),
+                        fs::write(self.forge_path("plan-candidate.json"),
                             output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
                             .map_err(|e| e.to_string())?;
                     }
                     return Ok(());
                 }
                 let goal = self.session.state.lock().unwrap().goal.clone();
-                self.save_plan(&json!({
+                crate::architecture::atomic_json(&self.forge_path("plan-candidate.json"), &json!({
                     "goal": goal, "status": "draft",
                     "stages": [
                         {"id": 1, "title": "first", "instructions": "append line one",
@@ -670,7 +780,7 @@ impl Ctx {
                          "acceptance": "file has line two", "commit": "feat: line two",
                          "status": "pending", "rounds": 0},
                     ],
-                }));
+                }))?;
             }
             "chat" => {
                 #[cfg(test)]
@@ -731,13 +841,13 @@ impl Ctx {
         let prompt = match mode {
             PlanMode::Standard => PLANNER_PROMPT
                 .replace("{goal}", goal)
-                .replace("{plan_path}", &format!("{FORGE_DIR}/plan.json")),
+                .replace("{plan_path}", &format!("{FORGE_DIR}/plan-candidate.json")),
             PlanMode::Refactor { focus } => fill_template(REFACTOR_PROMPT, &[
-                ("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan.json"),
+                ("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan-candidate.json"),
             ]),
         };
         match self.generate_plan(&prompt)
-            .and_then(|plan| self.finalize_plan(plan, goal, &[], "ready"))
+            .and_then(|plan| self.finalize_plan(plan, goal, None, "ready"))
         {
             Ok(()) => true,
             Err(e) => {
@@ -750,20 +860,17 @@ impl Ctx {
 
     pub(crate) fn revise_worker(&self, current_plan: &Value, feedback: &str) {
         let _worker = WorkerGuard(&self.session);
+        let authoritative = self.load_plan().unwrap_or_else(|| current_plan.clone());
+        let current_plan = &authoritative;
         let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
         let goal = current_plan["goal"].as_str().unwrap_or("");
-        let committed: Vec<Value> = current_plan["stages"].as_array().unwrap().iter()
-            .filter(|stage| stage["status"] == "committed").cloned().collect();
         let prompt = fill_template(REVISE_PROMPT, &[
             ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
-            ("{goal}", goal), ("{plan_path}", ".forge/plan.json"),
+            ("{goal}", goal), ("{plan_path}", ".forge/plan-candidate.json"),
         ]);
         let result = self.generate_plan(&prompt)
-            .and_then(|plan| self.finalize_plan(plan, goal, &committed, "revised"));
-        if let Err(mut error) = result {
-            if let Err(e) = fs::write(self.forge_path("plan.json"), snapshot) {
-                error.push_str(&format!("; could not restore previous plan: {e}"));
-            }
+            .and_then(|plan| self.finalize_plan(plan, goal, Some(current_plan), "revised"));
+        if let Err(error) = result {
             self.set_phase("plan_ready");
             self.log_event("error", &format!("revision failed: {error}"));
         }
@@ -805,28 +912,26 @@ impl Ctx {
 
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
         let tool = self.setting("planner");
-        // A previous goal's plan must never count as the new planner's output.
+        self.ensure_forge_dir();
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
-        let path = self.forge_path("plan.json");
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("could not remove previous plan: {e}")),
+        let path = self.forge_path("plan-candidate.json");
+        match fs::remove_file(&path) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("could not remove previous candidate: {e}")),
         }
-        .and_then(|_| self.run_agent(
-            "planner", &tool, prompt, &self.setting("planner_model"),
-        ))
-        .and_then(|usage| {
-            let mut plan = self.load_plan()
-                .ok_or_else(|| "planner did not produce a valid plan file".to_string())?;
-            if let Some(usage) = usage {
-                Self::add_usage(&mut plan, "planner_usage", &tool, &usage);
-            }
-            Ok(plan)
-        })
+        let usage = self.run_agent("planner", &tool, prompt, &self.setting("planner_model"))?;
+        let mut plan: Value = serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid candidate: {e}"))?;
+        if !plan["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
+        // Agent-authored usage may be an echo of the previous revision. Only
+        // the invocation result contributes new planner usage.
+        plan.as_object_mut().unwrap().remove("planner_usage");
+        if let Some(usage) = usage { Self::add_usage(&mut plan, "planner_usage", &tool, &usage); }
+        Ok(plan)
     }
 
-    fn finalize_plan(&self, mut plan: Value, goal: &str, committed: &[Value], action: &str)
+    fn finalize_plan(&self, mut plan: Value, goal: &str, previous: Option<&Value>, action: &str)
         -> Result<(), String>
     {
         let stages = plan["stages"].as_array_mut().unwrap();
@@ -841,14 +946,39 @@ impl Ctx {
                 stage["rounds"] = json!(0);
             }
         }
+        let committed: Vec<Value> = previous.into_iter().flat_map(|p| p["stages"].as_array().unwrap())
+            .filter(|s| s["status"] == "committed").cloned().collect();
         // Restore originals even if the agent edited, reordered, duplicated or dropped them.
         stages.retain(|stage| !committed.iter().any(|original| original["id"] == stage["id"]));
         stages.splice(0..0, committed.iter().cloned());
         let n = stages.len();
         plan["goal"] = json!(goal);
         plan["status"] = json!("draft");
-        fs::write(self.forge_path("plan.json"), serde_json::to_string_pretty(&plan).unwrap())
-            .map_err(|e| format!("could not save plan: {e}"))?;
+        if let Some(previous) = previous {
+            let mut edited = crate::plan::edit_plan(previous, &json!({"plan": plan})).map_err(str::to_owned)?;
+            if let Some(usage) = plan.get("planner_usage") {
+                // Preserve previous planning totals; the new invocation is additive.
+                for (tool, value) in usage.as_object().into_iter().flatten() {
+                    let target = &mut edited["planner_usage"];
+                    if !target.is_object() { *target = json!({}); }
+                    if !target[tool].is_object() { target[tool] = json!({}); }
+                    for (key, count) in value.as_object().into_iter().flatten() {
+                        if let Some(n) = count.as_i64() { target[tool][key] = json!(target[tool][key].as_i64().unwrap_or(0) + n); }
+                        else if key == "models" {
+                            if !target[tool][key].is_object() { target[tool][key] = json!({}); }
+                            for (model, n) in count.as_object().into_iter().flatten() { target[tool][key][model] = json!(target[tool][key][model].as_i64().unwrap_or(0) + n.as_i64().unwrap_or(0)); }
+                        }
+                    }
+                }
+            }
+            self.publish_plan(&edited, false)?;
+        } else {
+            let base = json!({"stages": [], "goal": goal});
+            let normalized = crate::plan::edit_plan(&base, &json!({"plan": plan})).map_err(str::to_owned)?;
+            plan["stages"] = normalized["stages"].clone();
+            plan["stage_id_high_water"] = normalized["stage_id_high_water"].clone();
+            self.publish_plan(&plan, true)?;
+        }
         self.set_phase("plan_ready");
         self.log_event("plan", &format!("plan {action} with {n} stages"));
         Ok(())
@@ -866,14 +996,15 @@ impl Ctx {
     }
 
     /// Caller holds queue_lock and owns the busy claim.
-    pub(crate) fn start_queue_run(&self, queue: &mut Value, id: u64, plan: &mut Value) {
+    pub(crate) fn start_queue_run(&self, queue: &mut Value, id: u64, plan: &mut Value) -> Result<(), String> {
         plan["status"] = json!("approved");
-        self.save_plan(plan);
+        self.save_plan(plan)?;
         self.set_queue_status(queue, id, "running");
         let mut s = self.session.state.lock().unwrap();
         s.goal = plan["goal"].as_str().unwrap_or("").to_string();
         s.phase = "running".into();
         s.run_started_unix = unix_timestamp();
+        Ok(())
     }
 
     fn run_queue_item(&self, id: u64) -> bool {
@@ -952,7 +1083,12 @@ impl Ctx {
                 }
                 let mut plan = self.load_plan().unwrap();
                 self.log_event("queue", &format!("goal {id}: automatically approved"));
-                self.start_queue_run(&mut queue, id, &mut plan);
+                if let Err(error) = self.start_queue_run(&mut queue, id, &mut plan) {
+                    self.set_phase("failed");
+                    self.log_event("error", &error);
+                    self.set_queue_status(&mut queue, id, "failed");
+                    break;
+                }
             }
             if !self.run_queue_item(id) {
                 return;
@@ -977,7 +1113,8 @@ impl Ctx {
         let round = stage["rounds"].as_i64().unwrap_or(1);
         let kind = if round == 1 { "Initial review" } else { "Re-review" };
         let mut context = format!("REVIEW ROUND: {round} (current attempt) — {kind}.\n");
-        let Some(verdict) = stage.get("last_verdict").filter(|v| v.is_object()) else {
+        let Some(verdict) = stage.get("last_verdict").filter(|v| v.is_object()
+            && stage["context_valid"] != false && stage["last_verdict_valid"] != false) else {
             context.push_str("No previous review findings for this stage.\n");
             return context;
         };
@@ -1044,7 +1181,7 @@ impl Ctx {
                 return Ok("stopped");
             }
             plan["stages"][idx]["rounds"] = json!(round + 1);
-            self.save_plan(plan);
+            self.save_plan(plan)?;
 
             let stage = plan["stages"][idx].clone();
             let implementer = self.setting("implementer");
@@ -1062,7 +1199,7 @@ impl Ctx {
                                    &self.setting("implementer_model"))?
                 }
             };
-            self.record_stage_usage(plan, idx, &implementer, usage);
+            self.record_stage_usage(plan, idx, &implementer, usage)?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1074,7 +1211,7 @@ impl Ctx {
             let reviewer = self.setting("reviewer");
             let usage = self.run_agent("reviewer", &reviewer, &p,
                                        &self.setting("reviewer_model"))?;
-            self.record_stage_usage(plan, idx, &reviewer, usage);
+            self.record_stage_usage(plan, idx, &reviewer, usage)?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1108,18 +1245,23 @@ impl Ctx {
                         .into(),
                 ]),
             };
+            let plan_revision = plan["revision"].clone();
             let stage = &mut plan["stages"][idx];
             stage["last_verdict"] = json!({
                 "approved": approved, "summary": summary, "issues": list,
                 "notes": notes, "checks": checks,
             });
+            stage["last_verdict_valid"] = json!(true);
+            stage["context_valid"] = json!(true);
+            let attempt = stage["attempt_id"].clone();
             let requests = Self::review_requests(&stage["last_verdict"]);
             stage.as_object_mut().unwrap().entry("reviews")
                 .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
+                    "role": "reviewer", "attempt_id": attempt, "revision": plan_revision,
                     "round": round + 1, "approved": approved, "summary": summary,
                     "issues": list, "notes": notes, "checks": checks, "unix": unix_timestamp(),
                 }));
-            self.save_plan(plan);
+            self.save_plan(plan)?;
 
             if approved {
                 let message = if summary.is_empty() {
@@ -1158,7 +1300,8 @@ impl Ctx {
     }
 
     fn run_worker_inner(&self) -> Result<(), String> {
-        let mut plan = self.load_plan().ok_or("no plan")?;
+        let loaded = self.load_plan().ok_or("no plan")?;
+        let mut plan = self.publish_plan(&loaded, false)?;
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {
@@ -1175,9 +1318,10 @@ impl Ctx {
             plan["stages"][idx]["started_unix"] = json!(unix_timestamp());
             // A resumed stage starts a new attempt; completion timing is no longer current.
             let stage = plan["stages"][idx].as_object_mut().unwrap();
+            stage.insert("attempt_id".into(), json!(crate::architecture::identity()));
             stage.remove("finished_unix");
             stage.remove("duration_secs");
-            self.save_plan(&plan);
+            self.save_plan(&plan)?;
             self.set_step(Some(sid), "implementing");
             self.log_event("stage", &format!("stage {sid} started: {title}"));
 
@@ -1188,7 +1332,7 @@ impl Ctx {
                     return Ok(());
                 }
                 "exhausted" => {
-                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked"));
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked")?);
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
                         "stage {sid} blocked after {duration}: reviewer still rejecting after max fix rounds — needs a human"));
@@ -1200,14 +1344,14 @@ impl Ctx {
                     if let Some(sha) = sha {
                         plan["stages"][idx]["sha"] = json!(sha);
                     }
-                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "committed"));
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "committed")?);
                     self.log_event("stage", &format!("stage {sid} committed in {duration}"));
                 }
             }
         }
 
         plan["status"] = json!("done");
-        self.save_plan(&plan);
+        self.save_plan(&plan)?;
         if self.app.settings.lock().unwrap()["auto_push"].as_bool() == Some(true) {
             self.set_step(None, "pushing");
             match self.git(&["push", "-u", "origin", "HEAD"]) {

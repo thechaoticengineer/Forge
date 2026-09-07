@@ -9,6 +9,9 @@
 //! Serves a JSON API on 127.0.0.1:8734 for the Quickshell panel.
 
 mod agent;
+mod architecture;
+mod review_history;
+mod contracts;
 mod app;
 mod http;
 mod plan;
@@ -69,6 +72,251 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    fn seed_mock_plan(ctx: &Ctx) {
+        ctx.ensure_forge_dir();
+        ctx.mock_agent("planner").unwrap();
+        let plan: Value = serde_json::from_slice(&fs::read(ctx.forge_path("plan-candidate.json")).unwrap()).unwrap();
+        ctx.publish_plan(&plan, true).unwrap();
+    }
+
+    #[test]
+    fn architecture_reconciliation_retains_unaffected_agreements_and_history() {
+        let test = QueueTest::new(false);
+        let mut first = editable_stage(1); first["depends_on"] = json!([]);
+        first["status"] = json!("committed"); first["custom"] = json!({"keep": true});
+        let mut second = editable_stage(2); second["depends_on"] = json!([1]);
+        second["reviews"] = json!([{"approved": true, "round": 1}]);
+        second["last_verdict"] = json!({"approved": true}); second["last_verdict_valid"] = json!(true);
+        second["usage"] = json!({"codex": {"total_tokens": 12}});
+        let mut third = editable_stage(3); third["depends_on"] = json!([]);
+        let mut fourth = editable_stage(4); fourth["depends_on"] = json!([2]);
+        test.app.save_plan(&json!({"goal": "Goal", "status": "draft", "stages": [first, second, third, fourth]})).unwrap();
+        let mut original = test.app.load_plan().unwrap();
+        let store = test.app.architecture_store();
+        let mut cp = store.checkpoint(&original).unwrap();
+        cp["session"] = json!({"provider": "codex", "reference": "exact-session",
+            "checkpoint_reference": "exact-turn", "resume_policy": "fork_from_checkpoint"});
+        cp["context_status"] = json!("ready");
+        for id in [1, 2, 3, 4] {
+            cp["agreements"][id.to_string()] = crate::architecture::agreement_fixture(&original, id as usize - 1);
+            cp["guidance"][id.to_string()] = json!({"version": 1, "id": format!("guidance-{id}"),
+                "stage_id": id, "revision": 1, "relevant_inputs": crate::plan::stage_inputs(&original, id as usize - 1),
+                "text": "Keep the contract", "unix": 10, "valid": true});
+        }
+        original = store.publish(original, cp, json!({"kind": "seed_context"})).unwrap();
+        let mut body = original.clone(); body["stages"][2]["instructions"] = json!("Unrelated edit");
+        let edited = edit_plan(&original, &json!({"plan": body})).unwrap();
+        test.app.save_plan(&edited).unwrap();
+        let published = test.app.load_plan().unwrap(); let cp = store.checkpoint(&published).unwrap();
+        assert_eq!(published["plan_id"], original["plan_id"]); assert_eq!(published["revision"], 2);
+        assert_eq!(published["stages"][0], original["stages"][0]);
+        assert_eq!(published["stages"][1], original["stages"][1]);
+        assert_eq!(cp["agreements"]["2"]["valid"], true); assert_eq!(cp["agreements"]["4"]["valid"], true);
+        assert_eq!(cp["agreements"]["3"]["valid"], false);
+        assert_eq!(cp["context_status"], "needs_recovery");
+        assert_eq!(cp["session"]["checkpoint_reference"], "exact-turn");
+        let mut body = published.clone(); body["stages"][1]["instructions"] = json!("Dependency edit");
+        let edited = edit_plan(&published, &json!({"plan": body})).unwrap(); test.app.save_plan(&edited).unwrap();
+        let changed = test.app.load_plan().unwrap(); let cp = store.checkpoint(&changed).unwrap();
+        assert_eq!(cp["agreements"]["2"]["valid"], false); assert_eq!(cp["agreements"]["4"]["valid"], false);
+        for key in ["reviews", "last_verdict", "usage"] { assert_eq!(changed["stages"][1][key], original["stages"][1][key]); }
+        assert_eq!(changed["stages"][1]["last_verdict_valid"], false);
+        let mut body = changed.clone(); body["goal"] = json!("New goal");
+        let edited = edit_plan(&changed, &json!({"plan": body})).unwrap();
+        assert_eq!(edited["stages"][0], original["stages"][0]);
+        assert_eq!(crate::plan::affected_stages(&changed, &edited).unwrap(), json!([1, 2, 3, 4]).as_array().unwrap().clone());
+    }
+
+    #[test]
+    fn architecture_stage_ids_survive_reorder_removal_and_do_not_recycle() {
+        let mut stages = vec![editable_stage(1), editable_stage(2), editable_stage(3)];
+        for s in &mut stages { s["depends_on"] = json!([]); s["model_agreement"] = json!({"valid": true}); }
+        let old = json!({"goal": "Goal", "revision": 1, "stages": stages});
+        let reordered = edit_plan(&old, &json!({"plan": {"stages": [old["stages"][2], old["stages"][0]]}})).unwrap();
+        assert_eq!(reordered["stages"][0], old["stages"][2]);
+        assert_eq!(crate::plan::affected_stages(&old, &reordered).unwrap(), vec![json!(2)]);
+        let added = edit_plan(&reordered, &json!({"plan": {"stages": [reordered["stages"][0], editable_stage(2)]}})).unwrap();
+        assert_eq!(added["stages"][1]["id"], 4);
+        let mut implicit = old.clone();
+        for stage in implicit["stages"].as_array_mut().unwrap() { stage.as_object_mut().unwrap().remove("depends_on"); }
+        let reordered = edit_plan(&implicit, &json!({"plan": {"stages": [implicit["stages"][2], implicit["stages"][0], implicit["stages"][1]]}})).unwrap();
+        for stage in reordered["stages"].as_array().unwrap() { assert_eq!(stage["model_agreement"]["valid"], false); }
+    }
+
+    #[test]
+    fn architecture_state_is_legacy_safe_bounded_and_reports_corruption() {
+        let test = QueueTest::new(false);
+        test.app.ensure_forge_dir();
+        fs::write(test.app.forge_path("plan.json"), json!({"goal": "legacy", "stages": [editable_stage(1)]}).to_string()).unwrap();
+        let (_, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(state["architecture"]["context_status"], "legacy");
+        assert!(!test.app.forge_path("architecture").exists());
+        let p = test.app.load_plan().unwrap(); test.app.save_plan(&p).unwrap();
+        let (_, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(state["architecture"]["revision"], 1);
+        assert_eq!(state["architecture"]["context_status"], "inactive");
+        assert!(state["architecture"].to_string().len() < 1000);
+        let (code, history) = api_request(&test.app.app, "GET", "/api/architecture/history?limit=1", json!({}));
+        assert_eq!(code, 200); assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(api_request(&test.app.app, "GET", "/api/architecture/history?cursor=bad", json!({})).0, 400);
+        assert_eq!(api_request(&test.app.app, "GET", "/api/architecture/history?plan_id=../escape", json!({})).0, 400);
+        fs::write(test.app.forge_path("plan.json"), b"{").unwrap();
+        let (_, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert!(state["plan"].is_null()); assert_eq!(state["architecture"]["context_status"], "error");
+    }
+
+    #[test]
+    fn architecture_history_and_reviews_route_current_and_archived_projects() {
+        let first = QueueTest::new(false); let second = QueueTest::new(false);
+        let engine = &first.app.app;
+        for ctx in [&first.app, &second.app] {
+            ctx.save_plan(&json!({"goal": ctx.project(), "stages": [{"id": 1, "title": "one",
+                "reviews": [{"summary": ctx.project()}]}]})).unwrap();
+        }
+        let first_plan = first.app.load_plan().unwrap();
+        let second_plan = second.app.load_plan().unwrap();
+        for ctx in [&first.app, &second.app] {
+            let id = ctx.load_plan().unwrap()["plan_id"].as_str().unwrap().to_owned();
+            for archived in [false, true] {
+                if archived { ctx.architecture_store().reset().unwrap(); }
+                let path = format!("/api/architecture/history?project={}&plan_id={id}&limit=1", ctx.project());
+                let (code, page) = api_request(engine, "GET", &path, json!({}));
+                assert_eq!(code, 200, "{page}"); assert_eq!(page["items"][0]["plan_id"], id);
+                let path = format!("/api/architecture/reviews?project={}&plan_id={id}&stage_id=1&limit=1", ctx.project());
+                let (code, page) = api_request(engine, "GET", &path, json!({}));
+                assert_eq!(code, 200, "{page}"); assert_eq!(page["items"][0]["summary"], ctx.project());
+                assert_eq!(page["plan_id"], id);
+            }
+        }
+        assert_ne!(first_plan["plan_id"], second_plan["plan_id"]);
+        assert_eq!(*engine.active_project.lock().unwrap(), first.app.project());
+        for endpoint in ["history", "reviews"] {
+            assert_eq!(api_request(engine, "GET", &format!("/api/architecture/{endpoint}?project=%XX"), json!({})).0, 400);
+            assert_eq!(api_request(engine, "GET", &format!("/api/architecture/{endpoint}?project=/not-a-forge-test-repo"), json!({})).0, 400);
+            let path = format!("/api/architecture/{endpoint}?project={}&plan_id={}&stage_id=1", second.app.project(), first_plan["plan_id"].as_str().unwrap());
+            assert_eq!(api_request(engine, "GET", &path, json!({})).0, 400);
+        }
+    }
+
+    #[test]
+    fn state_bounds_legacy_and_indexed_reviews_and_pages_the_full_records() {
+        let test = QueueTest::new(false); test.app.ensure_forge_dir();
+        let reviews: Vec<_> = (0..10_000).map(|i| json!({"round": i, "summary": "retained legacy review", "extra": i})).collect();
+        let legacy = json!({"goal": "legacy", "stages": [{"id": 1, "reviews": reviews}]});
+        fs::write(test.app.forge_path("plan.json"), legacy.to_string()).unwrap();
+        for indexed in [false, true] {
+            if indexed { test.app.save_plan(&legacy).unwrap(); }
+            for _ in 0..2 {
+                let (code, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+                assert_eq!(code, 200); assert!(state.to_string().len() < 15_000);
+                assert_eq!(state["plan"]["stages"][0]["reviews"].as_array().unwrap().len(), 8);
+                assert_eq!(state["plan"]["stages"][0]["review_count"], 10_000);
+                assert_eq!(state["plan"]["stages"][0]["reviews_truncated"], true);
+            }
+            assert_eq!(test.app.session.legacy_state_cache.lock().unwrap().is_some(), !indexed);
+            let (code, page) = api_request(&test.app.app, "GET", "/api/architecture/reviews?stage_id=1&cursor=9998&limit=1", json!({}));
+            assert_eq!(code, 200, "{page}"); assert_eq!(page["items"], json!([reviews[9998]]));
+            assert_eq!(page["next_cursor"], 9999);
+            assert_eq!(test.app.forge_path("architecture").exists(), indexed);
+        }
+        assert_eq!(test.app.load_plan().unwrap()["stages"][0]["reviews"], json!(reviews));
+    }
+
+    #[test]
+    fn reviewer_prompts_exclude_obsolete_inputs_but_keep_fresh_round_feedback() {
+        for field in ["context_valid", "last_verdict_valid"] {
+            let test = QueueTest::new(false); seed_mock_plan(&test.app);
+            let mut original = test.app.load_plan().unwrap();
+            let old = json!({"approved": false, "summary": "OAuth design", "issues": ["Add OAuth middleware for the old goal"]});
+            original["stages"][0]["last_verdict"] = old.clone();
+            original["stages"][0]["reviews"] = json!([old]);
+            test.app.save_plan(&original).unwrap();
+            let original = test.app.load_plan().unwrap();
+            let mut body = original.clone(); body["stages"][0]["instructions"] = json!("Remove OAuth; use local login");
+            let mut edited = edit_plan(&original, &json!({"plan": body})).unwrap();
+            // Either explicit invalidation flag is sufficient, including legacy mixed records.
+            edited["stages"][0].as_object_mut().unwrap().remove(if field == "context_valid" { "last_verdict_valid" } else { "context_valid" });
+            test.app.save_plan(&edited).unwrap();
+            {
+                let mut settings = test.app.app.settings.lock().unwrap();
+                settings["max_fix_rounds"] = json!(1);
+                settings["mock_reviewer_prompts"] = json!([]);
+                settings["mock_verdicts"] = json!([
+                    {"approved": false, "issues": ["Validate the new local login"]},
+                    {"approved": true, "issues": []}, {"approved": true, "issues": []}]);
+            }
+            test.app.run_worker();
+            let settings = test.app.app.settings.lock().unwrap();
+            let prompts = settings["mock_reviewer_prompts"].as_array().unwrap();
+            assert!(prompts.len() >= 2);
+            for prompt in prompts { assert!(!prompt.as_str().unwrap().contains("Add OAuth middleware for the old goal")); }
+            assert!(prompts[0].as_str().unwrap().contains("No previous review findings"));
+            assert!(prompts[1].as_str().unwrap().contains("Validate the new local login"));
+            let saved = test.app.load_plan().unwrap();
+            assert_eq!(saved["stages"][0]["reviews"][0], old);
+            assert_eq!(saved["stages"][0]["context_valid"], true);
+        }
+    }
+
+    #[test]
+    fn architecture_serializes_project_writes_and_queue_goals_get_new_identities() {
+        let test = QueueTest::new(false); test.start();
+        let first = test.app.load_plan().unwrap();
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let ctx = test.app.clone(); let mut p = first.clone(); p["status"] = json!("approved");
+            threads.push(std::thread::spawn(move || ctx.save_plan(&p).unwrap()));
+        }
+        for thread in threads { thread.join().unwrap(); }
+        assert_eq!(test.app.load_plan().unwrap()["plan_id"], first["plan_id"]);
+        assert_eq!(api_request(&test.app.app, "POST", "/api/approve", json!({})).0, 200);
+        wait_for_worker(&test.app);
+        let second = test.app.load_plan().unwrap();
+        assert_ne!(first["plan_id"], second["plan_id"]); assert_eq!(second["revision"], 1);
+        let store = test.app.architecture_store();
+        let history = store.history(first["plan_id"].as_str(), 0, 100).unwrap();
+        assert!(history["items"].as_array().unwrap().iter().all(|e| e["plan_id"] == first["plan_id"]));
+        assert!(history["items"].as_array().unwrap().iter().any(|e| e["payload"]["reviews"].as_array().is_some_and(|r| !r.is_empty())));
+        let other = QueueTest::new(false); other.app.save_plan(&second).unwrap();
+        assert_ne!(other.app.load_plan().unwrap()["plan_id"], second["plan_id"]);
+        assert!(other.app.architecture_store().history(first["plan_id"].as_str(), 0, 10).is_err());
+    }
+
+    #[test]
+    fn legacy_execution_imports_identity_before_recording_attempt_reviews() {
+        let test = QueueTest::new(false);
+        test.app.ensure_forge_dir();
+        test.app.mock_agent("planner").unwrap();
+        let legacy = fs::read(test.app.forge_path("plan-candidate.json")).unwrap();
+        fs::write(test.app.forge_path("plan.json"), legacy).unwrap();
+        test.app.run_worker();
+        let plan = test.app.load_plan().unwrap();
+        assert_eq!(plan["revision"], 1);
+        for stage in plan["stages"].as_array().unwrap() {
+            assert!(stage["attempt_id"].is_string());
+            for review in stage["reviews"].as_array().unwrap() { assert_eq!(review["revision"], 1); }
+        }
+    }
+
+    #[test]
+    fn revision_usage_adds_only_new_invocation_and_ignores_echoed_totals() {
+        let test = QueueTest::new(false);
+        let original = json!({"goal": "Goal", "stages": [editable_stage(1)],
+            "planner_usage": {"mock": {"total_tokens": 10, "calls": 1, "models": {"model": 10}}}});
+        test.app.save_plan(&original).unwrap();
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["mock_plan_output"] = original;
+            settings["mock_usage"] = json!({"total": 5, "model": "model"});
+        }
+        let previous = test.app.load_plan().unwrap();
+        test.app.revise_worker(&previous, "Keep the stage");
+        let updated = test.app.load_plan().unwrap();
+        assert_eq!(updated["planner_usage"]["mock"]["total_tokens"], 15);
+        assert_eq!(updated["planner_usage"]["mock"]["calls"], 2);
+        assert_eq!(updated["planner_usage"]["mock"]["models"]["model"], 15);
+    }
+
     fn editable_stage(id: i64) -> Value {
         json!({"id": id, "title": "Repaired title", "instructions": "Repaired instructions",
             "acceptance": "", "commit": "feat: repair stage"})
@@ -79,7 +327,7 @@ mod tests {
         for body in [json!({"mode": "refactor"}), json!({"mode": "refactor", "goal": " \t\n\u{2003}"})] {
             let test = QueueTest::new(false);
             test.app.save_plan(&json!({"goal": "Old goal", "status": "approved",
-                "stages": [editable_stage(9)]}));
+                "stages": [editable_stage(9)]})).unwrap();
             test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!({
                 "goal": "Planner's goal", "status": "approved", "stages": [editable_stage(1)]});
             assert_eq!(api_request(&test.app.app, "POST", "/api/plan", body),
@@ -105,7 +353,7 @@ mod tests {
             assert!(prompt.contains("USER FOCUS (may be empty — if empty, choose the most valuable refactorings yourself):\n\n\nWrite"));
             assert!(prompt.contains("Rules: 2 to 8 stages, each independently committable, ordered by dependency."));
             assert!(prompt.contains("Every stage's acceptance criteria must require that observable behavior is preserved and builds/tests still pass."));
-            assert!(prompt.ends_with("Do NOT implement anything, do not modify any other file. Only write .forge/plan.json."));
+            assert!(prompt.ends_with("Do NOT implement anything, do not modify any other file. Only write .forge/plan-candidate.json."));
             let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
                 .split_once("\n\nRules:").unwrap().0;
             assert!(prompt.contains(schema));
@@ -131,7 +379,7 @@ mod tests {
             let settings = test.app.app.settings.lock().unwrap();
             let prompt = settings["mock_planner_prompt"].as_str().unwrap();
             assert!(prompt.contains(&format!("yourself):\n{focus}\n\nWrite")));
-            assert!(prompt.ends_with("Only write .forge/plan.json."));
+            assert!(prompt.ends_with("Only write .forge/plan-candidate.json."));
             assert_eq!(test.app.read_history()[0]["text"], format!("planning started for goal: {goal}"));
         }
     }
@@ -140,7 +388,8 @@ mod tests {
     fn plan_api_rejects_unknown_modes_without_starting_planning() {
         let test = QueueTest::new(false);
         let original = json!({"goal": "Original goal", "status": "draft", "stages": [editable_stage(1)]});
-        test.app.save_plan(&original);
+        test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
         test.app.set_phase("plan_ready");
         for mode in [json!("nonsense"), json!("REFACTOR"), json!(" refactor "), json!(null), json!(42), json!(false)] {
             assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"mode": mode})),
@@ -183,7 +432,7 @@ mod tests {
                 assert_eq!(test.app.load_plan().unwrap()["goal"], goal);
                 assert_eq!(test.app.load_plan().unwrap()["status"], "draft");
                 assert_eq!(test.app.app.settings.lock().unwrap()["mock_planner_prompt"],
-                    PLANNER_PROMPT.replace("{goal}", goal).replace("{plan_path}", ".forge/plan.json"));
+                    PLANNER_PROMPT.replace("{goal}", goal).replace("{plan_path}", ".forge/plan-candidate.json"));
             }
         }
     }
@@ -193,7 +442,8 @@ mod tests {
         let test = QueueTest::new(false);
         let original = json!({"goal": "Explain {question} and {history}", "status": "draft",
             "stages": [editable_stage(1)]});
-        test.app.save_plan(&original);
+        test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
         test.app.set_phase("plan_ready");
         test.app.app.settings.lock().unwrap()["planner_model"] = json!("chat-model");
         let before = fs::read(test.app.forge_path("plan.json")).unwrap();
@@ -254,7 +504,7 @@ mod tests {
         assert!(!test.app.session.busy.load(Ordering::SeqCst));
         for has_plan in [false, true] {
             if has_plan {
-                test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]}));
+                test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]})).unwrap();
             }
             for flag in [&test.app.session.busy, &test.app.session.queue_active] {
                 flag.store(true, Ordering::SeqCst);
@@ -274,7 +524,7 @@ mod tests {
         let first = QueueTest::new(false);
         let engine = &first.app.app;
         let second = QueueTest::with_engine(false, Some(Arc::clone(engine)));
-        second.app.save_plan(&json!({"goal": "Second", "stages": [editable_stage(1)]}));
+        second.app.save_plan(&json!({"goal": "Second", "stages": [editable_stage(1)]})).unwrap();
         second.app.set_phase("blocked");
         first.app.acquire_busy().unwrap();
         let _worker = WorkerGuard(&first.app.session);
@@ -300,7 +550,7 @@ mod tests {
             ("mock", json!({"answer": 42})), ("mock", json!({"answer": " \n"})),
         ] {
             let test = QueueTest::new(false);
-            test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]}));
+            test.app.save_plan(&json!({"goal": "Goal", "stages": [editable_stage(1)]})).unwrap();
             test.app.set_phase("plan_ready");
             let before = fs::read(test.app.forge_path("plan.json")).unwrap();
             fs::write(test.app.forge_path("answer.json"), r#"{"answer":"stale answer"}"#).unwrap();
@@ -341,7 +591,7 @@ mod tests {
     fn plan_generation_and_reset_clear_chat() {
         for reset in [false, true] {
             let test = QueueTest::new(false);
-            test.app.save_plan(&json!({"goal": "Old goal", "stages": [editable_stage(1)]}));
+            test.app.save_plan(&json!({"goal": "Old goal", "stages": [editable_stage(1)]})).unwrap();
             assert_eq!(api_request(&test.app.app, "POST", "/api/plan/chat",
                 json!({"question": "Why?"})), (200, json!({"ok": true})));
             wait_for_worker(&test.app);
@@ -372,7 +622,8 @@ mod tests {
         committed["reviews"] = json!([{"approved": true}]);
         let original = json!({"goal": "Original {feedback} goal", "status": "draft",
             "stages": [committed, {"id": 2, "status": "pending"}]});
-        test.app.save_plan(&original);
+        test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
         let feedback = format!("Improve {{goal}} and {{plan_path}}: {}", "界🙂".repeat(200));
         assert_eq!(api_request(&test.app.app, "POST", "/api/plan/revise",
             json!({"feedback": format!(" \t{feedback}\n")})), (200, json!({"ok": true})));
@@ -390,7 +641,7 @@ mod tests {
         assert!(prompt.contains(&serde_json::to_string_pretty(&original).unwrap()));
         assert!(prompt.contains(&feedback));
         assert!(prompt.contains("Keep the same overall goal:\nOriginal {feedback} goal"));
-        assert!(prompt.contains("Only write .forge/plan.json."));
+        assert!(prompt.contains("Only write .forge/plan-candidate.json."));
         let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
             .split_once("\n\nRules:").unwrap().0;
         assert!(prompt.contains(schema));
@@ -411,7 +662,8 @@ mod tests {
         second["rounds"] = json!(2);
         let original = json!({"goal": "Goal", "status": "approved",
             "stages": [first, second, editable_stage(2)]});
-        test.app.save_plan(&original);
+        test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
         test.app.acquire_busy().unwrap();
         test.app.revise_worker(&original, "Split the remaining work");
         let plan = test.app.load_plan().unwrap();
@@ -436,7 +688,7 @@ mod tests {
             let test = QueueTest::new(false);
             let original = json!({"goal": "Keep this goal", "status": "draft",
                 "stages": [editable_stage(1), editable_stage(2)]});
-            test.app.save_plan(&original);
+            test.app.save_plan(&original).unwrap();
             let before = fs::read(test.app.forge_path("plan.json")).unwrap();
             {
                 let mut settings = test.app.app.settings.lock().unwrap();
@@ -467,7 +719,8 @@ mod tests {
             (400, json!({"error": "no plan"})));
         assert!(!first.app.session.busy.load(Ordering::SeqCst));
         let original = json!({"goal": "Goal", "status": "draft", "stages": [editable_stage(1)]});
-        first.app.save_plan(&original);
+        first.app.save_plan(&original).unwrap();
+        let original = first.app.load_plan().unwrap();
         for flag in [&first.app.session.busy, &first.app.session.queue_active] {
             flag.store(true, Ordering::SeqCst);
             assert_eq!(api_request(engine, "POST", "/api/plan/revise", body.clone()),
@@ -478,7 +731,7 @@ mod tests {
         assert_eq!(first.app.read_history(), json!([]));
         first.app.acquire_busy().unwrap();
         let _worker = WorkerGuard(&first.app.session);
-        second.app.save_plan(&original);
+        second.app.save_plan(&original).unwrap();
         let mut targeted = body;
         targeted["project"] = json!(second.app.project());
         assert_eq!(api_request(engine, "POST", "/api/plan/revise", targeted),
@@ -493,7 +746,8 @@ mod tests {
         for revision in [false, true] {
             let test = QueueTest::new(false);
             let original = json!({"goal": "Original goal", "stages": [editable_stage(1)]});
-            test.app.save_plan(&original);
+            test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
             test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!({
                 "goal": "Wrong goal", "status": "approved", "stages": [editable_stage(2), editable_stage(3)]});
             test.app.acquire_busy().unwrap();
@@ -529,11 +783,14 @@ mod tests {
         assert_eq!(edited["goal"], "New goal");
         assert_eq!(edited["status"], "draft");
         assert_eq!(edited["metadata"], "keep");
+        assert_eq!(edited["stages"][0]["reviews"], original["stages"][0]["reviews"]);
+        assert_eq!(edited["stages"][0]["last_verdict"], original["stages"][0]["last_verdict"]);
+        assert_eq!(edited["stages"][0]["last_verdict_valid"], false);
         for (stage, id) in edited["stages"].as_array().unwrap().iter().zip([3, 9]) {
-            let mut expected = editable_stage(id);
-            expected["status"] = json!("pending");
-            expected["rounds"] = json!(0);
-            assert_eq!(stage, &expected);
+            assert_eq!(stage["id"], id);
+            assert_eq!(stage["status"], "pending");
+            assert_eq!(stage["rounds"], 0);
+            assert!(stage.get("sha").is_none());
         }
         for goal in [Value::Null, json!(42), json!(" \t\n\u{2003}")] {
             let edited = edit_plan(&original, &json!({"plan": {
@@ -599,7 +856,8 @@ mod tests {
         let mut committed = editable_stage(1);
         committed["status"] = json!("committed");
         let original = json!({"goal": "Goal", "status": "approved", "stages": [committed]});
-        test.app.save_plan(&original);
+        test.app.save_plan(&original).unwrap();
+        let original = test.app.load_plan().unwrap();
         test.app.session.state.lock().unwrap().goal = "Goal".into();
         let before = fs::read(test.app.forge_path("plan.json")).unwrap();
         let mut bodies = vec![json!({}), json!(null), json!({"plan": null}),
@@ -643,7 +901,8 @@ mod tests {
             (400, json!({"error": "no plan"})));
         assert!(!first.app.forge_path("plan.json").exists());
         let original = json!({"goal": "Old goal", "status": "approved", "stages": [editable_stage(1)]});
-        first.app.save_plan(&original);
+        first.app.save_plan(&original).unwrap();
+        let original = first.app.load_plan().unwrap();
         let before = fs::read(first.app.forge_path("plan.json")).unwrap();
         for flag in [&first.app.session.busy, &first.app.session.queue_active] {
             flag.store(true, Ordering::SeqCst);
@@ -657,7 +916,8 @@ mod tests {
         let first_plan = first.app.load_plan().unwrap();
         assert_eq!(first_plan["status"], "draft");
         first.app.session.busy.store(true, Ordering::SeqCst);
-        second.app.save_plan(&original);
+        second.app.save_plan(&original).unwrap();
+        let second_original = second.app.load_plan().unwrap();
         second.app.set_phase("blocked");
         let mut targeted = body;
         targeted["project"] = json!(second.app.project());
@@ -668,8 +928,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(state["phase"], "plan_ready");
         assert_eq!(state["goal"], "Edited goal");
-        assert_eq!(state["plan"], edit_plan(&original, &json!({"plan": {
-            "goal": "Edited goal", "stages": [editable_stage(1)]}})).unwrap());
+        let mut expected = edit_plan(&second_original, &json!({"plan": {
+            "goal": "Edited goal", "stages": [editable_stage(1)]}})).unwrap();
+        expected["architecture"] = state["plan"]["architecture"].clone();
+        assert_eq!(state["plan"], expected);
         assert_eq!(first.app.load_plan().unwrap(), first_plan);
         let history = second.app.read_history();
         assert_eq!(history[0]["kind"], "plan");
@@ -918,7 +1180,7 @@ mod tests {
     #[test]
     fn resumed_run_keeps_usage_and_tracks_each_invocations_model() {
         let test = QueueTest::new(true);
-        test.app.mock_agent("planner").unwrap();
+        seed_mock_plan(&test.app);
         {
             let mut settings = test.app.app.settings.lock().unwrap();
             settings["mock_usage"] = json!({"total": 10});
@@ -1040,7 +1302,7 @@ mod tests {
     #[test]
     fn run_completion_uses_run_start_time_before_cleanup() {
         let test = QueueTest::new(true);
-        test.app.save_plan(&json!({"stages": [], "status": "approved"}));
+        test.app.save_plan(&json!({"stages": [], "status": "approved"})).unwrap();
         let started = unix_timestamp() - 252;
         {
             let mut s = test.app.session.state.lock().unwrap();
@@ -1147,7 +1409,7 @@ mod tests {
                 {"status": "committed", "sha": sha, "commit": "initial", "title": "Initial stage"},
                 {"status": "committed", "commit": "feat: no changes", "title": "No changes"},
             ],
-        }));
+        })).unwrap();
         test.app.run_worker();
         let reports = test.app.read_reports();
         assert_eq!(reports.as_array().unwrap().len(), 1);
@@ -1172,7 +1434,7 @@ mod tests {
                 "id": 1, "title": "Default message", "status": "pending",
                 "instructions": "append a line", "acceptance": "file has a line",
             }],
-        }));
+        })).unwrap();
         test.app.run_worker();
         assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
         let reports = test.app.read_reports();
@@ -1403,7 +1665,7 @@ mod tests {
         first.app.set_step(Some(1), "reviewing");
         first.app.session.state.lock().unwrap().goal = "first project's work".into();
         first.app.session.queue_active.store(true, Ordering::SeqCst);
-        first.app.save_plan(&json!({"goal": "first project's work", "stages": []}));
+        first.app.save_plan(&json!({"goal": "first project's work", "stages": []})).unwrap();
         let post = |path: &str, body: Value| api_request(engine, "POST", path, body).0;
         for route in ["/api/project", "/api/project/select"] {
             assert_eq!(post(route, json!({"path": second.app.project()})), 200);
@@ -1477,7 +1739,7 @@ mod tests {
                 let _queue_guard = test.app.session.queue_lock.lock().unwrap();
                 test.app.start_queue_run(
                     &mut test.app.load_queue(), id, &mut test.app.load_plan().unwrap(),
-                );
+                ).unwrap();
             }
             test.app.queue_worker(Some(id));
             assert!(!test.app.session.busy.load(Ordering::SeqCst));
@@ -1537,7 +1799,7 @@ mod tests {
                 {"approved": false, "issues": issues},
             ]);
         }
-        test.app.mock_agent("planner").unwrap();
+        seed_mock_plan(&test.app);
         test.app.run_worker();
         let plan = test.app.load_plan().unwrap();
         let stage = &plan["stages"][0];
@@ -1582,7 +1844,7 @@ mod tests {
                              "checks": ["Inspected mock.txt.", null, "Verified the appended line."]},
                         ]);
                     }
-                    test.app.mock_agent("planner").unwrap();
+                    seed_mock_plan(&test.app);
                     test.app.run_worker();
                     let plan = test.app.load_plan().unwrap();
                     let stage = &plan["stages"][0];
@@ -1597,6 +1859,7 @@ mod tests {
                     assert_eq!(reviews[0], json!({
                         "round": 1, "approved": true, "summary": summary, "issues": [],
                         "notes": [], "checks": checks, "unix": reviews[0]["unix"],
+                        "role": "reviewer", "revision": plan["revision"], "attempt_id": stage["attempt_id"],
                     }));
                     assert!(reviews[0]["unix"].as_i64().unwrap() > 0);
                     let message = if summary.is_empty() {
@@ -1634,7 +1897,7 @@ mod tests {
                      "checks": ["Inspected mock.txt.", null]},
                 ]);
             }
-            test.app.mock_agent("planner").unwrap();
+            seed_mock_plan(&test.app);
             test.app.run_worker();
             let plan = test.app.load_plan().unwrap();
             let stage = &plan["stages"][0];
@@ -1647,6 +1910,9 @@ mod tests {
             let mut review = stage["reviews"][0].clone();
             assert_eq!(review.as_object_mut().unwrap().remove("round"), Some(json!(1)));
             assert!(review.as_object_mut().unwrap().remove("unix").unwrap().as_i64().unwrap() > 0);
+            assert_eq!(review.as_object_mut().unwrap().remove("role"), Some(json!("reviewer")));
+            assert_eq!(review.as_object_mut().unwrap().remove("revision"), Some(plan["revision"].clone()));
+            assert_eq!(review.as_object_mut().unwrap().remove("attempt_id"), Some(stage["attempt_id"].clone()));
             assert_eq!(review, expected);
             let history = test.app.read_history();
             let events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
@@ -1680,7 +1946,7 @@ mod tests {
                         settings["max_fix_rounds"] = json!(requested_rounds);
                         settings["mock_verdicts"] = json!(verdicts);
                     }
-                    test.app.mock_agent("planner").unwrap();
+                    seed_mock_plan(&test.app);
                     test.app.run_worker();
                     let plan = test.app.load_plan().unwrap();
                     let stage = &plan["stages"][0];
@@ -1767,7 +2033,7 @@ mod tests {
                 settings["mock_verdicts"] = json!(verdicts);
                 settings["mock_reviewer_prompts"] = json!([]);
             }
-            test.app.mock_agent("planner").unwrap();
+            seed_mock_plan(&test.app);
             let mut plan = test.app.load_plan().unwrap();
             plan["goal"] = json!(format!("Goal with literal {markers}"));
             plan["stages"][0]["title"] = json!("Title with literal {instructions}");
@@ -1777,7 +2043,7 @@ mod tests {
                 "issues": [foreign], "notes": [], "checks": [foreign]});
             plan["stages"][1]["last_verdict"] = other_verdict.clone();
             plan["stages"][1]["reviews"] = json!([other_verdict]);
-            test.app.save_plan(&plan);
+            test.app.save_plan(&plan).unwrap();
             test.app.run_worker();
 
             let plan = test.app.load_plan().unwrap();
@@ -1857,7 +2123,7 @@ mod tests {
                         settings["max_fix_rounds"] = json!(max_rounds);
                         settings["mock_verdicts"] = json!(vec![request.clone(); max_rounds + 1]);
                     }
-                    test.app.mock_agent("planner").unwrap();
+                    seed_mock_plan(&test.app);
                     test.app.run_worker();
                     let plan = test.app.load_plan().unwrap();
                     let stage = &plan["stages"][0];
@@ -1898,7 +2164,7 @@ mod tests {
         ] {
             let test = QueueTest::new(true);
             test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([verdict]);
-            test.app.mock_agent("planner").unwrap();
+            seed_mock_plan(&test.app);
             test.app.run_worker();
             let plan = test.app.load_plan().unwrap();
             let stage = &plan["stages"][0];
@@ -1920,7 +2186,7 @@ mod tests {
              "issues": ["Add the missing line.", 42]},
             {"approved": true, "summary": summary, "issues": []},
         ]);
-        test.app.mock_agent("planner").unwrap();
+        seed_mock_plan(&test.app);
         test.app.run_worker();
         let plan = test.app.load_plan().unwrap();
         let stage = &plan["stages"][0];
@@ -1970,7 +2236,7 @@ mod tests {
                 {"approved": true, "issues": []},
             ]);
         }
-        test.app.mock_agent("planner").unwrap();
+        seed_mock_plan(&test.app);
         test.app.run_worker();
         let blocked = test.app.load_plan().unwrap();
         assert_eq!(blocked["stages"][0]["status"], "blocked");

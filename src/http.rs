@@ -54,7 +54,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let mut body_text = String::new();
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-    let project_endpoint = matches!(path, "/api/state" | "/api/agent_log" | "/api/diff"
+    let project_endpoint = matches!(path, "/api/state" | "/api/architecture/history" | "/api/architecture/reviews" | "/api/agent_log" | "/api/diff"
         | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
@@ -86,6 +86,8 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         else { &active_project });
 
     let (code, response) = match (method, path) {
+        (tiny_http::Method::Get, "/api/architecture/reviews") => api_architecture_reviews(&ctx, query),
+        (tiny_http::Method::Get, "/api/architecture/history") => api_architecture_history(&ctx, query),
         (tiny_http::Method::Get, "/api/state") => api_state(app, &ctx, &active_project),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(&ctx, query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(&ctx),
@@ -134,7 +136,34 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     let mut snap = snap;
     snap["settings"] = app.settings.lock().unwrap().clone();
     snap["busy"] = json!(ctx.session.busy.load(Ordering::SeqCst));
-    snap["plan"] = ctx.load_plan().unwrap_or(Value::Null);
+    {
+        let _guard = ctx.session.persistence_lock.lock().unwrap();
+        let store = ctx.architecture_store();
+        // Legacy files remain untouched on reads. Cache only their bounded view;
+        // metadata changes force revalidation. Indexed publications need no cache.
+        let stamp = fs::metadata(ctx.forge_path("plan.json")).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}:{}:{}:{}:{}", m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+        });
+        let mut cache = ctx.session.legacy_state_cache.lock().unwrap();
+        let cached = cache.as_ref().filter(|(key, _)| Some(key) == stamp.as_ref()).map(|(_, p)| p.clone());
+        let loaded = match cached { Some(p) => Ok(Some(p)), None => store.load_raw() };
+        match loaded {
+            Ok(plan) => {
+                snap["architecture"] = store.summary(plan.as_ref()).unwrap_or(Value::Null);
+                let bounded = plan.map(|p| store.state_plan(p));
+                if let Some(p) = bounded.as_ref().filter(|p| p.get("architecture").is_none()) {
+                    if let Some(stamp) = stamp { *cache = Some((stamp, p.clone())); }
+                } else { *cache = None; }
+                snap["plan"] = bounded.unwrap_or(Value::Null);
+            }
+            Err(error) => {
+                snap["plan"] = Value::Null;
+                snap["architecture"] = json!({"context_status": "error", "error": error});
+            }
+        }
+        snap["persistence_error"] = json!(*ctx.session.persistence_error.lock().unwrap());
+    }
     snap["queue"] = ctx.load_queue()["items"].clone();
     snap["queue_active"] = json!(ctx.session.queue_active.load(Ordering::SeqCst));
     drop(_queue_guard);
@@ -423,7 +452,7 @@ fn api_plan_edit(ctx: &Ctx, body: &Value) -> (u32, Value) {
     };
     match edit_plan(&plan, body) {
         Ok(edited) => {
-            ctx.save_plan(&edited);
+            if let Err(error) = ctx.save_plan(&edited) { return (500, json!({"error": error})); }
             {
                 let mut s = ctx.session.state.lock().unwrap();
                 s.phase = "plan_ready".into();
@@ -455,13 +484,17 @@ fn api_approve(ctx: &Ctx) -> (u32, Value) {
         }
         ctx.session.stop_requested.store(false, Ordering::SeqCst);
         ctx.session.queue_active.store(true, Ordering::SeqCst);
-        ctx.start_queue_run(&mut queue, id, &mut plan);
+        if let Err(error) = ctx.start_queue_run(&mut queue, id, &mut plan) {
+            ctx.session.busy.store(false, Ordering::SeqCst);
+            ctx.session.queue_active.store(false, Ordering::SeqCst);
+            return (500, json!({"error": error}));
+        }
         ctx.log_event("queue", &format!("goal {id}: approved by user"));
         let ctx2 = ctx.clone();
         std::thread::spawn(move || ctx2.queue_worker(Some(id)));
     } else {
         plan["status"] = json!("approved");
-        ctx.save_plan(&plan);
+        if let Err(error) = ctx.save_plan(&plan) { return (500, json!({"error": error})); }
     }
     ctx.log_event("plan", "plan approved by user");
     (200, json!({"ok": true}))
@@ -521,7 +554,8 @@ fn api_reset_plan(ctx: &Ctx) -> (u32, Value) {
     if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
         (409, json!({"error": "busy"}))
     } else {
-        let _ = fs::remove_file(ctx.forge_path("plan.json"));
+        let _guard = ctx.session.persistence_lock.lock().unwrap();
+        if let Err(error) = ctx.architecture_store().reset() { return (500, json!({"error": error})); }
         let _ = fs::remove_file(ctx.forge_path("chat.jsonl"));
         ctx.set_phase("idle");
         ctx.log_event("plan", "plan discarded");
@@ -568,4 +602,33 @@ fn api_self_update(app: &App, ctx: &Ctx) -> (u32, Value) {
             (500, json!({"error": format!("systemd-run failed: {e}")}))
         }
     }
+}
+
+fn api_architecture_history(ctx: &Ctx, query: &str) -> (u32, Value) {
+    let result = (|| {
+        let id = query_value(query, "plan_id")?;
+        let cursor = query_value(query, "cursor")?.unwrap_or_else(|| "0".into())
+            .parse::<u64>().map_err(|_| "invalid cursor")?;
+        let limit = query_value(query, "limit")?.unwrap_or_else(|| "20".into())
+            .parse::<usize>().map_err(|_| "invalid limit")?;
+        let _guard = ctx.session.persistence_lock.lock().unwrap();
+        ctx.architecture_store().history(id.as_deref(), cursor, limit)
+    })();
+    match result { Ok(page) => (200, page), Err(error) => (400, json!({"error": error})) }
+}
+
+fn api_architecture_reviews(ctx: &Ctx, query: &str) -> (u32, Value) {
+    let result = (|| {
+        let id = query_value(query, "plan_id")?;
+        let checkpoint = query_value(query, "checkpoint")?;
+        let stage = query_value(query, "stage_id")?.ok_or("stage_id required")?
+            .parse::<i64>().map_err(|_| "invalid stage_id")?;
+        let cursor = query_value(query, "cursor")?.unwrap_or_else(|| "0".into())
+            .parse::<u64>().map_err(|_| "invalid cursor")?;
+        let limit = query_value(query, "limit")?.unwrap_or_else(|| "20".into())
+            .parse::<usize>().map_err(|_| "invalid limit")?;
+        let _guard = ctx.session.persistence_lock.lock().unwrap();
+        ctx.architecture_store().reviews(id.as_deref(), stage, checkpoint.as_deref(), cursor, limit)
+    })();
+    match result { Ok(page) => (200, page), Err(error) => (400, json!({"error": error})) }
 }
