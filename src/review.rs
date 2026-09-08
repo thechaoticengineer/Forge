@@ -773,8 +773,10 @@ impl Ctx {
         if !mock {
             let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
             let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model);
-            if !result.model_reported || selected["eligible"] != true || result.effective_model != selected["resolved_id"].as_str().unwrap_or(model) {
-                return Err("model routing blocked: reviewer effective model or eligibility changed".into());
+            let expected = selected["resolved_id"].as_str().unwrap_or(model);
+            if !result.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, expected, &result.effective_model) {
+                return Err(format!("model routing blocked: reviewer effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
+                    result.effective_model, result.model_reported, selected["eligible"]));
             }
         }
         let mut verdict = normalize(
@@ -1045,10 +1047,10 @@ impl Ctx {
                     Ok(output) => {
                         record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
                         record["model_reported"] = json!(output.model_reported);
-                        record["unexpected_substitution"] = json!((!output.model_reported || output.effective_model != model));
+                        record["unexpected_substitution"] = json!((!output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model)));
                         record["status"] = json!("completed");
                         record["usage"] = output.usage.as_ref().map(|u| json!({"input":u.input_tokens,"output":u.output_tokens,"total":u.total_tokens})).unwrap_or(Value::Null);
-                        record["verification_state"] = json!(if output.model_reported && output.effective_model == model { "execution_verified" } else { "unexpected_substitution" });
+                        record["verification_state"] = json!(if output.model_reported && crate::agent::same_model(implementer, model, &output.effective_model) { "execution_verified" } else { "unexpected_substitution" });
                     }
                     Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); record["failure_kind"] = json!(super::reassessment::failure_kind(error)); }
                 }
@@ -1057,7 +1059,7 @@ impl Ctx {
                 match result {
                     Ok(output) => {
                         self.record_stage_usage(plan, idx, role, implementer, output.usage.clone())?;
-                        if !output.model_reported || output.effective_model != model {
+                        if !output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model) {
                             let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
                             plan["stages"][idx]["model_block"] = json!(error);
                             self.save_plan(plan)?;

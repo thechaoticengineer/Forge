@@ -164,3 +164,36 @@ fn raw_stream_preserves_codex_and_stderr_behavior() {
     assert_eq!(state.agent_last_line, "Done");
 }
 
+#[test]
+fn claude_long_context_init_and_wire_model_are_the_same_identity() {
+    let input = [
+        json!({"type":"system","subtype":"init","model":"claude-opus-5[1m]"}),
+        json!({"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"Review complete"}]}}),
+        json!({"type":"result","subtype":"success","is_error":false,"result":"approved",
+            "usage":{"input_tokens":10,"output_tokens":2},"modelUsage":{"claude-opus-5":{"inputTokens":10,"outputTokens":2}}})
+    ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let result = crate::agent::stream_agent_result(input.as_bytes(), &log, &Mutex::new(State::default()), 4096, true).unwrap();
+    assert!(result.completed && result.model_reported);
+    // Preserve provider-reported evidence; compare the context suffix at identity boundaries.
+    assert_eq!(result.effective_model,"claude-opus-5");
+    assert!(crate::agent::same_model("claude","claude-opus-5[1m]",&result.effective_model));
+    assert!(!crate::agent::same_model("claude","claude-fable-5-1[1m]",&result.effective_model));
+}
+
+#[test]
+fn model_identity_equivalence_is_limited_to_claude_context_suffix() {
+    use crate::agent::same_model;
+    assert!(same_model("claude","claude-opus-5","claude-opus-5[1m]"));
+    assert!(same_model("codex","gpt-6-astra","gpt-6-astra"));
+    for (provider, expected, reported) in [
+        ("claude","claude-opus-5[1m]","claude-opus-4"),
+        ("claude","claude-opus-5[1m]","claude-sonnet-5"),
+        ("claude","claude-opus-5[1m]","claude-opus-5[2m]"),
+        ("claude","opus[1m]","claude-opus-5"),
+        ("claude","claude-opus-5","<synthetic>"),
+        ("codex","claude-opus-5[1m]","claude-opus-5"),
+        ("claude","",""),
+        ("claude","claude-opus-5[1m]",""),
+    ] { assert!(!same_model(provider,expected,reported),"{provider}: {expected} / {reported}"); }
+}

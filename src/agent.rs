@@ -26,6 +26,19 @@ pub(crate) struct AgentResult {
     pub completed: bool,
     pub error: Option<String>,
 }
+
+/// Claude's CLI/catalogue may append its long-context option to the model ID,
+/// while assistant messages report the same wire model without it. Resolve
+/// aliases through the catalogue first; never equate model families or versions.
+pub(crate) fn same_model(provider: &str, expected: &str, reported: &str) -> bool {
+    fn identity(model: &str) -> &str {
+        if model.starts_with("claude-") { model.strip_suffix("[1m]").unwrap_or(model) }
+        else { model }
+    }
+    !expected.is_empty() && !reported.is_empty()
+        && if provider == "claude" { identity(expected) == identity(reported) }
+            else { expected == reported }
+}
 pub(crate) fn session_id(id: &str) -> bool {
     // Both CLIs emit UUIDs. Refuse names, paths and option-like values.
     id.len() == 36

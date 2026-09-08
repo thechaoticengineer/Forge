@@ -520,7 +520,7 @@ impl Ctx {
                     return Err(format!("architect model is no longer eligible: {}", selected["error"].as_str().unwrap_or(&model)));
                 }
                 let expected = selected["resolved_id"].as_str().unwrap_or(&model);
-                if output.effective_model != expected {
+                if !crate::agent::same_model(&provider, expected, &output.effective_model) {
                     return Err(format!("architect effective model changed: expected {expected}, reported {}", output.effective_model));
                 }
             }

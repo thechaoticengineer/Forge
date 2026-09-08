@@ -837,6 +837,11 @@ the other provider: Codex implementations use Claude review, while Claude
 implementations use Codex review. If all adequate independent choices are
 unavailable, Forge preserves the work and blocks instead of using self-review.
 
+Model identity checks recognize Claude's exact `[1m]` context suffix: the CLI may
+report it at initialization while assistant messages report the same model ID
+without it. Raw reported IDs remain in the audit history. Different families,
+versions, unknown suffixes and unresolved aliases still fail identity checks.
+
 `cargo test` uses fake discovery/process protocols and isolated temporary
 caches, including HTTP responsiveness tests. The optional bridge's no-prompt
 contract and panel controls can be tested without installing its SDK:

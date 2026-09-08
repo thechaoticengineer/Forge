@@ -559,7 +559,7 @@ impl Ctx {
         if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
         let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
         let selected = self.app.catalogue.execution_with_effort(&policy, Provider::parse(provider).ok_or("invalid selection provider")?, model, effort);
-        if !output.model_reported || selected["eligible"] != true || output.effective_model != selected["resolved_id"].as_str().unwrap_or(model) { return Err("selection effective-model mismatch or missing report".into()); }
+        if !output.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, selected["resolved_id"].as_str().unwrap_or(model), &output.effective_model) { return Err("selection effective-model mismatch or missing report".into()); }
         if output.output.len() > 48 * 1024 {
             return Err("routing output exceeds 48 KiB".into());
         }
