@@ -3,7 +3,7 @@ use crate::app::{App, Ctx};
 use crate::catalogue::{Catalogue, Discovery, Failure, FailureKind, Policy, Probe, Provider};
 use crate::catalogue_process::Budget;
 use crate::metadata::{Clock, Fetch, FetchRequest, FetchResponse, Scheduler, Service};
-use crate::tests::api_request;
+use crate::test_support::api_request;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;

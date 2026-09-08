@@ -745,7 +745,7 @@ fn idle_state_displays_legacy_gate_errors_as_blocked_without_mutating_plan() {
     let before = fs::read(f.ctx.forge_path("plan.json")).unwrap();
     for (busy, expected) in [(false, "blocked"), (true, "in_progress"), (false, "blocked")] {
         f.ctx.session.busy.store(busy, Ordering::SeqCst);
-        let (code, state) = crate::tests::api_request(&f.ctx.app, "GET", "/api/state", json!({}));
+        let (code, state) = crate::test_support::api_request(&f.ctx.app, "GET", "/api/state", json!({}));
         assert_eq!(code, 200);
         assert_eq!(state["plan"]["stages"][0]["status"], expected);
         assert_eq!(state["plan"]["stages"][0]["review_gate"]["status"], "error");
