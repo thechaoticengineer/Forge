@@ -47,7 +47,7 @@ impl Ctx {
     }
 
     fn run_queue_item(&self, id: u64) -> bool {
-        self.run_worker_core();
+        self.run_with_busy_claim();
         let _queue_guard = self.session.queue_lock.lock().unwrap();
         let phase = self.session.state.lock().unwrap().phase.clone();
         // A user-stopped run retains its plan for human intervention.

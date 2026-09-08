@@ -1,5 +1,13 @@
 //! Engine-owned scope policy and snapshot-bound, immutable review gates.
-use super::*;
+use super::Ctx;
+use crate::agent::{AgentRequest, AgentResult, AgentUsage};
+use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
+use crate::util::unix_timestamp;
+use serde_json::{Value, json};
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

@@ -1,4 +1,6 @@
 use super::*;
+use crate::app::App;
+use std::sync::Arc;
 
 struct Fixture {
     root: PathBuf,
