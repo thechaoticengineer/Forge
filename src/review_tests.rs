@@ -325,6 +325,9 @@ fn stale_malformed_contradictory_or_unevidenced_verdicts_never_commit() {
         let p = f.run();
         f.assert_no_commit();
         assert_eq!(p["stages"][0]["review_gate"]["status"], "error");
+        assert_eq!(p["stages"][0]["status"], "blocked");
+        assert!(p["stages"][0]["finished_unix"].as_i64().is_some());
+        assert!(p["stages"][0]["duration_secs"].as_i64().is_some());
         assert!(!f.ctx.forge_path("verdict.json").exists());
     }
 }
@@ -558,6 +561,14 @@ fn criterion_evidence_is_complete_and_prompts_preserve_literal_inputs() {
 fn runtime_artifacts_do_not_change_snapshot_and_verdict_identity_fields_are_exact() {
     let f = Fixture::new("Implement feature", 0);
     let p = f.reviewed();
+    let identity: Value = serde_json::from_slice(&fs::read(f.ctx.forge_path("review-identity.json")).unwrap()).unwrap();
+    assert_eq!(identity, p["stages"][0]["reviews"].as_array().unwrap().last().unwrap()["identity"]);
+    for role in ["reviewer", "architect"] {
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let prompt = settings[format!("mock_{role}_prompts")][0].as_str().unwrap();
+        assert!(prompt.contains(".forge/review-identity.json"));
+        assert!(prompt.contains("Do not manually transcribe hashes"));
+    }
     let before = snapshot(f.ctx.project()).unwrap();
     fs::write(f.ctx.forge_path("unrelated-runtime.json"), "{}").unwrap();
     assert_eq!(snapshot(f.ctx.project()).unwrap(), before);
@@ -608,18 +619,19 @@ fn reviewer_cli_is_fresh_and_architect_review_resumes_with_scoped_tools() {
         assert!(!args.iter().any(|s| s.contains("dangerously")));
         if provider == "claude" {
             assert!(args.iter().any(|s| s == "Read,Glob,Grep,Bash"));
+        } else {
+            assert!(args.iter().any(|s| s == "sandbox_workspace_write.network_access=true"));
         }
         let r = AgentRequest {
             role: "architect_review",
             session: Some("11111111-2222-4333-8444-555555555555"),
             ..r
         };
-        assert!(
-            crate::agent::command(&r)
-                .unwrap()
-                .get_args()
-                .any(|s| s == "11111111-2222-4333-8444-555555555555")
-        );
+        let resumed = crate::agent::command(&r).unwrap();
+        assert!(resumed.get_args().any(|s| s == "11111111-2222-4333-8444-555555555555"));
+        if provider == "codex" {
+            assert!(resumed.get_args().any(|s| s == "sandbox_workspace_write.network_access=true"));
+        }
     }
 }
 #[test]
@@ -679,4 +691,65 @@ fn duplicate_keys_and_tampered_evidence_cannot_authorize_commit() {
     p["stages"][0]["reviews"][1]["criteria"] = json!([]);
     assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err());
     f.assert_no_commit();
+}
+
+#[test]
+fn verdict_presentation_wrappers_preserve_validation() {
+    let f = Fixture::new("Implement feature", 0);
+    let p = f.reviewed();
+    let record = &p["stages"][0]["reviews"][0];
+    let raw = record.to_string();
+    let preamble = "All checks pass. Shared fixtures use `crate::test_support` as intended.";
+    let parse = |output: &str| normalize(output, &record["identity"], "The requested change works.");
+    for wrapped in [
+        format!("  {raw}\n"),
+        format!("{preamble}\n\n{raw}"),
+        format!("```json\n{raw}\n```"),
+        format!("{preamble}\n\n```\n{raw}\n```"),
+        format!("```json\r\n{raw}\r\n```"),
+    ] {
+        assert_eq!(parse(&wrapped).unwrap(), parse(&raw).unwrap());
+    }
+    let duplicate = raw.replacen("\"approved\":true", "\"approved\":false,\"approved\":true", 1);
+    let nested_duplicate = raw.replacen("\"role\":\"reviewer\"", "\"role\":\"architect\",\"role\":\"reviewer\"", 1);
+    for invalid in [
+        format!("{preamble}\n{duplicate}"),
+        format!("```json\n{nested_duplicate}\n```"),
+        format!("{preamble}\n{{}}\n{raw}"),
+        format!("{preamble}\n{raw}\n{raw}"),
+        format!("{preamble}\n{{broken\n{raw}"),
+        format!("{preamble}\n[{raw}]"),
+        format!("{preamble}\n{raw}\nActually, changes are needed."),
+        format!("```json\n{raw}"),
+        format!("```json\n{raw}\n```\nMore text"),
+        format!("```text\n{raw}\n```"),
+        format!("{}\n{raw}", "x".repeat(128 * 1024)),
+    ] {
+        assert!(parse(&invalid).is_err(), "unexpectedly accepted: {invalid}");
+    }
+    for field in ["identity", "criteria", "project_checks", "acceptance_evidence"] {
+        let mut invalid = record.clone();
+        invalid[field] = Value::Null;
+        assert!(parse(&format!("{preamble}\n```json\n{invalid}\n```")).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn idle_state_displays_legacy_gate_errors_as_blocked_without_mutating_plan() {
+    let f = Fixture::new("Implement feature", 1);
+    let mut p = f.plan();
+    p["stages"][0]["status"] = json!("in_progress");
+    p["stages"][0]["review_gate"] = json!({"status":"error","error":"malformed verdict"});
+    p["stages"][0]["rounds"] = json!(1);
+    f.ctx.save_plan(&p).unwrap();
+    let before = fs::read(f.ctx.forge_path("plan.json")).unwrap();
+    for (busy, expected) in [(false, "blocked"), (true, "in_progress"), (false, "blocked")] {
+        f.ctx.session.busy.store(busy, Ordering::SeqCst);
+        let (code, state) = crate::tests::api_request(&f.ctx.app, "GET", "/api/state", json!({}));
+        assert_eq!(code, 200);
+        assert_eq!(state["plan"]["stages"][0]["status"], expected);
+        assert_eq!(state["plan"]["stages"][0]["review_gate"]["status"], "error");
+        assert_eq!(state["plan"]["stages"][0]["rounds"], 1);
+        assert_eq!(fs::read(f.ctx.forge_path("plan.json")).unwrap(), before);
+    }
 }

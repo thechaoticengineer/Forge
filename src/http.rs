@@ -187,6 +187,19 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
         }
         snap["persistence_error"] = json!(*ctx.session.persistence_error.lock().unwrap());
     }
+    // Older engines left failed stages in_progress. Correct their idle display
+    // without rewriting the persisted plan, review history or attempt budget.
+    if snap["busy"] == false {
+        for stage in snap.get_mut("plan").and_then(|p| p.get_mut("stages"))
+            .and_then(Value::as_array_mut).into_iter().flatten() {
+            if stage["status"] == "in_progress" && matches!(
+                stage["review_gate"]["status"].as_str(),
+                Some("error" | "blocked" | "exhausted" | "invalidated")
+            ) {
+                stage["status"] = json!("blocked");
+            }
+        }
+    }
     snap["queue"] = ctx.load_queue()["items"].clone();
     snap["queue_active"] = json!(ctx.session.queue_active.load(Ordering::SeqCst));
     drop(_queue_guard);

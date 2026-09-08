@@ -83,7 +83,24 @@ impl Ctx {
             return Err(error.into());
         }
         if plan["stages"][idx]["reassessment"]["pending"].is_object() {
-            return Err("model routing blocked: interrupted selection reservation; revise scope/constraints to recover or inspect saved evidence".into());
+            let pending = plan["stages"][idx]["reassessment"]["pending"].clone();
+            let restored = (pending["kind"] == "material_assignment_change")
+                .then(|| self.restored_assignment(plan, idx)).transpose()?;
+            if let Some(agreement) = restored.filter(|a| *a == pending["old_agreement"]) {
+                self.reviewer_config(agreement["effective"]["provider"].as_str().ok_or("missing agreed provider")?)?;
+                let state = &mut plan["stages"][idx]["reassessment"];
+                state["history"].as_array_mut().unwrap().push(json!({
+                    "kind":"material_assignment_restored", "reservation":pending,
+                    "agreement_id":agreement["id"], "unix":unix_timestamp()
+                }));
+                state.as_object_mut().unwrap().remove("pending");
+                state.as_object_mut().unwrap().remove("error");
+                state["status"] = json!("reusing");
+                // Keep count, signatures and review rounds: recovery refunds no budget.
+                self.save_plan(plan)?;
+            } else {
+                return Err("model routing blocked: interrupted selection reservation; revise scope/constraints to recover or inspect saved evidence".into());
+            }
         }
         match self.validated_assignment(plan, idx) {
             Ok(a) => Ok(a),

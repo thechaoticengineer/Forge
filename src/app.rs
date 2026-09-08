@@ -1419,7 +1419,7 @@ impl Ctx {
                 self.save_plan(plan)?;
                 return Ok("stopped");
             }
-            self.save_plan(plan)?;
+            self.finish_stage(plan, idx, "blocked")?;
         }
         if matches!(result, Ok("stopped")) {
             plan["stages"][idx]["review_gate"]["status"] = json!("interrupted");
@@ -1519,7 +1519,7 @@ impl Ctx {
                             plan["stages"][idx]["review_gate"]["status"] = json!("invalidated");
                             plan["stages"][idx]["review_gate"]["error"] = json!(error);
                             plan["stages"][idx]["last_verdict_valid"] = json!(false);
-                            self.save_plan(&plan)?;
+                            self.finish_stage(&mut plan, idx, "blocked")?;
                             return Err(error);
                         }
                     };

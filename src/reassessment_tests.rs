@@ -286,6 +286,53 @@ fn persisted_reservations_stop_loops_and_do_not_cross_projects() {
         before
     );
 }
+
+#[test]
+fn restored_material_assignment_recovers_reservation_without_refunding_or_selecting() {
+    for kind in ["material_assignment_change", "repeated_reasoning_failure"] {
+        let f = Fixture::new();
+        let mut p = f.attempt();
+        p["stages"][0]["rounds"] = json!(1);
+        f.ctx.reassessment_init(&mut p, 0);
+        let old = p["stages"][0]["model_agreement"].clone();
+        p["stages"][0]["reassessment"]["count"] = json!(1);
+        p["stages"][0]["reassessment"]["signatures"] = json!(["reserved"]);
+        p["stages"][0]["reassessment"]["pending"] = json!({
+            "kind":kind,"old_agreement":old,"signature":"reserved",
+            "evidence":{"local_validity":"legacy reviewer setting changed"}
+        });
+        f.ctx.save_plan(&p).unwrap();
+        let settings = f.ctx.app.settings.lock().unwrap().clone();
+        let app = Arc::new(App::new(f.root.to_str().unwrap(), settings));
+        let ctx = app.context(f.root.to_str().unwrap());
+        let mut restored = ctx.load_plan().unwrap();
+        // A real capability change must still block and retain its reservation.
+        let options = ctx.routing_options().unwrap();
+        let mut changed = options.clone();
+        changed[0]["resolved_id"] = json!("different-model");
+        ctx.app.settings.lock().unwrap()["mock_routing_options"] = json!(changed);
+        assert!(ctx.assignment_boundary(&mut restored, 0).is_err());
+        assert!(ctx.load_plan().unwrap()["stages"][0]["reassessment"]["pending"].is_object());
+        ctx.app.settings.lock().unwrap()["mock_routing_options"] = json!(options);
+        let result = ctx.assignment_boundary(&mut restored, 0);
+        if kind == "material_assignment_change" {
+            assert_eq!(result.unwrap(), old);
+            assert!(restored["stages"][0]["reassessment"]["pending"].is_null());
+            assert_eq!(restored["stages"][0]["reassessment"]["history"][0]["kind"], "material_assignment_restored");
+            assert_eq!(ctx.assignment_boundary(&mut restored, 0).unwrap(), old);
+        } else {
+            assert!(result.is_err());
+            assert!(restored["stages"][0]["reassessment"]["pending"].is_object());
+        }
+        assert_eq!(restored["stages"][0]["rounds"], 1);
+        assert_eq!(restored["stages"][0]["review_budget"], 3);
+        assert_eq!(restored["stages"][0]["reassessment"]["count"], 1);
+        assert_eq!(restored["stages"][0]["reassessment"]["signatures"], json!(["reserved"]));
+        let settings = ctx.app.settings.lock().unwrap();
+        assert_eq!(settings["mock_routing_planner_requests"].as_array().unwrap().len(), 1);
+        assert_eq!(settings["mock_routing_architect_requests"].as_array().unwrap().len(), 1);
+    }
+}
 #[test]
 fn outcome_channel_rejects_forged_identity_and_validates_escalation_evidence() {
     let f = Fixture::new();

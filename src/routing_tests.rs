@@ -101,6 +101,30 @@ fn configured_strong_without_official_metadata_and_explicit_unverified_effort() 
     assert_eq!(f.counts(), (1, 1));
     assert_eq!(a["proposal_ids"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn automatic_reviewer_selector_changes_reuse_all_stage_agreements() {
+    let f = Fixture::new();
+    f.set("reviewer", json!("codex"));
+    let mut candidate = plan();
+    candidate["stages"].as_array_mut().unwrap().push(stage(2));
+    let p = f.publish(candidate).unwrap();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert_eq!(cp["agreements"]["1"]["policy_inputs"]["reviewer"], "codex");
+    assert_eq!(cp["agreements"]["1"]["reviewer"]["provider"], "claude");
+    f.set("reviewer", json!("claude"));
+    assert!(f.ctx.routing_required(&p, &cp).unwrap().is_empty());
+    for idx in 0..2 {
+        assert_eq!(f.ctx.validated_assignment(&p, idx).unwrap(), p["stages"][idx]["model_agreement"]);
+    }
+    assert_eq!(f.counts(), (1, 1));
+    // An explicit reviewer or manual routing keeps the selector authoritative.
+    f.set("reviewer_model", json!("other-test"));
+    assert!(f.ctx.routing_required(&p, &cp).is_err());
+    f.set("reviewer_model", json!(""));
+    f.set("automatic_routing", json!(false));
+    assert_eq!(f.ctx.routing_required(&p, &cp).unwrap(), vec![1, 2]);
+}
 #[test]
 fn critical_work_never_uses_cheapest_unclassified_or_inadequate_tier() {
     for model in ["budget-test", "hallucinated"] {

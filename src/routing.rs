@@ -189,9 +189,18 @@ fn cheaper(a: &Value, b: &Value, basis: &Value) -> bool {
 fn effort_rank(e: &str) -> u64 {
     match e { "minimal" => 1, "low" => 2, "medium" => 3, "high" => 4, "xhigh" => 5, "max" => 6, _ => 0 }
 }
-fn material_inputs(v: &Value) -> Value {
+fn automatic_reviewer(settings: &Value) -> bool {
+    settings["automatic_routing"] != false
+        && settings["reviewer_model"].as_str().is_none_or(str::is_empty)
+}
+fn material_inputs(v: &Value, settings: &Value) -> Value {
     let mut v = v.clone();
     if let Some(obj) = v.as_object_mut() { for k in ["pricing", "relative_cost_preference", "billing_basis", "tier_provenance"] { obj.remove(k); } }
+    // Automatic review resolves the opposite provider at execution. The legacy
+    // global selector is unused and may change back to its default on restart.
+    if automatic_reviewer(settings) {
+        if let Some(obj) = v.as_object_mut() { obj.remove("reviewer"); }
+    }
     v
 }
 fn billing_facts(price: &Value) -> Value {
@@ -419,7 +428,7 @@ impl Ctx {
                 .and_then(|p| policy_inputs(&settings, &validity_stage, &p, &options));
             let valid = a["valid"] == true
                 && same_inputs
-                && check.as_ref().is_ok_and(|p| material_inputs(p) == material_inputs(&a["policy_inputs"]));
+                && check.as_ref().is_ok_and(|p| material_inputs(p, &settings) == material_inputs(&a["policy_inputs"], &settings));
             if stage["reassessment"]["pending"].is_object() {
                 ids.push(stage["id"].as_i64().ok_or("invalid stage id")?);
                 continue;
@@ -717,6 +726,12 @@ impl Ctx {
         unreachable!()
     }
     pub(crate) fn validated_assignment(&self, plan: &Value, idx: usize) -> Result<Value, String> {
+        self.check_assignment(plan, idx, false)
+    }
+    pub(crate) fn restored_assignment(&self, plan: &Value, idx: usize) -> Result<Value, String> {
+        self.check_assignment(plan, idx, true)
+    }
+    fn check_assignment(&self, plan: &Value, idx: usize, ignore_reservation: bool) -> Result<Value, String> {
         let current = self.load_plan().ok_or("missing saved plan")?;
         if let Some(error) = current["stages"][idx]["model_block"].as_str() {
             return Err(error.into());
@@ -729,6 +744,9 @@ impl Ctx {
         let cp = self.architecture_store().checkpoint(&current)?;
         // Only the launching stage is checked; unrelated pending stages have their own boundary.
         let mut local = current;
+        if ignore_reservation {
+            local["stages"][idx].as_object_mut().unwrap().remove("reassessment");
+        }
         for (i, s) in local["stages"]
             .as_array_mut()
             .unwrap()

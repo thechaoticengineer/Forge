@@ -110,6 +110,17 @@ to actionable requests even when `approved` was true; new output must leave
 notes empty. A rejected verdict without details receives a verification request.
 `apply_review_notes` is ignored and cannot bypass the gate.
 
+The engine writes the current role identity to `.forge/review-identity.json`
+before each review and asks the reviewer to load it with a script when assembling
+the final JSON. The file is read-only during review; the returned identity still
+must match exactly. A prose preamble or a JSON Markdown fence is accepted, while
+duplicate keys, multiple JSON candidates and trailing commentary are rejected.
+
+Codex reviews enable `sandbox_workspace_write.network_access` so scratch tests
+can bind ephemeral loopback ports. The outer Bubblewrap filesystem restrictions
+remain in force, matching the host network access already available to Claude
+reviews. This setting applies only to review roles.
+
 ### Budgets, commits and history
 
 `max_fix_rounds` (default `3`) means extra fix/review rounds after the initial

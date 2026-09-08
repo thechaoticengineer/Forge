@@ -403,6 +403,24 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
     if output.len() > 128 * 1024 {
         return Err("oversized verdict".into());
     }
+    // Accept a prose preamble and an optional Markdown fence, but never search
+    // past an earlier JSON candidate or ignore content after the verdict.
+    // UniqueJson still rejects duplicate keys at every nesting level.
+    let output = output.trim();
+    let start = output.find(['{', '[']).into_iter()
+        .chain(output.find("```"))
+        .min().unwrap_or(0);
+    let output = &output[start..];
+    let output = if let Some(fenced) = output.strip_prefix("```json\n")
+        .or_else(|| output.strip_prefix("```\n"))
+        .or_else(|| output.strip_prefix("```json\r\n"))
+        .or_else(|| output.strip_prefix("```\r\n"))
+    {
+        fenced.trim_end().strip_suffix("```")
+            .ok_or("malformed verdict: unclosed JSON fence")?.trim()
+    } else {
+        output
+    };
     let UniqueJson(mut v) =
         serde_json::from_str(output).map_err(|e| format!("malformed verdict: {e}"))?;
     if v["identity"] != *identity {
@@ -617,6 +635,8 @@ impl Ctx {
             ))
         ));
         prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], cp["guidance"][plan["stages"][idx]["id"].to_string()], plan["plan_id"].as_str().unwrap()));
+        crate::architecture::atomic_json(&self.forge_path("review-identity.json"), &identity)?;
+        prompt.push_str("\nThe engine also wrote the exact identity to .forge/review-identity.json (read-only during this review). Assemble your final verdict in private /tmp using a script: load that file with json.load, assign the resulting object to verdict['identity'], and serialize the verdict with json.dumps. Return that exact serialized JSON. Do not manually transcribe hashes or reconstruct the identity. The engine still validates the complete identity and rejects any mismatch.\n");
         if role == "architect" {
             let requests: Vec<_> = plan["stages"][idx]["reviews"]
                 .as_array()
