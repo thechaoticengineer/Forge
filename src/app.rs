@@ -737,7 +737,16 @@ impl Ctx {
         crate::agent::verify_capabilities(request, self.project(), &executable)?;
         let built = Self::agent_command(request)?;
         let mut cmd = Command::new(&executable);
-        cmd.args(built.get_args());
+        // Linux limits each argv entry independently of ARG_MAX. Large saved
+        // architecture contexts travel through stdin, never a shell or argv.
+        let prompt_stdin = request.prompt.len() > 32 * 1024;
+        let args: Vec<_> = built.get_args().collect();
+        if prompt_stdin {
+            cmd.args(&args[..args.len() - 1]);
+            if tool == "codex" { cmd.arg("-"); }
+        } else {
+            cmd.args(args);
+        }
         let codex_home = crate::agent::codex_session::home();
         #[cfg(test)]
         let codex_home = self.app.settings.lock().unwrap()["test_codex_home"].as_str()
@@ -770,7 +779,7 @@ impl Ctx {
             .and_then(crate::agent::codex_session::Snapshot::capture));
         let child = cmd
             .process_group(0)
-            .stdin(Stdio::null())
+            .stdin(if prompt_stdin { Stdio::piped() } else { Stdio::null() })
             .current_dir(self.project())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -793,10 +802,16 @@ impl Ctx {
         };
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
+        let stdin = child.stdin.take();
         let stderr_log = Arc::clone(&log);
         let pid = child.id() as i32;
         let failed_reader = AtomicBool::new(false);
-        let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
+        let (stdout_result, stderr_result, status_result, input_result) = std::thread::scope(|scope| {
+            let input_writer = scope.spawn(|| {
+                let result = stdin.map_or(Ok(()), |mut input| input.write_all(request.prompt.as_bytes()));
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result.map_err(|e| format!("agent prompt input failed: {e}"))
+            });
             let stdout_reader = scope.spawn(|| {
                 let result = stream_agent_result(stdout, &log, &self.session.state, 1500, tool == "claude");
                 if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
@@ -821,9 +836,11 @@ impl Ctx {
             unsafe { libc::kill(-pid, libc::SIGKILL); }
             let _ = child.wait();
             (stdout_reader.join().unwrap_or_else(|_| Err("agent stdout reader panicked".into())),
-             stderr_reader.join().unwrap_or_else(|_| Err("agent stderr reader panicked".into())), status)
+             stderr_reader.join().unwrap_or_else(|_| Err("agent stderr reader panicked".into())), status,
+             input_writer.join().unwrap_or_else(|_| Err("agent prompt writer panicked".into())))
         });
         self.clear_agent_activity();
+        input_result.map_err(|e| self.agent_error(role, e))?;
         let mut result = stdout_result?;
         let tail = result.output.clone();
         let mut usage = result.usage.take();

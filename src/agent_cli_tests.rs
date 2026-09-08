@@ -88,6 +88,31 @@ fn pair(args: &[String], a: &str, b: &str) -> bool {
     args.windows(2).any(|p| p[0] == a && p[1] == b)
 }
 
+#[test]
+fn large_prompts_use_stdin_while_output_is_drained() {
+    for provider in ["codex", "claude"] {
+        let terminal = if provider == "codex" {
+            format!(r#"print(json.dumps({{'type':'thread.started','thread_id':'{ID}'}}))
+print(json.dumps({{'type':'turn.completed'}}))"#)
+        } else {
+            format!(r#"print(json.dumps({{'type':'result','subtype':'success','session_id':'{ID}','result':'ok'}}))"#)
+        };
+        let f = Cli::new(provider, &format!(r#"
+# Fill both output pipes before consuming stdin: a synchronous writer deadlocks.
+for _ in range(128):
+    print('x' * 1024, flush=True)
+    print('y' * 1024, file=sys.stderr, flush=True)
+with open('received-prompt','wb') as output: output.write(sys.stdin.buffer.read())
+{terminal}
+"#));
+        let prompt = "Large context: żółw `literal` $(literal)\n".repeat(8000);
+        f.ctx.run_agent(&AgentRequest { prompt: &prompt, ..request(provider) }).unwrap();
+        assert_eq!(fs::read(f.root.join("received-prompt")).unwrap(), prompt.as_bytes());
+        assert!(f.args().iter().all(|a| a.len() < 32 * 1024));
+        assert_eq!(f.args().last().is_some_and(|a| a == "-"), provider == "codex");
+    }
+}
+
 // Shape observed in Codex CLI 0.153.4: exec stdout lacks model, while the
 // exact rollout records task_started, turn_context and task_complete.
 fn codex_rollout_script(model: &str) -> String {
@@ -341,8 +366,10 @@ time.sleep(60)
         );
         let f = Cli::new("codex", &body);
         let start = Instant::now();
+        let prompt = "context".repeat(40_000);
+        let req = AgentRequest { prompt: &prompt, ..request("codex") };
         let result = std::thread::scope(|scope| {
-            let task = scope.spawn(|| f.ctx.run_agent(&request("codex")));
+            let task = scope.spawn(|| f.ctx.run_agent(&req));
             while !f.root.join("descendant.pid").exists() {
                 assert!(start.elapsed() < Duration::from_secs(3));
                 std::thread::sleep(Duration::from_millis(10));
