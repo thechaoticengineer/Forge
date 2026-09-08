@@ -453,6 +453,78 @@ fn planning_and_revision_share_normalization() {
 }
 
 #[test]
+fn candidate_publication_preserves_selection_counts_and_failure_effects() {
+    for revision in [false, true] {
+        for supplied_proposal in [false, true] {
+            for outcome in ["success", "malformed candidate", "failed publication"] {
+                let test = QueueTest::new(false);
+                let previous = if revision {
+                    test.app.save_plan(&json!({"goal": "Goal", "status": "draft", "stages": [editable_stage(1)]})).unwrap();
+                    test.app.load_plan()
+                } else { None };
+                let before = fs::read(test.app.forge_path("plan.json")).ok();
+                let checkpoint = previous.as_ref().map(|p| test.app.architecture_store().checkpoint(p).unwrap());
+                let mut stage = editable_stage(2);
+                if supplied_proposal {
+                    let option = test.app.routing_options().unwrap().into_iter().find(|o| o["eligible"] == true).unwrap();
+                    stage["model_proposal"] = json!({"provider": option["provider"], "model": option["model"],
+                        "native_effort": option["effort"], "risk": "standard", "complexity": "standard",
+                        "task": "functionality", "rationale": "Planner proposal from candidate"});
+                    stage["model_proposal_inputs"] = json!({"forged": true});
+                    stage["model_proposer"] = json!({"forged": true});
+                }
+                {
+                    let mut settings = test.app.app.settings.lock().unwrap();
+                    settings["mock_plan_output"] = json!({"stages": [stage]});
+                    if outcome == "malformed candidate" { settings["mock_plan_output"]["stages"] = json!([42]); }
+                    if outcome == "failed publication" { settings["mock_architect_output"] = json!("not JSON"); }
+                }
+                test.app.acquire_busy().unwrap();
+                if let Some(previous) = &previous {
+                    test.app.revise_worker(previous, "Improve the plan");
+                } else {
+                    test.app.plan_worker("Goal", &PlanMode::Standard);
+                }
+                let expected_calls = usize::from(outcome != "malformed candidate");
+                let settings = test.app.app.settings.lock().unwrap();
+                for key in ["mock_architect_requests", "mock_routing_architect_requests"] {
+                    assert_eq!(settings[key].as_array().map_or(0, Vec::len), expected_calls, "{revision}/{supplied_proposal}/{outcome}/{key}");
+                }
+                assert_eq!(settings["mock_routing_planner_requests"].as_array().map_or(0, Vec::len),
+                    if supplied_proposal { 0 } else { expected_calls });
+                drop(settings);
+                let history = test.app.read_history();
+                let success_message = format!("plan {} with 1 stages", if revision { "revised" } else { "ready" });
+                if outcome == "success" {
+                    assert_eq!(test.app.session.state.lock().unwrap().phase, "plan_ready");
+                    assert_eq!(history.as_array().unwrap().last().unwrap()["text"], success_message);
+                    let plan = test.app.load_plan().unwrap();
+                    assert_eq!(plan["stages"][0]["model_agreement"]["agreed"], true);
+                    if supplied_proposal {
+                        assert_eq!(plan["stages"][0]["model_proposal"], stage["model_proposal"]);
+                        assert_eq!(plan["stages"][0]["model_proposal_inputs"], test.app.proposal_inputs(&plan, 0));
+                        assert_eq!(plan["stages"][0]["model_proposer"], plan["planner_selection_actor"]);
+                    }
+                } else {
+                    assert_eq!(fs::read(test.app.forge_path("plan.json")).ok(), before);
+                    if let Some(previous) = &previous {
+                        assert_eq!(test.app.architecture_store().checkpoint(previous).unwrap(), checkpoint.unwrap());
+                    }
+                    assert_eq!(test.app.session.state.lock().unwrap().phase,
+                        if outcome == "failed publication" { "blocked" } else if revision { "plan_ready" } else { "failed" });
+                    assert!(!history.as_array().unwrap().iter().any(|e| e["text"] == success_message));
+                    let error = history.as_array().unwrap().last().unwrap()["text"].as_str().unwrap();
+                    assert!(error.starts_with(if revision { "revision failed: " } else { "planning failed: " }));
+                    assert!(error.contains(if outcome == "malformed candidate" {
+                        "planner produced a stage that is not an object"
+                    } else { "invalid architect output" }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn plan_edit_resets_execution_and_preserves_or_replaces_goal() {
     let original = json!({"goal": "Old goal", "status": "blocked", "metadata": "keep",
         "stages": [{"id": 3, "title": "Old title", "instructions": "Old instructions",

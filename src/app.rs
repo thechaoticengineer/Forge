@@ -4,7 +4,7 @@ mod review;
 mod reassessment;
 use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
-use crate::usage::{accumulate_invocation_usage, merge_planner_revision_totals};
+use crate::usage::accumulate_invocation_usage;
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1109,53 +1109,14 @@ impl Ctx {
         }
     }
 
-    fn finalize_plan(&self, mut plan: Value, goal: &str, previous: Option<&Value>, action: &str)
+    fn finalize_plan(&self, plan: Value, goal: &str, previous: Option<&Value>, action: &str)
         -> Result<(), String>
     {
-        let stages = plan["stages"].as_array_mut().unwrap();
-        for stage in stages.iter_mut() {
-            if !stage.is_object() {
-                return Err("planner produced a stage that is not an object".into());
-            }
-            // Planner output cannot forge execution records or relax user constraints.
-            let saved_constraint = previous.and_then(|p| p["stages"].as_array()).and_then(|stages| stages.iter().find(|s| s["id"] == stage["id"]))
-                .map(|s| s["model_constraint"].clone()).unwrap_or(Value::Null);
-            stage.as_object_mut().unwrap().retain(|key, _| ["id", "title", "instructions", "acceptance", "commit", "depends_on", "model_proposal"].contains(&key.as_str()));
-            if !saved_constraint.is_null() { stage["model_constraint"] = saved_constraint; }
-            stage["status"] = json!("pending");
-            stage["rounds"] = json!(0);
-        }
-        let committed: Vec<Value> = previous.into_iter().flat_map(|p| p["stages"].as_array().unwrap())
-            .filter(|s| s["status"] == "committed").cloned().collect();
-        // Restore originals even if the agent edited, reordered, duplicated or dropped them.
-        stages.retain(|stage| !committed.iter().any(|original| original["id"] == stage["id"]));
-        stages.splice(0..0, committed.iter().cloned());
-        let n = stages.len();
-        plan["goal"] = json!(goal);
-        plan["status"] = json!("draft");
+        let (mut plan, n) = crate::candidate_draft::prepare_candidate_draft(plan, goal, previous)?;
         if let Some(previous) = previous {
-            let mut edited = crate::plan::edit_plan(previous, &json!({"plan": plan})).map_err(str::to_owned)?;
-            for (idx, stage) in edited["stages"].as_array_mut().unwrap().iter_mut().enumerate() {
-                if stage["status"] != "committed" { stage["model_proposal"] = plan["stages"][idx]["model_proposal"].clone(); }
-            }
-            if let Some(usage) = plan.get("planner_usage") {
-                merge_planner_revision_totals(&mut edited, usage);
-            }
-            if !edited["planner_usage"].is_null() {
-                if !edited["role_usage"].is_object() { edited["role_usage"] = json!({}); }
-                edited["role_usage"]["planner"] = edited["planner_usage"].clone();
-            }
-            edited["planner_selection_actor"] = plan["planner_selection_actor"].clone();
-            self.bind_planner_proposals(&mut edited);
-            self.architect_publish(edited, Some(previous), "draft revision")?;
+            self.bind_planner_proposals(&mut plan);
+            self.architect_publish(plan, Some(previous), "draft revision")?;
         } else {
-            let base = json!({"stages": [], "goal": goal});
-            let normalized = crate::plan::edit_plan(&base, &json!({"plan": plan})).map_err(str::to_owned)?;
-            let proposals: Vec<Value> = plan["stages"].as_array().unwrap().iter().map(|s| s["model_proposal"].clone()).collect();
-            plan["stages"] = normalized["stages"].clone();
-            for (idx, proposal) in proposals.into_iter().enumerate() { plan["stages"][idx]["model_proposal"] = proposal; }
-            plan["stage_id_high_water"] = normalized["stage_id_high_water"].clone();
-            for key in ["plan_id", "revision", "architecture", "contract_version"] { plan.as_object_mut().unwrap().remove(key); }
             self.bind_planner_proposals(&mut plan);
             self.architect_publish(plan, None, "initial plan guidance")?;
         }

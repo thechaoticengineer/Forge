@@ -20,6 +20,7 @@ mod contracts;
 mod app;
 mod http;
 mod plan;
+mod candidate_draft;
 mod routing;
 mod prompts;
 mod util;
