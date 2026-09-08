@@ -1,5 +1,6 @@
 use crate::app::{App, FORGE_DIR};
 use crate::plan::default_settings;
+use crate::reports::{completed_run_report, completion_message};
 use crate::test_support::{QueueTest, api_request, wait_for_worker};
 use crate::util::{fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
@@ -259,5 +260,125 @@ fn duration_formats_seconds_and_minutes() {
         (61, "1m 1s"), (252, "4m 12s"), (3600, "60m 0s"),
     ] {
         assert_eq!(fmt_duration(secs), expected);
+    }
+}
+
+#[test]
+fn completed_report_preserves_optional_presence_and_clamps_duration() {
+    for (started, now, duration) in [(100, 352, 252), (400, 352, 0), (0, 352, 0), (-1, 352, 0)] {
+        let mut plan = json!({"stages": [], "architecture": {"stale": true}});
+        let mut expected = json!({
+            "version": 1, "project": "/project", "unix": now, "goal": null,
+            "plan_id": null, "revision": null, "duration_secs": duration,
+            "stages": 7, "commits": [], "stage_outcomes": [],
+            "architecture": {"authoritative": true},
+        });
+        assert_eq!(completed_run_report(&plan, "/project", 7, started, now,
+            json!({"authoritative": true})), expected);
+        for value in [Value::Null, json!({}), json!([]), json!(false), json!({"codex": {"total_tokens": 5}})] {
+            for key in ["usage", "planner_usage", "role_usage"] {
+                plan[key] = value.clone();
+                expected[key] = value.clone();
+            }
+            assert_eq!(completed_run_report(&plan, "/project", 7, started, now,
+                json!({"authoritative": true})), expected);
+        }
+    }
+}
+
+#[test]
+fn completed_report_includes_present_shas_and_preserves_commit_fallbacks() {
+    let plan = json!({"stages": [
+        {"title": "No SHA", "commit": "ignored"},
+        {"sha": null, "title": "Null SHA"},
+        {"sha": "", "commit": null, "title": "Empty SHA"},
+        {"sha": 42, "commit": false},
+        {"sha": "abc", "commit": "", "title": "Empty message"},
+        {"sha": "def", "commit": "feat: done", "title": "Named message"},
+    ]});
+    let report = completed_run_report(&plan, "/project", 6, 0, 100, Value::Null);
+    assert_eq!(report["commits"], json!([
+        {"sha": null, "message": "forge: stage", "title": "Null SHA"},
+        {"sha": "", "message": "forge: stage", "title": "Empty SHA"},
+        {"sha": 42, "message": "forge: stage", "title": null},
+        {"sha": "abc", "message": "", "title": "Empty message"},
+        {"sha": "def", "message": "feat: done", "title": "Named message"},
+    ]));
+    assert_eq!(completion_message(&report), "all stages committed — run complete in 0s");
+}
+
+#[test]
+fn completed_report_keeps_exact_stage_presentation() {
+    let plan = json!({"goal": "Ship", "plan_id": "plan-1", "revision": 2, "stages": [{
+        "id": 3, "title": "Finish", "status": "committed", "attempt_id": "attempt-1",
+        "rounds": 2, "sha": "abc", "commit": "feat: finish", "instructions": "omitted",
+        "model_agreement": {
+            "id": "agreement-1", "valid": true, "validated_proposal": {"model": "small"},
+            "effective": {"model": "large"}, "availability": "verified",
+            "verification_state": "execution_verified", "planner_reason": "plan reason",
+            "architect_reason": "architect reason", "trigger": "review",
+            "superseded_agreement": "agreement-0", "dialogue": ["omitted"],
+            "policy_inputs": {"policy": "routing-1", "tier": 3, "tier_provenance": "configured",
+                "relative_cost_preference": null, "pricing": {"input": 1}, "billing_basis": "tokens",
+                "constraint": {"provider": "codex"}, "omitted": true},
+        },
+        "model_invocations": [{"id": "first"}, {"id": "last", "tokens": 10}],
+        "review_policy": {"required_roles": ["architect", "reviewer"]},
+        "review_gate": {"status": "approved", "roles": {"reviewer": "approved"},
+            "identity": {"attempt_id": "attempt-1"}, "omitted": true},
+        "reassessment": {"count": 1, "operational_retries": 2, "omitted": true},
+        "usage": {"codex": {"total_tokens": 10}},
+    }, {}]});
+    let report = completed_run_report(&plan, "/project", 2, 100, 161, json!({"summary": "loaded"}));
+    assert_eq!(report, json!({
+        "version": 1, "project": "/project", "unix": 161, "duration_secs": 61,
+        "goal": "Ship", "plan_id": "plan-1", "revision": 2, "stages": 2,
+        "commits": [{"sha": "abc", "message": "feat: finish", "title": "Finish"}],
+        "architecture": {"summary": "loaded"}, "stage_outcomes": [{
+            "id": 3, "title": "Finish", "status": "committed", "attempt_id": "attempt-1",
+            "rounds": 2, "sha": "abc", "model_agreement": {
+                "id": "agreement-1", "valid": true, "validated_proposal": {"model": "small"},
+                "effective": {"model": "large"}, "availability": "verified",
+                "verification_state": "execution_verified", "planner_reason": "plan reason",
+                "architect_reason": "architect reason", "trigger": "review",
+                "superseded_agreement": "agreement-0", "policy_inputs": {
+                    "policy": "routing-1", "tier": 3, "tier_provenance": "configured",
+                    "relative_cost_preference": null, "pricing": {"input": 1}, "billing_basis": "tokens",
+                    "constraint": {"provider": "codex"}},
+            }, "last_invocation": {"id": "last", "tokens": 10}, "invocation_count": 2,
+            "review_policy": {"required_roles": ["architect", "reviewer"]},
+            "review_gate": {"status": "approved", "roles": {"reviewer": "approved"},
+                "identity": {"attempt_id": "attempt-1"}},
+            "reassessment": {"count": 1, "operational_retries": 2},
+            "usage": {"codex": {"total_tokens": 10}},
+        }, {
+            "id": null, "title": null, "status": null, "attempt_id": null, "rounds": null,
+            "sha": null, "model_agreement": null, "last_invocation": null, "invocation_count": 0,
+            "review_policy": null, "review_gate": {"status": null, "roles": null, "identity": null},
+            "reassessment": {"count": null, "operational_retries": null}, "usage": null,
+        }],
+    }));
+}
+
+#[test]
+fn completion_suffix_requires_nonempty_usage_and_formats_zero_one_many_commits() {
+    let mut plan = json!({"stages": [{"sha": null}], "planner_usage": {"codex": {"total_tokens": 7}},
+        "role_usage": {"planner": {"codex": {"total_tokens": 7}}}});
+    for usage in [None, Some(Value::Null), Some(json!({})), Some(json!([])), Some(json!(false)), Some(json!(7))] {
+        if let Some(usage) = usage { plan["usage"] = usage; }
+        let report = completed_run_report(&plan, "/project", 1, 100, 352, Value::Null);
+        assert_eq!(completion_message(&report), "all stages committed — run complete in 4m 12s");
+    }
+    plan["usage"] = json!({"zeta": {"total_tokens": "9"}, "codex": {"total_tokens": 1.5},
+        "claude": {"total_tokens": 200}, "alpha": null, "empty": {}, "large": {"total_tokens": u64::MAX}});
+    for (stages, suffix) in [
+        (json!([{}]), "0 commits"),
+        (json!([{"sha": null}, {}]), "1 commit"),
+        (json!([{"sha": "abc"}, {"sha": "def"}]), "2 commits"),
+    ] {
+        plan["stages"] = stages;
+        let report = completed_run_report(&plan, "/project", 2, 100, 352, Value::Null);
+        assert_eq!(completion_message(&report), format!(
+            "all stages committed — run complete in 4m 12s — {suffix} — alpha: 0 tokens, claude: 200 tokens, codex: 0 tokens, empty: 0 tokens, large: 0 tokens, zeta: 0 tokens"));
     }
 }

@@ -1520,45 +1520,17 @@ impl Ctx {
         self.set_phase("done");
         let started = self.session.state.lock().unwrap().run_started_unix;
         let now = unix_timestamp();
-        let duration_secs = if started > 0 { (now - started).max(0) } else { 0 };
-        let commits: Vec<Value> = plan["stages"].as_array().unwrap().iter()
-            .filter_map(|stage| stage.get("sha").map(|sha| json!({
-                "sha": sha, "message": stage["commit"].as_str().unwrap_or("forge: stage"),
-                "title": stage["title"],
-            })))
-            .collect();
-        let mut report = json!({
-            "unix": now, "goal": plan["goal"], "duration_secs": duration_secs,
-            "stages": count, "commits": commits,
-        });
-        report["version"] = json!(1);
-        report["project"] = json!(self.project());
-        report["plan_id"] = plan["plan_id"].clone();
-        report["revision"] = plan["revision"].clone();
+        let project = self.project();
         let published = self.architecture_store().load_raw()?.ok_or("missing completed plan")?;
-        report["architecture"] = self.architecture_store().summary(Some(&published))?;
-        report["stage_outcomes"] = json!(plan["stages"].as_array().unwrap().iter()
-            .map(crate::reports::stage_outcome).collect::<Vec<_>>());
-        for key in ["usage", "planner_usage", "role_usage"] {
-            if let Some(usage) = plan.get(key) {
-                report[key] = usage.clone();
-            }
-        }
+        let architecture = self.architecture_store().summary(Some(&published))?;
+        let report = crate::reports::completed_run_report(&plan, project, count, started, now, architecture);
         self.ensure_forge_dir();
         let mut f = fs::OpenOptions::new().create(true).append(true)
             .open(self.forge_path("reports.jsonl")).map_err(|e| format!("run report: {e}"))?;
         writeln!(f, "{report}").and_then(|_| f.sync_all())
             .and_then(|_| fs::File::open(self.forge_path("")).and_then(|dir| dir.sync_all()))
             .map_err(|e| format!("run report: {e}"))?;
-        let duration = fmt_duration(duration_secs);
-        let mut text = format!("all stages committed — run complete in {duration}");
-        if let Some(usage) = plan["usage"].as_object().filter(|usage| !usage.is_empty()) {
-            let tokens = usage.iter().map(|(tool, usage)| {
-                format!("{tool}: {} tokens", usage["total_tokens"].as_i64().unwrap_or(0))
-            }).collect::<Vec<_>>().join(", ");
-            let noun = if commits.len() == 1 { "commit" } else { "commits" };
-            text.push_str(&format!(" — {} {noun} — {tokens}", commits.len()));
-        }
+        let text = crate::reports::completion_message(&report);
         self.log_event("run", &text);
         Ok(())
     }
