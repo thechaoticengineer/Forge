@@ -1200,12 +1200,7 @@ impl Ctx {
         Ok("exhausted")
     }
 
-    pub(super) fn commit_reviewed(
-        &self,
-        plan: &Value,
-        idx: usize,
-        message: &str,
-    ) -> Result<Option<String>, String> {
+    fn validate_commit_approval(&self, plan: &Value, idx: usize) -> Result<(), String> {
         let stage = &plan["stages"][idx];
         let gate = &stage["review_gate"];
         if gate["status"] != "approved"
@@ -1223,15 +1218,6 @@ impl Ctx {
             || crate::plan::stage_inputs(&persisted, idx) != crate::plan::stage_inputs(plan, idx)
         {
             return Err("plan changed after review".into());
-        }
-        let expected = &gate["identity"]["snapshot"];
-        if snapshot(self.project())? != *expected {
-            return Err("implementation/index/HEAD changed after review".into());
-        }
-        if classify(self.project(), stage, stage["dual_promoted"] == true)?["scope"]
-            != gate["policy"]["scope"]
-        {
-            return Err("review scope changed before commit".into());
         }
         let current = aggregate(
             &gate["identity"],
@@ -1261,6 +1247,57 @@ impl Ctx {
             {
                 return Err("current verdict is not clean and evidenced".into());
             }
+        }
+        Ok(())
+    }
+
+    /// Recover the narrow crash window after Git's CAS commit and before the
+    /// completed-stage checkpoint publication. Never synthesize an approval.
+    pub(crate) fn recover_committed_stages(&self) -> Result<Vec<i64>, String> {
+        let Some(mut plan) = self.load_plan() else { return Ok(Vec::new()); };
+        let Some(idx) = plan["stages"].as_array().ok_or("invalid stages")?.iter()
+            .position(|stage| stage["status"] != "committed") else { return Ok(Vec::new()); };
+        let stage = &plan["stages"][idx];
+        if stage["review_gate"]["status"] != "approved" { return Ok(Vec::new()); }
+        let expected = &stage["review_gate"]["identity"]["snapshot"];
+        let actual = snapshot(self.project())?;
+        if actual["head"] == expected["head"] { return Ok(Vec::new()); }
+        self.validate_commit_approval(&plan, idx)?;
+        self.git(&["diff", "--quiet"])
+            .and_then(|_| self.git(&["diff", "--cached", "--quiet"]))
+            .map_err(|_| "uncommitted index/worktree changes prevent commit recovery")?;
+        let parents = self.git(&["rev-list", "--parents", "-n", "1", "HEAD"])?;
+        let parents: Vec<_> = parents.split_whitespace().collect();
+        if parents.len() != 2 || Some(parents[1]) != expected["head"].as_str()
+            || actual["tree"] != expected["tree"] || actual["content"] != expected["content"]
+            || self.git(&["rev-parse", "HEAD^{tree}"])? != expected["tree"]
+            || self.git(&["show", "-s", "--format=%B", "HEAD"])? != stage["commit"].as_str().unwrap_or("forge: stage") {
+            return Err("HEAD/worktree does not match the saved independently reviewed commit; recovery refused".into());
+        }
+        let sid = stage["id"].as_i64().ok_or("missing stage ID")?;
+        plan["stages"][idx]["sha"] = json!(self.git(&["rev-parse", "--short", "HEAD"])?);
+        self.finish_stage(&mut plan, idx, "committed")?;
+        self.log_event("stage", &format!("stage {sid} recovered: exact reviewed commit already exists; completion checkpoint restored"));
+        Ok(vec![sid])
+    }
+
+    pub(super) fn commit_reviewed(
+        &self,
+        plan: &Value,
+        idx: usize,
+        message: &str,
+    ) -> Result<Option<String>, String> {
+        self.validate_commit_approval(plan, idx)?;
+        let stage = &plan["stages"][idx];
+        let gate = &stage["review_gate"];
+        let expected = &gate["identity"]["snapshot"];
+        if snapshot(self.project())? != *expected {
+            return Err("implementation/index/HEAD changed after review".into());
+        }
+        if classify(self.project(), stage, stage["dual_promoted"] == true)?["scope"]
+            != gate["policy"]["scope"]
+        {
+            return Err("review scope changed before commit".into());
         }
         // Match snapshot's staging: git add rejects an explicitly excluded ignored path.
         self.git(&["add", "-A"])?;

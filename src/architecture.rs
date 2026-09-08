@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod storage;
 
 pub(crate) const VERSION: u64 = 1;
-const CHECKPOINT_LIMIT: usize = 64 * 1024;
+// Checkpoints accumulate agreements and completed-stage evidence. Use the
+// existing decoded-record memory budget for disk storage too; the 64 KiB
+// event/page budget is not a valid bound for an entire plan checkpoint.
+const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 const EVENT_LIMIT: usize = 64 * 1024;
 static IDS: AtomicU64 = AtomicU64::new(0);
 
@@ -1658,4 +1661,17 @@ mod tests {
             json!(["architect", "reviewer"])
         );
     }
+    #[test]
+    fn completed_stage_checkpoint_can_exceed_an_individual_event_budget() {
+        let temp = Temp::new();
+        let store = temp.store();
+        let old = publish(&store);
+        let mut cp = store.checkpoint(&old).unwrap();
+        // Accumulated distinct plan facts cannot be reduced by string deduplication.
+        cp["retained_facts"] = json!((0..180).map(|i| format!("fact-{i}:{}", "x".repeat(1000))).collect::<Vec<_>>());
+        let saved = store.publish(old, cp.clone(), json!({"kind":"execution"})).unwrap();
+        assert_eq!(store.checkpoint(&saved).unwrap(),cp);
+        assert_eq!(store.load().unwrap().unwrap(),saved);
+    }
+
 }

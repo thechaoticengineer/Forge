@@ -857,6 +857,7 @@ impl Ctx {
     }
 
     fn run_worker_inner(&self) -> Result<(), String> {
+        self.recover_committed_stages()?;
         let loaded = self.load_plan().ok_or("no plan")?;
         let cp = if loaded["architecture"].is_object() { self.architecture_store().checkpoint(&loaded)? } else { Value::Null };
         let pending_turn = loaded["plan_id"].as_str().and_then(|id| fs::read(self.forge_path("architecture").join(id).join("architect-pending.json")).ok())

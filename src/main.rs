@@ -72,6 +72,14 @@ fn main() {
     app.model_policy_path = Some(policy_path);
     *app.model_policy_error.lock().unwrap() = loaded.err();
     let app = Arc::new(app);
+    if std::env::args().nth(2).as_deref() == Some("--recover-committed") {
+        let ctx = app.context(&project);
+        match ctx.recover_committed_stages() {
+            Ok(stages) => println!("{}", json!({"recovered_stages":stages})),
+            Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+        }
+        return;
+    }
     app.refresh_catalogue();
     app.refresh_quota(false);
     {

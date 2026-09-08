@@ -753,3 +753,47 @@ fn idle_state_displays_legacy_gate_errors_as_blocked_without_mutating_plan() {
         assert_eq!(fs::read(f.ctx.forge_path("plan.json")).unwrap(), before);
     }
 }
+
+#[test]
+fn reviewed_git_commit_is_recovered_after_completion_checkpoint_failure() {
+    let f = Fixture::new("Implement feature", 0);
+    let p = f.reviewed();
+    let sha = f.ctx.commit_reviewed(&p,0,"feat: stage").unwrap().unwrap();
+    // Simulate the process ending after update-ref but before finish_stage/save.
+    assert_ne!(f.plan()["stages"][0]["status"],"committed");
+    assert_eq!(f.ctx.recover_committed_stages().unwrap(),vec![1]);
+    let saved=f.plan();
+    assert_eq!(saved["stages"][0]["status"],"committed");
+    assert_eq!(saved["stages"][0]["sha"],sha);
+    assert_eq!(saved["stages"][0]["review_gate"],p["stages"][0]["review_gate"]);
+    assert_eq!(saved["stages"][0]["rounds"],p["stages"][0]["rounds"]);
+    assert!(f.ctx.recover_committed_stages().unwrap().is_empty());
+    assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"2");
+}
+
+#[test]
+fn commit_recovery_requires_clean_exact_tree_parent_message_and_current_approvals() {
+    for case in ["dirty", "index", "other-commit", "wrong-message", "invalid-approval"] {
+        let f = Fixture::new("Implement feature", 0);
+        let mut p=f.reviewed();
+        if case=="wrong-message" {
+            f.ctx.commit_reviewed(&p,0,"other message").unwrap();
+        } else { f.ctx.commit_reviewed(&p,0,"feat: stage").unwrap(); }
+        match case {
+            "dirty" => fs::write(f.root.join("README.md"),"unreviewed change").unwrap(),
+            "index" => {
+                fs::write(f.root.join("README.md"),"staged change").unwrap();
+                f.ctx.git(&["add","README.md"]).unwrap();
+                f.ctx.git(&["restore","--source=HEAD","--worktree","README.md"]).unwrap();
+            },
+            "other-commit" => { f.ctx.git(&["commit","--allow-empty","-qm","other commit"]).unwrap(); },
+            "invalid-approval" => {
+                p["stages"][0]["reviews"][0]["approved"]=json!(false);
+                f.ctx.save_plan(&p).unwrap();
+            },
+            _ => {},
+        }
+        assert!(f.ctx.recover_committed_stages().is_err(),"accepted {case}");
+        assert_ne!(f.plan()["stages"][0]["status"],"committed");
+    }
+}

@@ -230,7 +230,7 @@ Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
   published plan and a bounded architecture checkpoint. The checkpoint holds
   the exact provider session and provider checkpoint reference, context summary,
   up to eight recent decision summaries, current guidance/agreements, and review
-  policy with its rationale. Stored architecture checkpoint data is limited to 64 KiB;
+  policy with its rationale. Stored and expanded architecture checkpoint data is limited to 4 MiB;
   execution loads restore the original review arrays and historical metadata.
 - `reviews/<file-id>.jsonl` and `.idx`: immutable review arrays and binary
   little-endian u64 record offsets. The plan's `architecture.review_history`
@@ -241,12 +241,15 @@ Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
 - `archived.json`: the last published plan reference, written before replacement
   or discard so its committed history remains addressable.
 
-Checkpoints and history events that exceed 64 KiB as plain JSON use a lossless
+Checkpoints and history events larger than 64 KiB can use a lossless
 `{"$forge_compact":1,"strings":[...],"value":...}` storage envelope. String values
 are stored once, so long stage descriptions repeated in transitive dependencies,
 guidance and model agreements do not multiply the stored size. Tagged object and
 string nodes preserve arbitrary user metadata without reference collisions.
-The stored limit remains 64 KiB (including the newline for events); expanded
+History events retain a 64 KiB stored limit (including the newline). Whole-plan
+checkpoints use the existing 4 MiB expanded-record budget for storage as well;
+64 KiB is only a compaction threshold for checkpoints. Compression is used when
+it reduces size, while unique checkpoint facts can remain plain JSON. Expanded
 records and history pages are bounded at 4 MiB. Reads restore the exact original
 JSON before contract validation, routing comparisons, prompts and API responses.
 Existing plain version-one files remain readable and small new records retain
@@ -883,7 +886,7 @@ unchanged stage boundaries, stops and completion do not incur summary turns.
 Successful commits append engine-verified outcomes to durable history and a
 bounded recent checkpoint preview. The full plan retains all committed stages.
 
-Stored checkpoints are capped at 64 KiB (4 MiB expanded), and individual architect
+Stored and expanded checkpoints are capped at 4 MiB, and individual architect
 responses at 48 KiB.
 Saved constraints and completed interfaces cannot be silently dropped; unresolved
 risks require explicit resolution by ID. Recent decision details remain bounded,
@@ -1184,3 +1187,11 @@ and full test suite run normally. HTTP fixtures bind ephemeral loopback ports.
 Do not use the live port 8734 for a smoke instance; use `FORGE_PORT=18734` and an
 isolated project/configuration. Validation needs no installation, instance restart,
 push, or paid generation.
+
+If Git commits an approved stage but checkpoint publication fails, the next Run
+can recover completion without another implementation or review. Recovery requires
+all saved current approvals, a clean index/worktree, the exact reviewed tree, a
+single parent matching the reviewed HEAD, and the intended commit message. Other
+HEAD changes or unreviewed edits are rejected. For offline recovery only, stop the
+engine service first, then run `forge-engine /path/to/project --recover-committed`;
+this command restores matching completion state without running subsequent stages.

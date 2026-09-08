@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 pub(super) const EXPANDED_LIMIT: usize = 4 * 1024 * 1024;
+const COMPACT_THRESHOLD: usize = 64 * 1024;
 
 fn encode(value: &Value, strings: &mut Vec<String>, indexes: &mut HashMap<String, usize>) -> Value {
     match value {
@@ -34,7 +35,7 @@ pub(crate) fn pack(value: &Value, limit: usize, kind: &str) -> Result<Value, Str
         ));
     }
     // Keep existing on-disk representations when they already fit.
-    if expanded <= limit {
+    if expanded <= limit.min(COMPACT_THRESHOLD) {
         return Ok(value.clone());
     }
     let mut strings = Vec::new();
@@ -43,6 +44,11 @@ pub(crate) fn pack(value: &Value, limit: usize, kind: &str) -> Result<Value, Str
     let stored = serde_json::to_vec(&packed)
         .map_err(|e| e.to_string())?
         .len();
+    // Compaction is an optimization, independent of the storage acceptance
+    // budget. Keep it for repeated content without penalizing unique facts.
+    if expanded <= limit && expanded <= stored {
+        return Ok(value.clone());
+    }
     if stored > limit {
         return Err(format!(
             "{kind} needs {stored} bytes after deduplication ({expanded} expanded); limit is {limit} bytes"
