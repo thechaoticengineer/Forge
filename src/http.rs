@@ -89,6 +89,8 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Get, "/api/architecture/reviews") => api_architecture_reviews(&ctx, query),
         (tiny_http::Method::Get, "/api/architecture/history") => api_architecture_history(&ctx, query),
         (tiny_http::Method::Get, "/api/models") => api_models(app, query),
+        (tiny_http::Method::Post, "/api/quota/refresh") =>
+            (202, json!({"ok":true,"started":app.refresh_quota(true)})),
         (tiny_http::Method::Post, "/api/models/refresh") =>
             (202, json!({"ok":true,"started":app.refresh_catalogue()})),
         (tiny_http::Method::Post, "/api/models/cancel") => {
@@ -146,6 +148,7 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     };
     let mut snap = snap;
     snap["settings"] = app.settings.lock().unwrap().clone();
+    snap["claude_quota"] = app.quota.snapshot();
     if let Ok(policy) = crate::catalogue::Policy::from_settings(&snap["settings"]) {
         snap["model_catalogue"] = app.catalogue.summary(&policy);
         snap["model_catalogue"]["policy_error"] = json!(*app.model_policy_error.lock().unwrap());

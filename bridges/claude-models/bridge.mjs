@@ -4,16 +4,17 @@ import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { discover } from './discovery.mjs';
 const [protocol, executable, cliVersion] = process.argv.slice(2);
-const envelope = { bridge_version: 1, source: 'claude_code_initialization', cli_version: cliVersion, sdk_version: '0.3.261' };
+const usage = protocol === '--forge-usage-v1';
+const envelope = { bridge_version: 1, source: usage ? 'claude_code_usage' : 'claude_code_initialization', cli_version: cliVersion, sdk_version: '0.3.261' };
 try {
-  if (protocol !== '--forge-discovery-v1' || executable !== 'claude' || cliVersion !== '2.1.263 (Claude Code)')
+  if ((!usage && protocol !== '--forge-discovery-v1') || executable !== 'claude' || cliVersion !== '2.1.263 (Claude Code)')
     throw new Error('unsupported CLI/bridge version');
   const require = createRequire(import.meta.url);
   if (JSON.parse(readFileSync(join(dirname(require.resolve('@anthropic-ai/claude-agent-sdk')), 'package.json'), 'utf8')).version !== envelope.sdk_version)
     throw new Error('unsupported SDK version');
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const models = await discover(query, executable);
-  process.stdout.write(JSON.stringify({ ...envelope, models }) + '\n');
+  const result = await discover(query, executable, usage ? 'usage' : 'models');
+  process.stdout.write(JSON.stringify({ ...envelope, [usage ? 'usage' : 'models']: result }) + '\n');
 } catch (e) {
   // Never emit account info, raw SDK errors, headers, or credential material.
   const auth = /unauthorized|authentication_error|authentication failed|not logged in|invalid.api.key|token expired/i.test(String(e));

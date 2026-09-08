@@ -25,6 +25,7 @@ mod routing;
 mod prompts;
 mod util;
 mod usage;
+mod quota;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -72,6 +73,7 @@ fn main() {
     *app.model_policy_error.lock().unwrap() = loaded.err();
     let app = Arc::new(app);
     app.refresh_catalogue();
+    app.refresh_quota(false);
     {
         // Engine-side periodic discovery/metadata refresh; no panel polling.
         let app = Arc::clone(&app);

@@ -24,6 +24,7 @@ pub(crate) enum PlanMode {
 }
 
 pub(crate) struct App {
+    pub(crate) quota: crate::quota::Service,
     pub(crate) catalogue: crate::catalogue::Catalogue,
     pub(crate) metadata: crate::metadata::Service,
     pub(crate) scheduler: crate::metadata::Scheduler,
@@ -92,6 +93,7 @@ impl App {
         if settings.get("automatic_routing").is_none() { settings["automatic_routing"] = json!(true); }
         if settings.get("routing_billing_basis").is_none() { settings["routing_billing_basis"] = Value::Null; }
         let app = Self {
+            quota: crate::quota::Service::default(),
             catalogue: crate::catalogue::Catalogue::default(),
             metadata: crate::metadata::Service::default(),
             scheduler: crate::metadata::Scheduler::new(unix_timestamp()),
@@ -112,6 +114,12 @@ impl App {
         policy.is_ok_and(|policy| self.catalogue.refresh(policy))
     }
 
+    pub(crate) fn refresh_quota(&self, manual: bool) -> bool {
+        let bridge = self.settings.lock().unwrap()["model_catalogue"]["claude_bridge"]
+            .as_str().unwrap_or("").to_string();
+        self.quota.refresh(bridge, manual)
+    }
+
     pub(crate) fn refresh_metadata(&self) -> bool {
         let policy = {
             let settings = self.settings.lock().unwrap();
@@ -128,6 +136,7 @@ impl App {
     /// Application-owned periodic refresh; the panel never polls for this.
     /// Metadata waits for discovery so it works from current snapshots.
     pub(crate) fn scheduler_tick(&self, now: i64) {
+        self.refresh_quota(false);
         let policy = {
             let settings = self.settings.lock().unwrap();
             crate::catalogue::Policy::from_settings(&settings)
@@ -698,6 +707,14 @@ impl Ctx {
         self.session.state.lock().unwrap().model_selection = selection.clone();
         if selection["eligible"] != true {
             return Err(self.agent_error(role, selection["error"].as_str().unwrap_or("model unavailable").into()));
+        }
+        if tool == "claude" {
+            let quota_model = selection["resolved_id"].as_str().unwrap_or(model);
+            self.app.quota.check(&policy.claude_bridge, quota_model)
+                .map_err(|error| self.agent_error(role, error))?;
+            if self.session.stop_requested.load(Ordering::SeqCst) {
+                return Err("provider launch stopped; saved work retained".into());
+            }
         }
         let requested_model = model.to_string();
         let executable = tool.to_string();
