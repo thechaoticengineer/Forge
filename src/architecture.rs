@@ -363,8 +363,26 @@ impl Store {
     pub(crate) fn state_plan(&self, mut plan: Value) -> Value {
         let refs = plan["architecture"]["review_history"].clone();
         for stage in plan["stages"].as_array_mut().into_iter().flatten() {
+            stage.as_object_mut().unwrap().remove("model_proposal_inputs");
+            // Full selection dialogue and transitive inputs are archived events,
+            // not polling data. Preserve the current choice and both rationales.
+            if let Some(a) = stage.get_mut("model_agreement").and_then(Value::as_object_mut) {
+                for key in ["dialogue", "relevant_inputs", "architectural_constraints"] {
+                    a.remove(key);
+                }
+            }
+            if let Some(calls) = stage["model_invocations"].as_array() {
+                let count = calls.len().max(if stage["model_invocations_truncated"] == true {
+                    stage["model_invocation_count"].as_u64().unwrap_or(0) as usize
+                } else { 0 });
+                let recent = calls.iter().skip(calls.len().saturating_sub(8)).cloned().collect::<Vec<_>>();
+                stage["model_invocation_count"] = json!(count);
+                stage["model_invocations_truncated"] = json!(count > 8);
+                stage["model_invocations"] = json!(recent);
+            }
             if let Some(history) = stage["reassessment"]["history"].as_array().cloned() {
-                stage["reassessment"]["history_count"] = json!(history.len());
+                stage["reassessment"]["history_count"] = json!(history.len().max(
+                    stage["reassessment"]["history_count"].as_u64().unwrap_or(0) as usize));
                 stage["reassessment"]["history"] = json!(history.into_iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().map(|mut h| {
                     for key in ["old_agreement","new_agreement"] {
                         if h[key].is_object() { h[key] = json!({"id":h[key]["id"],"effective":h[key]["effective"]}); }
@@ -769,12 +787,16 @@ impl Store {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map(|p| p["turn"] != cp["last_turn"]).unwrap_or(true),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         };
+        let mut guidance = cp["guidance"].clone();
+        for g in guidance.as_object_mut().into_iter().flat_map(|g| g.values_mut()) {
+            if let Some(g) = g.as_object_mut() { g.remove("relevant_inputs"); }
+        }
         Ok(
             json!({"version": VERSION, "plan_id": plan["plan_id"], "revision": plan["revision"],
             "checkpoint": plan["architecture"]["checkpoint"], "event_end": plan["architecture"]["event_end"],
             "context_status": if recovery_needed { json!("needs_recovery") } else { cp["context_status"].clone() },
             "session":cp["session"], "recovery":cp["recovery"], "effective_model":cp["effective_model"],
-            "guidance":cp["guidance"], "unresolved_risks":cp["unresolved_risks"], "constraints":cp["constraints"],
+            "guidance":guidance, "unresolved_risks":cp["unresolved_risks"], "constraints":cp["constraints"],
             "execution_outcomes":cp["execution_outcomes"], "role_usage":cp["role_usage"], "summary": cp["summary"].as_str().unwrap().chars().take(2000).collect::<String>(),
             "recent_decisions": cp["recent_decisions"].as_array().unwrap().iter().map(|d| json!({
                 "id": d["id"], "status": d["status"], "summary": d["summary"].as_str().unwrap_or("").chars().take(240).collect::<String>(),
@@ -928,7 +950,8 @@ impl Store {
             return Err("unterminated or oversized history event".into());
         }
         Ok(
-            json!({"items": items, "next_cursor": if next < end { json!(next) } else { Value::Null }, "event_end": end}),
+            json!({"plan_id":plan["plan_id"], "checkpoint":plan["architecture"]["checkpoint"],
+                "items": items, "next_cursor": if next < end { json!(next) } else { Value::Null }, "event_end": end}),
         )
     }
 }

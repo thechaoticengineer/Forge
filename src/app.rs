@@ -1533,17 +1533,25 @@ impl Ctx {
             "unix": now, "goal": plan["goal"], "duration_secs": duration_secs,
             "stages": count, "commits": commits,
         });
-        for key in ["usage", "planner_usage"] {
+        report["version"] = json!(1);
+        report["project"] = json!(self.project());
+        report["plan_id"] = plan["plan_id"].clone();
+        report["revision"] = plan["revision"].clone();
+        let published = self.architecture_store().load_raw()?.ok_or("missing completed plan")?;
+        report["architecture"] = self.architecture_store().summary(Some(&published))?;
+        report["stage_outcomes"] = json!(plan["stages"].as_array().unwrap().iter()
+            .map(crate::reports::stage_outcome).collect::<Vec<_>>());
+        for key in ["usage", "planner_usage", "role_usage"] {
             if let Some(usage) = plan.get(key) {
                 report[key] = usage.clone();
             }
         }
         self.ensure_forge_dir();
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true).append(true).open(self.forge_path("reports.jsonl"))
-        {
-            let _ = writeln!(f, "{report}");
-        }
+        let mut f = fs::OpenOptions::new().create(true).append(true)
+            .open(self.forge_path("reports.jsonl")).map_err(|e| format!("run report: {e}"))?;
+        writeln!(f, "{report}").and_then(|_| f.sync_all())
+            .and_then(|_| fs::File::open(self.forge_path("")).and_then(|dir| dir.sync_all()))
+            .map_err(|e| format!("run report: {e}"))?;
         let duration = fmt_duration(duration_secs);
         let mut text = format!("all stages committed — run complete in {duration}");
         if let Some(usage) = plan["usage"].as_object().filter(|usage| !usage.is_empty()) {

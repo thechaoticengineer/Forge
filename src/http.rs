@@ -174,6 +174,11 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
                     if let Some(stamp) = stamp { *cache = Some((stamp, p.clone())); }
                 } else { *cache = None; }
                 snap["plan"] = bounded.unwrap_or(Value::Null);
+                // Session counters are transient; plan-owned role totals survive restart.
+                snap["session_role_usage"] = snap["role_usage"].clone();
+                if snap["plan"]["role_usage"].is_object() {
+                    snap["role_usage"] = snap["plan"]["role_usage"].clone();
+                }
             }
             Err(error) => {
                 snap["plan"] = Value::Null;

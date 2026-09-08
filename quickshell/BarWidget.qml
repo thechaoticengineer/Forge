@@ -21,6 +21,25 @@ BarWidget {
   property int activeCount: 0
   property int problemCount: 0
   property int totalQueued: 0
+  property string lifecycleText: ""
+
+  function lifecycleSummary(state) {
+    const cp = state.architecture || {}, activity = state.architect_activity || {};
+    let text = "Architect: " + (cp.context_status === "needs_recovery" ? "needs recovery" : activity.status || cp.context_status || "inactive");
+    if (activity.reason) text += " · " + activity.reason;
+    const stages = state.plan && Array.isArray(state.plan.stages) ? state.plan.stages : [];
+    const stage = stages.find(s => s.id === state.current_stage) || stages.find(s => s.status !== "committed");
+    if (stage && stage.model_agreement) {
+      const a = stage.model_agreement, e = a.effective || {};
+      text += "\n" + e.provider + "/" + e.model + " · " + e.native_effort
+        + " · " + (a.verification_state || a.availability || "unverified");
+      const gate = stage.review_gate || {}, roles = gate.roles || {};
+      text += "\nCurrent gate: " + (gate.status || "pending")
+        + " · independent: " + (roles.reviewer || "pending")
+        + " · architect: " + (roles.architect === "not_required" ? "not required" : roles.architect || "pending");
+    }
+    return text;
+  }
 
   readonly property string statusGlyph: {
     if (!engineOnline) return "◇"
@@ -56,6 +75,7 @@ BarWidget {
           root.agentRole = s.agent ? s.agent.role || "" : ""
           root.agentTool = s.agent ? s.agent.tool || "" : ""
           root.goal = s.goal || ""
+          root.lifecycleText = root.lifecycleSummary(s)
           const stages = s.plan ? s.plan.stages : []
           root.committedStages = stages.filter(stage => stage.status === "committed").length
           root.totalStages = stages.length
@@ -102,6 +122,7 @@ BarWidget {
     tooltipText: {
       if (!root.engineOnline) return "Forge: engine offline"
       let tooltip = "Forge: " + root.phase
+      if (root.lifecycleText) tooltip += "\n" + root.lifecycleText
       if (root.phase === "running") {
         if (root.currentStage !== null)
           tooltip += "\nstage " + root.currentStage + ": " + root.currentStep

@@ -15,6 +15,7 @@ mod agent;
 mod architecture;
 mod architect;
 mod review_history;
+mod reports;
 mod contracts;
 mod app;
 mod http;
@@ -22,6 +23,8 @@ mod plan;
 mod routing;
 mod prompts;
 mod util;
+#[cfg(test)]
+mod lifecycle_tests;
 
 use crate::app::App;
 use crate::http::{PORT, handle};
@@ -384,7 +387,7 @@ mod tests {
             assert_eq!(status, 200);
             assert_eq!(state["goal"], "Refactor the codebase");
             assert_eq!(state["phase"], "plan_ready");
-            assert_eq!(state["plan"], test.app.load_plan().unwrap());
+            assert_eq!(state["plan"], test.app.architecture_store().state_plan(test.app.load_plan().unwrap()));
             assert_eq!(state["plan"]["goal"], "Refactor the codebase");
             assert_eq!(state["plan"]["status"], "draft");
             assert_eq!(state["plan"]["stages"][0]["id"], 1);
@@ -982,7 +985,7 @@ mod tests {
             expected["stages"][0][key] = state["plan"]["stages"][0][key].clone();
         }
         assert_eq!(state["plan"]["stages"][0]["model_agreement"]["agreed"], true);
-        assert_eq!(state["plan"], expected);
+        assert_eq!(state["plan"], second.app.architecture_store().state_plan(expected));
         assert_eq!(first.app.load_plan().unwrap(), first_plan);
         let history: Vec<_> = second.app.read_history().as_array().unwrap().iter().filter(|h| h["kind"] == "plan").cloned().collect();
         assert_eq!(history[0]["kind"], "plan");
@@ -1638,7 +1641,7 @@ mod tests {
         assert!(session.busy.load(Ordering::SeqCst));
     }
 
-    fn api_request(engine: &Arc<App>, method: &str, path: &str, body: Value) -> (u16, Value) {
+    pub(crate) fn api_request(engine: &Arc<App>, method: &str, path: &str, body: Value) -> (u16, Value) {
         use std::io::Read as _;
         let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
         let address = server.server_addr().to_ip().unwrap();

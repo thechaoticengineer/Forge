@@ -142,15 +142,20 @@ Item {
     const a = stage && stage.model_agreement
     if (!a) return "Model agreement pending — reconcile before approval"
     const e = a.effective || {}, p = a.policy_inputs || {}
+    const proposed = a.validated_proposal || {}
     let text = (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
       + e.provider + "/" + e.model + " · " + e.native_effort
       + " · " + (a.verification_state || a.availability || "unverified")
       + " · " + (p.tier || "unclassified") + " (" + (p.tier_provenance || "unknown provenance") + ")"
       + "\nPlanner: " + a.planner_reason + "\nArchitect: " + a.architect_reason
+    if (proposed.provider && proposed.model)
+      text += "\nProposed: " + proposed.provider + "/" + proposed.model + " · " + proposed.native_effort
     const calls = stage.model_invocations || []
     if (calls.length) {
       const last = calls[calls.length - 1], actual = last.effective || last.requested || {}
-      text += "\nExecution: " + actual.provider + "/" + actual.model + " · " + (last.verification_state || last.status)
+      text += "\nExecution: " + actual.provider + "/" + actual.model + " · "
+        + (actual.native_effort || (last.requested || {}).native_effort || "provider_default")
+        + " · " + (last.verification_state || last.status)
     }
     const routing = stage.reassessment || {}, history = routing.history || []
     if (routing.status) {
@@ -172,7 +177,8 @@ Item {
         + "\nConstraint: " + JSON.stringify(p.constraint || {})
         + "\nCost: " + (p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
           ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
-          : p.pricing ? JSON.stringify(p.pricing) : "unknown / no comparable billing data used")
+          : "unknown / no comparable billing data used")
+        + "\nRouting price: " + (p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing) : "unavailable / no comparable rate used")
         + "\nAgreement: " + a.id + " · policy: " + p.policy
       if (calls.length) text += "\nLatest invocation: " + JSON.stringify(calls[calls.length - 1])
     }
@@ -190,7 +196,7 @@ Item {
   function architectActivityText(activity, architecture) {
     const a = activity || {};
     const cp = architecture || {};
-    let text = "Architect · " + (a.status || cp.context_status || "legacy");
+    let text = "Architect · " + (cp.context_status === "needs_recovery" ? "needs_recovery" : a.status || cp.context_status || "legacy");
     if (a.error) text += " · " + a.error;
     else if (a.reason) text += " · " + a.reason;
     else if (cp.recovery && cp.recovery.reason) text += " · recovered: " + cp.recovery.reason;
@@ -220,6 +226,33 @@ Item {
       Object.keys(tools).forEach(function(tool) { total += tools[tool].total_tokens || 0; });
       return role + ": " + total + " tokens";
     }).join(" · ");
+  }
+
+  function reportLifecycleText(report) {
+    if (!report || !report.plan_id) return "";
+    const architecture = report.architecture || {};
+    let text = "Plan " + report.plan_id + " · revision " + report.revision;
+    if (architecture.summary) text += "\nArchitecture: " + architecture.summary;
+    (architecture.recent_decisions || []).forEach(function(d) {
+      text += "\nDecision: " + architectDecisionText(d);
+    });
+    (report.stage_outcomes || []).forEach(function(s) {
+      text += "\nStage " + s.id + ": " + s.title + " · " + s.status;
+      if (s.model_agreement) {
+        const view = Object.assign({}, s, {model_invocations:s.last_invocation ? [s.last_invocation] : []});
+        text += "\n" + stageModelText(view, true);
+      }
+      const gate = s.review_gate || {}, roles = gate.roles || {}, policy = s.review_policy || {};
+      text += "\nRecorded aggregate: " + (gate.status || "unavailable")
+        + " · independent: " + (roles.reviewer || "unavailable")
+        + " · architect: " + (roles.architect === "not_required" ? "not required" : roles.architect || "unavailable");
+      if (policy.rationale) text += "\nPolicy: " + policy.rationale;
+    });
+    const usage = architectUsageText(report);
+    if (usage) text += "\nRole usage: " + usage;
+    text += "\nArchived decisions, supersessions and agreements: /api/architecture/history?plan_id=" + encodeURIComponent(report.plan_id);
+    if (report.project) text += "&project=" + encodeURIComponent(report.project);
+    return text;
   }
 
   function catalogueProviderText(provider) {
@@ -2619,6 +2652,7 @@ Item {
                   width: parent.width
                   text: "goal: " + (reportRow.modelData.goal || "Untitled task")
                     + "\ncommits:\n" + (root.reportCommits(reportRow.modelData.commits) || "No commits")
+                    + "\n" + root.reportLifecycleText(reportRow.modelData)
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap

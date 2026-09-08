@@ -57,7 +57,8 @@ resolves its provider as the other provider relative to the actual implementer.
 The configured reviewer must match that provider; known unavailable models or
 incompatible effort/permission capabilities block execution. Configured explicit
 unverified fallbacks remain visibly unverified until execution verifies them.
-No automatic model routing is introduced by this gate.
+Automatic stage routing selects the implementer; the review gate enforces the
+same requirements for every selected model.
 
 Each role retains its authority. The aggregate keeps requests with `[architect]`
 or `[reviewer]` provenance. A reported `architecture_context_gap` requests a
@@ -235,8 +236,9 @@ have stable IDs, rationale, alternatives/tradeoffs, status/supersession, stage,
 revision, and timestamps. Model records distinguish proposals, agreements, and
 effective provider/model/native effort; retain both participants' reasons,
 capability-policy/catalogue provenance, availability verification state, trigger,
-and superseded agreement. Model discovery and architect guidance are active. Dual review gates are active; stage model routing remains reserved for later
-stages. Independent reviews always start fresh.
+and superseded agreement. Discovery, persistent guidance, joint stage routing,
+bounded reassessment and dual review gates are active. Independent reviews
+always start fresh.
 
 Publication uses an explicit commit protocol under a per-project persistence
 mutex (one engine writer per project):
@@ -305,7 +307,25 @@ review pagination reads the legacy inline array.
 are capped at 100 events and 256 KiB, with each event capped at 64 KiB. Add
 `plan_id=<archived-id>` to inspect a replaced/discarded plan, and the usual
 `project` query parameter for another project. State never reads the full
-architecture log. Existing feed/chat/report tail reads are capped at 2 MiB.
+architecture log. History pages include the stable `plan_id` and current
+`checkpoint`; event payloads retain decisions (including supersessions), model
+agreements and invalidations. Review pages retain each role's full verdict and
+identity. For example, after a queued goal has completed and been replaced:
+
+```text
+GET /api/architecture/history?plan_id=<completed-plan-id>&cursor=0&limit=20
+GET /api/architecture/reviews?plan_id=<completed-plan-id>&stage_id=1&cursor=0&limit=20
+```
+
+Use the event byte cursor only with the history endpoint, and the review record
+cursor only with the reviews endpoint. Both endpoints are read-only and accept
+an encoded `project` path without switching the active project. Existing
+feed/chat/report tail reads are capped at 2 MiB each.
+State keeps only eight recent model invocations per stage with
+`model_invocation_count` and `model_invocations_truncated`, and four reassessment
+history entries. Full selection dialogue and transitive input descriptions stay
+in durable artefacts; polling preserves the choice, both reasons, native effort,
+policy provenance, current gates, editing content and token totals.
 All these artefacts remain inside the existing `.forge` commit exclusion.
 
 ### Asking about the plan
@@ -365,14 +385,33 @@ replaced. Each line has:
   stage's `commit` text, or `forge: stage` if `commit` is missing or is not
   a string), and `title` (the stage title). Stages without a recorded SHA
   are omitted.
-- `usage` and `planner_usage`: copies of the plan's token totals by tool and
-  model, included when present.
+- `version: 1`, `project`, `plan_id` and `revision`: the completed plan's stable identity.
+- `architecture`: the published checkpoint reference, architectural summary,
+  recent decisions/supersessions, constraints, risks and verified outcomes.
+- `stage_outcomes`: each stage's final assignment and original validated proposal,
+  both selection reasons, configured tier/cost provenance, nullable published
+  pricing, last actual invocation, reassessment counts, review policy and its
+  rationale, separate role outcomes and aggregate identity, and usage.
+- `usage`, `planner_usage` and `role_usage`: copies of the plan's token totals,
+  included when present. Role totals retain provider/model breakdowns after
+  restart or plan replacement. `/api/state.role_usage` uses durable plan totals;
+  `session_role_usage` contains transient session counters.
+
+Report appends are synced before a queue goal is marked complete. A storage
+failure is reported and keeps that queue goal for recovery; its commits remain
+local. Full decisions and superseded agreements remain addressable through
+architecture history using the report's plan ID. Reports summarize token usage;
+they do not estimate CLI spend or convert API list rates into subscription costs.
+The append log is not an exactly-once completion ledger: explicitly rerunning a
+completed plan can append another report for the same plan/revision.
 
 `GET /api/state` returns the last 100 reports for the project under `reports`
 (an empty array when none exist). In the panel, open **History** and select
 **reports** to see completed tasks with their duration, commit count, and
 token totals per tool. Expand a task to see commit SHAs and messages, input/output/total
-counts, call counts, model totals, and separate planner usage. The reports
+counts, call counts, model totals, separate planner and role usage, architecture,
+routing reasons and recorded review gates. Older reports without these fields
+retain their original rendering. The reports
 filter appears once reports exist. The plan header and expanded stage rows
 also show token summaries when available.
 
@@ -603,8 +642,9 @@ permits every task; otherwise use explicit task tags: `documentation`,
 suitability strings must be replaced with these tags before using an entry for
 stage assignments. Numeric limits are descriptive inputs for both participants;
 they do not grant a higher capability tier. `relative_cost_preference` is nullable, ranges
-from 0 to 1000, and lower means preferred; it is not a monetary amount. Prices
-remain null. No current model IDs or capability rankings are built into Forge.
+from 0 to 1000, and lower means preferred; it is not a monetary amount. Configured
+entries do not supply verified prices; missing official prices remain null.
+No current model IDs or capability rankings are built into Forge.
 The planner and architect use these inputs to agree on stage assignments before
 approval, with the engine enforcing adequacy and supported native efforts.
 
@@ -694,7 +734,8 @@ of the active project; change the relevant scope identifier after switching
 accounts or user configuration in place. Project-specific CLI overrides are not
 authoritative catalogue evidence. Every probe has a 15-second total budget,
 page/output limits, stderr draining, cancellation, and cleanup of its own child
-process group. No periodic metadata research is implemented in this stage.
+process group. The separate engine metadata timer applies the selective refresh
+rules above; it does not start a selection dialogue for unchanged work.
 
 ### Optional Claude discovery bridge
 
@@ -974,3 +1015,91 @@ and the latest four history entries (full history stays in the saved plan/events
 Stage cards show retry/escalation/blocked status, the trigger, and both planner and
 architect reasons. History retains old/new agreements and invocations retain actual
 model reports and role token usage. Unknown prices remain unknown.
+
+### Default configuration and offline validation
+
+The shipped registry is empty. Before live planning, configure at least one
+eligible strong model for each provider used by planner/architect and independent
+review, then add cheaper adequate entries for simpler stages. This example uses
+placeholder IDs, not verified provider capability claims:
+
+```json
+{
+  "policy_revision": "my-routing-1",
+  "entries": [
+    {"provider":"codex", "model":"your-strong-codex-id", "tier":"strong",
+     "effort":"provider_default", "relative_cost_preference":5},
+    {"provider":"codex", "model":"your-small-codex-id", "tier":"standard",
+     "effort":"provider_default", "relative_cost_preference":1},
+    {"provider":"claude", "model":"your-strong-claude-id", "tier":"strong",
+     "effort":"provider_default", "relative_cost_preference":5}
+  ]
+}
+```
+
+`standard` permits ordinary functionality and simpler tasks; `basic` is sufficient
+only for simple tasks, and `strong` is required for critical/complex work. These
+are your configured judgments. A lower relative preference chooses among adequate
+options even when every price is unknown. An absent preference establishes no cost
+ordering. Published prices are used for comparison only with matching explicit
+`routing_billing_basis`; its default `null` leaves API list rates informational.
+
+The default providers are Claude for planning, Codex for architecture and the
+implementation preference, and Claude for independent review. Role model strings
+start empty; bootstrap resolves eligible configured strong entries. Automatic
+routing defaults on, stage overrides take precedence over global model pins, and
+adequacy/review requirements always apply. Only `model_catalogue` policy is saved
+to the user configuration file; other engine settings are process settings.
+`auto_push` defaults to `true` (disable it for local-only runs), and
+`queue_auto_approve` defaults to `false`. This stage does not change Git behavior.
+
+Discovery runs at startup and every 360 minutes; metadata is first considered
+after discovery and every 1440 minutes, with a 168-hour TTL. The scheduler ticks
+every 30 seconds. Missing/unsupported official documents use a 1-hour negative
+cache/backoff doubling to 24 hours. Only the documented official HTTPS sources
+and accepted document format are supported; unavailable metadata remains unknown.
+`curl` is needed for live official research; the optional Claude bridge needs its
+separately provisioned Agent SDK. Neither is required for offline fixture tests.
+An unsupported discovery mechanism allows explicit configured unverified choices;
+missing executables, authentication failures and known rejected choices block.
+
+One disagreement reconciliation exchange is allowed. Each stage attempt defaults
+to three reassessments and two transient operational retries; repeat failures
+trigger at two and measured context pressure at 85%. Three additional fix rounds
+are allowed after the initial review. All reservations survive restart. Existing
+agreements are reused at approval/execution unless relevant inputs change; a
+restart alone neither reselects models nor refreshes the review budget. Recovery
+uses the authoritative plan/checkpoint and pending-session marker described above.
+
+Validation from this checkout uses no provider credentials or network:
+
+```sh
+cargo build --offline
+cargo test --offline
+node --test tests/*.test.mjs bridges/claude-models/discovery.test.mjs
+omarchy plugin validate "$PWD"
+/usr/lib/qt6/bin/qmlformat quickshell/Panel.qml > /dev/null
+/usr/lib/qt6/bin/qmlformat quickshell/BarWidget.qml > /dev/null
+```
+
+Use an already installed Node binary if a version-manager shim has no selected
+version. Qt tool locations depend on the distribution. QML parsing, JavaScript
+rendering tests and plugin manifest validation pass in the stage-8 environment.
+Standalone `qmllint` cannot fully resolve the runtime `qs.Commons`/`qs.Ui` imports
+and reports the resulting unresolved widget types, plus an existing `enabled`
+property shadow warning. Live shell rendering is not validated because that would
+require loading changes into the running Omarchy instance.
+
+The deterministic lifecycle fixture joins startup discovery, unknown pricing,
+configured unverified execution, conditional periodic official refresh, joint
+draft agreement, approval reuse, cheap documentation/functionality, interrupted
+review and process reconstruction, evidenced escalation/context handoff, current
+dual gates, commits, durable reports and a fresh critical queued plan. It asserts
+selection and review call counts. Companion fixtures cover transaction failures,
+provider switching, disagreement bounds, negative caching, legacy editing,
+project isolation and unchanged acceptance/build/test requirements. Model output
+and check evidence are simulated at injected provider boundaries; the Forge build
+and full test suite run normally. HTTP fixtures bind ephemeral loopback ports.
+Do not use the live port 8734 for a smoke instance; use `FORGE_PORT=18734` and an
+isolated project/configuration. Validation needs no installation, instance restart,
+push, or paid generation.
