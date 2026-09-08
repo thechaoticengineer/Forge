@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -468,6 +469,14 @@ Item {
       // A poll started before a save must not overwrite its refreshed snapshot.
       if (resp && serial > root.stateResponseSerial) {
         root.stateResponseSerial = serial
+        // Preserve view models across unchanged polls; replacing ListView and
+        // Repeater models can rebuild delegates and reset the reading position.
+        if (root.engineState && resp.project === root.engineState.project) {
+          for (const key of ["plan", "architecture"]) {
+            if (JSON.stringify(resp[key]) === JSON.stringify(root.engineState[key]))
+              resp[key] = root.engineState[key]
+          }
+        }
         root.engineState = resp
       }
       if (done) done()
@@ -945,7 +954,14 @@ Item {
           const stages = root.displayedStages
           if (stages.length === 0) return
           root.selectedStageIndex = Math.max(0, Math.min(index, stages.length - 1))
-          stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
+          if (root.editingPlan) {
+            stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
+            panelScroll.reveal(stageFrame)
+          } else {
+            stageList.forceLayout()
+            const row = stageList.itemAtIndex(root.selectedStageIndex)
+            if (row) panelScroll.reveal(row)
+          }
         }
 
         function selectReport(index) {
@@ -954,6 +970,7 @@ Item {
           root.selectedReportKey = root.reportKey(root.reports[selected], selected)
           reportList.positionViewAtIndex(selected, ListView.Contain)
           reportList.readingY = reportList.contentY
+          panelScroll.reveal(outputFrame)
         }
 
         function scrollOutput(direction) {
@@ -970,6 +987,7 @@ Item {
           }
           if (view === historyList) historyList.readingY = view.contentY
           if (view === reportList) reportList.readingY = view.contentY
+          panelScroll.reveal(outputFrame)
         }
 
         function scrollDiff(amount) {
@@ -1040,9 +1058,11 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
+            panelScroll.reveal(goalFlick.parent)
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.ShiftModifier) {
             feedbackField.forceActiveFocus()
+            panelScroll.reveal(feedbackField.parent)
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
             if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
@@ -1059,7 +1079,14 @@ Item {
               event.accepted = true
             } else if (event.modifiers === Qt.NoModifier) {
               // Keep action guards identical to their PanelButton.enabled bindings.
-              if (event.key === Qt.Key_P) {
+              if (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp) {
+                panelScroll.scrollPage(event.key === Qt.Key_PageDown ? 1 : -1)
+                event.accepted = true
+              } else if (event.key === Qt.Key_Home || event.key === Qt.Key_End) {
+                panelScroll.cancelFlick()
+                panelScroll.contentY = event.key === Qt.Key_Home ? 0 : panelScroll.maximumY
+                event.accepted = true
+              } else if (event.key === Qt.Key_P) {
                 if (createPlanButton.enabled)
                   root.act("/api/plan", { goal: goalField.text })
                 event.accepted = true
@@ -1135,10 +1162,33 @@ Item {
         }
       }
 
-      Column {
+      Flickable {
+        id: panelScroll
         anchors.fill: parent
         anchors.margins: Style.space(16)
         anchors.bottomMargin: Style.space(16) + keyboardHint.height + Style.space(10)
+        clip: true
+        contentWidth: width
+        contentHeight: panelColumn.implicitHeight
+        flickableDirection: Flickable.VerticalFlick
+        boundsBehavior: Flickable.StopAtBounds
+        readonly property real maximumY: Math.max(0, contentHeight - height)
+        function scrollPage(direction) {
+          cancelFlick()
+          contentY = Math.max(0, Math.min(maximumY, contentY + direction * height * 0.8))
+        }
+        function reveal(item) {
+          const top = item.mapToItem(contentItem, 0, 0).y
+          if (top < contentY || top + item.height > contentY + height)
+            contentY = Math.max(0, Math.min(maximumY, top))
+        }
+        ScrollBar.vertical: ScrollBar {
+          policy: ScrollBar.AsNeeded
+        }
+
+      Column {
+        id: panelColumn
+        width: panelScroll.width - Style.space(16)
         spacing: Style.space(10)
 
         // ---------------------------------------------------- header
@@ -2045,17 +2095,24 @@ Item {
           }
         }
         Rectangle {
+          id: stageFrame
           width: parent.width
-          height: Math.max(Style.space(100), parent.height * 0.34
-            - (queueSection.visible ? queueSection.height + Style.space(10) : 0)
-            - (chatSection.visible ? chatSection.height + Style.space(10) : 0))
+          height: root.editingPlan
+            ? Math.max(Style.space(260), panelScroll.height * 0.45)
+            : stageList.contentHeight + Style.space(16)
           color: root.surface
           radius: 4
           ListView {
             id: stageList
             anchors.fill: parent
             anchors.margins: Style.space(8)
+            anchors.rightMargin: Style.space(root.editingPlan ? 22 : 8)
             clip: true
+            interactive: root.editingPlan
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {
+              policy: root.editingPlan ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+            }
             spacing: Style.space(6)
             model: root.displayedStages
             delegate: Rectangle {
@@ -2128,7 +2185,8 @@ Item {
                     width: Math.min(implicitWidth, stageRow.width)
                     text: root.editingPlan && stageRow.modelData.status === "committed"
                       ? "committed — locked" : stageRow.modelData.status === "blocked"
-                      ? "blocked · review budget exhausted" : stageRow.modelData.status
+                      ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
+                         ? "blocked · review budget exhausted" : "blocked") : stageRow.modelData.status
                       + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
                     color: stageRow.modelData.status === "committed" ? root.success
                       : stageRow.modelData.status === "in_progress" ? root.working
@@ -2448,8 +2506,9 @@ Item {
         }
 
         Rectangle {
+          id: outputFrame
           width: parent.width
-          height: Math.max(0, parent.height - y)
+          height: Math.max(Style.space(180), panelScroll.height * 0.3)
           color: root.surface
           radius: 4
           Flickable {
@@ -2686,6 +2745,7 @@ Item {
             }
           }
         }
+      }
       }
 
       Text {
@@ -3249,6 +3309,8 @@ Item {
                     { key: "Tab", description: "Toggle Live / History" },
                     { key: "h / l", description: "Select Live / History" },
                     { key: "Ctrl+d / Ctrl+u", description: "Scroll Live / History half a page down / up" },
+                    { key: "Page Down / Page Up", description: "Scroll the whole panel down / up" },
+                    { key: "Home / End", description: "Jump to the top / bottom of the panel" },
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
                     { key: "6", description: "History: Reports (when available)" },
                     { key: "p", description: "Create plan from goal" },

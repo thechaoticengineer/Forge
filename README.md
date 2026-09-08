@@ -563,6 +563,8 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `Tab` | Toggle Live / History |
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
+| `Page Down` / `Page Up` | Scroll the whole panel down / up |
+| `Home` / `End` | Jump to the top / bottom of the panel |
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
