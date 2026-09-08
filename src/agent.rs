@@ -19,6 +19,7 @@ pub(crate) struct AgentResult {
     pub output: String,
     pub session: Option<String>,
     pub effective_model: String,
+    pub model_reported: bool,
     pub usage: Option<AgentUsage>,
     pub completed: bool,
     pub error: Option<String>,
@@ -543,6 +544,7 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
     if decoded.effective_model.is_empty() {
         decoded.effective_model = usage.as_ref().map(|u| u.model.clone()).unwrap_or_default();
     }
+    decoded.model_reported = !decoded.effective_model.is_empty();
     decoded.usage = usage;
     Ok(decoded)
 }

@@ -1,5 +1,7 @@
 #[path = "review.rs"]
 mod review;
+#[path = "reassessment.rs"]
+mod reassessment;
 use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
@@ -648,14 +650,21 @@ impl Ctx {
 
     pub(crate) fn run_agent(&self, request: &AgentRequest<'_>) -> Result<AgentResult, String> {
         let AgentRequest { role, provider: tool, prompt, model, effort, session } = *request;
+        if self.session.stop_requested.load(Ordering::SeqCst) { return Err("provider launch stopped; saved work retained".into()); }
         let _ = prompt;
         #[cfg(test)]
         {
             let mut settings = self.app.settings.lock().unwrap();
             if !settings["mock_agent_requests"].is_array() { settings["mock_agent_requests"] = json!([]); }
-            settings["mock_agent_requests"].as_array_mut().unwrap().push(json!({"role":role,"provider":tool,"model":model,"effort":effort,"prompt":prompt}));
+            settings["mock_agent_requests"].as_array_mut().unwrap().push(json!({"role":role,"provider":tool,"model":model,"effort":effort,"prompt":prompt,"session":session}));
         }
-        if tool == "mock" {
+        let mock_execution = tool == "mock";
+        #[cfg(test)]
+        let mock_execution = mock_execution || (matches!(role,"implementer"|"fixer") && {
+            let settings = self.app.settings.lock().unwrap();
+            settings["test_fake_providers"] == true && settings["test_real_implementation_cli"] != true
+        });
+        if mock_execution {
             #[cfg(test)]
             if role == "planner" {
                 let mut settings = self.app.settings.lock().unwrap();
@@ -684,6 +693,11 @@ impl Ctx {
                 }
             }
             self.mock_agent(role)?;
+            #[cfg(test)]
+            if matches!(role, "implementer" | "fixer") {
+                let mut settings = self.app.settings.lock().unwrap();
+                if let Some(error) = settings["mock_implementation_errors"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)).and_then(|v| v.as_str().map(str::to_owned)) { return Err(error); }
+            }
             let usage = self.app.settings.lock().unwrap().get("mock_usage")
                 .filter(|usage| usage.is_object()).map(|usage| AgentUsage {
                     input_tokens: usage["input"].as_i64().unwrap_or(0),
@@ -701,7 +715,13 @@ impl Ctx {
                 self.app.settings.lock().unwrap()["mock_effective_models"].as_array_mut().filter(|a| !a.is_empty())
                     .map(|a| a.remove(0).as_str().unwrap().to_string()).unwrap_or(effective_model)
             } else { effective_model };
-            return Ok(AgentResult { usage, effective_model, completed: true, ..AgentResult::default() });
+            #[allow(unused_mut)]
+            let mut output = String::new();
+            #[cfg(test)]
+            if matches!(role, "implementer" | "fixer") {
+                output = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0).to_string()).unwrap_or_default();
+            }
+            return Ok(AgentResult { output, usage, effective_model, model_reported:true, completed: true, ..AgentResult::default() });
         }
         let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
         let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
@@ -830,7 +850,7 @@ impl Ctx {
             return Err(format!("{tool} exited with {status}: {etail} {tail}"));
         }
         if let Some(error) = result.error { return Err(self.agent_error(role, error)); }
-        if matches!(role, "architect" | "architect_review" | "reviewer" | "chat" | "planner") && !result.completed {
+        if !result.completed {
             return Err("provider ended without a successful structured result".into());
         }
         if session.is_some() && result.session.as_deref() != session {
@@ -1343,6 +1363,7 @@ impl Ctx {
             let completed: Vec<Value> = current["stages"].as_array().unwrap().iter().filter(|s| s["status"] == "committed")
                 .map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"sha":s["sha"]})).collect();
             prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes: {}\nRecent execution outcomes: {}\nRead the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), cp["execution_outcomes"]));
+            prompt.push_str(&format!("\n[implementer] Last validated outcome/escalation request: {}\n[engine] Latest routing handoff: {}\n", stage["implementer_outcome"], stage["reassessment"]["history"].as_array().and_then(|h| h.last()).map(|h| json!({"kind":h["kind"],"evidence":h["evidence"]})).unwrap_or(Value::Null)));
             let worktree = self.git(&["status", "--short"])?;
             let diff = self.git(&["diff", "HEAD", "--", ".", ":(exclude).forge"])?;
             prompt.push_str(&format!("\nSAVED ARCHITECTURAL SUMMARY: {}\nRelevant decisions: {}\nWORKTREE: {}\nDIFF (bounded preview; inspect full staged/unstaged diff and all untracked contents yourself):\n{}\nOUTSTANDING FINDINGS:\n{}\nYou may be inheriting partial work from another agent. Inspect and preserve all existing changes, completed interfaces and accepted decisions before editing. Saved findings remain authoritative until resolved with evidence.\n", cp["summary"], cp["recent_decisions"], worktree, diff.chars().take(16000).collect::<String>(), Self::stage_review_context(stage)));
@@ -1357,6 +1378,7 @@ impl Ctx {
         if let Err(error) = &result {
             plan["stages"][idx]["review_gate"]["status"] = json!("error");
             plan["stages"][idx]["review_gate"]["error"] = json!(error);
+            if error.contains("model routing blocked:") { plan["stages"][idx]["reassessment"]["status"] = json!("blocked"); plan["stages"][idx]["reassessment"]["error"] = json!(error); }
             plan["stages"][idx]["last_verdict_valid"] = json!(false);
             let stage = &plan["stages"][idx];
             let mut requests = Self::review_requests(&stage["previous_requests"]);
@@ -1401,7 +1423,16 @@ impl Ctx {
 
     fn run_worker_inner(&self) -> Result<(), String> {
         let loaded = self.load_plan().ok_or("no plan")?;
-        let mut plan = self.architect_publish(loaded.clone(), Some(&loaded), "stage run").map_err(|e| format!("model routing blocked: {e}"))?;
+        let cp = if loaded["architecture"].is_object() { self.architecture_store().checkpoint(&loaded)? } else { Value::Null };
+        let pending_turn = loaded["plan_id"].as_str().and_then(|id| fs::read(self.forge_path("architecture").join(id).join("architect-pending.json")).ok())
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap_or(json!({"turn":"invalid"})));
+        let reusable = cp["context_status"] == "ready" && cp["session"]["resume_policy"] != "fork_from_checkpoint"
+            && pending_turn.as_ref().is_none_or(|p| p["turn"] == cp["last_turn"])
+            && loaded["stages"].as_array().into_iter().flatten().enumerate().all(|(idx,s)| s["status"] == "committed"
+                || (cp["guidance"][s["id"].to_string()]["valid"] == true && cp["guidance"][s["id"].to_string()]["relevant_inputs"] == crate::plan::stage_inputs(&loaded,idx)));
+        let mut plan = if reusable { loaded } else {
+            self.architect_publish(loaded.clone(), Some(&loaded), "stage run").map_err(|e| format!("model routing blocked: {e}"))?
+        };
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {
@@ -1426,6 +1457,7 @@ impl Ctx {
                 stage.insert("review_budget".into(), json!(self.app.settings.lock().unwrap()["max_fix_rounds"].as_i64().unwrap_or(3).max(0)));
                 stage.insert("dual_promoted".into(), json!(false));
                 stage.remove("attempt_head");
+                stage.remove("reassessment");
                 stage.remove("previous_requests");
             }
             stage.insert("review_gate".into(), json!({"status":"pending"}));

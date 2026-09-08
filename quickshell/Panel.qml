@@ -152,6 +152,20 @@ Item {
       const last = calls[calls.length - 1], actual = last.effective || last.requested || {}
       text += "\nExecution: " + actual.provider + "/" + actual.model + " · " + (last.verification_state || last.status)
     }
+    const routing = stage.reassessment || {}, history = routing.history || []
+    if (routing.status) {
+      text += "\nRouting: " + routing.status + " · reassessments " + (routing.count || 0)
+        + "/" + ((routing.limits || {}).max_reassessments ?? 3)
+        + " · operational retries " + (routing.operational_retries || 0)
+        + "/" + ((routing.limits || {}).max_operational_retries ?? 2)
+      const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
+      if (trigger) text += "\nTrigger: " + trigger.kind + " · " + JSON.stringify(trigger.evidence || trigger.error || "")
+      if (routing.error) text += "\n" + routing.error
+      if (detail) history.slice(-4).forEach(function(h) {
+        text += "\n" + h.kind
+        if (h.planner_reason) text += "\nPlanner: " + h.planner_reason + "\nArchitect: " + h.architect_reason
+      })
+    }
     if (stage.model_block) text += "\n" + stage.model_block
     if (detail) {
       text += "\nRisk: " + (a.validated_proposal || {}).risk + " · complexity: " + (a.validated_proposal || {}).complexity

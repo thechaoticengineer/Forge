@@ -16,6 +16,7 @@ pub(crate) fn default_settings() -> Value {
         "implementer_model": "",
         "reviewer_model": "",
         "max_fix_rounds": 3,
+        "reassessment_limits": {"max_reassessments":3,"max_operational_retries":2,"repeat_threshold":2,"context_percent":85},
         "auto_push": true,
         "queue_auto_approve": false,
     })
@@ -223,7 +224,7 @@ pub(crate) fn reconcile(old: &Value, new: &mut Value) -> Result<(), &'static str
         for key in ["guidance", "model_agreement"] {
             if stage[key].is_object() { stage[key]["valid"] = json!(false); }
         }
-        for key in ["started_unix", "finished_unix", "duration_secs", "sha"] {
+        for key in ["started_unix", "finished_unix", "duration_secs", "sha", "model_block", "reassessment"] {
             stage.as_object_mut().unwrap().remove(key);
         }
     }

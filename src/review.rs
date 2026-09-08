@@ -527,22 +527,28 @@ fn aggregate(identity: &Value, records: &[Value]) -> Value {
 }
 
 impl Ctx {
-    fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
+    pub(crate) fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
         let provider = match implementer {
             "codex" => "claude",
             "claude" => "codex",
             "mock" if self.setting("reviewer") == "mock" => "mock",
             _ => return Err("cannot resolve independent reviewer provider".into()),
         };
-        if self.setting("reviewer") != provider {
+        let automatic = self.app.settings.lock().unwrap()["automatic_routing"] != false;
+        if self.setting("reviewer") != provider && (!automatic || !self.setting("reviewer_model").is_empty()) {
             return Err(format!(
                 "independent reviewer must be configured as {provider}, the other provider relative to {implementer}"
             ));
         }
-        let model = self.setting("reviewer_model");
+        let mut model = self.setting("reviewer_model");
         if provider != "mock" {
             let policy =
                 crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            if model.is_empty() {
+                model = policy.entries.iter().filter(|e| e.provider.name() == provider && e.tier == crate::catalogue::Tier::Strong)
+                    .find(|e| self.app.catalogue.execution_input(&policy, e.provider, &e.model)["eligible"] == true)
+                    .map(|e| e.model.clone()).ok_or("no eligible strong independent reviewer model")?;
+            }
             let selected = self.app.catalogue.execution_input(
                 &policy,
                 crate::catalogue::Provider::parse(provider).unwrap(),
@@ -557,6 +563,21 @@ impl Ctx {
         Ok((provider.into(), model))
     }
 
+    fn review_with_retry(&self, plan: &mut Value, idx: usize, base: &Value, role: &str, provider: &str, model: &str) -> Result<Value,String> {
+        loop {
+            match self.invoke_review(plan,idx,base,role,provider,model) {
+                Ok(v) => {
+                    plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
+                    self.save_plan(plan)?;
+                    return Ok(v);
+                },
+                Err(error) => {
+                    if self.operational_retry(plan,idx,&error,role)? { continue; }
+                    return Err(format!("model routing blocked: {role}/{provider}: {error}; restore an eligible independent reviewer; work and checkpoint retained"));
+                }
+            }
+        }
+    }
     fn invoke_review(
         &self,
         plan: &mut Value,
@@ -638,7 +659,14 @@ impl Ctx {
                 &json!({"turn":turn,"previous_session":cp["session"]}),
             )?;
         }
-        let result = if provider == "mock" {
+        let mock = provider == "mock";
+        #[cfg(test)] let mock = mock || self.app.settings.lock().unwrap()["test_fake_providers"] == true;
+        #[cfg(test)] {
+            let mut settings = self.app.settings.lock().unwrap();
+            if !settings["test_review_sessions"].is_array() { settings["test_review_sessions"] = json!([]); }
+            settings["test_review_sessions"].as_array_mut().unwrap().push(json!({"role":role,"provider":provider,"model":model,"session":if role == "architect" {session.clone()} else {None},"prompt":prompt}));
+        }
+        let result = if mock {
             self.mock_review(&identity, &prompt, &plan["stages"][idx])
         } else {
             let effort = if role == "architect" {
@@ -675,6 +703,13 @@ impl Ctx {
         }
         if snapshot(self.project())? != base["snapshot"] {
             return Err("implementation or HEAD changed during review".into());
+        }
+        if !mock {
+            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model);
+            if !result.model_reported || selected["eligible"] != true || result.effective_model != selected["resolved_id"].as_str().unwrap_or(model) {
+                return Err("model routing blocked: reviewer effective model or eligibility changed".into());
+            }
         }
         let mut verdict = normalize(
             &result.output,
@@ -875,16 +910,6 @@ impl Ctx {
         idx: usize,
     ) -> Result<&'static str, String> {
         let budget = plan["stages"][idx]["review_budget"].as_u64().unwrap_or(0);
-        let assignment = self.validated_assignment(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
-        let implementer = assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?.to_string();
-        let (reviewer, reviewer_model) = match self.reviewer_config(&implementer) {
-            Ok(config) => config,
-            Err(error) => {
-                plan["stages"][idx]["review_gate"] = json!({"status":"configuration_blocked","error":error,"roles":{"architect":"no_current_verdict","reviewer":"unavailable_or_incompatible"}});
-                self.save_plan(plan)?;
-                return Ok("configuration_blocked");
-            }
-        };
         let sid = plan["stages"][idx]["id"].as_i64().unwrap();
         if plan["stages"][idx]["attempt_head"].is_null() {
             plan["stages"][idx]["attempt_head"] = json!(self.git(&["rev-parse", "HEAD"])?);
@@ -909,6 +934,9 @@ impl Ctx {
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
+            let mut assignment = self.assignment_boundary(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
+            let (mut reviewer, mut reviewer_model) = self.reviewer_config(assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?)
+                .map_err(|e| format!("model routing blocked: {e}"))?;
             // Reserve the round before any invocation; errors/restarts cannot replenish it.
             plan["stages"][idx]["rounds"] = json!(round + 1);
             plan["stages"][idx]["review_gate"] =
@@ -929,39 +957,69 @@ impl Ctx {
                 stage["last_verdict"] = stage["previous_requests"].clone();
                 stage["last_verdict_valid"] = json!(true);
             }
-            let prompt = self.stage_prompt(template, plan, &stage)?;
             let role = if round == 0 { "implementer" } else { "fixer" };
-            plan["stages"][idx]["implementer_provider"] = json!(implementer);
-            let assignment = self.validated_assignment(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
-            let effective = &assignment["effective"];
-            let model = effective["model"].as_str().ok_or("missing agreed model")?;
-            let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
-            let invocation = json!({"agreement_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
-            if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
-            plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
-            self.save_plan(plan)?;
-            let result = self.run_agent(&crate::agent::AgentRequest { role, provider:&implementer, model, effort, session:None, prompt:&prompt });
-            let record = plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().last_mut().unwrap();
-            match &result {
-                Ok(output) => {
-                    record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
-                    record["unexpected_substitution"] = json!(output.effective_model != model);
-                    record["status"] = json!("completed");
-                    record["verification_state"] = json!(if output.effective_model == model { "execution_verified" } else { "unexpected_substitution" });
-                }
-                Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); }
-            }
-            self.save_plan(plan)?;
-            let output = result?;
-            if output.effective_model != model {
-                let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
-                plan["stages"][idx]["model_block"] = json!(error);
+            let (output, turn) = loop {
+                if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
+                let turn = crate::architecture::identity();
+                stage = plan["stages"][idx].clone();
+                if round > 0 { stage["last_verdict"] = stage["previous_requests"].clone(); stage["last_verdict_valid"] = json!(true); }
+                let prompt = self.stage_prompt(template, plan, &stage)? + &self.outcome_prompt(plan, idx, &turn);
+                let effective = &assignment["effective"];
+                let implementer = effective["provider"].as_str().ok_or("missing agreed provider")?;
+                let model = effective["model"].as_str().ok_or("missing agreed model")?;
+                let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
+                plan["stages"][idx]["implementer_provider"] = json!(implementer);
+                let invocation = json!({"turn_id":turn,"agreement_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
+                if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
+                plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
                 self.save_plan(plan)?;
-                return Err(error.into());
+                let result = self.run_agent(&crate::agent::AgentRequest { role, provider:implementer, model, effort, session:None, prompt:&prompt });
+                let record = plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().last_mut().unwrap();
+                match &result {
+                    Ok(output) => {
+                        record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
+                        record["model_reported"] = json!(output.model_reported);
+                        record["unexpected_substitution"] = json!((!output.model_reported || output.effective_model != model));
+                        record["status"] = json!("completed");
+                        record["usage"] = output.usage.as_ref().map(|u| json!({"input":u.input_tokens,"output":u.output_tokens,"total":u.total_tokens})).unwrap_or(Value::Null);
+                        record["verification_state"] = json!(if output.model_reported && output.effective_model == model { "execution_verified" } else { "unexpected_substitution" });
+                    }
+                    Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); record["failure_kind"] = json!(super::reassessment::failure_kind(error)); }
+                }
+                self.save_plan(plan)?;
+                if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
+                match result {
+                    Ok(output) => {
+                        self.record_stage_usage(plan, idx, role, implementer, output.usage.clone())?;
+                        if !output.model_reported || output.effective_model != model {
+                            let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
+                            plan["stages"][idx]["model_block"] = json!(error);
+                            self.save_plan(plan)?;
+                            return Err(error.into());
+                        }
+                        plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
+                        self.save_plan(plan)?;
+                        break (output, turn);
+                    }
+                    Err(error) => {
+                        if self.operational_retry(plan, idx, &error,role)? { continue; }
+                        self.reassess(plan, idx, "provider_operational_failure", json!({"failure_kind":super::reassessment::failure_kind(&error),"error":crate::util::last_chars(&error,2000),"provider":implementer}))?;
+                        assignment = self.assignment_boundary(plan, idx)?;
+                        (reviewer, reviewer_model) = self.reviewer_config(assignment["effective"]["provider"].as_str().unwrap())?;
+                    }
+                }
+            };
+            let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
+            if let Some((kind,evidence)) = trigger {
+                if round < budget { self.reassess(plan, idx, &kind, evidence)?; continue; }
+                return Ok("exhausted");
             }
-            self.record_stage_usage(plan, idx, role, &implementer, output.usage)?;
-            if self.session.stop_requested.load(Ordering::SeqCst) {
-                return Ok("stopped");
+            if output.usage.as_ref().is_some_and(|u| {
+                let limit = assignment["policy_inputs"]["limits"]["context_window"].as_u64().unwrap_or(0);
+                let percent = plan["stages"][idx]["reassessment"]["limits"]["context_percent"].as_u64().unwrap_or(85);
+                limit > 0 && u.input_tokens.max(0) as u64 >= limit.saturating_mul(percent) / 100
+            }) && round < budget {
+                self.reassess(plan, idx, "context_pressure", json!({"measured_input_tokens":output.usage.as_ref().unwrap().input_tokens,"context_window":assignment["policy_inputs"]["limits"]["context_window"]}))?;
             }
             let snap = snapshot(self.project())?;
             if snap["head"] != plan["stages"][idx]["attempt_head"] {
@@ -972,6 +1030,12 @@ impl Ctx {
                 &plan["stages"][idx],
                 plan["stages"][idx]["dual_promoted"] == true,
             )?;
+            if assignment["validated_proposal"]["task"] == "documentation" && policy["scope"] != "ordinary_documentation"
+                && plan["stages"][idx]["routing_scope_floor"].is_null() {
+                plan["stages"][idx]["routing_scope_floor"] = json!(2);
+                self.save_plan(plan)?;
+                self.reassess(plan,idx,"material_scope_change",json!({"engine_scope":policy,"planned_task":"documentation"}))?;
+            }
             let mut base = json!({"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":sid,"attempt_id":plan["stages"][idx]["attempt_id"],"round":round+1,"policy":policy,"snapshot":snap});
             let mut records = vec![];
             loop {
@@ -984,7 +1048,7 @@ impl Ctx {
                 // Independent goes first: a scope promotion can bind both required
                 // verdicts to the promoted policy before any fixer is allowed.
                 let v =
-                    self.invoke_review(plan, idx, &base, "reviewer", &reviewer, &reviewer_model)?;
+                    self.review_with_retry(plan, idx, &base, "reviewer", &reviewer, &reviewer_model)?;
                 let promote = v["requires_dual"] == true
                     || v["architecture_context_gap"]
                         .as_str()
@@ -1053,11 +1117,16 @@ impl Ctx {
                     json!("reviewer_context_gap");
                 cp["context_gap"] = json!({"stage_id":sid,"text":gaps.join("\n"),"unresolved_requests":gate["requests"]});
                 let current = self.architecture_store().publish(current, cp, json!({"kind":"review_clarification_requested","requests":gate["requests"],"gaps":gaps}))?;
+                *plan = current.clone();
+                if self.repeated_findings(plan, idx, &gate["requests"])? { continue; }
+                let current = self.load_plan().ok_or("missing clarification plan")?;
                 *plan = self.architect_publish(
                     current.clone(),
                     Some(&current),
                     "review architectural clarification; retain both roles' unresolved authority",
                 )?;
+            } else if round < budget {
+                self.repeated_findings(plan, idx, &gate["requests"])?;
             }
         }
         Ok("exhausted")

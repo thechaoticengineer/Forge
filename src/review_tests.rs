@@ -356,6 +356,8 @@ fn partial_pair_failure_retains_history_but_never_reuses_approval_or_budget() {
 fn zero_and_nonzero_budgets_stay_exhausted_across_process_reconstruction() {
     for budget in [0, 1, 2] {
         let f = Fixture::new("Implement feature", budget);
+        // This test isolates the fix budget; reassessment budgets have separate coverage.
+        f.ctx.app.settings.lock().unwrap()["reassessment_limits"]["repeat_threshold"] = json!(10);
         f.setting(
             "mock_verdicts",
             json!(vec![reject("Unresolved"); budget as usize + 1]),
@@ -471,6 +473,10 @@ fn missing_current_role_or_changed_identity_cannot_commit() {
 #[test]
 fn reviewer_provider_is_opposite_and_known_unavailability_blocks() {
     let f = Fixture::new("Implement feature", 0);
+    f.setting("automatic_routing",json!(false));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+        {"provider":"codex","model":"review-codex","tier":"strong"},
+        {"provider":"claude","model":"review-claude","tier":"strong"}]);
     for (implementer, other) in [("codex", "claude"), ("claude", "codex")] {
         f.setting("reviewer", json!(implementer));
         assert!(f.ctx.reviewer_config(implementer).is_err());

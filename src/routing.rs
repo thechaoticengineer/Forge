@@ -186,6 +186,14 @@ fn cheaper(a: &Value, b: &Value, basis: &Value) -> bool {
         _ => false,
     }
 }
+fn effort_rank(e: &str) -> u64 {
+    match e { "minimal" => 1, "low" => 2, "medium" => 3, "high" => 4, "xhigh" => 5, "max" => 6, _ => 0 }
+}
+fn material_inputs(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(obj) = v.as_object_mut() { for k in ["pricing", "relative_cost_preference", "billing_basis", "tier_provenance"] { obj.remove(k); } }
+    v
+}
 fn billing_facts(price: &Value) -> Value {
     if !price.is_object() {
         return Value::Null;
@@ -213,7 +221,9 @@ fn policy_inputs(
     if !matches_constraint(selected, &c) {
         return Err("model conflicts with explicit stage/global constraint; edit the constraint or proposal".into());
     }
-    let min = minimum(stage, p);
+    let pending = &stage["reassessment"]["pending"];
+    let old = &pending["old_agreement"];
+    let min = minimum(stage, p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)).max(if pending.is_object() { old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) } else { 0 });
     let adequate = |o: &&Value| {
         o["eligible"] == true
             && rank(&o["tier"]) >= min
@@ -231,17 +241,38 @@ fn policy_inputs(
             }
         ));
     }
-    if p.provider != "mock"
-        && settings["reviewer"]
-            != if p.provider == "codex" {
-                "claude"
-            } else {
-                "codex"
-            }
-    {
-        return Err("cross-provider-review conflict: configure the other reviewer provider or narrow implementation choices".into());
+    if p.provider != "mock" && settings["reviewer"] != if p.provider == "codex" { "claude" } else { "codex" }
+        && (settings["automatic_routing"] == false || settings["reviewer_model"].as_str().is_some_and(|s| !s.is_empty())) {
+        return Err("cross-provider-review conflict: explicit reviewer constraint prevents switch".into());
+    }
+    if pending.is_object() {
+        if minimum(stage,p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)) < old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) { return Err("reassessment cannot lower the agreed risk/capability floor".into()); }
+        let effective = json!({"provider":p.provider,"model":selected["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort});
+        let same = effective == old["effective"];
+        let material = pending["kind"] == "material_assignment_change" || pending["kind"] == "material_scope_change";
+        if stage["reassessment"]["visited"].as_array().is_some_and(|v| v.contains(&effective)) && !(same && material) {
+            return Err("model oscillation or unchanged escalation rejected".into());
+        }
+        if rank(&selected["tier"]) < rank(&old["policy_inputs"]["tier"]) { return Err("reassessment cannot weaken capability".into()); }
+        let reasoning = pending["kind"] == "repeated_reasoning_failure" || pending["kind"] == "implementer_escalation";
+        if reasoning {
+            let higher_efforts: Vec<_> = options.iter().filter(|o| o["eligible"] == true && o["provider"] == old["effective"]["provider"]
+                && o["model"] == old["validated_proposal"]["model"] && rank(&o["tier"]) >= min && matches_constraint(o,&c)
+                && effort_rank(old["effective"]["native_effort"].as_str().unwrap_or("")) > 0
+                && effort_rank(o["effort"].as_str().unwrap_or("")) > effort_rank(old["effective"]["native_effort"].as_str().unwrap_or("")))
+                .collect();
+            if !higher_efforts.is_empty() && !higher_efforts.contains(&selected) { return Err("prefer supported effort-only escalation while capability remains adequate".into()); }
+            if higher_efforts.is_empty() && rank(&selected["tier"]) <= rank(&old["policy_inputs"]["tier"]) { return Err("reasoning escalation requires a stronger suitable capability tier".into()); }
+        }
+        if pending["kind"] == "provider_operational_failure" && selected["provider"] == old["effective"]["provider"] {
+            return Err("operational provider failure requires an eligible other provider".into());
+        }
+        if pending["kind"] == "context_pressure" && selected["limits"]["context_window"].as_u64().unwrap_or(0) <= old["policy_inputs"]["limits"]["context_window"].as_u64().unwrap_or(0) {
+            return Err("context pressure requires a measured larger context window".into());
+        }
     }
     if min == 1
+        && !pending.is_object() && stage["routing_validity_only"] != true
         && options.iter().filter(adequate).any(|o| {
             matches_constraint(o, &c)
                 && (o["provider"] == "mock"
@@ -269,10 +300,29 @@ fn policy_inputs(
 
 fn selection_plan(plan: &Value) -> Value {
     json!({"goal":plan["goal"],"plan_id":plan["plan_id"],"revision":plan["revision"],
-        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"]})).collect::<Vec<_>>()})
+        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":s["reassessment"]["pending"],"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
 }
 
 impl Ctx {
+    fn routing_handoff(&self, plan: &Value) -> Result<String, String> {
+        let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
+            .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
+        if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
+        Ok(format!("\nArchitecture checkpoint and referenced decisions: {cp}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. Higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
+            self.git(&["status","--short"]).unwrap_or_else(|e| e) , self.git(&["diff","HEAD","--",".",":(exclude).forge"] ).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>()))
+    }
+    pub(crate) fn has_operational_alternative(&self, plan: &Value, idx: usize) -> Result<bool,String> {
+        let stage = &plan["stages"][idx];
+        let old: Proposal = serde_json::from_value(stage["model_agreement"]["validated_proposal"].clone()).map_err(|e| e.to_string())?;
+        let settings = self.app.settings.lock().unwrap().clone();
+        let options = self.routing_options()?;
+        for o in &options {
+            let mut p = old.clone();
+            p.provider = o["provider"].as_str().unwrap_or("").into(); p.model = o["model"].as_str().unwrap_or("").into(); p.native_effort = o["effort"].as_str().unwrap_or("").into();
+            if policy_inputs(&settings,stage,&p,&options).is_ok() && self.reviewer_config(&p.provider).is_ok() { return Ok(true); }
+        }
+        Ok(false)
+    }
     pub(crate) fn proposal_inputs(&self, plan: &Value, idx: usize) -> Value {
         let settings = self.app.settings.lock().unwrap();
         json!({"stage":crate::plan::stage_inputs(plan, idx),"constraint":constraint(&settings, &plan["stages"][idx])})
@@ -361,12 +411,19 @@ impl Ctx {
             }
             let a = &cp["agreements"][stage["id"].to_string()];
             let same_inputs = a["relevant_inputs"] == crate::plan::stage_inputs(plan, idx);
+            let mut validity_stage = stage.clone();
+            validity_stage.as_object_mut().unwrap().remove("reassessment");
+            validity_stage["routing_validity_only"] = json!(true);
             let check = serde_json::from_value::<Proposal>(a["validated_proposal"].clone())
                 .map_err(|e| e.to_string())
-                .and_then(|p| policy_inputs(&settings, stage, &p, &options));
+                .and_then(|p| policy_inputs(&settings, &validity_stage, &p, &options));
             let valid = a["valid"] == true
                 && same_inputs
-                && check.as_ref().is_ok_and(|p| *p == a["policy_inputs"]);
+                && check.as_ref().is_ok_and(|p| material_inputs(p) == material_inputs(&a["policy_inputs"]));
+            if stage["reassessment"]["pending"].is_object() {
+                ids.push(stage["id"].as_i64().ok_or("invalid stage id")?);
+                continue;
+            }
             if !valid {
                 // Stage 7 owns reassessment of an existing assignment after operational/material failure.
                 if a["valid"] == true
@@ -402,9 +459,15 @@ impl Ctx {
             "{}\nRead-only planner selection turn. Return ONLY {{\"proposals\":[{{\"stage_id\":1,\"proposal\":<model_proposal>}}]}} for exactly these IDs: {ids:?}. Plan: {context_plan}\nArchitect disagreement: {feedback}",
             self.routing_prompt()?
         );
+        let prompt = prompt + &self.routing_handoff(plan)?;
         let (provider, model, effort) = self.bootstrap("planner")?;
         let output =
             self.routing_dialogue("planner", &provider, &model, &effort, &prompt, plan, ids)?;
+        if let Some(u) = output.get("_engine_usage") {
+            let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
+            Self::add_usage(plan,"usage",&provider,&usage);
+            Self::add_usage(&mut plan["role_usage"],"planner",&provider,&usage);
+        }
         let rows = output["proposals"]
             .as_array()
             .ok_or("planner omitted routing proposals")?;
@@ -442,6 +505,7 @@ impl Ctx {
         plan: &Value,
         ids: &[i64],
     ) -> Result<Value, String> {
+        if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
         if provider == "mock" {
             let mut settings = self.app.settings.lock().unwrap();
             let key = format!("mock_routing_{role}_requests");
@@ -482,13 +546,21 @@ impl Ctx {
             session: None,
             prompt,
         })?;
+        if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
+        let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
+        let selected = self.app.catalogue.execution_with_effort(&policy, Provider::parse(provider).ok_or("invalid selection provider")?, model, effort);
+        if !output.model_reported || selected["eligible"] != true || output.effective_model != selected["resolved_id"].as_str().unwrap_or(model) { return Err("selection effective-model mismatch or missing report".into()); }
         if output.output.len() > 48 * 1024 {
             return Err("routing output exceeds 48 KiB".into());
         }
         if !output.completed {
             return Err("incomplete selection dialogue".into());
         }
-        serde_json::from_str(&output.output).map_err(|e| format!("invalid selection output: {e}"))
+        let mut value: Value = serde_json::from_str(&output.output).map_err(|e| format!("invalid selection output: {e}"))?;
+        let obj = value.as_object_mut().ok_or("selection output must be an object")?;
+        obj.remove("_engine_usage");
+        if let Some(u) = output.usage { obj.insert("_engine_usage".into(),json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"total_tokens":u.total_tokens,"model":u.model})); }
+        Ok(value)
     }
     pub(crate) fn agree_routing(
         &self,
@@ -560,6 +632,7 @@ impl Ctx {
                     EVALUATION_CONTRACT,
                     json!(disagreements)
                 );
+                let prompt = prompt + &self.routing_handoff(plan)?;
                 let output = self.routing_dialogue(
                     "architect",
                     &provider,
@@ -569,6 +642,11 @@ impl Ctx {
                     plan,
                     &affected,
                 )?;
+                if let Some(u) = output.get("_engine_usage") {
+                    let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
+                    Self::add_usage(plan,"usage",&provider,&usage);
+                    Self::add_usage(&mut plan["role_usage"],"architect",&provider,&usage);
+                }
                 let replacements = output["model_evaluations"]
                     .as_array()
                     .ok_or("missing reconciliation evaluations")?;
@@ -597,6 +675,7 @@ impl Ctx {
                 let p: Proposal = serde_json::from_value(stage["model_proposal"].clone())
                     .map_err(|e| e.to_string())?;
                 let inputs = policy_inputs(&settings, stage, &p, &options)?;
+                let reviewer = self.reviewer_config(&p.provider)?;
                 let option = options
                     .iter()
                     .find(|o| {
@@ -612,15 +691,22 @@ impl Ctx {
                 let last = turns.last().unwrap();
                 let record = json!({"version":1,"id":agreement_id,"kind":"agreement","agreement_id":agreement_id,"valid":true,"agreed":true,
                     "proposal_ids":[last["planner_proposal_id"],last["architect_evaluation_id"]],"dialogue":turns,"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":id,
-                    "relevant_inputs":crate::plan::stage_inputs(plan, idx),"input_fingerprint":crate::metadata::fingerprint(json!({"stage":crate::plan::stage_inputs(plan,idx),"policy":inputs}).to_string().as_bytes()),"policy_inputs":inputs,
-                    "effective":{"provider":p.provider,"model":option["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort},
+                    "architectural_constraints":cp["constraints"],"relevant_inputs":crate::plan::stage_inputs(plan, idx),"input_fingerprint":crate::metadata::fingerprint(json!({"stage":crate::plan::stage_inputs(plan,idx),"policy":inputs}).to_string().as_bytes()),"policy_inputs":inputs,
+                    "reviewer":{"provider":reviewer.0,"model":reviewer.1},"effective":{"provider":p.provider,"model":option["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort},
                     "validated_proposal":p,"planner_reason":p.rationale,"architect_reason":e.rationale,"planner_bootstrap":stage["model_proposer"],
                     "architect_bootstrap":cp["routing_evaluator"],
                     "provenance":{"capability_policy_version":POLICY,"catalogue_revision":option["policy_revision"].as_str().unwrap_or("configured"),"official_sources":option["official_source"].as_str().into_iter().collect::<Vec<_>>(),"checked_unix":crate::util::unix_timestamp()},
                     "availability":if option["availability_unverified"] == true {"unverified"} else {"verified"},"verification_state":option["availability"],
-                    "trigger":"joint_assignment","superseded_agreement":old["id"],"unix":crate::util::unix_timestamp()});
+                    "trigger":stage["reassessment"]["pending"]["kind"].as_str().unwrap_or("joint_assignment"),"trigger_evidence":stage["reassessment"]["pending"]["evidence"],"superseded_agreement":old["id"],"unix":crate::util::unix_timestamp()});
                 cp["agreements"][id.to_string()] = record.clone();
-                plan["stages"][idx]["model_agreement"] = record;
+                plan["stages"][idx]["model_agreement"] = record.clone();
+                if plan["stages"][idx]["reassessment"]["pending"].is_object() {
+                    let state = &mut plan["stages"][idx]["reassessment"];
+                    let pending = state["pending"].clone();
+                    state["history"].as_array_mut().unwrap().push(json!({"kind":pending["kind"],"evidence":pending["evidence"],"old_agreement":pending["old_agreement"],"new_agreement":record,"planner_reason":record["planner_reason"],"architect_reason":record["architect_reason"]}));
+                    state.as_object_mut().unwrap().remove("pending");
+                    state["status"] = json!("reusing");
+                }
                 plan["stages"][idx]
                     .as_object_mut()
                     .unwrap()
@@ -656,7 +742,9 @@ impl Ctx {
         if !self.routing_required(&local, &cp)?.is_empty() {
             return Err("stage assignment missing/stale; reconcile before implementation".into());
         }
-        Ok(cp["agreements"][plan["stages"][idx]["id"].to_string()].clone())
+        let a = &cp["agreements"][plan["stages"][idx]["id"].to_string()];
+        if a["architectural_constraints"] != cp["constraints"] { return Err("material architectural constraints changed".into()); }
+        Ok(a.clone())
     }
 }
 pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required model proposal against cross-stage constraints, failure impact and capability/cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Explicit agreement requires both classifications to match. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;

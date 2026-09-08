@@ -340,7 +340,7 @@ impl Ctx {
             let routing_ids = self.routing_required(&candidate, &cp)?;
             let missing: Vec<i64> = routing_ids.iter().copied().filter(|id| {
                 candidate["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id)
-                    .is_none_or(|s| !s["model_proposal"].is_object() || s["model_proposal_inputs"] != self.proposal_inputs(&candidate, candidate["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap()))
+                    .is_none_or(|s| s["reassessment"]["pending"].is_object() || !s["model_proposal"].is_object() || s["model_proposal_inputs"] != self.proposal_inputs(&candidate, candidate["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap()))
             }).collect();
             self.propose_routing(&mut candidate, &missing, &Value::Null)?;
             let mut required = vec![];
@@ -449,6 +449,7 @@ impl Ctx {
             }
             let context = json!({"plan":context_plan,"checkpoint":cp,"decisions":included,
                 "history_path":dir.join("events.jsonl"),"repository_observations":observations,
+                "unfinished_diff_preview":self.git(&["diff","HEAD","--",".",":(exclude).forge"]).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>(),
                 "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
             let mut prompt = format!(
                 "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved constraints and completed interfaces exactly; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Use the history_path to retrieve omitted or relevant decision details. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[]}}\nSupply guidance for every required_stage_id. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
@@ -508,6 +509,13 @@ impl Ctx {
                 }
             }
             let output = output?;
+            if provider != "mock" {
+                let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
+                let selected = self.app.catalogue.execution_input(&policy, Provider::parse(&provider).ok_or("invalid architect provider")?, &model);
+                if !output.model_reported || selected["eligible"] != true || output.effective_model != selected["resolved_id"].as_str().unwrap_or(&model) {
+                    return Err("architect effective model missing, changed or ineligible".into());
+                }
+            }
             if self
                 .session
                 .stop_requested

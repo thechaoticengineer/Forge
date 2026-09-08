@@ -363,6 +363,15 @@ impl Store {
     pub(crate) fn state_plan(&self, mut plan: Value) -> Value {
         let refs = plan["architecture"]["review_history"].clone();
         for stage in plan["stages"].as_array_mut().into_iter().flatten() {
+            if let Some(history) = stage["reassessment"]["history"].as_array().cloned() {
+                stage["reassessment"]["history_count"] = json!(history.len());
+                stage["reassessment"]["history"] = json!(history.into_iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().map(|mut h| {
+                    for key in ["old_agreement","new_agreement"] {
+                        if h[key].is_object() { h[key] = json!({"id":h[key]["id"],"effective":h[key]["effective"]}); }
+                    }
+                    h
+                }).collect::<Vec<_>>());
+            }
             if stage["reviews"].is_object() && stage["reviews"].get("$forge_reviews").is_some() {
                 let reference = &refs[stage["id"].to_string()];
                 stage["reviews"] = reference["recent"].clone();

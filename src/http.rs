@@ -293,6 +293,10 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     if !candidate["automatic_routing"].is_boolean() || !(candidate["routing_billing_basis"].is_null() || candidate["routing_billing_basis"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) {
         return (400, json!({"error":"automatic_routing must be boolean; routing_billing_basis must be null or an exact billing basis (max 64 bytes)"}));
     }
+    let limits = &candidate["reassessment_limits"];
+    if limits.as_object().is_none_or(|o| o.len() != 4) || [("max_reassessments",0,8),("max_operational_retries",0,5),("repeat_threshold",2,10),("context_percent",50,95)].iter().any(|(k,min,max)| limits[*k].as_u64().is_none_or(|v| v < *min || v > *max)) {
+        return (400,json!({"error":"invalid reassessment_limits: reassessments 0..8, retries 0..5, repeat threshold 2..10, context percent 50..95"}));
+    }
     let policy = match crate::catalogue::Policy::from_settings(&candidate) {
         Ok(p) => p, Err(e) => return (400,json!({"error":e})),
     };

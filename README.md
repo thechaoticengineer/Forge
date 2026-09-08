@@ -821,8 +821,10 @@ key. A legacy `implementer` provider alone is a preference, not a pinned model.
 A nonempty legacy `implementer_model` remains a global provider/model constraint.
 Set `automatic_routing: false` to constrain unpinned stages to the configured
 implementer provider while still requiring a validated joint assignment.
-Planner and architect bootstrap settings and independent reviewer settings remain
-separate; automatic routing does not change them. Like other role settings,
+Planner and architect bootstrap settings remain separate. With automatic routing,
+an unpinned reviewer follows the other provider and uses an eligible strong registry
+entry. A nonempty `reviewer_model` pins its configured reviewer provider/model;
+disabling automatic routing also preserves the configured reviewer provider. Like other role settings,
 these switches are engine settings; the model registry has its separate persisted
 policy file.
 
@@ -891,9 +893,9 @@ clock/revision-only changes reuse agreements without selection calls.
 
 Before every implementation/fix invocation, a local check verifies the relevant
 saved inputs, chosen option and policy facts. Unrelated catalogue metadata and
-availability becoming verified do not invalidate the choice. Changed material
-capability, effort, resolution, price-policy or availability facts block with
-saved work; automatic reassessment/escalation is a later stage. Invocations record
+availability becoming verified do not invalidate the choice. Material capability, supported effort, alias resolution or removal changes trigger
+bounded reassessment at the next safe turn boundary. Cosmetic metadata, price,
+provenance and catalogue clock changes do not reopen an existing agreement. Invocations record
 proposed, requested and provider-reported effective models, including unexpected
 substitution. Every handoff includes the saved architecture summary, decisions,
 guidance, constraints, completed interfaces, outstanding findings and worktree/
@@ -905,3 +907,70 @@ stage for classification, constraints, cost qualification and invocation details
 Planning/revision failure retains the previous published plan and context as one
 atomic unit. Read-only plan Q&A never selects models or publishes architectural
 changes.
+
+
+### Bounded reassessment and recovery
+
+The engine reuses each agreement until there is concrete evidence: changed stage
+scope, risk or architectural constraints; the same unresolved role-attributed
+review request or implementer test failure repeated at the threshold; a validated
+implementer escalation request; measured provider input-token pressure against a
+known configured `limits.context_window`; a relevant capability/alias/removal
+change; or an operational provider failure that requires another assignment.
+Unknown context limits produce no pressure trigger. Input-token usage is a
+conservative per-invocation pressure signal, not a claim about exact remaining
+context or cost. Selection is never run just because a stage, review, retry or
+metadata refresh occurred. Review clarification and a triggered selection share
+one necessary architect turn where possible; valid guidance and checkpoints are
+reused. Every replacement must inspect and preserve inherited partial work.
+
+`POST /api/settings` accepts `reassessment_limits` (all four keys required):
+
+```json
+{"reassessment_limits":{"max_reassessments":3,"max_operational_retries":2,"repeat_threshold":2,"context_percent":85}}
+```
+
+Limits are copied into each attempt. Reassessments allow 0–8, operational retries
+0–5, repeated failures 2–10, and context pressure 50–95 percent. Defaults allow
+three evaluations and two operational retries total per attempt. A trigger
+signature can reserve only one evaluation. Reservations are persisted **before**
+paid selection or retry backoff. Transient rate limits, overload and timeouts
+receive exponential backoff (1, 2, 4, 8, 16 seconds if the retry budget allows),
+with stop checks every 25 ms. Authentication failures receive no paid retries;
+Forge either agrees an eligible alternative or blocks with an actionable error.
+Tool/process errors are recorded separately from reasoning failures and do not
+receive transient retries. Independent review uses the same shared retry budget
+and fails closed if its provider cannot supply a valid review.
+
+For reasoning failures, a supported higher native effort on the same adequate
+model is preferred when the previous effort is explicit. Provider-default effort
+is unknown and is not treated as a known lower level. Otherwise selection must
+choose a stronger suitable configured capability tier. Effort cannot replace
+required capability. Explicit user constraints, the agreed capability floor and
+other-provider review eligibility remain mandatory. Retired assignments cannot
+be revisited; an unchanged assignment is allowed only when revalidating material
+scope/policy changes. No assignment changes while a provider turn is running.
+Provider-reported model identity and native effort eligibility are checked; a
+missing or unexpected effective model report blocks with work retained.
+
+Implementers return an engine-owned JSON outcome on their final output channel.
+Forge supplies and validates the exact plan, stage, attempt and unique turn IDs,
+status (`completed`, `test_failure`, `escalation`), bounded evidence and optional
+request (`kind`, `reason`, `required_capability`). Unknown fields and stale IDs
+are rejected. Legacy prose is accepted as ordinary completion and cannot request
+an escalation. Agents must never write routing or outcome data into `.forge`.
+
+A stop preserves the worktree, unresolved requests and last committed architect
+checkpoint. Restart retains spent fix rounds, retry/evaluation counts and trigger
+signatures. An interrupted or failed selection reservation blocks automatic replay,
+so repeated restarts cannot create paid selection loops. Correct the reported
+provider/configuration issue; for a blocked selection or effective-model mismatch,
+revise the affected stage scope/constraint and reconcile explicitly to start a new
+attempt. Switching models never resets `max_fix_rounds`. New goals and projects
+have separate identities and budgets.
+
+The state API exposes attempt status, limits, counters, pending trigger evidence
+and the latest four history entries (full history stays in the saved plan/events).
+Stage cards show retry/escalation/blocked status, the trigger, and both planner and
+architect reasons. History retains old/new agreements and invocations retain actual
+model reports and role token usage. Unknown prices remain unknown.

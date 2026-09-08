@@ -33,3 +33,11 @@ test('stage constraints can be narrowed or cleared and survive manual save', () 
   assert.match(qml,/content.model_constraint = stage.model_constraint \|\| null/);
   assert.match(qml,/automatic_routing:/);
 });
+test('routing status shows bounded retry counts, trigger evidence and both decision reasons', () => {
+  const routed = structuredClone(stage);
+  routed.reassessment = {status:'blocked',count:2,operational_retries:1,
+    limits:{max_reassessments:3,max_operational_retries:2},error:'No adequate eligible model',
+    history:[{kind:'repeated_reasoning_failure',evidence:['[reviewer] same failing test'],planner_reason:'Stronger capability needed',architect_reason:'Preserve the invariant'}]};
+  const text = ctx.stageModelText(routed,true);
+  for (const expected of ['blocked','reassessments 2/3','operational retries 1/2','repeated_reasoning_failure','same failing test','Stronger capability needed','Preserve the invariant','No adequate eligible model']) assert.ok(text.includes(expected));
+});

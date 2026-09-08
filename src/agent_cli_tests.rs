@@ -107,6 +107,7 @@ print('diagnostic on stderr', file=sys.stderr)
     assert_eq!(output.session.as_deref(), Some(ID));
     assert_eq!(output.output, "{\"answer\":\"ok\"}");
     assert_eq!(output.effective_model, "exact-model");
+    assert!(!output.model_reported, "requested model fallback is not a provider report");
     assert_eq!(output.usage.unwrap().total_tokens, 120);
     let args = fixture.args();
     assert!(pair(&args, "resume", ID));
@@ -149,6 +150,7 @@ print(json.dumps({{'type':'result','subtype':'success','session_id':'{ID}','is_e
     assert_eq!(result.output, "{\"answer\":\"yes\"}");
     assert_eq!(result.session.as_deref(), Some(ID));
     assert_eq!(result.effective_model, "effective-claude");
+    assert!(result.model_reported);
     assert_eq!(result.usage.unwrap().total_tokens, 100);
     let args = fixture.args();
     assert!(pair(&args, "--resume", ID));

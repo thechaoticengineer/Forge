@@ -195,6 +195,7 @@ fn exact_ids_native_efforts_constraints_and_review_conflicts_are_validated() {
     assert!(f.publish(plan()).unwrap_err().contains("constraint"));
     let f = Fixture::new();
     f.set("reviewer", json!("codex"));
+    f.set("automatic_routing", json!(false));
     f.select(proposal("strong-test", "critical", "persistence"));
     assert!(f.publish(plan()).unwrap_err().contains("cross-provider"));
     for c in [
