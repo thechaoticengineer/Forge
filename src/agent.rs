@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::io::{BufRead as _, BufReader};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod codex_session;
+
 /// Provider-native request. Only the architect may attach an authoritative session.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentRequest<'a> {
@@ -87,6 +89,11 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
                     "-c",
                     "features.image_generation=false",
                 ]);
+                if review {
+                    // The outer read-only Bubblewrap mount remains authoritative.
+                    // Checks in scratch space need sockets for loopback fixtures.
+                    c.args(["-c", "sandbox_workspace_write.network_access=true"]);
+                }
             } else {
                 c.arg("--dangerously-bypass-approvals-and-sandbox");
             }

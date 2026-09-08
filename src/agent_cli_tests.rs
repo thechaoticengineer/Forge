@@ -47,6 +47,7 @@ with open('argv.json','w') as f: json.dump(sys.argv[1:],f)
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut settings = crate::plan::default_settings();
         settings[format!("test_cli_{provider}")] = json!(script);
+        settings["test_codex_home"] = json!(root.join("codex-home"));
         let mut app = App::new(root.to_str().unwrap(), settings);
         app.catalogue = crate::catalogue::Catalogue::new(
             Arc::new(Discovered),
@@ -85,6 +86,96 @@ fn request(provider: &str) -> AgentRequest<'_> {
 }
 fn pair(args: &[String], a: &str, b: &str) -> bool {
     args.windows(2).any(|p| p[0] == a && p[1] == b)
+}
+
+// Shape observed in Codex CLI 0.153.4: exec stdout lacks model, while the
+// exact rollout records task_started, turn_context and task_complete.
+fn codex_rollout_script(model: &str) -> String {
+    format!(r#"
+from pathlib import Path
+import uuid
+session = '{ID}'
+turn = str(uuid.uuid4())
+path = Path(os.environ['CODEX_HOME']) / 'sessions/2026/09/08' / ('rollout-fixture-' + session + '.jsonl')
+path.parent.mkdir(parents=True, exist_ok=True)
+events = []
+if not path.exists():
+    events.append({{'type':'session_meta','payload':{{'id':session,'cwd':os.getcwd()}}}})
+events.extend([
+    {{'type':'event_msg','payload':{{'type':'task_started','turn_id':turn}}}},
+    {{'type':'turn_context','payload':{{'turn_id':turn,'cwd':os.getcwd(),'model':'{model}'}}}},
+    {{'type':'event_msg','payload':{{'type':'task_complete','turn_id':turn}}}}
+])
+with path.open('a') as f:
+    for event in events: f.write(json.dumps(event) + '\n')
+print(json.dumps({{'type':'thread.started','thread_id':session}}))
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':answer if 'answer' in globals() else '{{}}'}}}}))
+print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':10,'output_tokens':5}}}}))
+"#)
+}
+
+#[test]
+fn codex_session_metadata_supplies_model_for_fresh_and_resumed_invocations() {
+    let fixture = Cli::new("codex", &codex_rollout_script("exact-model"));
+    for session in [None, Some(ID)] {
+        let mut req = request("codex");
+        req.session = session;
+        let output = fixture.ctx.run_agent(&req).unwrap();
+        assert!(output.model_reported);
+        assert_eq!(output.effective_model, "exact-model");
+        assert_eq!(output.usage.unwrap().model, "exact-model");
+    }
+}
+
+#[test]
+fn codex_stream_model_takes_precedence_over_rollout_fallback() {
+    let fixture = Cli::new("codex", &format!("{}\nprint(json.dumps({{'type':'model','model':'stream-model'}}))", codex_rollout_script("rollout-model")));
+    let output = fixture.ctx.run_agent(&request("codex")).unwrap();
+    assert!(output.model_reported);
+    assert_eq!(output.effective_model, "stream-model");
+}
+
+#[test]
+fn architect_publishes_with_codex_rollout_model_and_retains_plan_on_substitution() {
+    let answer = r#"
+context = json.JSONDecoder().raw_decode(sys.argv[-1].split('Context:\n', 1)[1])[0]
+plan = context['plan']
+answer = json.dumps({'version':1,'plan_id':plan['plan_id'],'revision':plan['revision'],
+    'checkpoint':{'summary':'Preserve contracts.','constraints':[],'completed_interfaces':[]},
+    'decisions':[],'guidance':[{'stage_id':i,'text':'Check interfaces.'} for i in context['required_stage_ids']],
+    'unresolved_risks':[],'resolved_risks':[],
+    'model_evaluations':[dict(stage_id=s['id'],agree=True,rationale='Checked interfaces.',
+        **{k:s['model_proposal'][k] for k in ('risk','complexity','task')})
+        for s in plan['stages'] if s['id'] in context['required_model_stage_ids']]})
+"#;
+    let fixture = Cli::new("codex", &format!("{answer}\n{}", codex_rollout_script("exact-model")));
+    {
+        let mut settings = fixture.ctx.app.settings.lock().unwrap();
+        settings["architect"] = json!("codex");
+        settings["architect_model"] = json!("exact-model");
+        settings["planner"] = json!("mock");
+        settings["implementer"] = json!("mock");
+        settings["reviewer"] = json!("mock");
+        settings["automatic_routing"] = json!(false);
+        let mut policy = Policy::default();
+        policy.entries.push(serde_json::from_value(json!({"provider":"codex","model":"exact-model","tier":"strong"})).unwrap());
+        settings["model_catalogue"] = json!(policy);
+    }
+    let candidate = json!({"goal":"check model verification","status":"draft","stages":[
+        {"id":1,"title":"API","instructions":"Preserve API","acceptance":"tests pass","commit":"fix: API","status":"pending"}]});
+    let plan = fixture.ctx.architect_publish(candidate, None, "initial").unwrap();
+    assert_eq!(fixture.ctx.session.state.lock().unwrap().architect_activity["status"], "ready");
+    assert_eq!(fixture.ctx.architecture_store().checkpoint(&plan).unwrap()["effective_model"]["model"], "exact-model");
+    let before = fs::read(fixture.ctx.forge_path("plan.json")).unwrap();
+    let script = fixture.root.join("codex");
+    let body = fs::read_to_string(&script).unwrap().replace("'model':'exact-model'", "'model':'substituted-model'");
+    fs::write(&script, body).unwrap();
+    let mut revised = plan.clone();
+    revised["stages"][0]["instructions"] = json!("Preserve and verify API");
+    let revised = crate::plan::edit_plan(&plan, &json!({"plan":revised})).unwrap();
+    let error = fixture.ctx.architect_publish(revised, Some(&plan), "revision").unwrap_err();
+    assert_eq!(error, "architect effective model changed: expected exact-model, reported substituted-model");
+    assert_eq!(fs::read(fixture.ctx.forge_path("plan.json")).unwrap(), before);
 }
 
 #[test]

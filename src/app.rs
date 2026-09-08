@@ -738,7 +738,16 @@ impl Ctx {
         let built = Self::agent_command(request)?;
         let mut cmd = Command::new(&executable);
         cmd.args(built.get_args());
+        let codex_home = crate::agent::codex_session::home();
+        #[cfg(test)]
+        let codex_home = self.app.settings.lock().unwrap()["test_codex_home"].as_str()
+            .map(std::path::PathBuf::from).or(codex_home);
+        let codex_home = codex_home.map(|home| if home.is_absolute() { home } else {
+            std::path::Path::new(self.project()).join(home)
+        });
         if matches!(role, "reviewer" | "architect_review") { cmd = crate::agent::review_sandbox(&cmd, self.project(), tool)?; }
+        #[cfg(test)]
+        if let Some(home) = &codex_home { cmd.env("CODEX_HOME", home); }
         self.log_event("model", &format!("[{role}] {tool}/{} · {} · policy {} · effort {}",
             if model.is_empty() { "provider default" } else { model }, selection["availability"].as_str().unwrap_or("unverified"),
             policy.policy_revision, selection["effort"].as_str().unwrap_or("provider_default")));
@@ -756,6 +765,9 @@ impl Ctx {
         }
 
         use std::os::unix::process::CommandExt;
+        let codex_snapshot = (tool == "codex").then(|| codex_home.as_deref()
+            .ok_or_else(|| "Codex home unavailable".to_string())
+            .and_then(crate::agent::codex_session::Snapshot::capture));
         let child = cmd
             .process_group(0)
             .stdin(Stdio::null())
@@ -855,6 +867,18 @@ impl Ctx {
         }
         if session.is_some() && result.session.as_deref() != session {
             return Err("resumed session identity mismatch".into());
+        }
+        if !result.model_reported && let Some(snapshot) = codex_snapshot {
+            let reported = snapshot.and_then(|snapshot| result.session.as_deref()
+                .ok_or_else(|| "Codex stream omitted exact session identity".to_string())
+                .and_then(|id| snapshot.model(id, self.project())));
+            match reported {
+                Ok(model) => {
+                    result.effective_model = model;
+                    result.model_reported = true;
+                }
+                Err(error) => self.log_event("model", &format!("[{role}] effective model unavailable: {error}")),
+            }
         }
         self.app.catalogue.observe(&policy, provider, &requested_model, Ok(()));
         selection["availability"] = json!("execution_verified"); selection["availability_unverified"] = json!(false);
