@@ -6,7 +6,7 @@ import { discover } from './discovery.mjs';
 const [protocol, executable, cliVersion] = process.argv.slice(2);
 const envelope = { bridge_version: 1, source: 'claude_code_initialization', cli_version: cliVersion, sdk_version: '0.3.261' };
 try {
-  if (protocol !== '--forge-discovery-v1' || executable !== 'claude' || cliVersion !== '2.1.261 (Claude Code)')
+  if (protocol !== '--forge-discovery-v1' || executable !== 'claude' || cliVersion !== '2.1.263 (Claude Code)')
     throw new Error('unsupported CLI/bridge version');
   const require = createRequire(import.meta.url);
   if (JSON.parse(readFileSync(join(dirname(require.resolve('@anthropic-ai/claude-agent-sdk')), 'package.json'), 'utf8')).version !== envelope.sdk_version)
