@@ -83,6 +83,43 @@ impl Discovery for Fixed {
         }
     }
 }
+
+// Each provider reports entry and waits for the test to supply its result.
+// Receiving both requests before replying also verifies provider parallelism.
+type ProbeRequest = (Provider, Budget, std::sync::mpsc::Sender<Option<Probe>>);
+struct Controlled {
+    entered: std::sync::mpsc::Sender<ProbeRequest>,
+}
+impl Controlled {
+    fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<ProbeRequest>) {
+        let (entered, requests) = std::sync::mpsc::channel();
+        (Arc::new(Self { entered }), requests)
+    }
+}
+impl Discovery for Controlled {
+    fn probe(&self, provider: Provider, _: &Policy, budget: Budget) -> Probe {
+        let (reply, result) = std::sync::mpsc::channel();
+        self.entered.send((provider, budget, reply)).unwrap();
+        result
+            .recv_timeout(Duration::from_secs(3))
+            .expect("test must release the provider")
+            .expect("injected discovery panic")
+    }
+}
+fn start_controlled_refresh(
+    c: &Catalogue,
+    p: &Policy,
+    requests: &std::sync::mpsc::Receiver<ProbeRequest>,
+) -> BTreeMap<Provider, (Budget, std::sync::mpsc::Sender<Option<Probe>>)> {
+    assert!(c.refresh(p.clone()));
+    let mut pending = BTreeMap::new();
+    for _ in 0..2 {
+        let (provider, budget, reply) = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(pending.insert(provider, (budget, reply)).is_none());
+    }
+    pending
+}
+
 struct Script {
     lines: VecDeque<String>,
     exchanges: VecDeque<(Value, Vec<Value>)>,
@@ -761,5 +798,426 @@ fn cli_version_changes_are_reported_against_last_good_cache() {
     assert_eq!(
         restarted.summary(&p)["providers"][0]["changes"]["cli_version_changed"],
         true
+    );
+}
+
+#[test]
+fn overlapping_refresh_preserves_execution_evidence_and_joins_both_providers() {
+    let temp = Temp::new();
+    let p = policy();
+    let (discovery, requests) = Controlled::new();
+    let c = Catalogue::new(discovery, temp.0.clone(), Duration::from_secs(2));
+    let mut pending = start_controlled_refresh(&c, &p, &requests);
+    let mut other_scope = p.clone();
+    other_scope.codex_scope = "must-not-replace-running-scope".into();
+    assert!(!c.refresh(other_scope));
+    c.observe(
+        &p,
+        Provider::Codex,
+        "explicit-model",
+        Err(Failure::new(FailureKind::Auth)),
+    );
+    c.observe(
+        &p,
+        Provider::Claude,
+        "explicit-model",
+        Err(Failure::new(FailureKind::Rejected)),
+    );
+    c.reject_effort(&p, Provider::Claude, "explicit-model", "high");
+    c.observe(&p, Provider::Claude, "verified-model", Ok(()));
+    let mut model = row("explicit-model");
+    model.supported_efforts = Some(vec!["high".into()]);
+    pending
+        .remove(&Provider::Codex)
+        .unwrap()
+        .1
+        .send(Some(Probe {
+            cli_version: Some("fixture 1".into()),
+            result: Ok(vec![model.clone()]),
+        }))
+        .unwrap();
+    let key = scope(Provider::Codex, &p);
+    let path = temp.0.join(format!("{key}.json"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Publication by one worker does not release the outer single-flight claim.
+    assert!(!c.refresh(p.clone()));
+    assert!(c.running());
+    let cache = read_cache(&path, Provider::Codex, &key).unwrap().unwrap();
+    assert_eq!(cache.models, vec![model.clone()]);
+    assert_eq!(cache.scope, key);
+    pending
+        .remove(&Provider::Claude)
+        .unwrap()
+        .1
+        .send(Some(Probe {
+            cli_version: Some("fixture 1".into()),
+            result: Ok(vec![model]),
+        }))
+        .unwrap();
+    wait(&c);
+    let details = c.details(&p);
+    assert_eq!(details["providers"][0]["status"], "unavailable");
+    assert_eq!(details["providers"][0]["blocker"]["kind"], "auth");
+    assert_eq!(details["providers"][0]["execution_blocked"], true);
+    assert!(details["providers"][0]["error"].is_null());
+    assert!(details["providers"][0]["cache_error"].is_null());
+    assert_eq!(
+        c.execution_input(&p, Provider::Codex, "explicit-model")["eligible"],
+        false
+    );
+    assert_eq!(
+        c.execution_input(&p, Provider::Claude, "explicit-model")["eligible"],
+        false
+    );
+    let effort = c.execution_with_effort(&p, Provider::Claude, "explicit-model", "high");
+    assert_eq!(effort["eligible"], false);
+    assert_eq!(effort["native_effort_args"], json!([]));
+    assert_eq!(
+        c.execution_input(&p, Provider::Claude, "verified-model")["availability"],
+        "execution_verified"
+    );
+    c.observe(&p, Provider::Claude, "explicit-model", Ok(()));
+    assert_eq!(
+        c.execution_input(&p, Provider::Claude, "explicit-model")["availability"],
+        "execution_verified"
+    );
+    assert!(c.state.lock().unwrap().cancel.is_none());
+}
+
+#[test]
+fn controlled_cancellation_and_probe_panic_release_the_refresh_claim() {
+    let temp = Temp::new();
+    let p = policy();
+    let (discovery, requests) = Controlled::new();
+    let c = Catalogue::new(discovery, temp.0.clone(), Duration::from_secs(2));
+    let pending = start_controlled_refresh(&c, &p, &requests);
+    assert!(Arc::ptr_eq(
+        &pending[&Provider::Codex].0.cancel,
+        &pending[&Provider::Claude].0.cancel
+    ));
+    c.cancel();
+    assert!(!c.refresh(p.clone()));
+    for (_, (budget, reply)) in pending {
+        assert_eq!(budget.check().unwrap_err().kind, FailureKind::Cancelled);
+        reply
+            .send(Some(Probe {
+                cli_version: None,
+                result: budget.check().map(|()| vec![]),
+            }))
+            .unwrap();
+    }
+    wait(&c);
+    for provider in c.summary(&p)["providers"].as_array().unwrap() {
+        assert_eq!(provider["status"], "discovery_failed");
+        assert_eq!(provider["error"]["kind"], "cancelled");
+    }
+    assert!(c.state.lock().unwrap().cancel.is_none());
+    let pending = start_controlled_refresh(&c, &p, &requests);
+    for (provider, (budget, reply)) in pending {
+        assert!(budget.check().is_ok());
+        reply
+            .send(if provider == Provider::Codex {
+                None
+            } else {
+                Some(Probe {
+                    cli_version: Some("fixture 1".into()),
+                    result: Ok(vec![row("model")]),
+                })
+            })
+            .unwrap();
+    }
+    wait(&c);
+    let summary = c.summary(&p);
+    assert_eq!(summary["providers"][0]["error"]["kind"], "process");
+    assert_eq!(summary["providers"][0]["status"], "discovery_failed");
+    assert_eq!(summary["providers"][1]["status"], "discovered");
+    assert!(c.state.lock().unwrap().cancel.is_none());
+}
+
+#[test]
+fn failed_probe_statuses_recover_only_applicable_missing_executable_blockers() {
+    use FailureKind::*;
+    for (cached, blocker, version, failure, status, remaining_blocker) in [
+        (false, None, None, Io, "discovery_failed", None),
+        (
+            false,
+            None,
+            Some("fixture 2"),
+            Unsupported,
+            "unsupported_discovery",
+            None,
+        ),
+        (true, None, Some("fixture 2"), Io, "cached_stale", None),
+        (
+            true,
+            None,
+            Some("fixture 2"),
+            Unsupported,
+            "unsupported_discovery",
+            None,
+        ),
+        (
+            true,
+            Some(MissingExecutable),
+            None,
+            Io,
+            "unavailable",
+            Some(MissingExecutable),
+        ),
+        (
+            true,
+            Some(MissingExecutable),
+            Some("fixture 2"),
+            Io,
+            "cached_stale",
+            None,
+        ),
+        (
+            true,
+            Some(MissingExecutable),
+            Some("fixture 2"),
+            Unsupported,
+            "unsupported_discovery",
+            None,
+        ),
+        (
+            true,
+            Some(Auth),
+            Some("fixture 2"),
+            Io,
+            "unavailable",
+            Some(Auth),
+        ),
+        (
+            true,
+            Some(MissingExecutable),
+            Some("fixture 2"),
+            Auth,
+            "unavailable",
+            Some(Auth),
+        ),
+        (
+            true,
+            None,
+            Some("fixture 2"),
+            Rejected,
+            "unavailable",
+            Some(Rejected),
+        ),
+    ] {
+        let temp = Temp::new();
+        let p = policy();
+        let key = scope(Provider::Codex, &p);
+        let path = temp.0.join(format!("{key}.json"));
+        let good = if cached {
+            let seed = Catalogue::new(
+                Fixed::new(Ok(vec![row("explicit-model")])),
+                temp.0.clone(),
+                Duration::from_secs(2),
+            );
+            assert!(seed.refresh(p.clone()));
+            wait(&seed);
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            None
+        };
+        let (discovery, requests) = Controlled::new();
+        let c = Catalogue::new(discovery, temp.0.clone(), Duration::from_secs(2));
+        let pending = start_controlled_refresh(&c, &p, &requests);
+        if let Some(kind) = blocker {
+            c.observe(
+                &p,
+                Provider::Codex,
+                "explicit-model",
+                Err(Failure::new(kind)),
+            );
+        }
+        for (_, (_, reply)) in pending {
+            reply
+                .send(Some(Probe {
+                    cli_version: version.map(str::to_owned),
+                    result: Err(Failure::new(failure)),
+                }))
+                .unwrap();
+        }
+        wait(&c);
+        let details = c.details(&p);
+        let state = &details["providers"][0];
+        assert_eq!(
+            state["status"], status,
+            "{blocker:?}, {version:?}, {failure:?}"
+        );
+        assert_eq!(state["blocker"]["kind"], json!(remaining_blocker));
+        assert_eq!(state["error"]["kind"], json!(failure));
+        assert_eq!(
+            state["cached_cli_version"],
+            if cached {
+                json!("fixture 1")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            state["cli_version"],
+            json!(version.or(if cached { Some("fixture 1") } else { None }))
+        );
+        assert_eq!(
+            c.execution_input(&p, Provider::Codex, "explicit-model")["eligible"],
+            remaining_blocker.is_none()
+        );
+        if let Some(good) = good {
+            assert_eq!(std::fs::read(&path).unwrap(), good);
+            let cache: Value = serde_json::from_slice(&good).unwrap();
+            for field in ["models", "diff", "removed", "refreshed_unix"] {
+                assert_eq!(state[field], cache[field], "{field}");
+            }
+        } else {
+            assert!(!path.exists());
+            assert_eq!(state["models"], json!([]));
+        }
+        // CLI version comparisons must still use the last successful discovery.
+        let pending = start_controlled_refresh(&c, &p, &requests);
+        for (_, (_, reply)) in pending {
+            reply
+                .send(Some(Probe {
+                    cli_version: Some("fixture 2".into()),
+                    result: Ok(vec![row("explicit-model")]),
+                }))
+                .unwrap();
+        }
+        wait(&c);
+        assert_eq!(
+            c.summary(&p)["providers"][0]["changes"]["cli_version_changed"],
+            cached
+        );
+        let retained_execution_blocker =
+            blocker.is_some() && !(blocker == Some(MissingExecutable) && version.is_some());
+        assert_eq!(
+            c.execution_input(&p, Provider::Codex, "explicit-model")["eligible"],
+            !retained_execution_blocker
+        );
+        assert_eq!(
+            read_cache(&path, Provider::Codex, &key)
+                .unwrap()
+                .unwrap()
+                .cli_version,
+            "fixture 2"
+        );
+    }
+}
+
+#[test]
+fn refresh_diffs_current_models_and_retires_then_reactivates_aliases() {
+    let temp = Temp::new();
+    let p = policy();
+    let mut original = row("explicit-model");
+    original.aliases = vec!["old-alias".into()];
+    original.resolved_id = Some("old-wire".into());
+    let fixed = Fixed::new(Ok(vec![original.clone()]));
+    let c = Catalogue::new(fixed.clone(), temp.0.clone(), Duration::from_secs(2));
+    assert!(c.refresh(p.clone()));
+    wait(&c);
+    let key = scope(Provider::Codex, &p);
+    let path = temp.0.join(format!("{key}.json"));
+    let mut disk = read_cache(&path, Provider::Codex, &key).unwrap().unwrap();
+    disk.models = vec![row("unrelated-disk-model")];
+    disk.cli_version = "unrelated-disk-version".into();
+    disk.removed.insert("disk-tombstone".into());
+    write_cache(&path, &disk).unwrap();
+    let mut changed = original.clone();
+    changed.aliases = vec!["new-alias".into()];
+    changed.resolved_id = Some("new-wire".into());
+    *fixed.result.lock().unwrap() = Ok(vec![changed.clone()]);
+    assert!(c.refresh(p.clone()));
+    wait(&c);
+    let good = std::fs::read(&path).unwrap();
+    let cache: Value = serde_json::from_slice(&good).unwrap();
+    assert_eq!(cache["models"], json!([changed]));
+    assert_eq!(
+        cache["diff"],
+        json!({"added":[], "removed":[], "alias_retargeted":["explicit-model"], "capabilities_changed":[], "cli_version_changed":false})
+    );
+    assert_eq!(cache["removed"], json!(["old-alias", "old-wire"]));
+    *fixed.result.lock().unwrap() = Err(Failure::new(FailureKind::Io));
+    let restarted = Catalogue::new(fixed.clone(), temp.0.clone(), Duration::from_secs(2));
+    assert!(restarted.refresh(p.clone()));
+    wait(&restarted);
+    assert_eq!(std::fs::read(&path).unwrap(), good);
+    let details = restarted.details(&p);
+    for field in ["models", "diff", "removed", "refreshed_unix"] {
+        assert_eq!(details["providers"][0][field], cache[field]);
+    }
+    for id in ["old-alias", "old-wire"] {
+        assert_eq!(
+            restarted.execution_input(&p, Provider::Codex, id)["eligible"],
+            false
+        );
+    }
+    *fixed.result.lock().unwrap() = Ok(vec![original]);
+    assert!(restarted.refresh(p.clone()));
+    wait(&restarted);
+    for id in ["explicit-model", "old-alias", "old-wire"] {
+        assert_eq!(
+            restarted.execution_input(&p, Provider::Codex, id)["availability"],
+            "discovered"
+        );
+        assert_eq!(
+            restarted.execution_input(&p, Provider::Codex, id)["eligible"],
+            true
+        );
+    }
+    for id in ["new-alias", "new-wire"] {
+        assert_eq!(
+            restarted.execution_input(&p, Provider::Codex, id)["eligible"],
+            false
+        );
+    }
+    assert_eq!(
+        json!(
+            read_cache(&path, Provider::Codex, &key)
+                .unwrap()
+                .unwrap()
+                .removed
+        ),
+        json!(["new-alias", "new-wire"])
+    );
+}
+
+#[test]
+fn cache_publication_failure_is_reported_and_cleared_by_next_success() {
+    let temp = Temp::new();
+    let p = policy();
+    let key = scope(Provider::Codex, &p);
+    let path = temp.0.join(format!("{key}.json"));
+    std::fs::create_dir(&path).unwrap();
+    let c = Catalogue::new(
+        Fixed::new(Ok(vec![row("explicit-model")])),
+        temp.0.clone(),
+        Duration::from_secs(2),
+    );
+    assert!(c.refresh(p.clone()));
+    wait(&c);
+    assert_eq!(
+        c.summary(&p)["providers"][0]["cache_error"],
+        "cache publication failed"
+    );
+    assert_eq!(
+        c.execution_input(&p, Provider::Codex, "explicit-model")["availability"],
+        "discovered"
+    );
+    std::fs::remove_dir(&path).unwrap();
+    assert!(c.refresh(p.clone()));
+    wait(&c);
+    assert!(c.summary(&p)["providers"][0]["cache_error"].is_null());
+    assert_eq!(
+        read_cache(&path, Provider::Codex, &key)
+            .unwrap()
+            .unwrap()
+            .models,
+        vec![row("explicit-model")]
     );
 }

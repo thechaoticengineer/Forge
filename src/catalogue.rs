@@ -619,6 +619,106 @@ impl ProviderState {
             invalid_efforts: BTreeMap::new(),
         }
     }
+
+    // Called under the hydration lock; reading the cache stays in the worker.
+    fn hydrate_cache(&mut self, cached: Result<Option<Cache>, String>) {
+        match cached {
+            Ok(Some(c)) if self.refreshed_unix.is_none() => {
+                self.status = "cached_stale".into();
+                self.models = c.models;
+                self.cached_cli_version = Some(c.cli_version.clone());
+                self.cli_version = Some(c.cli_version);
+                self.refreshed_unix = Some(c.refreshed_unix);
+                self.diff = c.diff;
+                self.removed = c.removed;
+            }
+            Err(e) => self.cache_error = Some(e),
+            _ => {}
+        }
+    }
+
+    // Apply to current state so execution evidence recorded during probing survives.
+    fn apply_successful_probe(
+        &mut self,
+        models: Vec<Model>,
+        cli_version: Option<String>,
+        scope: String,
+    ) -> Cache {
+        let mut changes = diff(&self.models, &models);
+        changes.cli_version_changed =
+            self.cached_cli_version.is_some() && self.cached_cli_version != cli_version;
+        self.removed.extend(changes.removed.iter().cloned());
+        // Also retire explicit wire IDs covered by a removed or retargeted alias.
+        for old in &self.models {
+            for id in old.aliases.iter().chain(old.resolved_id.iter()) {
+                if !models.iter().any(|m| {
+                    m.id == *id || m.resolved_id.as_ref() == Some(id) || m.aliases.contains(id)
+                }) {
+                    self.removed.insert(id.clone());
+                }
+            }
+        }
+        for m in &models {
+            for id in std::iter::once(&m.id)
+                .chain(m.aliases.iter())
+                .chain(m.resolved_id.iter())
+            {
+                self.removed.remove(id);
+            }
+        }
+        self.models = models;
+        self.cached_cli_version = cli_version.clone();
+        self.cli_version = cli_version;
+        self.diff = changes;
+        self.refreshed_unix = Some(unix_timestamp());
+        self.status = "discovered".into();
+        self.error = None;
+        if !self.execution_blocked {
+            self.blocker = None;
+        }
+        if self.blocker.is_some() {
+            self.status = "unavailable".into();
+        }
+        Cache {
+            version: VERSION,
+            provider: self.provider,
+            scope,
+            cli_version: self.cli_version.clone().unwrap_or_default(),
+            refreshed_unix: self.refreshed_unix.unwrap(),
+            models: self.models.clone(),
+            diff: self.diff.clone(),
+            removed: self.removed.clone(),
+        }
+    }
+
+    fn apply_failed_probe(&mut self, e: Failure, cli_version: Option<String>) {
+        if cli_version.is_some()
+            && self
+                .blocker
+                .as_ref()
+                .is_some_and(|b| b.kind == FailureKind::MissingExecutable)
+        {
+            self.blocker = None;
+            self.execution_blocked = false;
+        }
+        if e.blocks() {
+            self.blocker = Some(e.clone());
+        }
+        self.status = if self.blocker.is_some() {
+            "unavailable"
+        } else if e.kind == FailureKind::Unsupported {
+            "unsupported_discovery"
+        } else if self.refreshed_unix.is_some() {
+            "cached_stale"
+        } else {
+            "discovery_failed"
+        }
+        .into();
+        self.error = Some(e);
+        if cli_version.is_some() {
+            self.cli_version = cli_version;
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -632,6 +732,70 @@ pub(crate) struct Catalogue {
     cache_root: PathBuf,
     timeout: Duration,
 }
+// Keep cache I/O and probing outside the three original state-lock boundaries.
+fn refresh_provider(
+    state: &Mutex<State>,
+    discovery: &dyn Discovery,
+    root: &Path,
+    provider: Provider,
+    policy: &Policy,
+    timeout: Duration,
+    cancel: Arc<AtomicBool>,
+) {
+    let key = scope(provider, policy);
+    let path = root.join(format!("{key}.json"));
+    let cached = read_cache(&path, provider, &key);
+    {
+        let mut locked = state.lock().unwrap();
+        let s = locked.providers.get_mut(&provider).unwrap();
+        s.hydrate_cache(cached);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        discovery.probe(
+            provider,
+            policy,
+            Budget {
+                deadline: Instant::now() + timeout,
+                cancel,
+            },
+        )
+    }))
+    .unwrap_or(Probe {
+        cli_version: None,
+        result: Err(Failure::new(FailureKind::Process)),
+    });
+    let cache = {
+        let mut locked = state.lock().unwrap();
+        let s = locked.providers.get_mut(&provider).unwrap();
+        match result.result {
+            Ok(models) => Some(s.apply_successful_probe(models, result.cli_version, key)),
+            Err(e) => {
+                s.apply_failed_probe(e, result.cli_version);
+                None
+            }
+        }
+    };
+    if let Some(cache) = cache {
+        if let Err(e) = write_cache(&path, &cache) {
+            state
+                .lock()
+                .unwrap()
+                .providers
+                .get_mut(&provider)
+                .unwrap()
+                .cache_error = Some(e);
+        } else {
+            state
+                .lock()
+                .unwrap()
+                .providers
+                .get_mut(&provider)
+                .unwrap()
+                .cache_error = None;
+        }
+    }
+}
+
 // Stable FNV-1a partition key; no secret or credential contents are read or stored.
 fn scope(provider: Provider, policy: &Policy) -> String {
     let configured = if provider == Provider::Codex {
@@ -729,142 +893,9 @@ impl Catalogue {
                     let cancel = cancel.clone();
                     let policy = &policy;
                     threads.spawn(move || {
-                        let key = scope(provider, policy);
-                        let path = root.join(format!("{key}.json"));
-                        let cached = read_cache(&path, provider, &key);
-                        {
-                            let mut locked = state.lock().unwrap();
-                            let s = locked.providers.get_mut(&provider).unwrap();
-                            match cached {
-                                Ok(Some(c)) if s.refreshed_unix.is_none() => {
-                                    s.status = "cached_stale".into();
-                                    s.models = c.models;
-                                    s.cached_cli_version = Some(c.cli_version.clone());
-                                    s.cli_version = Some(c.cli_version);
-                                    s.refreshed_unix = Some(c.refreshed_unix);
-                                    s.diff = c.diff;
-                                    s.removed = c.removed;
-                                }
-                                Err(e) => s.cache_error = Some(e),
-                                _ => {}
-                            }
-                        }
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            discovery.probe(
-                                provider,
-                                policy,
-                                Budget {
-                                    deadline: Instant::now() + timeout,
-                                    cancel,
-                                },
-                            )
-                        }))
-                        .unwrap_or(Probe {
-                            cli_version: None,
-                            result: Err(Failure::new(FailureKind::Process)),
-                        });
-                        let cache = {
-                            let mut locked = state.lock().unwrap();
-                            let s = locked.providers.get_mut(&provider).unwrap();
-                            match result.result {
-                                Ok(models) => {
-                                    let mut changes = diff(&s.models, &models);
-                                    changes.cli_version_changed = s.cached_cli_version.is_some()
-                                        && s.cached_cli_version != result.cli_version;
-                                    s.removed.extend(changes.removed.iter().cloned());
-                                    // Also retire explicit wire IDs covered by a removed or retargeted alias.
-                                    for old in &s.models {
-                                        for id in old.aliases.iter().chain(old.resolved_id.iter()) {
-                                            if !models.iter().any(|m| {
-                                                m.id == *id
-                                                    || m.resolved_id.as_ref() == Some(id)
-                                                    || m.aliases.contains(id)
-                                            }) {
-                                                s.removed.insert(id.clone());
-                                            }
-                                        }
-                                    }
-                                    for m in &models {
-                                        for id in std::iter::once(&m.id)
-                                            .chain(m.aliases.iter())
-                                            .chain(m.resolved_id.iter())
-                                        {
-                                            s.removed.remove(id);
-                                        }
-                                    }
-                                    s.models = models;
-                                    s.cached_cli_version = result.cli_version.clone();
-                                    s.cli_version = result.cli_version;
-                                    s.diff = changes;
-                                    s.refreshed_unix = Some(unix_timestamp());
-                                    s.status = "discovered".into();
-                                    s.error = None;
-                                    if !s.execution_blocked {
-                                        s.blocker = None;
-                                    }
-                                    if s.blocker.is_some() {
-                                        s.status = "unavailable".into();
-                                    }
-                                    Some(Cache {
-                                        version: VERSION,
-                                        provider,
-                                        scope: key,
-                                        cli_version: s.cli_version.clone().unwrap_or_default(),
-                                        refreshed_unix: s.refreshed_unix.unwrap(),
-                                        models: s.models.clone(),
-                                        diff: s.diff.clone(),
-                                        removed: s.removed.clone(),
-                                    })
-                                }
-                                Err(e) => {
-                                    if result.cli_version.is_some()
-                                        && s.blocker.as_ref().is_some_and(|b| {
-                                            b.kind == FailureKind::MissingExecutable
-                                        })
-                                    {
-                                        s.blocker = None;
-                                        s.execution_blocked = false;
-                                    }
-                                    if e.blocks() {
-                                        s.blocker = Some(e.clone());
-                                    }
-                                    s.status = if s.blocker.is_some() {
-                                        "unavailable"
-                                    } else if e.kind == FailureKind::Unsupported {
-                                        "unsupported_discovery"
-                                    } else if s.refreshed_unix.is_some() {
-                                        "cached_stale"
-                                    } else {
-                                        "discovery_failed"
-                                    }
-                                    .into();
-                                    s.error = Some(e);
-                                    if result.cli_version.is_some() {
-                                        s.cli_version = result.cli_version;
-                                    }
-                                    None
-                                }
-                            }
-                        };
-                        if let Some(cache) = cache {
-                            if let Err(e) = write_cache(&path, &cache) {
-                                state
-                                    .lock()
-                                    .unwrap()
-                                    .providers
-                                    .get_mut(&provider)
-                                    .unwrap()
-                                    .cache_error = Some(e);
-                            } else {
-                                state
-                                    .lock()
-                                    .unwrap()
-                                    .providers
-                                    .get_mut(&provider)
-                                    .unwrap()
-                                    .cache_error = None;
-                            }
-                        }
+                        refresh_provider(
+                            &state, discovery.as_ref(), &root, provider, policy, timeout, cancel,
+                        );
                     });
                 }
             });
