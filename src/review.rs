@@ -1,0 +1,1138 @@
+//! Engine-owned scope policy and snapshot-bound, immutable review gates.
+use super::*;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+fn git_bytes(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(out.stdout)
+}
+fn digest(bytes: &[u8]) -> Result<String, String> {
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bytes)
+        .map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("snapshot hashing failed".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .ok_or("missing digest")?
+        .into())
+}
+fn paths(bytes: &[u8]) -> Result<Vec<String>, String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            String::from_utf8(p.to_vec()).map_err(|_| "non-UTF8 path requires manual review".into())
+        })
+        .collect()
+}
+fn implementation(path: &str) -> bool {
+    path != ".forge" && !path.starts_with(".forge/")
+}
+
+/// A raw layout identity and a normalized final tree are both necessary: git add
+/// changes the former legitimately, but must never change reviewed content.
+fn snapshot(root: &str) -> Result<Value, String> {
+    let head = String::from_utf8(git_bytes(root, &["rev-parse", "HEAD"])?)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    let names = paths(&git_bytes(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?)?;
+    let mut names: std::collections::BTreeSet<_> = names
+        .into_iter()
+        .chain(paths(&git_bytes(
+            root,
+            &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        )?)?)
+        .filter(|p| implementation(p))
+        .collect();
+    let mut content = Vec::new();
+    for path in std::mem::take(&mut names) {
+        let full = PathBuf::from(root).join(&path);
+        let (mode, bytes) = match fs::symlink_metadata(&full) {
+            Ok(m) if m.is_symlink() => (
+                0o120000,
+                fs::read_link(&full)
+                    .map_err(|e| e.to_string())?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ),
+            Ok(m) if m.is_file() => (
+                if m.permissions().mode() & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                },
+                fs::read(&full).map_err(|e| e.to_string())?,
+            ),
+            Ok(_) => {
+                return Err(format!(
+                    "unsupported directory/submodule in snapshot: {path}"
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, vec![]),
+            Err(e) => return Err(e.to_string()),
+        };
+        let hash = digest(&bytes)?;
+        content.extend_from_slice(format!("{}:{path}:{mode}:{hash}\n", path.len()).as_bytes());
+    }
+    let head_ref = String::from_utf8_lossy(&git_bytes(
+        root,
+        &["rev-parse", "--symbolic-full-name", "HEAD"],
+    )?)
+    .trim()
+    .to_string();
+    content.extend_from_slice(head_ref.as_bytes());
+    let index = git_bytes(
+        root,
+        &["ls-files", "--stage", "-z", "--", ".", ":(exclude).forge"],
+    )?;
+    let staged = git_bytes(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+            ".",
+            ":(exclude).forge",
+        ],
+    )?;
+    let unstaged = git_bytes(
+        root,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+            ".",
+            ":(exclude).forge",
+        ],
+    )?;
+    let content_hash = digest(&content)?;
+    let mut raw = head.as_bytes().to_vec();
+    for part in [&index, &staged, &unstaged, &content] {
+        raw.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        raw.extend_from_slice(part);
+    }
+    // Isolated index computes the tree git add will produce without touching the real index.
+    let temp = std::env::temp_dir().join(format!(
+        "forge-review-index-{}",
+        crate::architecture::identity()
+    ));
+    let tree = (|| {
+        for args in [
+            vec!["read-tree", "HEAD"],
+            // Naming an ignored .forge even in an exclude pathspec makes git add fail.
+            // Reset runtime paths afterward, using this same isolated index.
+            vec!["add", "-A"],
+            vec!["reset", "-q", "HEAD", "--", ".forge"],
+        ] {
+            let out = Command::new("git")
+                .args(args)
+                .env("GIT_INDEX_FILE", &temp)
+                .current_dir(root)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+            }
+        }
+        let out = Command::new("git")
+            .arg("write-tree")
+            .env("GIT_INDEX_FILE", &temp)
+            .current_dir(root)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("cannot compute reviewed tree".into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    })();
+    let _ = fs::remove_file(temp);
+    Ok(json!({"head":head,"fingerprint":digest(&raw)?,"content":content_hash,"tree":tree?}))
+}
+fn dual(reason: &str) -> Value {
+    json!({"version":1,"required_roles":["architect","reviewer"],"scope":"code_or_contract","rationale":reason})
+}
+fn classify(root: &str, stage: &Value, promoted: bool) -> Result<Value, String> {
+    if promoted {
+        return Ok(dual("Dual review retained for this attempt"));
+    }
+    let intent = format!(
+        "{} {}",
+        stage["title"].as_str().unwrap_or(""),
+        stage["instructions"].as_str().unwrap_or("")
+    )
+    .to_lowercase();
+    let risky = |text: &str| {
+        let lower = text.to_lowercase();
+        [
+            "api",
+            "schema",
+            "interface",
+            "contract",
+            "architect",
+            "security",
+            "must",
+            "shall",
+            "required",
+            "guarantee",
+            "decision",
+            "config",
+            "build",
+            "executable",
+            "```",
+            "~~~",
+            "<script",
+            "<!--",
+            "\n    ",
+            "\t",
+            "`",
+            "permission",
+            "authentication",
+            "authorization",
+            "always",
+            "never",
+            "choose",
+            "chosen",
+            "=",
+            "{",
+            "}",
+            "print(",
+            "#!/",
+            "import ",
+            "export ",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+    };
+    if !["documentation", "prose", "spelling", "typo", "explanation"]
+        .iter()
+        .any(|s| intent.contains(s))
+        || risky(&intent)
+    {
+        return Ok(dual("Stage intent is code, contractual, or uncertain"));
+    }
+    let mut changed = paths(&git_bytes(
+        root,
+        &[
+            "diff",
+            "HEAD",
+            "--name-only",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).forge",
+        ],
+    )?)?;
+    changed.extend(paths(&git_bytes(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).forge",
+        ],
+    )?)?);
+    let untracked = paths(&git_bytes(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?)?;
+    // New/deleted/renamed documents, executable bits, and unknown formats are uncertain.
+    if untracked.iter().any(|p| implementation(p)) {
+        return Ok(dual(
+            "Untracked implementation content requires dual review",
+        ));
+    }
+    if changed.is_empty() {
+        return Ok(dual("Empty or uncertain implementation diff"));
+    }
+    for path in changed {
+        if !(path.ends_with(".md") || path.ends_with(".txt") || path.ends_with(".rst")) {
+            return Ok(dual("Mixed or non-prose file changes"));
+        }
+        let Ok(m) = fs::symlink_metadata(PathBuf::from(root).join(&path)) else {
+            return Ok(dual("Deleted or unreadable document"));
+        };
+        if !m.is_file() || m.mode() & 0o111 != 0 {
+            return Ok(dual("Non-ordinary document mode"));
+        }
+        let diff = git_bytes(
+            root,
+            &[
+                "diff",
+                "HEAD",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                "--",
+                &path,
+            ],
+        )?;
+        let mut diff = diff;
+        diff.extend(git_bytes(
+            root,
+            &[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+                &path,
+            ],
+        )?);
+        diff.extend(git_bytes(
+            root,
+            &["diff", "--no-ext-diff", "--no-textconv", "--", &path],
+        )?);
+        let diff = String::from_utf8(diff).map_err(|_| "non-text diff".to_string())?;
+        if diff.contains("new file mode")
+            || diff.contains("old mode")
+            || diff.contains("deleted file")
+            || risky(&diff)
+        {
+            return Ok(dual(
+                "Full diff contains executable, normative, architectural, or uncertain content",
+            ));
+        }
+    }
+    Ok(
+        json!({"version":1,"required_roles":["reviewer"],"scope":"ordinary_documentation","rationale":"Prose intent and full diff contain only existing non-executable documents without detected contractual or normative content; independent scope verification required"}),
+    )
+}
+struct UniqueJson(Value);
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON without duplicate keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<UniqueJson, A::Error> {
+                let mut values = vec![];
+                while let Some(UniqueJson(v)) = a.next_element()? {
+                    values.push(v);
+                }
+                Ok(UniqueJson(json!(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<UniqueJson, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = a.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate verdict key"));
+                    }
+                    let UniqueJson(v) = a.next_value()?;
+                    values.insert(key, v);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+fn criteria(acceptance: &str) -> Vec<&str> {
+    acceptance
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, String> {
+    if output.len() > 128 * 1024 {
+        return Err("oversized verdict".into());
+    }
+    let UniqueJson(mut v) =
+        serde_json::from_str(output).map_err(|e| format!("malformed verdict: {e}"))?;
+    if v["identity"] != *identity {
+        return Err("wrong or missing review identity".into());
+    }
+    if !v["approved"].is_boolean()
+        || v["summary"].as_str().is_none_or(|s| s.trim().is_empty())
+        || !v["requires_dual"].is_boolean()
+    {
+        return Err("missing verdict fields".into());
+    }
+    for field in ["issues", "checks"] {
+        if v[field].as_array().is_none_or(|a| {
+            a.iter()
+                .any(|s| s.as_str().is_none_or(|s| s.trim().is_empty()))
+        }) {
+            return Err(format!("malformed {field}"));
+        }
+    }
+    if v["notes"].is_null() {
+        v["notes"] = json!([]);
+    }
+    if v["notes"].as_array().is_none_or(|a| {
+        a.iter()
+            .any(|s| s.as_str().is_none_or(|s| s.trim().is_empty()))
+    }) {
+        return Err("malformed notes".into());
+    }
+    if !v["notes"].as_array().unwrap().is_empty() {
+        v["approved"] = json!(false);
+    }
+    if v["approved"] == true && !v["issues"].as_array().unwrap().is_empty() {
+        return Err("contradictory approval with requests".into());
+    }
+    if let Some(gap) = v["architecture_context_gap"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+    {
+        v["approved"] = json!(false);
+        v["issues"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(format!("Resolve architectural context gap: {gap}")));
+    }
+    if v["approved"] == true {
+        let required = criteria(acceptance);
+        if v["criteria"].as_array().is_none_or(|items| {
+            items.len() != required.len()
+                || required.iter().any(|criterion| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["criterion"] == *criterion
+                                && item["status"] == "passed"
+                                && item["evidence"]
+                                    .as_str()
+                                    .is_some_and(|s| !s.trim().is_empty())
+                        })
+                        .count()
+                        != 1
+                })
+        }) {
+            return Err("approval lacks individual criterion evidence".into());
+        }
+        if v["checks"].as_array().unwrap().is_empty()
+            || v["acceptance_evidence"]["acceptance"] != acceptance
+            || v["acceptance_evidence"]["verified"] != true
+            || v["acceptance_evidence"]["evidence"]
+                .as_str()
+                .is_none_or(|s| s.trim().is_empty())
+            || v["project_checks"].as_array().is_none_or(|a| {
+                a.is_empty()
+                    || a.iter().any(|c| {
+                        !matches!(c["status"].as_str(), Some("passed" | "unavailable"))
+                            || c["command"].as_str().is_none_or(|s| s.trim().is_empty())
+                            || c["evidence"].as_str().is_none_or(|s| s.trim().is_empty())
+                    })
+            })
+        {
+            return Err(
+                "approval lacks evidenced acceptance criteria or required project checks".into(),
+            );
+        }
+    } else if Ctx::review_requests(&v).is_empty() {
+        v["issues"] =
+            json!(["Review rejected without actionable details; verify the stage end to end"]);
+    }
+    Ok(v)
+}
+fn aggregate(identity: &Value, records: &[Value]) -> Value {
+    let required = identity["policy"]["required_roles"].as_array().unwrap();
+    let mut roles = json!({"architect":"not_required","reviewer":"pending"});
+    let mut requests = vec![];
+    for role in required {
+        let name = role.as_str().unwrap();
+        let record = records.iter().find(|r| {
+            r["identity"]["role"] == *role
+                && r["identity"]["snapshot"] == identity["snapshot"]
+                && r["identity"]["policy"] == identity["policy"]
+                && r["identity"]["plan_id"] == identity["plan_id"]
+                && r["identity"]["revision"] == identity["revision"]
+                && r["identity"]["stage_id"] == identity["stage_id"]
+                && r["identity"]["attempt_id"] == identity["attempt_id"]
+                && r["identity"]["round"] == identity["round"]
+        });
+        roles[name] = json!(match record {
+            Some(r) if r["approved"] == true && Ctx::review_requests(r).is_empty() => "approved",
+            Some(_) => "changes_requested",
+            None => "pending",
+        });
+        if let Some(r) = record {
+            for text in Ctx::review_requests(r) {
+                requests.push(json!({"role":name,"text":text}));
+            }
+        }
+    }
+    let approved = required
+        .iter()
+        .all(|r| roles[r.as_str().unwrap()] == "approved");
+    json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if approved {"approved"} else {"blocked"},"requests":requests})
+}
+
+impl Ctx {
+    fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
+        let provider = match implementer {
+            "codex" => "claude",
+            "claude" => "codex",
+            "mock" if self.setting("reviewer") == "mock" => "mock",
+            _ => return Err("cannot resolve independent reviewer provider".into()),
+        };
+        if self.setting("reviewer") != provider {
+            return Err(format!(
+                "independent reviewer must be configured as {provider}, the other provider relative to {implementer}"
+            ));
+        }
+        let model = self.setting("reviewer_model");
+        if provider != "mock" {
+            let policy =
+                crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            let selected = self.app.catalogue.execution_input(
+                &policy,
+                crate::catalogue::Provider::parse(provider).unwrap(),
+                &model,
+            );
+            if selected["eligible"] != true {
+                return Err(format!(
+                    "independent reviewer unavailable/incompatible: {selected}"
+                ));
+            }
+        }
+        Ok((provider.into(), model))
+    }
+
+    fn invoke_review(
+        &self,
+        plan: &mut Value,
+        idx: usize,
+        base: &Value,
+        role: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Value, String> {
+        let _guard = self.session.architect_lock.lock().unwrap();
+        let mut identity = base.clone();
+        identity["role"] = json!(role);
+        *plan = self.load_plan().ok_or("missing current review plan")?;
+        let mut cp = self.architecture_store().checkpoint(plan)?;
+        let mut context_stage = plan["stages"][idx].clone();
+        // Only preceding findings, never the other role's current endorsement.
+        context_stage["last_verdict"] = context_stage["previous_requests"].clone();
+        context_stage["last_verdict_valid"] = json!(true);
+        let mut prompt = self.stage_prompt(REVIEW_PROMPT, plan, &context_stage)?;
+        if role == "architect" {
+            prompt = prompt.replacen(
+                "You are an independent reviewer in a fresh session.",
+                "You are this plan's persistent architect in the saved session.",
+                1,
+            );
+        }
+        if plan["plan_id"] != base["plan_id"]
+            || plan["revision"] != base["revision"]
+            || plan["stages"][idx]["attempt_id"] != base["attempt_id"]
+        {
+            return Err("plan identity changed before review".into());
+        }
+        prompt.push_str(&format!(
+            "\nCRITERIA TO EVIDENCE: {}\n",
+            json!(criteria(
+                plan["stages"][idx]["acceptance"].as_str().unwrap_or("")
+            ))
+        ));
+        prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], cp["guidance"][plan["stages"][idx]["id"].to_string()], plan["plan_id"].as_str().unwrap()));
+        if role == "architect" {
+            let requests: Vec<_> = plan["stages"][idx]["reviews"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| {
+                    r["identity"]["round"] == base["round"]
+                        && r["identity"]["attempt_id"] == base["attempt_id"]
+                })
+                .flat_map(Ctx::review_requests)
+                .collect();
+            prompt.push_str(&format!(
+                "Current actionable independent requests (not an endorsement): {requests:?}\n"
+            ));
+            prompt.push_str("\nYou are the persistent architect reviewing recorded design, cross-stage interfaces and regressions. Your verdict has independent authority. For conflicting requests, record architectural clarification in architecture_context_gap without dismissing either role's unresolved findings.\n");
+        }
+        self.set_step(
+            plan["stages"][idx]["id"].as_i64(),
+            &format!("reviewing ({role})"),
+        );
+        for name in ["verdict.json", "architect-verdict.json"] {
+            match fs::remove_file(self.forge_path(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let turn = crate::architecture::identity();
+        let pending = self
+            .forge_path("architecture")
+            .join(plan["plan_id"].as_str().unwrap())
+            .join("architect-pending.json");
+        let session = cp["session"]["reference"].as_str().map(str::to_owned);
+        if role == "architect" {
+            if cp["session"]["provider"] != provider || cp["context_status"] != "ready" {
+                return Err("architect session requires recovery".into());
+            }
+            crate::architecture::atomic_json(
+                &pending,
+                &json!({"turn":turn,"previous_session":cp["session"]}),
+            )?;
+        }
+        let result = if provider == "mock" {
+            self.mock_review(&identity, &prompt, &plan["stages"][idx])
+        } else {
+            let effort = if role == "architect" {
+                self.bootstrap("architect")?.2
+            } else {
+                let policy =
+                    crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+                policy
+                    .entries
+                    .iter()
+                    .find(|e| e.provider.name() == provider && e.model == model)
+                    .map(|e| e.effort.clone())
+                    .unwrap_or_else(|| "provider_default".into())
+            };
+            self.run_agent(&AgentRequest {
+                role: if role == "architect" {
+                    "architect_review"
+                } else {
+                    "reviewer"
+                },
+                provider,
+                model,
+                effort: &effort,
+                session: if role == "architect" {
+                    session.as_deref()
+                } else {
+                    None
+                },
+                prompt: &prompt,
+            })
+        }?;
+        if self.session.stop_requested.load(Ordering::SeqCst) {
+            return Err("review stopped; approval invalid".into());
+        }
+        if snapshot(self.project())? != base["snapshot"] {
+            return Err("implementation or HEAD changed during review".into());
+        }
+        let mut verdict = normalize(
+            &result.output,
+            &identity,
+            plan["stages"][idx]["acceptance"].as_str().unwrap_or(""),
+        )?;
+        if verdict["approved"] == true && PathBuf::from(self.project()).join("Cargo.toml").is_file()
+        {
+            for command in ["cargo build", "cargo test"] {
+                if !verdict["project_checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| {
+                        c["status"] == "passed"
+                            && c["command"].as_str().is_some_and(|s| {
+                                s == command || s.starts_with(&format!("{command} "))
+                            })
+                    })
+                {
+                    return Err(format!("missing required successful {command} evidence"));
+                }
+            }
+        }
+        verdict["version"] = json!(1);
+        verdict["id"] = json!(crate::architecture::identity());
+        verdict["plan_id"] = base["plan_id"].clone();
+        verdict["stage_id"] = base["stage_id"].clone();
+        verdict["provider"] = json!(provider);
+        verdict["model"] = json!(if result.effective_model.is_empty() {
+            model
+        } else {
+            &result.effective_model
+        });
+        verdict["fresh_session"] = json!(role == "reviewer");
+        verdict["role"] = json!(role);
+        verdict["round"] = base["round"].clone();
+        verdict["attempt_id"] = base["attempt_id"].clone();
+        verdict["revision"] = base["revision"].clone();
+        verdict["policy"] = base["policy"].clone();
+        verdict["unix"] = json!(unix_timestamp());
+        if role == "architect"
+            && (result.session.as_deref() != session.as_deref()
+                || result
+                    .session
+                    .as_deref()
+                    .is_none_or(|s| !crate::agent::session_id(s)))
+        {
+            return Err("architect review session identity mismatch".into());
+        }
+        let stage = &mut plan["stages"][idx];
+        stage["context_valid"] = json!(true);
+        stage
+            .as_object_mut()
+            .unwrap()
+            .entry("reviews")
+            .or_insert(json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(verdict.clone());
+        if role == "reviewer" {
+            stage["last_verdict"] = verdict.clone();
+            stage["last_verdict_valid"] = json!(true);
+        }
+        if role == "architect" {
+            let reference = result
+                .session
+                .as_deref()
+                .filter(|s| crate::agent::session_id(s))
+                .ok_or("missing architect session identity")?;
+            if Some(reference) != session.as_deref() {
+                return Err("architect review changed session identity".into());
+            }
+            cp["last_turn"] = json!(turn);
+            cp["session"]["checkpoint_reference"] = json!(turn);
+            let _lock = self.session.persistence_lock.lock().unwrap();
+            *plan = self.architecture_store().publish(
+                plan.clone(),
+                cp,
+                json!({"kind":"architect_review","reviews":[verdict.clone()],"turn":turn}),
+            )?;
+        } else {
+            self.save_plan(plan)?;
+        }
+        self.record_stage_usage(plan, idx, role, provider, result.usage)?;
+        Ok(verdict)
+    }
+
+    fn mock_review(
+        &self,
+        identity: &Value,
+        prompt: &str,
+        stage: &Value,
+    ) -> Result<AgentResult, String> {
+        let role = identity["role"].as_str().unwrap();
+        let mut settings = self.app.settings.lock().unwrap();
+        let key = format!("mock_{role}_prompts");
+        settings
+            .as_object_mut()
+            .unwrap()
+            .entry(key)
+            .or_insert(json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(json!(prompt));
+        let key = if role == "architect" {
+            "mock_architect_verdicts"
+        } else {
+            "mock_verdicts"
+        };
+        #[cfg(test)]
+        if let Some(action) = settings[format!("mock_{role}_actions")]
+            .as_array_mut()
+            .filter(|a| !a.is_empty())
+            .map(|a| a.remove(0))
+        {
+            if let Some(writes) = action["write"].as_object() {
+                for (path, content) in writes {
+                    fs::write(
+                        PathBuf::from(self.project()).join(path),
+                        content.as_str().unwrap(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            if let Some(args) = action["git"].as_array() {
+                self.git(&args.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())?;
+            }
+            if action["stop"] == true {
+                self.session.stop_requested.store(true, Ordering::SeqCst);
+            }
+            if let Some(error) = action["error"].as_str() {
+                return Err(error.into());
+            }
+        }
+        let supplied = settings[key]
+            .as_array_mut()
+            .filter(|a| !a.is_empty())
+            .map(|a| a.remove(0));
+        let mut v = supplied.unwrap_or(json!({"approved":true,"summary":"Inspected mock implementation","issues":[],"checks":["Verified fixture"]}));
+        if let Some(raw) = v.as_str() {
+            return Ok(AgentResult {
+                output: raw.into(),
+                ..AgentResult::default()
+            });
+        }
+        if v["identity"].is_null() {
+            v["identity"] = identity.clone();
+        }
+        if v["requires_dual"].is_null() {
+            v["requires_dual"] = json!(false);
+        }
+        if v["criteria"].is_null() {
+            v["criteria"] = json!(criteria(stage["acceptance"].as_str().unwrap_or("")).iter().map(|s| json!({"criterion":s,"status":"passed","evidence":"Mock individual criterion verified"})).collect::<Vec<_>>());
+        }
+        if v["notes"].is_null() {
+            v["notes"] = json!([]);
+        }
+        if v["summary"].is_null() {
+            v["summary"] = json!("Mock review");
+        }
+        if v["checks"].is_null() {
+            v["checks"] = json!(["Verified mock fixture"]);
+        }
+        if v["acceptance_evidence"].is_null() {
+            v["acceptance_evidence"] = json!({"acceptance":stage["acceptance"].as_str().unwrap_or(""),"verified":true,"evidence":"Mock acceptance verified"});
+        }
+        if v["project_checks"].is_null() {
+            v["project_checks"] = json!([{"command":"mock checks","status":"passed","evidence":"Mock checks passed"}]);
+        }
+        let usage = settings["mock_usage"].as_object().map(|u| AgentUsage {
+            input_tokens: u.get("input").and_then(Value::as_i64).unwrap_or(0),
+            output_tokens: u.get("output").and_then(Value::as_i64).unwrap_or(0),
+            total_tokens: u.get("total").and_then(Value::as_i64).unwrap_or(0),
+            model: u.get("model").and_then(Value::as_str).unwrap_or("").into(),
+        });
+        drop(settings);
+        if usage.is_some() {
+            self.log_agent_finished(role, "mock", "", usage.as_ref());
+        }
+        let session = self
+            .architecture_store()
+            .checkpoint(&self.load_plan().unwrap())?["session"]["reference"]
+            .as_str()
+            .map(str::to_owned);
+        Ok(AgentResult {
+            output: v.to_string(),
+            session,
+            usage,
+            completed: true,
+            ..AgentResult::default()
+        })
+    }
+
+    pub(super) fn run_review_stage(
+        &self,
+        plan: &mut Value,
+        idx: usize,
+    ) -> Result<&'static str, String> {
+        let budget = plan["stages"][idx]["review_budget"].as_u64().unwrap_or(0);
+        let implementer = self.setting("implementer");
+        let (reviewer, reviewer_model) = match self.reviewer_config(&implementer) {
+            Ok(config) => config,
+            Err(error) => {
+                plan["stages"][idx]["review_gate"] = json!({"status":"configuration_blocked","error":error,"roles":{"architect":"no_current_verdict","reviewer":"unavailable_or_incompatible"}});
+                self.save_plan(plan)?;
+                return Ok("configuration_blocked");
+            }
+        };
+        let sid = plan["stages"][idx]["id"].as_i64().unwrap();
+        if plan["stages"][idx]["attempt_head"].is_null() {
+            plan["stages"][idx]["attempt_head"] = json!(self.git(&["rev-parse", "HEAD"])?);
+            self.save_plan(plan)?;
+        }
+        if plan["stages"][idx]["attempt_head"] != self.git(&["rev-parse", "HEAD"])? {
+            return Err("HEAD changed during stage attempt".into());
+        }
+        let start = plan["stages"][idx]["rounds"].as_u64().unwrap_or(0);
+        if start > budget {
+            let architect =
+                if plan["stages"][idx]["review_policy"]["scope"] == "ordinary_documentation" {
+                    "not_required"
+                } else {
+                    "no_current_verdict"
+                };
+            plan["stages"][idx]["review_gate"] = json!({"status":"exhausted","roles":{"architect":architect,"reviewer":"no_current_verdict"}});
+            self.save_plan(plan)?;
+            return Ok("exhausted");
+        }
+        for round in start..=budget {
+            if self.session.stop_requested.load(Ordering::SeqCst) {
+                return Ok("stopped");
+            }
+            // Reserve the round before any invocation; errors/restarts cannot replenish it.
+            plan["stages"][idx]["rounds"] = json!(round + 1);
+            plan["stages"][idx]["review_gate"] =
+                json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
+            plan["stages"][idx]["last_verdict_valid"] = json!(false);
+            self.save_plan(plan)?;
+            let template = if round == 0 {
+                IMPLEMENT_PROMPT
+            } else {
+                FIX_PROMPT
+            };
+            self.set_step(
+                Some(sid),
+                if round == 0 { "implementing" } else { "fixing" },
+            );
+            let mut stage = plan["stages"][idx].clone();
+            if round > 0 {
+                stage["last_verdict"] = stage["previous_requests"].clone();
+                stage["last_verdict_valid"] = json!(true);
+            }
+            let prompt = self.stage_prompt(template, plan, &stage)?;
+            let role = if round == 0 { "implementer" } else { "fixer" };
+            plan["stages"][idx]["implementer_provider"] = json!(implementer);
+            let usage = self.fresh_agent(
+                role,
+                &implementer,
+                &prompt,
+                &self.setting("implementer_model"),
+            )?;
+            self.record_stage_usage(plan, idx, role, &implementer, usage)?;
+            if self.session.stop_requested.load(Ordering::SeqCst) {
+                return Ok("stopped");
+            }
+            let snap = snapshot(self.project())?;
+            if snap["head"] != plan["stages"][idx]["attempt_head"] {
+                return Err("implementer changed HEAD".into());
+            }
+            let mut policy = classify(
+                self.project(),
+                &plan["stages"][idx],
+                plan["stages"][idx]["dual_promoted"] == true,
+            )?;
+            let mut base = json!({"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":sid,"attempt_id":plan["stages"][idx]["attempt_id"],"round":round+1,"policy":policy,"snapshot":snap});
+            let mut records = vec![];
+            loop {
+                plan["stages"][idx]["review_policy"] = policy.clone();
+                if policy["scope"] != "ordinary_documentation" {
+                    plan["stages"][idx]["dual_promoted"] = json!(true);
+                }
+                plan["stages"][idx]["review_gate"] = aggregate(&base, &records);
+                self.save_plan(plan)?;
+                // Independent goes first: a scope promotion can bind both required
+                // verdicts to the promoted policy before any fixer is allowed.
+                let v =
+                    self.invoke_review(plan, idx, &base, "reviewer", &reviewer, &reviewer_model)?;
+                let promote = v["requires_dual"] == true
+                    || v["architecture_context_gap"]
+                        .as_str()
+                        .is_some_and(|s| !s.trim().is_empty());
+                records.push(v);
+                plan["stages"][idx]["review_gate"] = aggregate(&base, &records);
+                self.save_plan(plan)?;
+                if policy["scope"] == "ordinary_documentation" && promote {
+                    let findings = records.last().map(Ctx::review_requests).unwrap_or_default();
+                    plan["stages"][idx]["previous_requests"] = json!({"approved":false,"summary":"Scope promotion; verify prior requests under dual policy", "issues":findings,"notes":[],"checks":[]});
+                    policy = dual("Independent reviewer identified architectural impact");
+                    base["policy"] = policy.clone();
+                    plan["stages"][idx]["dual_promoted"] = json!(true);
+                    continue;
+                }
+                if policy["scope"] != "ordinary_documentation" {
+                    let (provider, model, _) = self.bootstrap("architect")?;
+                    records.push(self.invoke_review(
+                        plan,
+                        idx,
+                        &base,
+                        "architect",
+                        &provider,
+                        &model,
+                    )?);
+                }
+                break;
+            }
+            let gate = aggregate(&base, &records);
+            let requests: Vec<_> = gate["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    format!(
+                        "[{}] {}",
+                        r["role"].as_str().unwrap(),
+                        r["text"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            plan["stages"][idx]["previous_requests"] = json!({"approved":false,"summary":"Combined unresolved role requests; both retain authority", "issues":requests,"notes":[],"checks":[]});
+            plan["stages"][idx]["review_gate"] = gate.clone();
+            self.save_plan(plan)?;
+            self.log_event(
+                "review",
+                &format!(
+                    "stage {sid} gate {}: architect {}, reviewer {}",
+                    gate["status"], gate["roles"]["architect"], gate["roles"]["reviewer"]
+                ),
+            );
+            if gate["status"] == "approved" {
+                return Ok("approved");
+            }
+            // Record clarification without erasing either role's requests.
+            let gaps: Vec<_> = records
+                .iter()
+                .filter_map(|r| r["architecture_context_gap"].as_str())
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if !gaps.is_empty() && round < budget {
+                let current = self.load_plan().ok_or("missing plan")?;
+                let mut cp = self.architecture_store().checkpoint(&current)?;
+                cp["guidance"][sid.to_string()]["valid"] = json!(false);
+                cp["guidance"][sid.to_string()]["invalidation_trigger"] =
+                    json!("reviewer_context_gap");
+                cp["context_gap"] = json!({"stage_id":sid,"text":gaps.join("\n"),"unresolved_requests":gate["requests"]});
+                let current = self.architecture_store().publish(current, cp, json!({"kind":"review_clarification_requested","requests":gate["requests"],"gaps":gaps}))?;
+                *plan = self.architect_publish(
+                    current.clone(),
+                    Some(&current),
+                    "review architectural clarification; retain both roles' unresolved authority",
+                )?;
+            }
+        }
+        Ok("exhausted")
+    }
+
+    pub(super) fn commit_reviewed(
+        &self,
+        plan: &Value,
+        idx: usize,
+        message: &str,
+    ) -> Result<Option<String>, String> {
+        let stage = &plan["stages"][idx];
+        let gate = &stage["review_gate"];
+        if gate["status"] != "approved"
+            || gate["identity"]["plan_id"] != plan["plan_id"]
+            || gate["identity"]["revision"] != plan["revision"]
+            || gate["identity"]["attempt_id"] != stage["attempt_id"]
+            || gate["identity"]["round"] != stage["rounds"]
+        {
+            return Err("no current aggregate review approval".into());
+        }
+        let persisted = self.load_plan().ok_or("missing persisted review gate")?;
+        if persisted["plan_id"] != plan["plan_id"]
+            || persisted["revision"] != plan["revision"]
+            || persisted["stages"][idx]["review_gate"] != *gate
+            || crate::plan::stage_inputs(&persisted, idx) != crate::plan::stage_inputs(plan, idx)
+        {
+            return Err("plan changed after review".into());
+        }
+        let expected = &gate["identity"]["snapshot"];
+        if snapshot(self.project())? != *expected {
+            return Err("implementation/index/HEAD changed after review".into());
+        }
+        if classify(self.project(), stage, stage["dual_promoted"] == true)?["scope"]
+            != gate["policy"]["scope"]
+        {
+            return Err("review scope changed before commit".into());
+        }
+        let current = aggregate(
+            &gate["identity"],
+            stage["reviews"].as_array().ok_or("missing reviews")?,
+        );
+        if current["status"] != "approved" {
+            return Err("missing current role approvals".into());
+        }
+        for role in gate["policy"]["required_roles"]
+            .as_array()
+            .ok_or("invalid gate roles")?
+        {
+            let mut identity = gate["identity"].clone();
+            identity["role"] = role.clone();
+            let record = stage["reviews"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["identity"] == identity)
+                .ok_or("missing current immutable verdict")?;
+            if normalize(
+                &record.to_string(),
+                &identity,
+                stage["acceptance"].as_str().unwrap_or(""),
+            )?["approved"]
+                != true
+            {
+                return Err("current verdict is not clean and evidenced".into());
+            }
+        }
+        // Match snapshot's staging: git add rejects an explicitly excluded ignored path.
+        self.git(&["add", "-A"])?;
+        self.git(&["reset", "-q", "HEAD", "--", ".forge"])?;
+        let staged = self.git(&["write-tree"])?;
+        let actual = snapshot(self.project())?;
+        if actual["head"] != expected["head"]
+            || actual["content"] != expected["content"]
+            || actual["tree"] != expected["tree"]
+            || staged != expected["tree"]
+        {
+            return Err("staged tree differs from reviewed content".into());
+        }
+        if staged == self.git(&["rev-parse", "HEAD^{tree}"])? {
+            return Ok(None);
+        }
+        // commit-tree fixes the exact reviewed tree; CAS update-ref rejects concurrent HEAD
+        // changes, and avoids hooks mutating the tree between verification and commit.
+        let head = expected["head"].as_str().unwrap();
+        let sha = self.git(&["commit-tree", &staged, "-p", head, "-m", message])?;
+        let last = snapshot(self.project())?;
+        if last != actual || self.session.stop_requested.load(Ordering::SeqCst) {
+            return Err("external edit or stop before commit".into());
+        }
+        self.git(&["update-ref", "-m", message, "HEAD", &sha, head])?;
+        let short = self.git(&["rev-parse", "--short", "HEAD"])?;
+        self.log_event("git", &format!("committed {short}: {message}"));
+        Ok(Some(short))
+    }
+}
+
+#[cfg(test)]
+#[path = "review_tests.rs"]
+mod tests;

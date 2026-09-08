@@ -99,8 +99,8 @@ fn atomic_json_checked(path: &Path, value: &Value, fail_sync: bool) -> Result<()
 pub(crate) fn checkpoint_default() -> Value {
     json!({"version": VERSION, "context_status": "inactive", "session": null,
         "summary": "", "recent_decisions": [], "guidance": {}, "agreements": {},
-        "review_policy": {"version": VERSION, "required_roles": ["reviewer"], "scope": "all",
-            "rationale": "Existing review path; architect review gates are not activated in stage one."}})
+        "review_policy": {"version": VERSION, "required_roles": ["architect", "reviewer"], "scope": "code_or_contract",
+            "rationale": "Conservative default; engine classifies each implementation snapshot before review."}})
 }
 fn validate_checkpoint(cp: &Value, plan: &Value) -> Result<(), String> {
     if cp["version"] != VERSION
@@ -1562,7 +1562,7 @@ mod tests {
         );
         assert_eq!(
             store.checkpoint(&p).unwrap()["review_policy"]["required_roles"],
-            json!(["reviewer"])
+            json!(["architect", "reviewer"])
         );
     }
 }

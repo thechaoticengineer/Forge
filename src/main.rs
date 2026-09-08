@@ -1161,12 +1161,12 @@ mod tests {
         assert_eq!(plan["planner_usage"], expected(1));
         assert_eq!(plan["stages"][0]["status"], "committed");
         assert_eq!(plan["stages"][0]["rounds"], 2);
-        assert_eq!(plan["stages"][0]["usage"], expected(4));
+        assert_eq!(plan["stages"][0]["usage"], expected(6));
         assert_eq!(plan["stages"][1]["status"], "committed");
-        assert_eq!(plan["stages"][1]["usage"], expected(2));
-        assert_eq!(plan["usage"], expected(6));
+        assert_eq!(plan["stages"][1]["usage"], expected(3));
+        assert_eq!(plan["usage"], expected(9));
         let history = test.app.read_history();
-        for role in ["planner", "implementer", "fixer", "reviewer"] {
+        for role in ["planner", "implementer", "fixer", "reviewer", "architect"] {
             assert!(history.as_array().unwrap().iter().any(|event|
                 event["kind"] == "agent"
                 && event["text"] == format!("[{role}] mock finished (125 tokens)")));
@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_run_keeps_usage_and_tracks_each_invocations_model() {
+    fn exhausted_run_keeps_usage_without_replenishing_budget() {
         let test = QueueTest::new(true);
         seed_mock_plan(&test.app);
         {
@@ -1216,7 +1216,7 @@ mod tests {
         let blocked = test.app.load_plan().unwrap();
         assert_eq!(blocked["stages"][0]["status"], "blocked");
         assert_eq!(blocked["usage"]["mock"], json!({
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 20, "calls": 2,
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 30, "calls": 3,
             "models": {"configured-model": 10},
         }));
         assert_eq!(blocked["stages"][0]["usage"], blocked["usage"]);
@@ -1224,15 +1224,9 @@ mod tests {
         test.app.app.settings.lock().unwrap()["mock_usage"]["model"] = json!("reported-model");
         test.app.run_worker();
         let plan = test.app.load_plan().unwrap();
-        assert_eq!(plan["status"], "done");
-        assert_eq!(plan["stages"][0]["usage"]["mock"], json!({
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 40, "calls": 4,
-            "models": {"configured-model": 10, "reported-model": 20},
-        }));
-        assert_eq!(plan["usage"]["mock"], json!({
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 60, "calls": 6,
-            "models": {"configured-model": 10, "reported-model": 40},
-        }));
+        assert_eq!(plan["stages"][0]["status"], "blocked");
+        assert_eq!(plan["stages"][0]["usage"], blocked["stages"][0]["usage"]);
+        assert_eq!(plan["usage"], blocked["usage"]);
     }
 
     #[test]
@@ -1397,9 +1391,9 @@ mod tests {
                 let mut completion = format!(
                     "all stages committed — run complete in {}", fmt_duration(duration));
                 if with_usage {
-                    assert_eq!(report["usage"], expected_usage(4));
+                    assert_eq!(report["usage"], expected_usage(6));
                     assert_eq!(report["planner_usage"], expected_usage(1));
-                    completion.push_str(" — 2 commits — mock: 500 tokens");
+                    completion.push_str(" — 2 commits — mock: 750 tokens");
                 } else {
                     assert!(report.get("usage").is_none());
                     assert!(report.get("planner_usage").is_none());
@@ -1521,18 +1515,18 @@ mod tests {
             let text = format!("stage {} committed in {duration}", stage["id"]);
             assert!(entries.iter().any(|entry| entry["goal"] == "second goal" && entry["text"] == text));
             let reviews = stage["reviews"].as_array().unwrap();
-            assert_eq!(reviews.len(), 1);
+            assert_eq!(reviews.len(), 2);
             assert_eq!(reviews[0]["round"], 1);
+            assert_eq!(reviews[1]["role"], "architect");
             assert_eq!(reviews[0]["approved"], true);
             assert_eq!(reviews[0]["issues"], json!([]));
             assert!(reviews[0]["unix"].as_i64().unwrap() > 0);
             let summary = reviews[0]["summary"].as_str().unwrap();
             assert!(!summary.is_empty());
-            assert_eq!(stage["last_verdict"], json!({
-                "approved": true, "summary": summary, "issues": [], "notes": [], "checks": [],
-            }));
+            assert_eq!(stage["last_verdict"], reviews[0]);
+            assert_eq!(stage["review_gate"]["status"], "approved");
             assert!(entries.iter().any(|entry| entry["kind"] == "review"
-                && entry["text"] == format!("stage {} approved: {summary}", stage["id"])));
+                && entry["text"].as_str().unwrap().starts_with(&format!("stage {} gate", stage["id"]))));
         }
     }
 
@@ -1628,7 +1622,17 @@ mod tests {
             stream.read_to_string(&mut response).unwrap();
             let (headers, body) = response.split_once("\r\n\r\n").unwrap();
             let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
-            (status, serde_json::from_str(body).unwrap())
+            let decoded = if headers.to_lowercase().contains("transfer-encoding: chunked") {
+                let mut rest = body; let mut decoded = String::new();
+                loop {
+                    let (size, tail) = rest.split_once("\r\n").unwrap();
+                    let size = usize::from_str_radix(size, 16).unwrap();
+                    if size == 0 { break; }
+                    decoded.push_str(&tail[..size]); rest = &tail[size + 2..];
+                }
+                decoded
+            } else { body.to_string() };
+            (status, serde_json::from_str(&decoded).unwrap())
         })
     }
 
@@ -1901,8 +1905,9 @@ mod tests {
             let test = QueueTest::new(true);
             test.app.app.settings.lock().unwrap()[role] = json!("invalid-agent");
             test.start();
-            assert_eq!(test.statuses(), ["failed", "queued"], "{role}");
-            assert_eq!(test.app.session.state.lock().unwrap().phase, "failed");
+            let expected = if role == "planner" { "failed" } else { "blocked" };
+            assert_eq!(test.statuses(), [expected, "queued"], "{role}");
+            assert_eq!(test.app.session.state.lock().unwrap().phase, expected);
             assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
             assert!(!test.app.session.busy.load(Ordering::SeqCst));
         }
@@ -1912,7 +1917,8 @@ mod tests {
     fn queue_blocked_stage_halts_and_releases_busy() {
         let test = QueueTest::new(true);
         // An exhausted review budget exercises the blocked-stage exit.
-        test.app.app.settings.lock().unwrap()["max_fix_rounds"] = json!(-1);
+        test.app.app.settings.lock().unwrap()["max_fix_rounds"] = json!(0);
+        test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([{ "approved": false, "issues": ["Unresolved defect"] }]);
         test.start();
         assert_eq!(test.statuses(), ["blocked", "queued"]);
         assert_eq!(test.app.session.state.lock().unwrap().phase, "blocked");
@@ -1928,534 +1934,8 @@ mod tests {
         assert_eq!(event["stage"], 1);
     }
 
-    #[test]
-    fn contradictory_review_runs_fixer_without_committing() {
-        let test = QueueTest::new(true);
-        let initial_head = test.app.git(&["rev-parse", "HEAD"]).unwrap();
-        let issues = json!(["Add the missing line."]);
-        {
-            let mut settings = test.app.app.settings.lock().unwrap();
-            settings["max_fix_rounds"] = json!(1);
-            settings["mock_verdicts"] = json!([
-                {"approved": true, "summary": "Looks good.", "issues": issues},
-                {"approved": false, "issues": issues},
-            ]);
-        }
-        seed_mock_plan(&test.app);
-        test.app.run_worker();
-        let plan = test.app.load_plan().unwrap();
-        let stage = &plan["stages"][0];
-        assert_eq!(stage["status"], "blocked");
-        assert_eq!(stage["rounds"], 2);
-        assert_eq!(stage["last_verdict"]["approved"], false);
-        let reviews = stage["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 2);
-        for review in reviews {
-            assert_eq!(review["approved"], false);
-            assert_eq!(review["issues"], issues);
-            assert_eq!(review["notes"], json!([]));
-            assert_eq!(review["checks"], json!([]));
-        }
-        assert_eq!(test.app.git(&["rev-parse", "HEAD"]).unwrap(), initial_head);
-        assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
-            "work by implementer\nwork by fixer\n");
-        let history = test.app.read_history();
-        let events = history.as_array().unwrap();
-        assert!(!events.iter().any(|entry| entry["kind"] == "review"
-            && entry["text"].as_str().unwrap().contains("approved")));
-        assert!(events.iter().any(|entry| entry["kind"] == "review"
-            && entry["text"] == "stage 1 changes requested: Add the missing line."));
-    }
-
-    #[test]
-    fn clean_initial_review_commits_without_a_fixer() {
-        assert!(default_settings().get("apply_review_notes").is_none());
-        for legacy_setting in [None, Some(true), Some(false)] {
-            for max_rounds in [0, 2] {
-                for summary in ["Verified the implementation.", ""] {
-                    let test = QueueTest::new(true);
-                    let checks = json!(["Inspected mock.txt.", "Verified the appended line."]);
-                    {
-                        let mut settings = test.app.app.settings.lock().unwrap();
-                        if let Some(value) = legacy_setting {
-                            settings["apply_review_notes"] = json!(value);
-                        }
-                        settings["max_fix_rounds"] = json!(max_rounds);
-                        settings["mock_verdicts"] = json!([
-                            {"approved": true, "summary": summary, "issues": [], "notes": [],
-                             "checks": ["Inspected mock.txt.", null, "Verified the appended line."]},
-                        ]);
-                    }
-                    seed_mock_plan(&test.app);
-                    test.app.run_worker();
-                    let plan = test.app.load_plan().unwrap();
-                    let stage = &plan["stages"][0];
-                    assert_eq!(stage["status"], "committed");
-                    assert_eq!(stage["rounds"], 1);
-                    assert_eq!(stage["last_verdict"], json!({
-                        "approved": true, "summary": summary, "issues": [],
-                        "notes": [], "checks": checks,
-                    }));
-                    let reviews = stage["reviews"].as_array().unwrap();
-                    assert_eq!(reviews.len(), 1);
-                    assert_eq!(reviews[0], json!({
-                        "round": 1, "approved": true, "summary": summary, "issues": [],
-                        "notes": [], "checks": checks, "unix": reviews[0]["unix"],
-                        "role": "reviewer", "revision": plan["revision"], "attempt_id": stage["attempt_id"],
-                    }));
-                    assert!(reviews[0]["unix"].as_i64().unwrap() > 0);
-                    let message = if summary.is_empty() {
-                        "stage 1 approved by reviewer".to_string()
-                    } else {
-                        format!("stage 1 approved: {summary}")
-                    };
-                    let history = test.app.read_history();
-                    let events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
-                        entry["kind"] == "review" && entry["stage"] == 1).collect();
-                    assert_eq!(events.len(), 1);
-                    assert_eq!(events[0]["text"], message);
-                    let committed_file = format!("{}:mock.txt", stage["sha"].as_str().unwrap());
-                    assert_eq!(test.app.git(&["show", &committed_file]).unwrap(), "work by implementer");
-                    assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
-                        "work by implementer\nwork by implementer\n");
-                    assert!(test.app.app.settings.lock().unwrap().get("mock_fixer_prompts").is_none());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_notes_preserve_feedback_and_checks_as_changes_requested() {
-        for approved in [false, true] {
-            let test = QueueTest::new(true);
-            let notes = json!(["Clarify the output.", "Simplify the helper."]);
-            let checks = json!(["Inspected mock.txt."]);
-            {
-                let mut settings = test.app.app.settings.lock().unwrap();
-                settings["max_fix_rounds"] = json!(0);
-                settings["mock_verdicts"] = json!([
-                    {"approved": approved, "summary": "Inspected the implementation.", "issues": [],
-                     "notes": ["Clarify the output.", 42, "Simplify the helper."],
-                     "checks": ["Inspected mock.txt.", null]},
-                ]);
-            }
-            seed_mock_plan(&test.app);
-            test.app.run_worker();
-            let plan = test.app.load_plan().unwrap();
-            let stage = &plan["stages"][0];
-            assert_eq!(stage["status"], "blocked");
-            let expected = json!({
-                "approved": false, "summary": "Inspected the implementation.",
-                "issues": [], "notes": notes, "checks": checks,
-            });
-            assert_eq!(stage["last_verdict"], expected);
-            let mut review = stage["reviews"][0].clone();
-            assert_eq!(review.as_object_mut().unwrap().remove("round"), Some(json!(1)));
-            assert!(review.as_object_mut().unwrap().remove("unix").unwrap().as_i64().unwrap() > 0);
-            assert_eq!(review.as_object_mut().unwrap().remove("role"), Some(json!("reviewer")));
-            assert_eq!(review.as_object_mut().unwrap().remove("revision"), Some(plan["revision"].clone()));
-            assert_eq!(review.as_object_mut().unwrap().remove("attempt_id"), Some(stage["attempt_id"].clone()));
-            assert_eq!(review, expected);
-            let history = test.app.read_history();
-            let events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
-                entry["kind"] == "review" && entry["stage"] == 1).collect();
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["text"],
-                "stage 1 changes requested: Clarify the output.; Simplify the helper.");
-        }
-    }
-
-    #[test]
-    fn requested_changes_repeat_fix_and_review_until_clean() {
-        for legacy_setting in [None, Some(true), Some(false)] {
-            for field in ["issues", "notes", "both"] {
-                for requested_rounds in [1, 2] {
-                    let test = QueueTest::new(true);
-                    let mut request = json!({"approved": true, "issues": [], "notes": []});
-                    if field != "notes" {
-                        request["issues"] = json!(["Clarify the output.", "Clarify the output."]);
-                    }
-                    if field != "issues" {
-                        request["notes"] = json!(["Clarify the output.", "Simplify the helper."]);
-                    }
-                    let mut verdicts = vec![request.clone(); requested_rounds];
-                    verdicts.push(json!({"approved": true, "issues": [], "notes": []}));
-                    {
-                        let mut settings = test.app.app.settings.lock().unwrap();
-                        if let Some(value) = legacy_setting {
-                            settings["apply_review_notes"] = json!(value);
-                        }
-                        settings["max_fix_rounds"] = json!(requested_rounds);
-                        settings["mock_verdicts"] = json!(verdicts);
-                    }
-                    seed_mock_plan(&test.app);
-                    test.app.run_worker();
-                    let plan = test.app.load_plan().unwrap();
-                    let stage = &plan["stages"][0];
-                    assert_eq!(stage["status"], "committed");
-                    assert_eq!(stage["rounds"], requested_rounds + 1);
-                    let reviews = stage["reviews"].as_array().unwrap();
-                    assert_eq!(reviews.len(), requested_rounds + 1);
-                    for (i, review) in reviews.iter().enumerate() {
-                        assert_eq!(review["round"], i + 1);
-                        assert_eq!(review["approved"], i == requested_rounds);
-                        if i < requested_rounds {
-                            assert_eq!(review["issues"], request["issues"]);
-                            assert_eq!(review["notes"], request["notes"]);
-                        } else {
-                            assert_eq!(review["issues"], json!([]));
-                            assert_eq!(review["notes"], json!([]));
-                        }
-                    }
-                    assert_eq!(stage["last_verdict"], json!({
-                        "approved": true, "summary": "", "issues": [], "notes": [], "checks": [],
-                    }));
-                    let fixed_content = format!("work by implementer\n{}", "work by fixer\n".repeat(requested_rounds));
-                    let committed_file = format!("{}:mock.txt", stage["sha"].as_str().unwrap());
-                    assert_eq!(test.app.git(&["show", &committed_file]).unwrap(), fixed_content.trim_end());
-                    assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
-                        format!("{fixed_content}work by implementer\n"));
-                    let history = test.app.read_history();
-                    let events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
-                        entry["kind"] == "review" && entry["stage"] == 1).collect();
-                    assert_eq!(events.len(), reviews.len());
-                    for (i, event) in events.iter().enumerate() {
-                        let text = event["text"].as_str().unwrap();
-                        if i < requested_rounds {
-                            assert!(text.starts_with("stage 1 changes requested:"));
-                            assert!(!text.contains("approved"));
-                        } else {
-                            assert_eq!(text, "stage 1 approved by reviewer");
-                        }
-                    }
-                    let settings = test.app.app.settings.lock().unwrap();
-                    let prompts = settings["mock_fixer_prompts"].as_array().unwrap();
-                    assert_eq!(prompts.len(), requested_rounds);
-                    for prompt in prompts {
-                        let prompt = prompt.as_str().unwrap();
-                        assert_eq!(prompt.matches("- Clarify the output.\n").count(), 1);
-                        assert_eq!(prompt.matches("- Simplify the helper.\n").count(), usize::from(field != "issues"));
-                        assert!(!prompt.contains("reviewer rejected without details"));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn follow_up_prompts_use_only_the_latest_stage_feedback_verbatim() {
-        for new_second_round_request in [false, true] {
-            let test = QueueTest::new(true);
-            let markers = "{goal} {plan_overview} {sid} {title} {instructions} {acceptance} {forge_dir} {verdict_path} {issues} {review_context}";
-            let issue = format!("Fix Unicode 界🙂 output.\nKeep these literals: {markers}");
-            let note = format!("Legacy request: preserve indentation.\n  Zażółć gęślą {markers}");
-            let summary = format!("Reviewed the output.\nRésumé 界🙂 {markers}");
-            let check = format!("cargo test: failed\nDetails 界🙂 {markers}");
-            let latest = format!("New defect: handle empty input.\nEvidence 界🙂 {markers}");
-            let latest_summary = "Previous output requests resolved; empty input still fails.";
-            let latest_check = "cargo test empty_input: failed";
-            let foreign = "OTHER STAGE FEEDBACK MUST STAY LOCAL";
-            let clean = json!({"approved": true, "summary": "Verified all criteria and fixes.",
-                "issues": [], "notes": [], "checks": ["cargo build: passed", "cargo test: passed"]});
-            let mut verdicts = vec![json!({
-                // Contradictory approval and duplicate legacy notes must be normalized.
-                "approved": true, "summary": summary, "issues": [issue, null, issue],
-                "notes": [issue, note, 42], "checks": [check, false],
-            })];
-            if new_second_round_request {
-                verdicts.push(json!({"approved": false, "summary": latest_summary,
-                    "issues": [latest], "checks": [latest_check]}));
-            }
-            verdicts.push(clean.clone());
-            verdicts.push(clean);
-            let fixes = if new_second_round_request { 2 } else { 1 };
-            {
-                let mut settings = test.app.app.settings.lock().unwrap();
-                settings["max_fix_rounds"] = json!(fixes);
-                settings["mock_verdicts"] = json!(verdicts);
-                settings["mock_reviewer_prompts"] = json!([]);
-            }
-            seed_mock_plan(&test.app);
-            let mut plan = test.app.load_plan().unwrap();
-            plan["goal"] = json!(format!("Goal with literal {markers}"));
-            plan["stages"][0]["title"] = json!("Title with literal {instructions}");
-            plan["stages"][0]["instructions"] = json!("Instructions with literal {acceptance}");
-            plan["stages"][0]["acceptance"] = json!("Criteria with literal {verdict_path}");
-            let other_verdict = json!({"approved": false, "summary": foreign,
-                "issues": [foreign], "notes": [], "checks": [foreign]});
-            plan["stages"][1]["last_verdict"] = other_verdict.clone();
-            plan["stages"][1]["reviews"] = json!([other_verdict]);
-            test.app.save_plan(&plan).unwrap();
-            test.app.run_worker();
-
-            let plan = test.app.load_plan().unwrap();
-            let stage = &plan["stages"][0];
-            assert_eq!(stage["status"], "committed");
-            assert_eq!(stage["rounds"], fixes + 1);
-            assert_eq!(stage["reviews"].as_array().unwrap().len(), fixes + 1);
-            assert_eq!(test.app.git(&["show", &format!("{}:mock.txt", stage["sha"].as_str().unwrap())]).unwrap(),
-                format!("work by implementer\n{}", "work by fixer\n".repeat(fixes)).trim_end());
-            assert_eq!(plan["stages"][1]["reviews"][0], other_verdict);
-
-            let settings = test.app.app.settings.lock().unwrap();
-            let reviews = settings["mock_reviewer_prompts"].as_array().unwrap();
-            let fixers = settings["mock_fixer_prompts"].as_array().unwrap();
-            assert_eq!(reviews.len(), fixes + 2); // Includes the next stage's initial review.
-            assert_eq!(fixers.len(), fixes);
-            let initial = reviews[0].as_str().unwrap();
-            assert!(initial.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
-            assert!(initial.contains("No previous review findings for this stage."));
-            assert!(!initial.contains("BEGIN PREVIOUS REVIEW CONTEXT"));
-            for prompt in reviews[..fixes + 1].iter().chain(fixers) {
-                let prompt = prompt.as_str().unwrap();
-                assert!(!prompt.contains(foreign));
-                assert!(prompt.contains("Title with literal {instructions}"));
-                assert!(prompt.contains("Instructions with literal {acceptance}"));
-                assert!(prompt.contains("Criteria with literal {verdict_path}"));
-            }
-            let preceding = format!(
-                "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{summary}\nOutstanding change requests (including legacy notes):\n- {issue}\n- {note}\nPrevious checks (must be verified again):\n- {check}\nEND PREVIOUS REVIEW CONTEXT\n"
-            );
-            for prompt in [&reviews[1], &fixers[0]] {
-                let prompt = prompt.as_str().unwrap();
-                assert!(prompt.contains("REVIEW ROUND: 2 (current attempt) — Re-review."));
-                assert!(prompt.contains("immediately preceding review in this attempt"));
-                assert!(prompt.contains(&preceding));
-                assert_eq!(prompt.matches(&issue).count(), 1);
-                assert_eq!(prompt.matches(&note).count(), 1);
-            }
-            assert!(fixers[0].as_str().unwrap().contains(&format!("Goal with literal {markers}")));
-            if new_second_round_request {
-                let preceding = format!(
-                    "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{latest_summary}\nOutstanding change requests (including legacy notes):\n- {latest}\nPrevious checks (must be verified again):\n- {latest_check}\nEND PREVIOUS REVIEW CONTEXT\n"
-                );
-                for prompt in [&reviews[2], &fixers[1]] {
-                    let prompt = prompt.as_str().unwrap();
-                    assert!(prompt.contains("REVIEW ROUND: 3 (current attempt) — Re-review."));
-                    assert!(prompt.contains(&preceding));
-                    for old_feedback in [&issue, &note, &summary, &check] {
-                        assert!(!prompt.contains(old_feedback));
-                    }
-                }
-                assert_eq!(stage["reviews"][1]["approved"], false);
-            }
-            let next_stage = reviews.last().unwrap().as_str().unwrap();
-            assert!(next_stage.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
-            assert!(next_stage.contains(foreign));
-            for feedback in [&issue, &note, &summary, &check, &latest] {
-                assert!(!next_stage.contains(feedback));
-            }
-        }
-    }
-
-    #[test]
-    fn unresolved_requests_exhaust_budget_without_commit_or_later_stage() {
-        for legacy_setting in [None, Some(true), Some(false)] {
-            for field in ["issues", "notes"] {
-                for max_rounds in [0, 1, 2] {
-                    let test = QueueTest::new(true);
-                    let initial_head = test.app.git(&["rev-parse", "HEAD"]).unwrap();
-                    let mut request = json!({"approved": true, "issues": [], "notes": []});
-                    request[field] = json!(["Clarify the output."]);
-                    {
-                        let mut settings = test.app.app.settings.lock().unwrap();
-                        if let Some(value) = legacy_setting {
-                            settings["apply_review_notes"] = json!(value);
-                        }
-                        settings["max_fix_rounds"] = json!(max_rounds);
-                        settings["mock_verdicts"] = json!(vec![request.clone(); max_rounds + 1]);
-                    }
-                    seed_mock_plan(&test.app);
-                    test.app.run_worker();
-                    let plan = test.app.load_plan().unwrap();
-                    let stage = &plan["stages"][0];
-                    assert_eq!(stage["status"], "blocked");
-                    assert_eq!(stage["rounds"], max_rounds + 1);
-                    assert!(stage.get("sha").is_none());
-                    assert_eq!(stage["last_verdict"]["approved"], false);
-                    assert_eq!(stage["last_verdict"][field], request[field]);
-                    let reviews = stage["reviews"].as_array().unwrap();
-                    assert_eq!(reviews.len(), max_rounds + 1);
-                    for review in reviews {
-                        assert_eq!(review["approved"], false);
-                        assert_eq!(review[field], request[field]);
-                    }
-                    assert_eq!(test.app.session.state.lock().unwrap().phase, "blocked");
-                    assert_eq!(test.app.git(&["rev-parse", "HEAD"]).unwrap(), initial_head);
-                    assert_eq!(plan["stages"][1]["status"], "pending");
-                    assert_eq!(plan["stages"][1]["rounds"], 0);
-                    assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
-                        format!("work by implementer\n{}", "work by fixer\n".repeat(max_rounds)));
-                    let history = test.app.read_history();
-                    let events: Vec<_> = history.as_array().unwrap().iter().filter(|entry|
-                        entry["kind"] == "review").collect();
-                    assert_eq!(events.len(), max_rounds + 1);
-                    assert!(events.iter().all(|entry| entry["text"]
-                        .as_str().unwrap().starts_with("stage 1 changes requested:")));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn review_notes_and_checks_default_to_empty_arrays() {
-        for verdict in [
-            json!({"approved": true}),
-            json!({"approved": true, "notes": "not an array", "checks": {"invalid": true}}),
-            json!({"approved": true, "notes": [42, null], "checks": [false, {}]}),
-        ] {
-            let test = QueueTest::new(true);
-            test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([verdict]);
-            seed_mock_plan(&test.app);
-            test.app.run_worker();
-            let plan = test.app.load_plan().unwrap();
-            let stage = &plan["stages"][0];
-            assert_eq!(stage["status"], "committed");
-            assert_eq!(stage["reviews"].as_array().unwrap().len(), 1);
-            for recorded in [&stage["last_verdict"], &stage["reviews"][0]] {
-                assert_eq!(recorded["notes"], json!([]));
-                assert_eq!(recorded["checks"], json!([]));
-            }
-        }
-    }
-
-    #[test]
-    fn review_history_preserves_rejections_after_fix_and_approval() {
-        let test = QueueTest::new(true);
-        let summary = "界🙂".repeat(200);
-        test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([
-            {"approved": false, "summary": "Inspected output; a line is missing.",
-             "issues": ["Add the missing line.", 42]},
-            {"approved": true, "summary": summary, "issues": []},
-        ]);
-        seed_mock_plan(&test.app);
-        test.app.run_worker();
-        let plan = test.app.load_plan().unwrap();
-        let stage = &plan["stages"][0];
-        assert_eq!(stage["status"], "committed");
-        let reviews = stage["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 2);
-        for (i, review) in reviews.iter().enumerate() {
-            assert_eq!(review["round"], i + 1);
-            assert_eq!(review["approved"], i == 1);
-            assert!(review["unix"].as_i64().unwrap() > 0);
-        }
-        assert_eq!(reviews[0]["summary"], "Inspected output; a line is missing.");
-        assert_eq!(reviews[0]["issues"], json!(["Add the missing line."]));
-        assert_eq!(reviews[1]["summary"], summary);
-        assert_eq!(reviews[1]["issues"], json!([]));
-        assert_eq!(stage["last_verdict"], json!({
-            "approved": true, "summary": summary, "issues": [], "notes": [], "checks": [],
-        }));
-        let history = test.app.read_history();
-        let events: Vec<_> = history.as_array().unwrap().iter()
-            .filter(|entry| entry["kind"] == "review" && entry["stage"] == 1).collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["text"], "stage 1 changes requested: Add the missing line.");
-        assert_eq!(events[1]["text"], format!("stage 1 approved: {}", "界🙂".repeat(150)));
-        assert_eq!(fs::read_to_string(test.path.join("mock.txt")).unwrap(),
-            "work by implementer\nwork by fixer\nwork by implementer\n");
-    }
-
-    #[test]
-    fn review_history_accumulates_after_exhaustion_and_resume() {
-        let test = QueueTest::new(true);
-        let resumed_rejection = json!({
-            "approved": false,
-            "summary": "The resumed implementation still misses an output line.",
-            "issues": ["Add the missing output line."],
-            "notes": [],
-            "checks": ["Compared the resumed output with the acceptance criteria."],
-        });
-        {
-            let mut settings = test.app.app.settings.lock().unwrap();
-            settings["max_fix_rounds"] = json!(1);
-            settings["mock_reviewer_prompts"] = json!([]);
-            settings["mock_verdicts"] = json!([
-                {"approved": false, "issues": []},
-                "not readable JSON",
-                resumed_rejection,
-                {"approved": true, "issues": []},
-            ]);
-        }
-        seed_mock_plan(&test.app);
-        test.app.run_worker();
-        let blocked = test.app.load_plan().unwrap();
-        assert_eq!(blocked["stages"][0]["status"], "blocked");
-        let previous = blocked["stages"][0]["reviews"].as_array().unwrap();
-        assert_eq!(previous.len(), 2);
-        for (i, review) in previous.iter().enumerate() {
-            assert_eq!(review["round"], i + 1);
-            assert_eq!(review["approved"], false);
-            assert_eq!(review["summary"], "");
-            assert!(review["unix"].as_i64().unwrap() > 0);
-        }
-        assert_eq!(previous[0]["issues"], json!(["reviewer rejected without details"]));
-        let missing_verdict_issues = json!([
-            "The previous review session failed to produce a verdict. Re-verify the implementation end to end."
-        ]);
-        assert_eq!(previous[1]["issues"], missing_verdict_issues);
-        assert_eq!(blocked["stages"][0]["last_verdict"], json!({
-            "approved": false, "summary": "", "issues": missing_verdict_issues, "notes": [], "checks": [],
-        }));
-
-        test.app.run_worker();
-        let resumed = test.app.load_plan().unwrap();
-        let stage = &resumed["stages"][0];
-        assert_eq!(stage["status"], "committed");
-        assert_eq!(stage["rounds"], 2);
-        let reviews = stage["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 4);
-        assert_eq!(&reviews[..2], previous.as_slice());
-        // Round numbers are local to the attempt; earlier attempts stay intact.
-        assert_eq!(reviews[2]["round"], 1);
-        for field in ["approved", "summary", "issues", "notes", "checks"] {
-            assert_eq!(reviews[2][field], resumed_rejection[field]);
-        }
-        assert!(reviews[2]["unix"].as_i64().unwrap() > 0);
-        assert_eq!(reviews[3]["round"], 2);
-        assert_eq!(reviews[3]["approved"], true);
-        assert_eq!(reviews[3]["summary"], "");
-        assert_eq!(reviews[3]["issues"], json!([]));
-        assert!(reviews[3]["unix"].as_i64().unwrap() > 0);
-        assert_eq!(stage["last_verdict"], json!({
-            "approved": true, "summary": "", "issues": [], "notes": [], "checks": [],
-        }));
-        assert!(test.app.read_history().as_array().unwrap().iter().any(|entry|
-            entry["kind"] == "review" && entry["text"] == "stage 1 approved by reviewer"));
-        let settings = test.app.app.settings.lock().unwrap();
-        let prompts = settings["mock_reviewer_prompts"].as_array().unwrap();
-        assert_eq!(prompts.len(), 5); // Four reviews of this stage, then the next stage.
-        assert!(prompts[0].as_str().unwrap().contains("No previous review findings for this stage."));
-        assert!(prompts[1].as_str().unwrap().contains("- reviewer rejected without details\n"));
-        let resumed_prompt = prompts[2].as_str().unwrap();
-        assert!(resumed_prompt.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
-        assert!(resumed_prompt.contains("from this stage's previous attempt"));
-        assert!(resumed_prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
-        assert!(!resumed_prompt.contains("reviewer rejected without details"));
-        let fixers = settings["mock_fixer_prompts"].as_array().unwrap();
-        assert_eq!(fixers.len(), 2); // One fix per attempt.
-        let preceding = format!(
-            "BEGIN PREVIOUS REVIEW CONTEXT\nEffective decision: changes requested\nSummary:\n{}\nOutstanding change requests (including legacy notes):\n- {}\nPrevious checks (must be verified again):\n- {}\nEND PREVIOUS REVIEW CONTEXT\n",
-            resumed_rejection["summary"].as_str().unwrap(),
-            resumed_rejection["issues"][0].as_str().unwrap(),
-            resumed_rejection["checks"][0].as_str().unwrap(),
-        );
-        for prompt in [&prompts[3], &fixers[1]] {
-            let prompt = prompt.as_str().unwrap();
-            assert!(prompt.contains("REVIEW ROUND: 2 (current attempt) — Re-review."));
-            assert!(prompt.contains("immediately preceding review in this attempt"));
-            assert!(prompt.contains(&preceding));
-            assert!(!prompt.contains("from this stage's previous attempt"));
-            assert!(!prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
-            assert!(!prompt.contains("reviewer rejected without details"));
-        }
-        let next_stage_prompt = prompts[4].as_str().unwrap();
-        assert!(next_stage_prompt.contains("REVIEW ROUND: 1 (current attempt) — Initial review."));
-        assert!(next_stage_prompt.contains("No previous review findings for this stage."));
-        assert!(!next_stage_prompt.contains(missing_verdict_issues[0].as_str().unwrap()));
-        assert!(!next_stage_prompt.contains(resumed_rejection["issues"][0].as_str().unwrap()));
-    }
+    // Scope, paired verdicts, evidence, budgets and review-history regressions
+    // are exercised in app::review::tests (src/review_tests.rs).
 
     #[test]
     fn claude_assistant_text() {

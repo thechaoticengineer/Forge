@@ -210,6 +210,7 @@ pub(crate) fn reconcile(old: &Value, new: &mut Value) -> Result<(), &'static str
         stage["rounds"] = json!(0);
         stage["context_valid"] = json!(false);
         stage["last_verdict_valid"] = json!(false);
+        stage["review_gate"] = json!({"status":"obsolete"});
         for key in ["guidance", "model_agreement"] {
             if stage[key].is_object() { stage[key]["valid"] = json!(false); }
         }

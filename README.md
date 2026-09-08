@@ -14,77 +14,130 @@ Rust engine + Quickshell (Omarchy) panel.
    criteria, and a proposed commit message.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
-   - the **implementer** (one tool) implements the stage,
-   - an independent, adversarial **reviewer** (the other tool, always a fresh session)
-     reviews the uncommitted diff and writes `.forge/verdict.json`,
-   - **changes requested** loop back to the implementer with all requested
-     edits, up to a bounded number of fix rounds,
-   - every fix gets another independent review in a fresh session, with the
-     previous findings supplied for verification,
-   - a **clean approval** ends the loop and the stage is committed with the
-     proposed message; remaining requests after the budget is exhausted block
-     the stage.
-5. After the last stage, Forge pushes to `origin`.
+   - the **implementer** implements the stage,
+   - the engine classifies the full implementation snapshot,
+   - a fresh, adversarial **independent reviewer** verifies the stage and its scope,
+   - the persistent **architect** also reviews code and architectural contracts,
+   - requested edits return to the implementer, followed by all required reviews again,
+   - the engine commits only a current, clean aggregate gate and the exact reviewed tree.
+5. After the last stage, Forge pushes to `origin` when `auto_push` is enabled.
 
-The reviewer starts by assuming there is a defect and actively looking for
-it in the diff and surrounding code. Before approving, it must verify each
-acceptance criterion individually and independently run the project's
-available build and tests. It must record the evidence and results, including
-exact commands; if a build or test is unavailable, it must explain how it
-established that. A failed or unrun available check, or an acceptance
-criterion it could not verify, requires changes requested.
+### Scope and review authority
 
-The reviewer's verdict has the shape
-`{"approved": bool, "summary": str, "issues": [str, ...], "notes": [str, ...], "checks": [str, ...]}`.
-The summary describes what the reviewer inspected and found, even on
-approval. `issues` contain every specific, actionable requested edit, including
-in-scope improvements; `checks` list the commands and inspections actually
-performed and their results, including each acceptance criterion. New verdicts
-must leave `notes` empty; the field remains for compatibility. `approved: true`
-requires both `issues` and `notes` to be empty and all acceptance criteria and
-checks verified. Requested edits require `approved: false` with actionable
-issues. Forge normalizes any verdict containing issues or legacy notes to
-changes requested, even if the reviewer supplied `approved: true`. Missing or
-unreadable verdicts and negative verdicts without findings produce a change
-request explaining the review failure.
+Scope policy version 1 belongs to the engine. Ordinary documentation needs one
+fresh independent review; **architect review is not required**. The engine
+records the committed outcome in the architectural checkpoint so subsequent
+stages retain context without an architect approval or summary turn.
 
-The `max_fix_rounds` setting (default `3`) limits extra fixer/review rounds
-after the initial implementation and review: by default, at most four reviews
-per stage attempt. A second round is conditional on findings; a clean first
-review proceeds directly to commit. Each subsequent round must independently
-verify the previous requests and inspect the current implementation for
-remaining or newly discovered in-scope defects. Reviewers must not repeat
-resolved requests without evidence or invent findings merely because this is
-a later round. Every remaining request requires another fix and review while
-budget remains; exhausted requests block, including on the initial review
-when `max_fix_rounds` is `0`. A clean approval on any round ends the loop.
+The documentation exception requires both prose-oriented stage intent and the
+actual full diff: staged changes, unstaged changes and untracked implementation
+content. Spelling, explanations and prose examples consistent with existing
+behavior can qualify. An extension or implementer declaration alone cannot
+qualify. API/schema/interface contracts, design decisions, normative architecture
+or security requirements, executable examples, build/configuration changes,
+mixed changes and uncertain scope require **both roles**, including in Markdown.
 
-Legacy settings containing `apply_review_notes` still load, but its value is
-ignored and it is no longer a default setting. Neither `false` nor exhausted
-budget allows notes to bypass the clean-approval requirement. There is no
-approval-triggered polishing step.
+The classifier deliberately errs toward dual review. It considers existing,
+non-executable `.md`, `.txt` and `.rst` files only; unknown/new/deleted files,
+mode changes, executable syntax, code fences and contractual/normative language
+in intent or full diff context require both roles. Its checks are conservative
+lexical signals, not proof of semantic equivalence. The independent reviewer
+must inspect actual behavior and confirm scope. It promotes suspected
+architectural impact with `requires_dual`, explaining why in `scope_reason`.
+Promotion records a new policy and requires new verdicts bound to that policy;
+previous verdicts remain historical. Scope is checked after each fix and before
+commit. Once dual review is required, it remains required for the attempt.
 
-Every review round is recorded in the stage's `reviews` array in
-`.forge/plan.json`, with `round` (starting at 1), `approved`, `summary`,
-`issues`, `notes`, `checks`, and `unix` (a Unix timestamp in seconds).
-The latest normalized verdict is also stored as `last_verdict`. Earlier
-feedback stays available through every fix and the final approval; completed
-entries are not rewritten. Round numbering restarts at 1 when a stage is
-retried in a new attempt, while earlier history remains intact. Saved
-`approved: true` records with no issues and nonempty notes display amber
-`approved with optional notes` in both stage summaries and review history,
-with the feedback labeled `optional notes`. Saved approvals containing issues
-retain the red `legacy approval with change requests` display. This historical
-rendering does not rewrite saved records or change the current reviewer
-contract: new approvals require empty issues and notes, and incoming legacy
-notes still normalize to changes requested.
+Both roles inspect the same HEAD, index and working content before a fixer
+runs. Reviews are sequential because the engine has one active-agent/log state.
+The architect checks recorded decisions, cross-stage interfaces and regressions.
+The independent reviewer receives agreed constraints and preceding actionable
+requests, never the architect's current approval as an endorsement. The engine
+resolves its provider as the other provider relative to the actual implementer.
+The configured reviewer must match that provider; known unavailable models or
+incompatible effort/permission capabilities block execution. Configured explicit
+unverified fallbacks remain visibly unverified until execution verifies them.
+No automatic model routing is introduced by this gate.
 
-If the reviewer still requests changes after the fix rounds, the stage is marked
-blocked and Forge stops for you. Full history of every agent session,
-verdict, and git action is visible in the panel and kept in
-`.forge/history.jsonl`. Final review approval events include the reviewer's
-summary, limited to 300 characters; the stage's `reviews` array keeps
-the full summary.
+Each role retains its authority. The aggregate keeps requests with `[architect]`
+or `[reviewer]` provenance. A reported `architecture_context_gap` requests a
+persistent architectural clarification and records its guidance/decisions;
+it does not erase either role's unresolved requests. Fixes must satisfy both
+roles wherever dual review applies. Clean first-round results need no fixer.
+
+### Verdict protocol and verification
+
+Reviewers return JSON in their final response; the engine alone publishes
+validated output. Old `.forge/verdict.json` and `architect-verdict.json` files
+are cleared before calls and cannot supply an approval. Every verdict echoes an
+exact `identity`: plan ID/revision, stage ID, attempt ID, round, role, policy and
+snapshot. The snapshot fingerprints HEAD and its symbolic reference, staged
+and unstaged diffs, index entries, and tracked/untracked implementation bytes
+and executable/symlink modes. Forge runtime artifacts under the root `.forge/`
+are excluded. A normalized tree hash separately represents the eventual commit.
+
+Alongside `approved`, `summary`, `issues`, `notes` and `checks`, output includes:
+
+- `requires_dual` and `scope_reason` for scope verification;
+- `criteria`, with each supplied criterion, its status and concrete evidence;
+- `acceptance_evidence`, echoing the complete acceptance text, verification and evidence;
+- `project_checks`, recording exact commands, passed/failed/unavailable status,
+  and actual output or evidence establishing that a check does not exist.
+
+Every acceptance criterion must be individually verified. The independent
+reviewer must run all available required project builds/tests, including for
+documentation. Rust repositories with a root `Cargo.toml` additionally require
+successful `cargo build` and `cargo test` entries at the engine boundary.
+Other project-specific requirements are discovered and verified by the reviewer.
+An unavailable dependency or sandbox restriction preventing an available check
+from running is a rejection. Evidence is validated structurally and inspected
+by the reviewing agents; the engine does not infer correctness from a command
+name alone. Failed, unrun or unevidenced available checks prevent approval.
+
+Reviews use Bubblewrap (`bwrap`) to make the host repository, Git metadata and
+Forge runtime files read-only. Private `/tmp` is writable for faithful scratch
+copies and build/test outputs. Only the selected provider's session directory
+is writable host state. Provider hooks, apps and external tool servers are
+disabled; the independent reviewer has no resume reference. Missing sandbox or
+permission capabilities fail closed. Reviewers run checks in scratch copies of
+the actual implementation without editing source, then return only scoped JSON.
+The engine also verifies content has not changed after each role.
+
+Missing/malformed/stale identities, malformed fields, contradictory approvals
+and missing evidence invalidate the round. Incoming legacy `notes` normalize
+to actionable requests even when `approved` was true; new output must leave
+notes empty. A rejected verdict without details receives a verification request.
+`apply_review_notes` is ignored and cannot bypass the gate.
+
+### Budgets, commits and history
+
+`max_fix_rounds` (default `3`) means extra fix/review rounds after the initial
+round: at most four implementation/fix rounds by default, each with all required
+roles. A scope promotion can require a fresh independent verdict in the same
+round under the new policy. Rounds are reserved durably before calls. Stops,
+errors, partial paired-review failure and process restarts consume the reserved
+round and never reset the saved budget or reuse approval. Exhaustion blocks the
+stage. An approved plan revision starts a new attempt; changing a setting or
+pressing Run again does not replenish the current attempt.
+
+Commit validation checks current required verdicts, identity, policy and the
+unchanged snapshot. After staging, the actual index tree must equal the reviewed
+normalized tree, with unchanged worktree content and HEAD. The engine creates
+that exact tree's commit with `git commit-tree` and advances HEAD with an expected
+old-value `git update-ref`; concurrent HEAD changes are rejected. This path does
+not run commit hooks, so required project checks must be evidenced during review.
+Successful commits add an engine checkpoint outcome without modifying reviewed
+files. The final content check happens immediately before the ref update;
+external tools should not edit a repository during an active stage.
+
+Immutable role records accumulate in `reviews`; `last_verdict` remains the
+latest independent verdict for compatibility. `review_policy` and the distinct
+`review_gate` expose current policy/reason, each role's outcome, aggregate status
+and actionable requests. An architect outcome of `not_required` explicitly means
+**architect review not required**, never approval. Historical approval is shown
+separately from current pending, blocked, error, interrupted or invalidated gates.
+Legacy note-only approvals keep their historical rendering; incoming notes never
+permit a current clean gate. Full feedback remains in paginated review history.
 
 ### Refactor plans
 
@@ -133,9 +186,10 @@ monotonic `revision` starting at 1. Manual edits and AI revisions retain the
 identity and advance its revision; execution updates retain the revision.
 Replacement plans, including successive queue goals, get fresh identities.
 Discarding a plan archives it; the next plan also gets a fresh identity.
-Every stage execution attempt has an `attempt_id`; review `round` numbering
-still restarts at 1 for each attempt. New review history includes its role,
-attempt identity, and plan revision.
+Every stage execution attempt has an `attempt_id` and saved review budget. Stops
+and restarts preserve both the attempt and consumed rounds. An approved plan
+revision starts a new attempt at round 1. Review records bind role, attempt,
+plan revision, scope policy and implementation fingerprint.
 
 Legacy plans remain readable without a write on startup or `/api/state`.
 Their first mutation lazily imports them, retaining unknown metadata, usage,
@@ -181,8 +235,8 @@ have stable IDs, rationale, alternatives/tradeoffs, status/supersession, stage,
 revision, and timestamps. Model records distinguish proposals, agreements, and
 effective provider/model/native effort; retain both participants' reasons,
 capability-policy/catalogue provenance, availability verification state, trigger,
-and superseded agreement. Model discovery and architect guidance are active. Stage model routing and dual review gates remain
-reserved for later stages; independent reviews still start fresh.
+and superseded agreement. Model discovery and architect guidance are active. Dual review gates are active; stage model routing remains reserved for later
+stages. Independent reviews always start fresh.
 
 Publication uses an explicit commit protocol under a per-project persistence
 mutex (one engine writer per project):
@@ -355,12 +409,13 @@ cargo run [/path/to/project]
 
 The engine serves a JSON API on `http://127.0.0.1:8734` for the panel
 (also usable with `curl`). Requires `claude` and/or `codex` CLIs on
-PATH, logged in.
+PATH, logged in. Review execution also requires `bwrap` and `sha256sum`.
 
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/architect/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
-Each reviewed stage has a **last completed review** chip showing its own
+Each stage shows its **review policy**, **architect and independent outcomes**,
+and **current aggregate gate**. Each reviewed stage also has a **historical review** chip showing its own
 round and decision: a clean `approved`, amber `approved with optional notes`
 for saved `approved: true` records with no issues and nonempty notes, or a red
 change-request decision. Saved approvals containing issues display
@@ -379,7 +434,7 @@ change requests, notes, checks under `verified:`, and timestamp (UTC).
 Earlier requests remain visible after final approval. Expanded history uses
 the same decisions, colors, and request counts as the chip: historical
 notes-only approvals display amber `approved with optional notes`, with their
-feedback labeled `optional notes`. Saved approvals containing issues retain
+feedback labeled `legacy notes (change requests)`. Saved approvals containing issues retain
 the red `legacy approval with change requests` label and request count;
 notes on change-request decisions are labeled `legacy notes (change requests)`.
 All feedback remains available through the paginated review history API. Plans with only `last_verdict`

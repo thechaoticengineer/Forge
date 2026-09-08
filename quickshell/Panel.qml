@@ -624,6 +624,17 @@ Item {
     return JSON.stringify([report.unix, report.goal, index])
   }
 
+  function reviewGateText(stage) {
+    const gate = stage.review_gate || {}
+    const policy = stage.review_policy || {}
+    const roles = gate.roles || {}
+    return "Review policy: " + (policy.scope || "pending")
+      + " · gate: " + (gate.status || "pending")
+      + "\nArchitect: " + (roles.architect === "not_required" ? "review not required" : (roles.architect || "pending"))
+      + " · Independent: " + (roles.reviewer || "pending")
+      + (policy.rationale ? "\n" + policy.rationale : "")
+  }
+
   function reviewStrings(values) {
     const strings = []
     // Nested ListView data may be a QML sequence rather than a JS Array.
@@ -2051,10 +2062,20 @@ Item {
                     font.bold: true
                   }
                   Text {
+                    visible: !!stageRow.modelData.review_gate
+                    width: stageRow.width
+                    text: root.reviewGateText(stageRow.modelData)
+                    textFormat: Text.PlainText
+                    color: root.mutedForeground
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Text {
                     visible: stageRow.reviewHistory.length > 0
                     width: Math.min(implicitWidth, stageRow.width)
                     text: stageRow.lastReview
-                      ? "last completed review · " + root.reviewRoundLabel(stageRow.lastReview)
+                      ? "historical review · " + root.reviewRoundLabel(stageRow.lastReview)
                         + ": " + stageRow.lastDecision.label
                         + (stageRow.modelData.last_verdict_valid === false ? " · obsolete for current work" : "")
                       : ""
@@ -2140,7 +2161,7 @@ Item {
                     spacing: 2
                     Text {
                       width: stageRow.width
-                      text: "review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
+                      text: (reviewRound.verdict.role || "reviewer") + " review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
                         + reviewRound.decision.label
                       textFormat: Text.PlainText
                       color: reviewRound.decision.optionalNotes ? root.working
@@ -2183,7 +2204,7 @@ Item {
                     Text {
                       visible: reviewRound.notes.length > 0
                       width: stageRow.width
-                      text: (reviewRound.decision.optionalNotes ? "optional notes:" : "legacy notes (change requests):")
+                      text: "legacy notes (change requests):"
                         + "\n• " + reviewRound.notes.join("\n• ")
                       textFormat: Text.PlainText
                       color: reviewRound.decision.optionalNotes ? root.working : root.mutedForeground

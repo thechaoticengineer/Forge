@@ -1,3 +1,5 @@
+#[path = "review.rs"]
+mod review;
 use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
@@ -478,8 +480,8 @@ impl Ctx {
                     let mut record = review.clone();
                     if record.is_object() {
                         record["version"] = json!(crate::architecture::VERSION);
-                        record["id"] = json!(crate::architecture::identity());
-                        record["policy"] = cp["review_policy"].clone();
+                        if record["id"].is_null() { record["id"] = json!(crate::architecture::identity()); }
+                        if record["policy"].is_null() { record["policy"] = cp["review_policy"].clone(); }
                         record["stage_id"] = stage["id"].clone();
                         if record["role"].is_null() { record["role"] = json!("reviewer"); }
                         reviews.push(record);
@@ -491,7 +493,7 @@ impl Ctx {
                 for stage in next["stages"].as_array().unwrap() {
                     let before = old["stages"].as_array().unwrap().iter().find(|s| s["id"] == stage["id"]);
                     if stage["status"] == "committed" && before.is_none_or(|s| s["status"] != "committed") {
-                        let outcome = json!({"stage_id":stage["id"],"revision":next["revision"],"status":"committed","sha":stage["sha"],"acceptance":stage["acceptance"].as_str().unwrap_or("").chars().take(500).collect::<String>(),"unix":unix_timestamp()});
+                        let outcome = json!({"stage_id":stage["id"],"revision":next["revision"],"status":"committed","sha":stage["sha"],"review_gate":stage["review_gate"],"review_policy":stage["review_policy"],"acceptance":stage["acceptance"].as_str().unwrap_or("").chars().take(500).collect::<String>(),"unix":unix_timestamp()});
                         outcomes.push(outcome.clone());
                         if !cp["execution_outcomes"].is_array() { cp["execution_outcomes"] = json!([]); }
                         let recent = cp["execution_outcomes"].as_array_mut().unwrap(); recent.push(outcome);
@@ -613,23 +615,6 @@ impl Ctx {
         }
     }
 
-    fn commit_stage(&self, message: &str) -> Result<Option<String>, String> {
-        // A pathspec naming FORGE_DIR makes `git add` fail when the project also
-        // gitignores it, so stage everything and unstage FORGE_DIR instead.
-        self.git(&["add", "-A"])?;
-        self.git(&["reset", "-q", "--", FORGE_DIR])?;
-        let exclude = format!(":(exclude){FORGE_DIR}");
-        let dirty = self.git(&["status", "--porcelain", "--", ".", &exclude])?;
-        if dirty.is_empty() {
-            self.log_event("git", "nothing to commit for this stage");
-            return Ok(None);
-        }
-        self.git(&["commit", "-m", message])?;
-        let sha = self.git(&["rev-parse", "--short", "HEAD"])?;
-        self.log_event("git", &format!("committed {sha}: {message}"));
-        Ok(Some(sha))
-    }
-
     // ---------------------------------------------------------- agents
 
     fn agent_command(request: &AgentRequest<'_>) -> Result<Command, String> {
@@ -728,6 +713,7 @@ impl Ctx {
         let built = Self::agent_command(request)?;
         let mut cmd = Command::new(&executable);
         cmd.args(built.get_args());
+        if matches!(role, "reviewer" | "architect_review") { cmd = crate::agent::review_sandbox(&cmd, self.project(), tool)?; }
         self.log_event("model", &format!("[{role}] {tool}/{} · {} · policy {} · effort {}",
             if model.is_empty() { "provider default" } else { model }, selection["availability"].as_str().unwrap_or("unverified"),
             policy.policy_revision, selection["effort"].as_str().unwrap_or("provider_default")));
@@ -839,7 +825,7 @@ impl Ctx {
             return Err(format!("{tool} exited with {status}: {etail} {tail}"));
         }
         if let Some(error) = result.error { return Err(self.agent_error(role, error)); }
-        if matches!(role, "architect" | "chat" | "planner") && !result.completed {
+        if matches!(role, "architect" | "architect_review" | "reviewer" | "chat" | "planner") && !result.completed {
             return Err("provider ended without a successful structured result".into());
         }
         if session.is_some() && result.session.as_deref() != session {
@@ -924,6 +910,13 @@ impl Ctx {
                     .map_err(|e| e.to_string())?;
             }
             "implementer" | "fixer" => {
+                #[cfg(test)]
+                if let Some(edits) = self.app.settings.lock().unwrap()["mock_edits"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)) {
+                    for (path, content) in edits.as_object().ok_or("invalid mock edits")? {
+                        fs::write(PathBuf::from(self.project()).join(path), content.as_str().unwrap()).map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
                 let mut f = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1325,130 +1318,34 @@ impl Ctx {
 
     /// Implement + independent review + bounded fix loop for one stage.
     fn run_one_stage(&self, plan: &mut Value, idx: usize) -> Result<&'static str, String> {
-        let max_rounds = self.app.settings.lock().unwrap()["max_fix_rounds"]
-            .as_i64()
-            .unwrap_or(3);
-        let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
-
-        for round in 0..=max_rounds {
+        let result = self.run_review_stage(plan, idx);
+        if let Err(error) = &result {
+            plan["stages"][idx]["review_gate"]["status"] = json!("error");
+            plan["stages"][idx]["review_gate"]["error"] = json!(error);
+            plan["stages"][idx]["last_verdict_valid"] = json!(false);
+            let stage = &plan["stages"][idx];
+            let mut requests = Self::review_requests(&stage["previous_requests"]);
+            for record in stage["reviews"].as_array().into_iter().flatten().filter(|r|
+                r["attempt_id"] == stage["attempt_id"] && r["round"] == stage["rounds"]) {
+                for request in Self::review_requests(record) {
+                    requests.push(format!("[{}] {request}", record["role"].as_str().unwrap_or("reviewer")));
+                }
+            }
+            requests.push(format!("[engine] {error}; re-verify the entire stage and all required checks"));
+            plan["stages"][idx]["previous_requests"] = json!({"approved":false,"summary":"Review interrupted or invalid; prior unresolved findings retain authority","issues":requests,"notes":[],"checks":[]});
             if self.session.stop_requested.load(Ordering::SeqCst) {
+                plan["stages"][idx]["review_gate"]["status"] = json!("interrupted");
+                self.save_plan(plan)?;
                 return Ok("stopped");
             }
-            plan["stages"][idx]["rounds"] = json!(round + 1);
             self.save_plan(plan)?;
-
-            let stage = plan["stages"][idx].clone();
-            let implementer = self.setting("implementer");
-            let usage = match round {
-                0 => {
-                    self.set_step(Some(sid), "implementing");
-                    let p = self.stage_prompt(IMPLEMENT_PROMPT, plan, &stage)?;
-                    self.fresh_agent("implementer", &implementer, &p,
-                                   &self.setting("implementer_model"))?
-                }
-                _ => {
-                    self.set_step(Some(sid), &format!("fixing (round {round})"));
-                    let p = self.stage_prompt(FIX_PROMPT, plan, &stage)?;
-                    self.fresh_agent("fixer", &implementer, &p,
-                                   &self.setting("implementer_model"))?
-                }
-            };
-            self.record_stage_usage(plan, idx, if round == 0 {"implementer"} else {"fixer"}, &implementer, usage)?;
-            if self.session.stop_requested.load(Ordering::SeqCst) {
-                return Ok("stopped");
-            }
-
-            self.set_step(Some(sid), "reviewing");
-            let verdict_path = self.forge_path("verdict.json");
-            let _ = fs::remove_file(&verdict_path);
-            let p = self.stage_prompt(REVIEW_PROMPT, plan, &stage)?;
-            let reviewer = self.setting("reviewer");
-            let usage = self.fresh_agent("reviewer", &reviewer, &p,
-                                       &self.setting("reviewer_model"))?;
-            self.record_stage_usage(plan, idx, "reviewer", &reviewer, usage)?;
-            if self.session.stop_requested.load(Ordering::SeqCst) {
-                return Ok("stopped");
-            }
-
-            let verdict: Option<Value> = fs::read_to_string(&verdict_path)
-                .ok()
-                .and_then(|t| serde_json::from_str(&t).ok());
-            let summary = verdict.as_ref()
-                .and_then(|v| v["summary"].as_str()).unwrap_or("");
-            let string_list = |field: &str| -> Vec<String> {
-                verdict.as_ref().and_then(|v| v[field].as_array())
-                    .map(|a| a.iter().filter_map(|i| i.as_str().map(String::from)).collect())
-                    .unwrap_or_default()
-            };
-            let notes = string_list("notes");
-            let checks = string_list("checks");
-            let (approved, list) = match &verdict {
-                Some(v) => {
-                    let mut list = string_list("issues");
-                    // Legacy notes are requested edits too, regardless of the incoming decision.
-                    let approved = v["approved"].as_bool() == Some(true)
-                        && list.is_empty() && notes.is_empty();
-                    if !approved && list.is_empty() && notes.is_empty() {
-                        list.push("reviewer rejected without details".into());
-                    }
-                    (approved, list)
-                }
-                None => (false, vec![
-                    "The previous review session failed to produce a verdict. \
-                     Re-verify the implementation end to end."
-                        .into(),
-                ]),
-            };
-            let plan_revision = plan["revision"].clone();
-            let stage = &mut plan["stages"][idx];
-            stage["last_verdict"] = json!({
-                "approved": approved, "summary": summary, "issues": list,
-                "notes": notes, "checks": checks,
-            });
-            stage["last_verdict_valid"] = json!(true);
-            stage["context_valid"] = json!(true);
-            let attempt = stage["attempt_id"].clone();
-            let requests = Self::review_requests(&stage["last_verdict"]);
-            stage.as_object_mut().unwrap().entry("reviews")
-                .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!({
-                    "role": "reviewer", "attempt_id": attempt, "revision": plan_revision,
-                    "round": round + 1, "approved": approved, "summary": summary,
-                    "issues": list, "notes": notes, "checks": checks, "unix": unix_timestamp(),
-                }));
-            self.save_plan(plan)?;
-
-            if approved {
-                let message = if summary.is_empty() {
-                    format!("stage {sid} approved by reviewer")
-                } else {
-                    let summary: String = summary.chars().take(300).collect();
-                    format!("stage {sid} approved: {summary}")
-                };
-                self.log_event("review", &message);
-                return Ok("approved");
-            }
-            if round < max_rounds {
-                if let Some(gap) = verdict.as_ref().and_then(|v| v["architecture_context_gap"].as_str()).filter(|s| !s.trim().is_empty() && s.len() <= 2000) {
-                    let current = self.load_plan().ok_or("missing plan for architectural context gap")?;
-                    let mut cp = self.architecture_store().checkpoint(&current)?;
-                    cp["guidance"][sid.to_string()]["valid"] = json!(false);
-                    cp["guidance"][sid.to_string()]["invalidation_trigger"] = json!("reviewer_context_gap");
-                    cp["context_gap"] = json!({"stage_id":sid,"text":gap});
-                    let current = {
-                        let _guard = self.session.persistence_lock.lock().unwrap();
-                        self.architecture_store().publish(current, cp, json!({"kind":"architect_context_gap","stage_id":sid,"text":gap}))?
-                    };
-                    *plan = self.architect_publish(current.clone(), Some(&current), "reviewer identified architectural context gap")?;
-                }
-            }
-            if verdict.is_none() {
-                self.log_event("error", "reviewer produced no readable verdict; retrying stage");
-            } else {
-                let summary: String = requests.join("; ").chars().take(1500).collect();
-                self.log_event("review", &format!("stage {sid} changes requested: {summary}"));
-            }
         }
-        Ok("exhausted")
+        if matches!(result, Ok("stopped")) {
+            plan["stages"][idx]["review_gate"]["status"] = json!("interrupted");
+            plan["stages"][idx]["last_verdict_valid"] = json!(false);
+            self.save_plan(plan)?;
+        }
+        result
     }
 
     pub(crate) fn run_worker(&self) {
@@ -1486,8 +1383,19 @@ impl Ctx {
             plan["stages"][idx]["status"] = json!("in_progress");
             plan["stages"][idx]["started_unix"] = json!(unix_timestamp());
             // A resumed stage starts a new attempt; completion timing is no longer current.
+            let plan_revision = plan["revision"].clone();
             let stage = plan["stages"][idx].as_object_mut().unwrap();
-            stage.insert("attempt_id".into(), json!(crate::architecture::identity()));
+            if stage.get("attempt_id").is_none() || stage.get("attempt_revision") != Some(&plan_revision) {
+                stage.insert("attempt_id".into(), json!(crate::architecture::identity()));
+                stage.insert("attempt_revision".into(), plan_revision);
+                stage.insert("rounds".into(), json!(0));
+                stage.insert("review_budget".into(), json!(self.app.settings.lock().unwrap()["max_fix_rounds"].as_i64().unwrap_or(3).max(0)));
+                stage.insert("dual_promoted".into(), json!(false));
+                stage.remove("attempt_head");
+                stage.remove("previous_requests");
+            }
+            stage.insert("review_gate".into(), json!({"status":"pending"}));
+            stage.insert("last_verdict_valid".into(), json!(false));
             stage.remove("finished_unix");
             stage.remove("duration_secs");
             self.save_plan(&plan)?;
@@ -1500,16 +1408,31 @@ impl Ctx {
                     self.log_event("run", "stopped by user; progress is saved, run again to continue");
                     return Ok(());
                 }
+                "configuration_blocked" => {
+                    self.finish_stage(&mut plan, idx, "blocked")?;
+                    self.set_phase("blocked");
+                    self.log_event("stage", &format!("stage {sid} blocked: independent reviewer configuration requires correction"));
+                    return Ok(());
+                }
                 "exhausted" => {
                     let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked")?);
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
-                        "stage {sid} blocked after {duration}: reviewer still rejecting after max fix rounds — needs a human"));
+                        "stage {sid} blocked after {duration}: required review gate is not clean after max fix rounds — needs a human"));
                     return Ok(());
                 }
                 _approved => {
                     let msg = plan["stages"][idx]["commit"].as_str().unwrap_or("forge: stage").to_string();
-                    let sha = self.commit_stage(&msg)?;
+                    let sha = match self.commit_reviewed(&plan, idx, &msg) {
+                        Ok(sha) => sha,
+                        Err(error) => {
+                            plan["stages"][idx]["review_gate"]["status"] = json!("invalidated");
+                            plan["stages"][idx]["review_gate"]["error"] = json!(error);
+                            plan["stages"][idx]["last_verdict_valid"] = json!(false);
+                            self.save_plan(&plan)?;
+                            return Err(error);
+                        }
+                    };
                     if let Some(sha) = sha {
                         plan["stages"][idx]["sha"] = json!(sha);
                     }

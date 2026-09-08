@@ -45,7 +45,7 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
         session,
         prompt,
     } = *request;
-    if session.is_some_and(|s| !session_id(s)) || (session.is_some() && role != "architect") {
+    if session.is_some_and(|s| !session_id(s)) || (session.is_some() && !matches!(role, "architect" | "architect_review")) {
         return Err("only architect may resume an exact UUID session".into());
     }
     if !model.is_empty() && !crate::catalogue::identifier(model) {
@@ -53,11 +53,12 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
     }
     if !matches!(
         role,
-        "architect" | "chat" | "planner" | "implementer" | "fixer" | "reviewer"
+        "architect" | "architect_review" | "chat" | "planner" | "implementer" | "fixer" | "reviewer"
     ) {
         return Err("unknown agent role".into());
     }
-    let readonly = matches!(role, "architect" | "chat" | "planner");
+    let review = matches!(role, "architect_review" | "reviewer");
+    let readonly = matches!(role, "architect" | "chat" | "planner") || review;
     let mut c = Command::new(provider);
     match provider {
         "codex" => {
@@ -65,7 +66,7 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
             if readonly {
                 c.args([
                     "--sandbox",
-                    "read-only",
+                    if review { "workspace-write" } else { "read-only" },
                     "--ignore-user-config",
                     "--ignore-rules",
                     "-c",
@@ -113,7 +114,7 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
                     "--permission-mode",
                     "dontAsk",
                     "--tools",
-                    "Read,Glob,Grep",
+                    if review { "Read,Glob,Grep,Bash" } else { "Read,Glob,Grep" },
                     "--strict-mcp-config",
                     "--mcp-config",
                     "{\"mcpServers\":{}}",
@@ -123,6 +124,7 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
             } else {
                 c.arg("--dangerously-skip-permissions");
             }
+            if review { c.args(["--allowedTools", "Read,Glob,Grep,Bash"]); }
             if let Some(id) = session {
                 c.args(["--resume", id]);
             }
@@ -151,7 +153,7 @@ pub(crate) fn verify_capabilities(
     use crate::catalogue_process::{Budget, CommandSpec, Launcher, SystemLauncher};
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
-    if !matches!(request.role, "architect" | "chat" | "planner") {
+    if !matches!(request.role, "architect" | "architect_review" | "reviewer" | "chat" | "planner") {
         return Ok(());
     }
     let args = if request.provider == "codex" {
@@ -211,6 +213,30 @@ pub(crate) fn verify_capabilities(
         );
     }
     Ok(())
+}
+
+/// Reviews can execute checks in private scratch space, but cannot write repository,
+/// Git metadata, Forge state, or arbitrary host paths. Fail closed if bwrap is absent.
+pub(crate) fn review_sandbox(command: &std::process::Command, project: &str, provider: &str) -> Result<std::process::Command, String> {
+    use std::path::PathBuf;
+    let mut c = std::process::Command::new("bwrap");
+    c.args(["--die-with-parent", "--new-session", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+    // Provider session persistence is the only writable host state. The provider
+    // flags independently disable hooks, apps and external tool servers.
+    let home = std::env::var_os("HOME").ok_or("missing provider home")?;
+    let home = PathBuf::from(home);
+    let codex = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
+    let project = std::fs::canonicalize(project).map_err(|e| e.to_string())?;
+    for path in [if provider == "codex" { codex } else { claude }] {
+        let path = std::fs::canonicalize(path).map_err(|e| format!("review provider state unavailable: {e}"))?;
+        if project.starts_with(&path) || path.starts_with(&project) { return Err("review state overlaps implementation".into()); }
+        c.arg("--bind").arg(&path).arg(&path);
+    }
+    // /tmp may contain the project in tests or user checkouts; restore it readonly.
+    c.arg("--ro-bind").arg(&project).arg(&project);
+    c.arg("--chdir").arg(&project).arg("--").arg(command.get_program()).args(command.get_args());
+    Ok(c)
 }
 
 #[derive(Default, Clone, Debug)]
