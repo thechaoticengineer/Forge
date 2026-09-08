@@ -53,6 +53,51 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn long_dependent_stages_publish_and_reload_without_duplicating_checkpoint_text() {
+    let f = Fixture::new();
+    let mut candidate = f.plan();
+    candidate["stages"] = json!((1..=4).map(|id| json!({
+        "id":id,"title":format!("Refactor stage {id}"),
+        "instructions":format!("Stage {id}: {}", "Preserve existing interfaces and behavior. ".repeat(160)),
+        "acceptance":format!("Stage {id}: {}", "All original assertions and checks pass. ".repeat(25)),
+        "commit":format!("refactor: stage {id}"),"status":"pending"
+    })).collect::<Vec<_>>());
+    let plan = f.ctx.architect_publish(candidate, None, "large initial plan").unwrap();
+    let checkpoint = f.cp(&plan);
+    assert!(serde_json::to_vec(&checkpoint).unwrap().len() > 128 * 1024);
+    let dir = f.ctx.forge_path("architecture").join(plan["plan_id"].as_str().unwrap());
+    let bundle: Value = serde_json::from_slice(&fs::read(dir.join("checkpoints")
+        .join(format!("{}.json", plan["architecture"]["checkpoint"].as_str().unwrap()))).unwrap()).unwrap();
+    assert_eq!(bundle["checkpoint"]["$forge_compact"], 1);
+    assert!(serde_json::to_vec(&bundle["checkpoint"]).unwrap().len() <= 64 * 1024);
+    let stored_event = fs::read(dir.join("events.jsonl")).unwrap();
+    assert!(stored_event.len() <= 64 * 1024);
+    assert_eq!(serde_json::from_slice::<Value>(&stored_event).unwrap()["$forge_compact"], 1);
+    let history = f.ctx.architecture_store().history(None, 0, 1).unwrap();
+    assert!(serde_json::to_vec(&history["items"][0]).unwrap().len() > 64 * 1024);
+    assert_eq!(history["items"][0]["payload"]["model_agreements"], checkpoint["agreements"]);
+    let rebuilt = Arc::new(App::new(f.root.to_str().unwrap(), f.ctx.app.settings.lock().unwrap().clone()));
+    let ctx = rebuilt.context(f.root.to_str().unwrap());
+    assert_eq!(ctx.load_plan().unwrap(), plan);
+    assert_eq!(ctx.architecture_store().checkpoint(&plan).unwrap(), checkpoint);
+    // Editing a dependency must still invalidate its transitive dependants;
+    // storage deduplication never substitutes a hash for exact input equality.
+    let mut edited = plan.clone();
+    edited["stages"][1]["instructions"] = json!("Changed stage 2 interface");
+    let edited = crate::plan::edit_plan(&plan, &json!({"plan":edited})).unwrap();
+    ctx.save_plan(&edited).unwrap();
+    let saved = ctx.load_plan().unwrap();
+    let cp = ctx.architecture_store().checkpoint(&saved).unwrap();
+    assert_eq!(cp["agreements"]["1"], checkpoint["agreements"]["1"]);
+    for id in ["2", "3", "4"] { assert_eq!(cp["agreements"][id]["valid"], false); }
+    assert_eq!(ctx.architecture_store().checkpoint(&plan).unwrap(), checkpoint);
+    let first_page = ctx.architecture_store().history(None, 0, 1).unwrap();
+    let cursor = first_page["next_cursor"].as_u64().unwrap();
+    assert_eq!(cursor, stored_event.len() as u64);
+    assert_eq!(ctx.architecture_store().history(None, cursor, 1).unwrap()["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn architect_keeps_identity_across_revisions_stages_reconstruction_and_completion() {
     let f = Fixture::new();
     let plan = f.initial();

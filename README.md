@@ -219,7 +219,7 @@ Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
   published plan and a bounded architecture checkpoint. The checkpoint holds
   the exact provider session and provider checkpoint reference, context summary,
   up to eight recent decision summaries, current guidance/agreements, and review
-  policy with its rationale. Architecture checkpoint data is limited to 64 KiB;
+  policy with its rationale. Stored architecture checkpoint data is limited to 64 KiB;
   execution loads restore the original review arrays and historical metadata.
 - `reviews/<file-id>.jsonl` and `.idx`: immutable review arrays and binary
   little-endian u64 record offsets. The plan's `architecture.review_history`
@@ -229,6 +229,18 @@ Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
   arrays reuse files, and removed stages retain their manifest entries.
 - `archived.json`: the last published plan reference, written before replacement
   or discard so its committed history remains addressable.
+
+Checkpoints and history events that exceed 64 KiB as plain JSON use a lossless
+`{"$forge_compact":1,"strings":[...],"value":...}` storage envelope. String values
+are stored once, so long stage descriptions repeated in transitive dependencies,
+guidance and model agreements do not multiply the stored size. Tagged object and
+string nodes preserve arbitrary user metadata without reference collisions.
+The stored limit remains 64 KiB (including the newline for events); expanded
+records and history pages are bounded at 4 MiB. Reads restore the exact original
+JSON before contract validation, routing comparisons, prompts and API responses.
+Existing plain version-one files remain readable and small new records retain
+their original format. Unknown encodings, invalid references and expansion beyond
+the bound fail closed. Oversized unique data reports its measured size and limit.
 
 `src/contracts.rs` defines version-one provider-neutral invocation/result,
 catalogue, decision, guidance, model-selection, and review records. Decisions
@@ -304,7 +316,8 @@ review pagination reads the legacy inline array.
 
 `GET /api/architecture/history?cursor=0&limit=20` pages committed events; follow
 `next_cursor` until null. Cursors are byte offsets at event boundaries. Pages
-are capped at 100 events and 256 KiB, with each event capped at 64 KiB. Add
+are capped at 100 events and 256 KiB of stored data (4 MiB expanded), with each
+stored event capped at 64 KiB. Add
 `plan_id=<archived-id>` to inspect a replaced/discarded plan, and the usual
 `project` query parameter for another project. State never reads the full
 architecture log. History pages include the stable `plan_id` and current
@@ -821,7 +834,8 @@ unchanged stage boundaries, stops and completion do not incur summary turns.
 Successful commits append engine-verified outcomes to durable history and a
 bounded recent checkpoint preview. The full plan retains all committed stages.
 
-Checkpoints are capped at 64 KiB and individual architect responses at 48 KiB.
+Stored checkpoints are capped at 64 KiB (4 MiB expanded), and individual architect
+responses at 48 KiB.
 Saved constraints and completed interfaces cannot be silently dropped; unresolved
 risks require explicit resolution by ID. Recent decision details remain bounded,
 while the append-only history retains full rationale, alternatives and

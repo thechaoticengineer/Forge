@@ -512,8 +512,15 @@ impl Ctx {
             if provider != "mock" {
                 let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
                 let selected = self.app.catalogue.execution_input(&policy, Provider::parse(&provider).ok_or("invalid architect provider")?, &model);
-                if !output.model_reported || selected["eligible"] != true || output.effective_model != selected["resolved_id"].as_str().unwrap_or(&model) {
-                    return Err("architect effective model missing, changed or ineligible".into());
+                if !output.model_reported {
+                    return Err("architect effective model missing: provider did not report a model in the stream or current session metadata; see model log".into());
+                }
+                if selected["eligible"] != true {
+                    return Err(format!("architect model is no longer eligible: {}", selected["error"].as_str().unwrap_or(&model)));
+                }
+                let expected = selected["resolved_id"].as_str().unwrap_or(&model);
+                if output.effective_model != expected {
+                    return Err(format!("architect effective model changed: expected {expected}, reported {}", output.effective_model));
                 }
             }
             if self

@@ -7,6 +7,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "architecture_storage.rs"]
+mod storage;
+
 pub(crate) const VERSION: u64 = 1;
 const CHECKPOINT_LIMIT: usize = 64 * 1024;
 const EVENT_LIMIT: usize = 64 * 1024;
@@ -114,10 +117,10 @@ fn validate_checkpoint(cp: &Value, plan: &Value) -> Result<(), String> {
             cp["context_status"].as_str(),
             Some("inactive" | "ready" | "needs_recovery")
         )
-        || serde_json::to_vec(cp).map_err(|e| e.to_string())?.len() > CHECKPOINT_LIMIT
     {
-        return Err("invalid or oversized architectural checkpoint".into());
+        return Err("invalid architectural checkpoint structure".into());
     }
+    storage::pack(cp, CHECKPOINT_LIMIT, "architectural checkpoint")?;
     let policy: crate::contracts::ReviewPolicy =
         serde_json::from_value(cp["review_policy"].clone()).map_err(|e| e.to_string())?;
     if policy.version != VERSION
@@ -421,7 +424,8 @@ impl Store {
             return Err("unsupported plan contract".into());
         }
         let dir = self.directory(id)?;
-        let bundle = read_json(&dir.join("checkpoints").join(format!("{token}.json")))?;
+        let mut bundle = read_json(&dir.join("checkpoints").join(format!("{token}.json")))?;
+        bundle["checkpoint"] = storage::unpack(bundle["checkpoint"].take(), CHECKPOINT_LIMIT, "architectural checkpoint")?;
         if bundle["version"] != VERSION
             || (bundle["plan"] != *plan && self.hydrate(bundle["plan"].clone())? != *plan)
         {
@@ -450,7 +454,7 @@ impl Store {
         if bytes.last() != Some(&b'\n') {
             return Err("unterminated committed event".into());
         }
-        let event: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let event = storage::unpack(serde_json::from_slice(&bytes).map_err(|e| e.to_string())?, EVENT_LIMIT - 1, "architecture event")?;
         if event["checkpoint"] != token
             || event["plan_id"] != id
             || event["revision"] != plan["revision"]
@@ -653,7 +657,8 @@ impl Store {
         };
         let event = json!({"version": VERSION, "id": identity(), "plan_id": id,
             "revision": revision, "unix": unix_timestamp(), "checkpoint": token, "payload": payload});
-        let mut bytes = serde_json::to_vec(&event).map_err(|e| e.to_string())?;
+        let stored_event = storage::pack(&event, EVENT_LIMIT - 1, "architecture event")?;
+        let mut bytes = serde_json::to_vec(&stored_event).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         if bytes.len() > EVENT_LIMIT {
             return Err("oversized architecture event".into());
@@ -723,7 +728,8 @@ impl Store {
         if stop == "reviews" {
             return Err("injected interruption after review files".into());
         }
-        let bundle = json!({"version": VERSION, "plan": plan, "checkpoint": cp});
+        let stored_cp = storage::pack(&cp, CHECKPOINT_LIMIT, "architectural checkpoint")?;
+        let bundle = json!({"version": VERSION, "plan": plan, "checkpoint": stored_cp});
         if stop == "partial_snapshot" {
             fs::write(
                 dir.join("checkpoints").join(format!(".{token}.tmp")),
@@ -885,7 +891,8 @@ impl Store {
         page["checkpoint"] = plan["architecture"]["checkpoint"].clone();
         Ok(page)
     }
-    /// Byte cursor, max 100 records / 256 KiB. Never reads beyond the published prefix.
+    /// Byte cursor, max 100 records / 256 KiB stored / 4 MiB expanded.
+    /// Never reads beyond the published prefix.
     pub(crate) fn history(
         &self,
         id: Option<&str>,
@@ -921,6 +928,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
         let mut items = Vec::new();
         let mut next = cursor;
+        let mut expanded_bytes = 0;
         for line in bytes
             .split_inclusive(|b| *b == b'\n')
             .take(limit.clamp(1, 100))
@@ -931,7 +939,11 @@ impl Store {
             if line.len() > EVENT_LIMIT {
                 return Err("oversized event".into());
             }
-            let item: Value = serde_json::from_slice(line).map_err(|e| e.to_string())?;
+            let item = storage::unpack(serde_json::from_slice(line).map_err(|e| e.to_string())?, EVENT_LIMIT - 1, "architecture event")?;
+            let item_bytes = serde_json::to_vec(&item).map_err(|e| e.to_string())?.len();
+            if !items.is_empty() && expanded_bytes + item_bytes > storage::EXPANDED_LIMIT {
+                break;
+            }
             if item["version"] != VERSION
                 || item["plan_id"] != plan["plan_id"]
                 || !item["id"].as_str().is_some_and(safe_id)
@@ -944,6 +956,7 @@ impl Store {
                 return Err("mismatched history event".into());
             }
             next += line.len() as u64;
+            expanded_bytes += item_bytes;
             items.push(item);
         }
         if items.is_empty() && cursor < end {
@@ -1206,6 +1219,54 @@ mod tests {
         }
         assert_eq!(reloaded["revision"], 1);
     }
+    #[test]
+    fn compact_records_keep_transaction_recovery_and_archive_history() {
+        for point in ["partial_event", "events", "partial_snapshot", "checkpoint", "publication_error", "publication"] {
+            let temp = Temp::new();
+            let store = temp.store();
+            let old = publish(&store);
+            let mut cp = checkpoint_default();
+            cp["retained_metadata"] = json!(vec!["long retained context ".repeat(200); 40]);
+            let payload = json!({"kind":"revision","retained_metadata":cp["retained_metadata"]});
+            let mut next = old.clone();
+            next["revision"] = json!(2);
+            assert!(store.publish_at(next.clone(), cp.clone(), payload.clone(), point).is_err());
+            let current = store.load().unwrap().unwrap();
+            if point == "publication" {
+                assert_eq!(store.checkpoint(&current).unwrap(), cp);
+            } else {
+                assert_eq!(current, old);
+                let committed = store.publish(next, cp.clone(), payload.clone()).unwrap();
+                assert_eq!(store.checkpoint(&committed).unwrap(), cp);
+            }
+            let current = store.load().unwrap().unwrap();
+            let history = store.history(None, 0, 10).unwrap();
+            assert_eq!(history["items"].as_array().unwrap().len(), 2);
+            assert_eq!(history["items"][1]["payload"], payload);
+            store.reset().unwrap();
+            assert_eq!(store.history(current["plan_id"].as_str(), 0, 10).unwrap()["items"], history["items"]);
+            assert_eq!(store.checkpoint(&current).unwrap(), cp);
+        }
+    }
+
+    #[test]
+    fn compact_history_pages_bound_expansion_and_preserve_byte_cursors() {
+        let temp = Temp::new();
+        let store = temp.store();
+        let payload = json!({"kind":"context","data":vec!["x".repeat(4000); 550]});
+        let first = store.publish(plan(), checkpoint_default(), payload.clone()).unwrap();
+        let second = store.publish(first.clone(), checkpoint_default(), payload.clone()).unwrap();
+        let page = store.history(None, 0, 100).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["payload"], payload);
+        assert_eq!(page["next_cursor"], first["architecture"]["event_end"]);
+        let page = store.history(None, page["next_cursor"].as_u64().unwrap(), 100).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["payload"], payload);
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(page["event_end"], second["architecture"]["event_end"]);
+    }
+
     #[test]
     fn interrupted_writes_recover_at_the_single_publication_boundary() {
         for point in [
