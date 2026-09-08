@@ -119,8 +119,8 @@ fn run(s: &Service, policy: &Policy, snaps: Vec<Snapshot>) {
     assert!(s.refresh(policy, snaps));
     wait(s);
 }
-const CODEX_URL: &str = "https://developers.openai.com/codex/models.json";
-const CLAUDE_URL: &str = "https://platform.claude.com/docs/models.json";
+const CODEX_URL: &str = "https://learn.chatgpt.com/docs/models.md";
+const CLAUDE_URL: &str = "https://platform.claude.com/docs/en/models/overview.md";
 
 #[test]
 fn zero_research_on_fresh_unchanged_startup_and_selective_refresh() {
@@ -677,4 +677,78 @@ fn catalogue_snapshot_covers_discovered_and_configured_only_models() {
     );
     // Capability changes move the fingerprint; unchanged discovery does not.
     assert_eq!(c.metadata_snapshot(&policy), snaps);
+}
+
+#[test]
+fn markdown_comparison_table_yields_exact_ids_and_token_counts() {
+    let doc = "\
+# Models overview\n\
+\n\
+| Feature | Claude A | Claude B | Claude C |\n\
+| :------ | :------- | :------- | :------- |\n\
+| Description | prose | prose | prose |\n\
+| [Pricing](https://platform.claude.com/docs/pricing) | $10 / MTok | $5 / MTok | $2 / MTok |\n\
+| Claude API ID | `model-a` | `model-b` | not-an-id |\n\
+| [Context window](https://platform.claude.com/docs/context) | 1M tokens | 200K tokens | 200K tokens |\n\
+| Max output | 128K tokens | 64K tokens | ~64K tokens |\n\
+| Reliable knowledge cutoff | Jun 2026 | May 2026 | May 2026 |\n";
+    let models = parse_document(doc.as_bytes()).unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models["model-a"]["context_window"], json!(1_000_000));
+    assert_eq!(models["model-a"]["max_output_tokens"], json!(128_000));
+    assert_eq!(models["model-b"]["context_window"], json!(200_000));
+    assert_eq!(models["model-b"]["max_output_tokens"], json!(64_000));
+    // Unrecognized labels, unbackticked IDs and non-exact counts stay unknown.
+    assert!(!models["model-a"].contains_key("pricing"));
+}
+
+#[test]
+fn markdown_slug_attributes_name_models_without_fields() {
+    let doc = "\
+## Recommended models\n\
+<ModelDetails name=\"gpt-x\" slug=\"gpt-x\" description=\"prose\" />\n\
+<ModelDetails slug=\"gpt-y-mini\" slug=\"bad id\" />\n";
+    let models = parse_document(doc.as_bytes()).unwrap();
+    assert_eq!(
+        models.keys().collect::<Vec<_>>(),
+        vec!["gpt-x", "gpt-y-mini"]
+    );
+    assert!(models.values().all(BTreeMap::is_empty));
+}
+
+#[test]
+fn markdown_without_documented_patterns_is_unsupported() {
+    for doc in [
+        "# Models\nJust prose about models.\n",
+        "| Feature | A |\n| :-- | :-- |\n| Context window | 1M tokens |\n",
+        "\u{fffd}\u{fffd}",
+    ] {
+        assert_eq!(
+            parse_document(doc.as_bytes()).unwrap_err(),
+            "unsupported document format"
+        );
+    }
+}
+
+
+#[test]
+fn stale_source_state_from_a_previous_adapter_url_is_pruned_on_refresh() {
+    let temp = Temp::new();
+    std::fs::write(
+        temp.store(),
+        json!({"version": 1, "records": [], "negative": [], "sources": {
+            "https://developers.openai.com/codex/models.json": {
+                "url": "https://developers.openai.com/codex/models.json",
+                "etag": null, "last_modified": null, "fingerprint": null,
+                "checked_unix": 999_000, "error": "http status 404",
+                "failures": 1, "next_attempt_unix": 2_000_000}}})
+        .to_string(),
+    )
+    .unwrap();
+    let clock = Arc::new(FakeClock(AtomicI64::new(1_000_000)));
+    let s = service(FakeFetch::new(), clock, &temp);
+    assert_eq!(s.summary()["source_errors"], 1);
+    run(&s, &Policy::default(), vec![]);
+    assert_eq!(s.summary()["source_errors"], 0);
+    assert!(s.details(&[])["sources"].as_array().unwrap().is_empty());
 }

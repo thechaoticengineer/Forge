@@ -229,13 +229,14 @@ pub(crate) fn retrieve(
     Err("too many redirects".into())
 }
 
-/// The documented source adapters: one machine-readable index document per
-/// provider. Documents that do not match the documented shape are unsupported
-/// and produce backoff state, never guesses.
+/// The documented source adapters: one official index document per provider —
+/// the markdown model pages both providers actually publish (no machine-readable
+/// JSON index exists). Documents that do not match a documented shape are
+/// unsupported and produce backoff state, never guesses.
 pub(crate) fn source_url(provider: Provider) -> &'static str {
     match provider {
-        Provider::Codex => "https://developers.openai.com/codex/models.json",
-        Provider::Claude => "https://platform.claude.com/docs/models.json",
+        Provider::Codex => "https://learn.chatgpt.com/docs/models.md",
+        Provider::Claude => "https://platform.claude.com/docs/en/models/overview.md",
     }
 }
 /// An API list rate is stored only when complete: currency, unit, billing
@@ -253,14 +254,23 @@ fn pricing(v: &Value) -> Option<Value> {
     Some(json!({"label": "api_list_rate", "currency": currency, "unit": unit,
         "basis": basis, "as_of": as_of, "input": input, "output": output}))
 }
-/// Documented shape: {"models":[{"id","context_window","max_output_tokens",
-/// "reasoning","lifecycle","pricing":{...}}]}. Fields are optional; absent or
-/// invalid values remain unknown.
+/// Documented shapes: a JSON index {"models":[{"id","context_window",
+/// "max_output_tokens","reasoning","lifecycle","pricing":{...}}]}, or the
+/// providers' official markdown model pages. Fields are optional; absent or
+/// unparseable values remain unknown rather than guessed.
 fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value>>, String> {
     if body.len() > MAX_BODY {
         return Err("document exceeds size limit".into());
     }
-    let doc: Value = serde_json::from_slice(body).map_err(|_| "unsupported document format")?;
+    let Ok(doc) = serde_json::from_slice::<Value>(body) else {
+        let text = std::str::from_utf8(body).map_err(|_| "unsupported document format")?;
+        let models = parse_markdown(text);
+        return if models.is_empty() {
+            Err("unsupported document format".into())
+        } else {
+            Ok(models)
+        };
+    };
     let rows = doc["models"]
         .as_array()
         .filter(|a| a.len() <= 512)
@@ -291,6 +301,92 @@ fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value
         models.insert(id.to_string(), fields);
     }
     Ok(models)
+}
+
+/// Markdown extraction is limited to two exact, bounded patterns the official
+/// pages publish: comparison tables keyed by a "Claude API ID" row (context
+/// window and max output per column) and `slug="…"` model attributes, which
+/// name models without providing routing facts. Prose is never interpreted.
+fn parse_markdown(text: &str) -> BTreeMap<String, BTreeMap<String, Value>> {
+    let mut models = BTreeMap::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("slug=\"") {
+        rest = &rest[i + 6..];
+        let Some(j) = rest.find('"') else { break };
+        let id = &rest[..j];
+        if identifier(id) && models.len() < 512 {
+            models.entry(id.to_string()).or_default();
+        }
+        rest = &rest[j + 1..];
+    }
+    let mut table: Vec<Vec<String>> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('|') && line.ends_with('|') && line.len() > 1 {
+            let cells: Vec<String> = line[1..line.len() - 1]
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect();
+            // Alignment separators carry no data.
+            if !cells
+                .iter()
+                .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, ':' | '-')))
+            {
+                table.push(cells);
+            }
+        } else if !table.is_empty() {
+            table_facts(&table, &mut models);
+            table.clear();
+        }
+    }
+    table_facts(&table, &mut models);
+    models
+}
+/// One comparison table: the "Claude API ID" row names each column's model;
+/// only exactly recognized rows contribute fields.
+fn table_facts(table: &[Vec<String>], models: &mut BTreeMap<String, BTreeMap<String, Value>>) {
+    let ids: Vec<Option<String>> = match table.iter().find(|r| r.first().is_some_and(|c| plain_label(c) == "Claude API ID")) {
+        Some(row) => row[1..]
+            .iter()
+            .map(|c| {
+                let id = c.trim_matches('`');
+                (c.starts_with('`') && c.ends_with('`') && identifier(id)).then(|| id.to_string())
+            })
+            .collect(),
+        None => return,
+    };
+    for row in table {
+        let field = match row.first().map(|c| plain_label(c)).as_deref() {
+            Some("Context window") => "context_window",
+            Some("Max output") => "max_output_tokens",
+            _ => continue,
+        };
+        for (id, cell) in ids.iter().zip(&row[1..]) {
+            if let (Some(id), Some(n)) = (id, token_count(cell)) {
+                if models.len() < 512 || models.contains_key(id) {
+                    models.entry(id.clone()).or_default().insert(field.into(), json!(n));
+                }
+            }
+        }
+    }
+}
+/// A label cell is plain text or a single markdown link around it.
+fn plain_label(cell: &str) -> String {
+    match (cell.strip_prefix('['), cell.split_once("](")) {
+        (Some(_), Some((label, _))) => label[1..].to_string(),
+        _ => cell.to_string(),
+    }
+}
+/// Exact token counts like "200K tokens" or "1M tokens"; anything else stays unknown.
+fn token_count(cell: &str) -> Option<u64> {
+    let v = cell.strip_suffix(" tokens")?;
+    let (digits, mult) = match v.strip_suffix('M') {
+        Some(n) => (n, 1_000_000),
+        None => (v.strip_suffix('K')?, 1_000),
+    };
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 pub(crate) fn fingerprint(bytes: &[u8]) -> String {
@@ -540,6 +636,13 @@ fn run_pass(
         let s = state.lock().unwrap();
         (s.records.clone(), s.negative.clone(), s.sources.clone())
     };
+    // A source URL that is no longer an adapter's target would otherwise keep
+    // its stored freshness and error state — and its errors — forever.
+    sources.retain(|url, _| {
+        [Provider::Codex, Provider::Claude]
+            .iter()
+            .any(|p| source_url(*p) == url)
+    });
     // Selective research: only new/retargeted/materially changed models, newly
     // missing routing fields, TTL-expired records, or due negative retries.
     let mut by_url: BTreeMap<&'static str, Vec<&Snapshot>> = BTreeMap::new();

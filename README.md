@@ -687,10 +687,15 @@ Sources are limited to an enforceable HTTPS allowlist —
 `code.claude.com` and `platform.claude.com` — with every redirect hop
 revalidated; off-allowlist URLs, ports, credentials and non-HTTPS schemes are
 rejected. Two documented source adapters are fetched, one index document per
-provider (`developers.openai.com/codex/models.json` and
-`platform.claude.com/docs/models.json`), expected to contain
+provider (`learn.chatgpt.com/docs/models.md` and
+`platform.claude.com/docs/en/models/overview.md`). A JSON body must contain
 `{"models":[{"id", "context_window", "max_output_tokens", "reasoning",
-"lifecycle", "pricing"}]}`. Document content is data, never instructions.
+"lifecycle", "pricing"}]}`; a markdown body is read only through two exact,
+bounded patterns the official pages publish — comparison tables keyed by a
+"Claude API ID" row (context window and max output per column) and
+`slug="…"` model attributes, which name models without providing routing
+facts. Prose is never interpreted; unparseable values stay unknown. Document
+content is data, never instructions.
 Unsupported documents and models absent from their source get negative-cache
 entries with exponential backoff (1 h doubling, capped at 24 h) instead of
 arbitrary browsing or fabricated facts. Fields a source does not provide are

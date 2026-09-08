@@ -23,12 +23,12 @@ impl Clock for Time { fn now_unix(&self) -> i64 { self.0.load(Ordering::SeqCst) 
 struct OfficialFixture(Mutex<Vec<FetchRequest>>);
 impl Fetch for OfficialFixture {
     fn fetch(&self, r: &FetchRequest) -> Result<FetchResponse, String> {
-        assert!(matches!(r.url.as_str(), "https://developers.openai.com/codex/models.json" | "https://platform.claude.com/docs/models.json"));
+        assert!(matches!(r.url.as_str(), "https://learn.chatgpt.com/docs/models.md" | "https://platform.claude.com/docs/en/models/overview.md"));
         let mut calls = self.0.lock().unwrap();
         let revalidate = calls.iter().any(|old| old.url == r.url);
         if revalidate { assert!(r.etag.is_some()); }
         calls.push(r.clone());
-        let ids = if r.url.contains("openai") { vec!["small", "large"] } else { vec!["other"] };
+        let ids = if r.url.contains("chatgpt") { vec!["small", "large"] } else { vec!["other"] };
         Ok(FetchResponse { status: if revalidate {304} else {200}, location: None,
             etag: Some("fixture-v1".into()), last_modified: None,
             body: if revalidate { vec![] } else { json!({"models":ids.iter().map(|id| json!({
