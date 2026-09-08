@@ -289,7 +289,7 @@ fn architect_turn_validation_preserves_constraints_and_requires_risk_resolution(
     cp["unresolved_risks"] = json!([{"id":"risk-1","text":"unresolved"}]);
     let good = f
         .ctx
-        .mock_architect(&p, &cp, &[1], "", None)
+        .mock_architect(&p, &cp, &[1], &[], "", None)
         .unwrap()
         .output;
     assert!(apply_turn(&p, &cp, &good, &BTreeMap::new(), &[1]).is_ok());
@@ -344,7 +344,7 @@ fn strong_bootstraps_are_separate_configured_and_availability_unverified() {
     assert!(f.ctx.bootstrap("architect").is_err());
     f.ctx.app.settings.lock().unwrap()["architect_model"] = json!("architect-strong");
     f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][1]["effort"] = json!("high");
-    assert!(f.ctx.bootstrap("architect").is_err()); // Cannot guess effort from configured capability tier.
+    assert_eq!(f.ctx.bootstrap("architect").unwrap().2, "high"); // Explicit configured effort supported by the adapter.
 }
 
 #[test]

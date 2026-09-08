@@ -138,6 +138,41 @@ Item {
     catalogueWasRefreshing = refreshing
   }
 
+  function stageModelText(stage, detail) {
+    const a = stage && stage.model_agreement
+    if (!a) return "Model agreement pending — reconcile before approval"
+    const e = a.effective || {}, p = a.policy_inputs || {}
+    let text = (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
+      + e.provider + "/" + e.model + " · " + e.native_effort
+      + " · " + (a.verification_state || a.availability || "unverified")
+      + " · " + (p.tier || "unclassified") + " (" + (p.tier_provenance || "unknown provenance") + ")"
+      + "\nPlanner: " + a.planner_reason + "\nArchitect: " + a.architect_reason
+    const calls = stage.model_invocations || []
+    if (calls.length) {
+      const last = calls[calls.length - 1], actual = last.effective || last.requested || {}
+      text += "\nExecution: " + actual.provider + "/" + actual.model + " · " + (last.verification_state || last.status)
+    }
+    if (stage.model_block) text += "\n" + stage.model_block
+    if (detail) {
+      text += "\nRisk: " + (a.validated_proposal || {}).risk + " · complexity: " + (a.validated_proposal || {}).complexity
+        + "\nConstraint: " + JSON.stringify(p.constraint || {})
+        + "\nCost: " + (p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
+          ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
+          : p.pricing ? JSON.stringify(p.pricing) : "unknown / no comparable billing data used")
+        + "\nAgreement: " + a.id + " · policy: " + p.policy
+      if (calls.length) text += "\nLatest invocation: " + JSON.stringify(calls[calls.length - 1])
+    }
+    return text
+  }
+
+  function changeModelConstraint(index, key, value) {
+    const stage = editStages[index]
+    const c = Object.assign({}, stage.model_constraint || {})
+    if (value.trim()) c[key] = value.trim()
+    else delete c[key]
+    changeStageField(index, "model_constraint", Object.keys(c).length ? c : null)
+  }
+
   function architectActivityText(activity, architecture) {
     const a = activity || {};
     const cp = architecture || {};
@@ -532,6 +567,8 @@ Item {
     const stages = editStages.map(function(stage) {
       const content = { title: stage.title, instructions: stage.instructions,
         acceptance: stage.acceptance, commit: stage.commit }
+      content.model_constraint = stage.model_constraint || null
+      if (stage.depends_on !== undefined) content.depends_on = stage.depends_on
       if (stage.id !== undefined) content.id = stage.id
       return content
     })
@@ -1321,7 +1358,11 @@ Item {
             onClicked: root.cycleTool("architect")
           }
           PanelButton {
-            label: "implementer: "
+            label: "automatic routing: " + (root.engineState && root.engineState.settings.automatic_routing !== false ? "yes" : "no")
+            onClicked: root.act("/api/settings", { automatic_routing: !(root.engineState && root.engineState.settings.automatic_routing !== false) })
+          }
+          PanelButton {
+            label: "implementer preference: "
               + (root.engineState ? root.engineState.settings.implementer : "…")
             onClicked: root.cycleTool("implementer")
           }
@@ -2105,6 +2146,15 @@ Item {
                   font.italic: true
                 }
                 Text {
+                  width: stageRow.width
+                  text: root.stageModelText(stageRow.modelData, stageRow.expanded)
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: Text.Wrap
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Text {
                   visible: !stageRow.expanded
                   width: stageList.width
                   text: stageRow.modelData.instructions
@@ -2297,6 +2347,29 @@ Item {
                     label: "Commit"
                     value: stageRow.modelData.commit
                     onEdited: value => root.changeStageField(stageRow.index, "commit", value)
+                  }
+                  Text {
+                    width: parent.width
+                    text: "Stage constraint overrides the global model. Blank fields allow selection. Capability and independent-review checks still apply."
+                    color: root.mutedForeground
+                    wrapMode: Text.Wrap
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Repeater {
+                    model: ["provider", "model", "native_effort"]
+                    delegate: PlanEditField {
+                      required property string modelData
+                      width: stageEditor.width
+                      label: modelData === "provider" ? "Provider constraint (codex / claude)"
+                        : modelData === "model" ? "Exact model ID constraint" : "Native effort constraint"
+                      value: (stageRow.modelData.model_constraint || {})[modelData] || ""
+                      onEdited: value => root.changeModelConstraint(stageRow.index, modelData, value)
+                    }
+                  }
+                  PanelButton {
+                    label: "Clear stage constraint"
+                    onClicked: root.changeStageField(stageRow.index, "model_constraint", null)
                   }
                   Item { width: 1; height: Style.space(6) }
                 }
@@ -2619,7 +2692,7 @@ Item {
                 spacing: Style.space(6)
                 Text {
                   width: parent.width
-                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Use provider_default when effort support is unknown. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
+                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Automatic routing defaults on: a legacy provider alone is a preference; a nonempty global implementer_model still pins provider/model. Disabling automatic routing constrains choices to the implementer provider. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
                   wrapMode: Text.Wrap
                   color: root.mutedForeground
                   font.family: root.fontFamily

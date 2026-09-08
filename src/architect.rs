@@ -49,6 +49,8 @@ struct Turn {
     guidance: Vec<Guidance>,
     unresolved_risks: Vec<Risk>,
     resolved_risks: Vec<String>,
+    #[serde(default)]
+    model_evaluations: Value,
 }
 fn text_ok(s: &str, max: usize) -> bool {
     !s.trim().is_empty() && s.len() <= max
@@ -78,6 +80,7 @@ fn apply_turn(
     }
     let t: Turn =
         serde_json::from_str(output).map_err(|e| format!("invalid architect output: {e}"))?;
+    let _ = &t.model_evaluations;
     if t.version != 1 || t.plan_id != plan["plan_id"] || t.revision != plan["revision"] {
         return Err("stale architect plan/revision".into());
     }
@@ -200,6 +203,7 @@ fn apply_turn(
         if !seen.insert(g.stage_id) || !text_ok(&g.text, 4000) {
             return Err("invalid stage guidance".into());
         }
+        if plan["stages"][idx]["status"] == "committed" { continue; }
         next["guidance"][g.stage_id.to_string()] = json!({"version":1,"id":identity(),"stage_id":g.stage_id,
             "revision":plan["revision"],"relevant_inputs":crate::plan::stage_inputs(plan, idx),"text":g.text,"valid":true,"unix":unix_timestamp()});
     }
@@ -333,6 +337,12 @@ impl Ctx {
             {
                 return Err("invalid architect plan identity".into());
             }
+            let routing_ids = self.routing_required(&candidate, &cp)?;
+            let missing: Vec<i64> = routing_ids.iter().copied().filter(|id| {
+                candidate["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id)
+                    .is_none_or(|s| !s["model_proposal"].is_object() || s["model_proposal_inputs"] != self.proposal_inputs(&candidate, candidate["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap()))
+            }).collect();
+            self.propose_routing(&mut candidate, &missing, &Value::Null)?;
             let mut required = vec![];
             for (idx, stage) in candidate["stages"]
                 .as_array()
@@ -358,6 +368,7 @@ impl Ctx {
                         .unwrap()
                         .iter()
                         .position(|s| s["id"] == g["stage_id"]);
+                    if index.is_some_and(|idx| candidate["stages"][idx]["status"] == "committed") { continue; }
                     if index.is_none_or(|idx| {
                         g["relevant_inputs"] != crate::plan::stage_inputs(&candidate, idx)
                     }) {
@@ -397,7 +408,7 @@ impl Ctx {
             } else {
                 None
             };
-            if required.is_empty() && cp["context_status"] == "ready" && recovery.is_none() {
+            if required.is_empty() && routing_ids.is_empty() && cp["context_status"] == "ready" && recovery.is_none() {
                 if previous == Some(&candidate) {
                     return Ok(candidate);
                 }
@@ -438,11 +449,12 @@ impl Ctx {
             }
             let context = json!({"plan":context_plan,"checkpoint":cp,"decisions":included,
                 "history_path":dir.join("events.jsonl"),"repository_observations":observations,
-                "required_stage_ids":required,"reason":reason});
-            let prompt = format!(
+                "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
+            let mut prompt = format!(
                 "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved constraints and completed interfaces exactly; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Use the history_path to retrieve omitted or relevant decision details. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[]}}\nSupply guidance for every required_stage_id. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
                 candidate["plan_id"], candidate["revision"]
             );
+            prompt.push_str(&format!("\n{}\n{}\nEvaluate exactly required_model_stage_ids: {:?}. Include model_evaluations in the complete architect output.", self.routing_prompt()?, crate::routing::EVALUATION_CONTRACT, routing_ids));
             let turn = identity();
             atomic_json(
                 &pending_path,
@@ -458,7 +470,7 @@ impl Ctx {
             );
             let invoke = |session: Option<&str>| -> Result<AgentResult, String> {
                 if provider == "mock" {
-                    return self.mock_architect(&candidate, &cp, &required, &prompt, session);
+                    return self.mock_architect(&candidate, &cp, &required, &routing_ids, &prompt, session);
                 }
                 self.run_agent(&AgentRequest {
                     role: "architect",
@@ -516,6 +528,9 @@ impl Ctx {
             }
             let (mut next, records) =
                 apply_turn(&candidate, &cp, &output.output, &decisions, &required)?;
+            let evaluation_output: Value = serde_json::from_str(&output.output).map_err(|e| e.to_string())?;
+            next["routing_evaluator"] = json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
+            self.agree_routing(&mut candidate, &mut next, &routing_ids, &evaluation_output["model_evaluations"])?;
             next["session"] = json!({"provider":provider,"reference":reference,"checkpoint_reference":turn,"resume_policy":"exact_if_committed"});
             next["context_status"] = json!("ready");
             next["last_turn"] = json!(turn);
@@ -532,8 +547,8 @@ impl Ctx {
             if store.load()? != old {
                 return Err("plan changed during architect turn".into());
             }
-            let published = store.publish(candidate, next, json!({"kind":"architect_turn","turn":turn,"reason":reason,
-                "decisions":records,"resolved_risks":serde_json::from_str::<Value>(&output.output).unwrap()["resolved_risks"],
+            let published = store.publish(candidate, next.clone(), json!({"kind":"architect_turn","turn":turn,"reason":reason,
+                "model_agreements":next["agreements"],"decisions":records,"resolved_risks":serde_json::from_str::<Value>(&output.output).unwrap()["resolved_risks"],
                 "recovery_reason":recovery_reason,"previous_session":cp["session"],"session":reference}))?;
             self.session.state.lock().unwrap().architect_activity =
                 json!({"status":"ready","reason":recovery_reason,"session":reference});
@@ -552,6 +567,7 @@ impl Ctx {
         plan: &Value,
         cp: &Value,
         required: &[i64],
+        routing_ids: &[i64],
         prompt: &str,
         session: Option<&str>,
     ) -> Result<AgentResult, String> {
@@ -570,6 +586,12 @@ impl Ctx {
                 }
             }
         }
+        if !routing_ids.is_empty() {
+            if !settings["mock_routing_architect_requests"].is_array() { settings["mock_routing_architect_requests"] = json!([]); }
+            settings["mock_routing_architect_requests"].as_array_mut().unwrap().push(json!({"ids":routing_ids,"prompt":prompt}));
+        }
+        let evaluations = settings["mock_model_evaluations"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0))
+            .unwrap_or_else(|| crate::routing::mock_evaluations(plan, routing_ids));
         let raw = identity().replace('-', "");
         let id = format!(
             "{}-{}-{}-{}-{}",
@@ -583,6 +605,7 @@ impl Ctx {
             "version":1,"plan_id":plan["plan_id"],"revision":plan["revision"],"checkpoint":{"summary":"Keep stage interfaces and acceptance constraints.",
             "constraints":strings(&cp["constraints"]),"completed_interfaces":strings(&cp["completed_interfaces"])},"decisions":[],
             "guidance":required.iter().map(|id| json!({"stage_id":id,"text":"Preserve existing interfaces and verify the stage acceptance checks."})).collect::<Vec<_>>(),
+            "model_evaluations":evaluations,
             "unresolved_risks":cp["unresolved_risks"].as_array().cloned().unwrap_or_default(),"resolved_risks":[]}).to_string());
         Ok(AgentResult {
             output,

@@ -12,6 +12,7 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
    "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
    "acceptance": "concrete acceptance criteria",
    "commit": "proposed conventional commit message",
+   "model_proposal": {"risk":"standard","complexity":"standard","task":"functionality","provider":"exact eligible provider","model":"exact eligible registry ID","native_effort":"provider_default","rationale":"stage-specific reasoning"},
    "status": "pending", "rounds": 0}
 ]}
 
@@ -32,6 +33,7 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
    "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
    "acceptance": "concrete acceptance criteria",
    "commit": "proposed conventional commit message",
+   "model_proposal": {"risk":"standard","complexity":"standard","task":"functionality","provider":"exact eligible provider","model":"exact eligible registry ID","native_effort":"provider_default","rationale":"stage-specific reasoning"},
    "status": "pending", "rounds": 0}
 ]}
 
@@ -57,6 +59,7 @@ Rewrite the plan and write it as JSON to the file {plan_path} (create the direct
    "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
    "acceptance": "concrete acceptance criteria",
    "commit": "proposed conventional commit message",
+   "model_proposal": {"risk":"standard","complexity":"standard","task":"functionality","provider":"exact eligible provider","model":"exact eligible registry ID","native_effort":"provider_default","rationale":"stage-specific reasoning"},
    "status": "pending", "rounds": 0}
 ]}
 
@@ -116,7 +119,7 @@ INSTRUCTIONS:
 ACCEPTANCE CRITERIA:
 {acceptance}
 
-You already implemented this stage; the uncommitted changes are yours.
+This stage has partial implementation, possibly from a different agent. Inspect and preserve the existing staged, unstaged and untracked work before making fixes.
 The review gate requested fixes. Resolve all requests with their role provenance; neither role can waive the other role's findings. Surface conflicting instructions explicitly as an architectural context gap. The round below is the upcoming review after your fixes.
 {review_context}
 

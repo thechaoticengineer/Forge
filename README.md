@@ -557,7 +557,7 @@ Configured selection options independently carry `configured_unverified` when
 availability cannot be verified. An absent discovery mechanism is not proof
 that a model is unavailable. Exact registry entries and existing explicit role
 model settings can run with unverified availability, using provider-default
-reasoning. Planner and architect bootstrap additionally require a configured
+reasoning or an explicitly configured native effort supported by the adapter. Planner and architect bootstrap additionally require a configured
 strong tier (see the bootstrap section below). The run state and history retain that qualification until successful
 execution supplies evidence. Missing executables, observed authentication
 failures, rejected models and previously discovered models that were removed
@@ -585,7 +585,7 @@ file is reported in the panel; Forge uses an empty registry. Set a new
       "provider": "codex",
       "model": "your-exact-model-id",
       "tier": "strong",
-      "suitability": ["critical contracts"],
+      "suitability": ["general"],
       "limits": {},
       "relative_cost_preference": 2,
       "effort": "provider_default"
@@ -596,19 +596,27 @@ file is reported in the panel; Forge uses an empty registry. Set a new
 
 The registry has at most 64 unique provider/model entries. `tier` is `basic`,
 `standard` or `strong`; these are **configured user policy**, not provider claims
-or rankings inferred from prices. Optional suitability text and numeric limits
-also have configured provenance. `relative_cost_preference` is nullable, ranges
+or rankings inferred from prices. Optional suitability tags and numeric limits
+also have configured provenance. For stage routing, empty suitability or `general`
+permits every task; otherwise use explicit task tags: `documentation`,
+`functionality`, `concurrency`, `persistence`, or `security`. Older descriptive
+suitability strings must be replaced with these tags before using an entry for
+stage assignments. Numeric limits are descriptive inputs for both participants;
+they do not grant a higher capability tier. `relative_cost_preference` is nullable, ranges
 from 0 to 1000, and lower means preferred; it is not a monetary amount. Prices
 remain null. No current model IDs or capability rankings are built into Forge.
-This stage exposes selection inputs and validates existing explicit role
-settings; it does not yet assign models to plan stages.
+The planner and architect use these inputs to agree on stage assignments before
+approval, with the engine enforcing adequacy and supported native efforts.
 
 `provider_default` emits no native effort override. A specific effort must be
-advertised for that model by fresh discovery and supported by the adapter;
-unknown/unsupported efforts are rejected without emitting arguments. An empty
-or missing supported-effort list never licenses a guessed setting. If refresh
-fails while a configured non-default effort is present, use `provider_default`
-or restore discovery. Discovery never sends a generation prompt, requests new
+advertised for that model by discovery and supported by the adapter, or match an
+explicit registry `effort` when model-specific effort support is unknown. The
+latter fallback accepts Codex `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
+and Claude `low`, `medium`, `high`, `xhigh`, `max`. These are adapter-supported
+values, not a claim that an unverified model supports them. A discovered empty
+or contradictory supported-effort list, an observed effort rejection, and known
+operational failures always block. Unknown or unconfigured efforts are rejected
+without emitting arguments; use `provider_default` or correct the configuration. Discovery never sends a generation prompt, requests new
 credentials, reads credential files, scrapes interactive pickers, or treats an
 Anthropic API model list as Claude Code subscription access.
 
@@ -751,8 +759,9 @@ provider default for these two roles. `mock` remains available for offline tests
 Configure both providers' strong entries through `model_catalogue.entries` in
 `POST /api/settings` (or the persisted model policy described above). Native
 reasoning effort comes from each entry's `effort`. `provider_default` sends no
-effort flag. Other values require discovered native support for that exact
-provider/model; Forge never translates effort names between providers.
+effort flag. Other values require discovered native support or the explicit
+configured effort fallback described above; Forge never translates effort names
+between providers.
 
 The planner inspects the repository and returns a candidate JSON plan. The
 architect receives the goal, full candidate and repository observations before
@@ -803,3 +812,96 @@ It writes chat answers but never mutates the plan, decisions, checkpoint or
 authoritative architect session. `GET /api/state` and the panel expose architect
 activity/recovery, exact session identity, current guidance, decision details,
 unresolved risks and usage per role, including legacy plans without context.
+
+
+### Joint stage model assignments
+
+`automatic_routing` defaults to `true`, including when older settings omit the
+key. A legacy `implementer` provider alone is a preference, not a pinned model.
+A nonempty legacy `implementer_model` remains a global provider/model constraint.
+Set `automatic_routing: false` to constrain unpinned stages to the configured
+implementer provider while still requiring a validated joint assignment.
+Planner and architect bootstrap settings and independent reviewer settings remain
+separate; automatic routing does not change them. Like other role settings,
+these switches are engine settings; the model registry has its separate persisted
+policy file.
+
+Selection precedence is explicit:
+
+1. A stage's user-authored `model_constraint` narrows choices first. It accepts
+   `provider`, `model`, and/or `native_effort`. `null` clears it. This overrides
+   the global implementation constraint, but cannot waive capability or review.
+2. Otherwise a nonempty `implementer_model` pins that model and its `implementer`
+   provider. With no pinned model, disabling automatic routing pins the provider.
+3. Otherwise the validated agreed assignment determines provider, model and
+   native effort. Existing provider settings serve as preferences/defaults.
+
+The plan editor exposes exact constraint fields. HTTP clients may include, for
+example, `"model_constraint":{"provider":"codex","model":"your-exact-id"}`
+on a pending stage in `POST /api/plan/edit`. Constraints survive AI revision;
+agent output cannot manufacture user overrides or committed records. Invalid
+IDs, efforts, inadequate tiers and cross-provider reviewer conflicts are reported
+before approval rather than silently overriding settings. The independent
+reviewer must use the other provider relative to the selected implementer.
+
+The planner proposes risk, complexity, task, provider/model, native effort and a
+stage-specific rationale in its existing standard/refactor/revision output.
+The persistent architect independently evaluates cross-stage constraints and
+failure impact in its guidance turn. Both must explicitly agree on classification
+and selection. Missing proposals from manual edits or legacy plans are batched
+into one strong planner turn. Disagreement allows one further planner/architect
+exchange for only the disputed stages, then blocks with the architect's reasons
+and correction instructions. A planner proposal alone never supplies architect
+approval. Malformed output or a policy violation also blocks publication.
+
+The engine's minimum policy is `stage-routing-1`. Critical or complex stages,
+including concurrency, persistence and security implementation, require the
+strongest suitable eligible tier, `strong`. A conservative implementation-text
+check also protects sensitive persistence/security/concurrency work from both
+participants underclassifying it. Explanatory prose about existing behavior is
+exempt from that text heuristic when explicitly classified as documentation;
+contracts, normative requirements and implementation work are not. Standard work requires `standard` or `strong`;
+simple work permits `basic` or higher. Unclassified models cannot meet these
+requirements. Tiers express configured adequacy, never quality inferred from
+price, provider, name or list order. The planner and architect must still verify
+that the selected option is suitable for the specific work.
+
+Simple functionality and documentation prefer a cheaper adequate option when
+both options have explicitly configured `relative_cost_preference` values, or
+when published prices have comparable currency, unit and billing basis and one
+option is no more expensive for both input and output (and cheaper for at least
+one). Configured preferences take precedence over published prices. Set
+`routing_billing_basis` to the exact published basis only when it applies to your
+execution billing; its default is `null`, because API list rates do not establish
+CLI subscription cost. Missing prices stay unknown. Different currencies, units,
+bases, or input/output tradeoffs do not establish a cheaper option. Neither price
+nor preference can make an inadequate tier acceptable. Every model has the same
+acceptance checks and review gate regardless of cost.
+
+Agreements retain both reasons, distinct proposal identities, explicit agreement,
+bootstrap provenance, relevant goal/stage/dependency/constraint inputs, an input
+fingerprint, resolved model and native effort, configured capability facts and
+billing provenance. Previous checkpoints and events retain superseded agreements;
+committed stage records remain unchanged. Explicit `depends_on` lists let an
+independent edit affect only its own pending stages; absent lists conservatively
+mean all earlier stages. Goal or applicable constraint changes reconcile affected
+pending stages before manual/queue approval or legacy execution. Approval,
+unchanged starts, ordinary fixes, restart, unrelated revisions and catalogue
+clock/revision-only changes reuse agreements without selection calls.
+
+Before every implementation/fix invocation, a local check verifies the relevant
+saved inputs, chosen option and policy facts. Unrelated catalogue metadata and
+availability becoming verified do not invalidate the choice. Changed material
+capability, effort, resolution, price-policy or availability facts block with
+saved work; automatic reassessment/escalation is a later stage. Invocations record
+proposed, requested and provider-reported effective models, including unexpected
+substitution. Every handoff includes the saved architecture summary, decisions,
+guidance, constraints, completed interfaces, outstanding findings and worktree/
+diff context, and directs a replacement agent to inspect and preserve partial work.
+
+Collapsed stage cards show the model/effort, availability verification, tier
+provenance and both rationales before approval and during execution. Expand a
+stage for classification, constraints, cost qualification and invocation details.
+Planning/revision failure retains the previous published plan and context as one
+atomic unit. Read-only plan Q&A never selects models or publishes architectural
+changes.

@@ -85,7 +85,9 @@ pub(crate) struct State {
 }
 
 impl App {
-    pub(crate) fn new(project: &str, settings: Value) -> Self {
+    pub(crate) fn new(project: &str, mut settings: Value) -> Self {
+        if settings.get("automatic_routing").is_none() { settings["automatic_routing"] = json!(true); }
+        if settings.get("routing_billing_basis").is_none() { settings["routing_billing_basis"] = Value::Null; }
         let app = Self {
             catalogue: crate::catalogue::Catalogue::default(),
             metadata: crate::metadata::Service::default(),
@@ -445,7 +447,7 @@ impl Ctx {
                         if let Some(records) = cp[key].as_object_mut() {
                             for (id, record) in records {
                                 let valid = next["stages"].as_array().unwrap().iter().any(|s|
-                                    s["id"].to_string() == *id && !affected.contains(&s["id"]));
+                                    s["id"].to_string() == *id && (s["status"] == "committed" || !affected.contains(&s["id"])));
                                 if !valid && record.is_object() {
                                     let trigger = if old["goal"] != next["goal"] { "goal_changed" }
                                         else if !next["stages"].as_array().unwrap().iter().any(|s| s["id"].to_string() == *id) { "stage_removed" }
@@ -621,15 +623,6 @@ impl Ctx {
         crate::agent::command(request)
     }
 
-    fn fresh_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<Option<AgentUsage>, String> {
-        let effort = if tool == "mock" { "provider_default".into() } else {
-            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-            policy.entries.iter().find(|e| e.provider.name() == tool && e.model == model)
-                .map(|e| e.effort.clone()).unwrap_or_else(|| "provider_default".into())
-        };
-        self.run_agent(&AgentRequest { role, provider: tool, prompt, model, effort: &effort, session: None }).map(|r| r.usage)
-    }
-
     fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<fs::File>>, String> {
         fs::OpenOptions::new()
             .create(true)
@@ -656,6 +649,12 @@ impl Ctx {
     pub(crate) fn run_agent(&self, request: &AgentRequest<'_>) -> Result<AgentResult, String> {
         let AgentRequest { role, provider: tool, prompt, model, effort, session } = *request;
         let _ = prompt;
+        #[cfg(test)]
+        {
+            let mut settings = self.app.settings.lock().unwrap();
+            if !settings["mock_agent_requests"].is_array() { settings["mock_agent_requests"] = json!([]); }
+            settings["mock_agent_requests"].as_array_mut().unwrap().push(json!({"role":role,"provider":tool,"model":model,"effort":effort,"prompt":prompt}));
+        }
         if tool == "mock" {
             #[cfg(test)]
             if role == "planner" {
@@ -696,7 +695,13 @@ impl Ctx {
             if usage.is_some() {
                 self.log_agent_finished(role, tool, "", usage.as_ref());
             }
-            return Ok(AgentResult { usage, effective_model: model.into(), completed: true, ..AgentResult::default() });
+            let effective_model = model.to_string();
+            #[cfg(test)]
+            let effective_model = if matches!(role, "implementer" | "fixer") {
+                self.app.settings.lock().unwrap()["mock_effective_models"].as_array_mut().filter(|a| !a.is_empty())
+                    .map(|a| a.remove(0).as_str().unwrap().to_string()).unwrap_or(effective_model)
+            } else { effective_model };
+            return Ok(AgentResult { usage, effective_model, completed: true, ..AgentResult::default() });
         }
         let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
         let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
@@ -971,7 +976,8 @@ impl Ctx {
         {
             Ok(()) => true,
             Err(e) => {
-                self.set_phase("failed");
+                let blocked = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
+                self.set_phase(if blocked { "blocked" } else { "failed" });
                 self.log_event("error", &format!("planning failed: {e}"));
                 false
             }
@@ -1045,11 +1051,13 @@ impl Ctx {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
             Err(e) => return Err(format!("could not remove previous candidate: {e}")),
         }
+        let prompt = format!("{prompt}\n{}", self.routing_prompt()?);
         let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.");
-        let result = self.run_agent(&AgentRequest { role:"planner", provider:&tool, model:&model, effort:&effort, session:None, prompt: if tool == "mock" {prompt} else {&readonly_prompt} })?;
+        let result = self.run_agent(&AgentRequest { role:"planner", provider:&tool, model:&model, effort:&effort, session:None, prompt: if tool == "mock" {&prompt} else {&readonly_prompt} })?;
         let mut plan: Value = if tool == "mock" {
             serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| format!("invalid candidate: {e}"))?
         } else { serde_json::from_str(&result.output).map_err(|e| format!("invalid candidate: {e}"))? };
+        plan["planner_selection_actor"] = json!({"provider":tool,"model":result.effective_model,"native_effort":effort});
         let usage = result.usage;
         if !plan["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
         // Agent-authored usage may be an echo of the previous revision. Only
@@ -1062,6 +1070,15 @@ impl Ctx {
         Ok(plan)
     }
 
+    fn bind_planner_proposals(&self, plan: &mut Value) {
+        for idx in 0..plan["stages"].as_array().unwrap().len() {
+            if plan["stages"][idx]["status"] != "committed" && plan["stages"][idx]["model_proposal"].is_object() {
+                plan["stages"][idx]["model_proposal_inputs"] = self.proposal_inputs(plan, idx);
+                plan["stages"][idx]["model_proposer"] = plan["planner_selection_actor"].clone();
+            }
+        }
+    }
+
     fn finalize_plan(&self, mut plan: Value, goal: &str, previous: Option<&Value>, action: &str)
         -> Result<(), String>
     {
@@ -1070,12 +1087,13 @@ impl Ctx {
             if !stage.is_object() {
                 return Err("planner produced a stage that is not an object".into());
             }
-            if stage.get("status").and_then(Value::as_str).is_none() {
-                stage["status"] = json!("pending");
-            }
-            if stage.get("rounds").is_none() {
-                stage["rounds"] = json!(0);
-            }
+            // Planner output cannot forge execution records or relax user constraints.
+            let saved_constraint = previous.and_then(|p| p["stages"].as_array()).and_then(|stages| stages.iter().find(|s| s["id"] == stage["id"]))
+                .map(|s| s["model_constraint"].clone()).unwrap_or(Value::Null);
+            stage.as_object_mut().unwrap().retain(|key, _| ["id", "title", "instructions", "acceptance", "commit", "depends_on", "model_proposal"].contains(&key.as_str()));
+            if !saved_constraint.is_null() { stage["model_constraint"] = saved_constraint; }
+            stage["status"] = json!("pending");
+            stage["rounds"] = json!(0);
         }
         let committed: Vec<Value> = previous.into_iter().flat_map(|p| p["stages"].as_array().unwrap())
             .filter(|s| s["status"] == "committed").cloned().collect();
@@ -1087,6 +1105,9 @@ impl Ctx {
         plan["status"] = json!("draft");
         if let Some(previous) = previous {
             let mut edited = crate::plan::edit_plan(previous, &json!({"plan": plan})).map_err(str::to_owned)?;
+            for (idx, stage) in edited["stages"].as_array_mut().unwrap().iter_mut().enumerate() {
+                if stage["status"] != "committed" { stage["model_proposal"] = plan["stages"][idx]["model_proposal"].clone(); }
+            }
             if let Some(usage) = plan.get("planner_usage") {
                 // Preserve previous planning totals; the new invocation is additive.
                 for (tool, value) in usage.as_object().into_iter().flatten() {
@@ -1106,13 +1127,18 @@ impl Ctx {
                 if !edited["role_usage"].is_object() { edited["role_usage"] = json!({}); }
                 edited["role_usage"]["planner"] = edited["planner_usage"].clone();
             }
+            edited["planner_selection_actor"] = plan["planner_selection_actor"].clone();
+            self.bind_planner_proposals(&mut edited);
             self.architect_publish(edited, Some(previous), "draft revision")?;
         } else {
             let base = json!({"stages": [], "goal": goal});
             let normalized = crate::plan::edit_plan(&base, &json!({"plan": plan})).map_err(str::to_owned)?;
+            let proposals: Vec<Value> = plan["stages"].as_array().unwrap().iter().map(|s| s["model_proposal"].clone()).collect();
             plan["stages"] = normalized["stages"].clone();
+            for (idx, proposal) in proposals.into_iter().enumerate() { plan["stages"][idx]["model_proposal"] = proposal; }
             plan["stage_id_high_water"] = normalized["stage_id_high_water"].clone();
             for key in ["plan_id", "revision", "architecture", "contract_version"] { plan.as_object_mut().unwrap().remove(key); }
+            self.bind_planner_proposals(&mut plan);
             self.architect_publish(plan, None, "initial plan guidance")?;
         }
         self.set_phase("plan_ready");
@@ -1133,6 +1159,7 @@ impl Ctx {
 
     /// Caller holds queue_lock and owns the busy claim.
     pub(crate) fn start_queue_run(&self, queue: &mut Value, id: u64, plan: &mut Value) -> Result<(), String> {
+        *plan = self.architect_publish(plan.clone(), Some(plan), "queue approval")?;
         plan["status"] = json!("approved");
         self.save_plan(plan)?;
         self.set_queue_status(queue, id, "running");
@@ -1203,7 +1230,8 @@ impl Ctx {
                 let _queue_guard = self.session.queue_lock.lock().unwrap();
                 let mut queue = self.load_queue();
                 if !planned {
-                    self.set_queue_status(&mut queue, id, "failed");
+                    let blocked = self.session.state.lock().unwrap().phase == "blocked";
+                    self.set_queue_status(&mut queue, id, if blocked { "blocked" } else { "failed" });
                     self.session.queue_active.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -1312,6 +1340,13 @@ impl Ctx {
                 return Err("required architectural guidance is missing or stale".into());
             }
             prompt.push_str(&format!("\nARCHITECT GUIDANCE:\n{}\nSaved constraints: {}\nCompleted interfaces: {}\nOutstanding risks: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", guidance["text"].as_str().unwrap_or(""), cp["constraints"], cp["completed_interfaces"], cp["unresolved_risks"], current["plan_id"].as_str().unwrap_or("")));
+            let completed: Vec<Value> = current["stages"].as_array().unwrap().iter().filter(|s| s["status"] == "committed")
+                .map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"sha":s["sha"]})).collect();
+            prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes: {}\nRecent execution outcomes: {}\nRead the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), cp["execution_outcomes"]));
+            let worktree = self.git(&["status", "--short"])?;
+            let diff = self.git(&["diff", "HEAD", "--", ".", ":(exclude).forge"])?;
+            prompt.push_str(&format!("\nSAVED ARCHITECTURAL SUMMARY: {}\nRelevant decisions: {}\nWORKTREE: {}\nDIFF (bounded preview; inspect full staged/unstaged diff and all untracked contents yourself):\n{}\nOUTSTANDING FINDINGS:\n{}\nYou may be inheriting partial work from another agent. Inspect and preserve all existing changes, completed interfaces and accepted decisions before editing. Saved findings remain authoritative until resolved with evidence.\n", cp["summary"], cp["recent_decisions"], worktree, diff.chars().take(16000).collect::<String>(), Self::stage_review_context(stage)));
+
         }
         Ok(prompt)
     }
@@ -1357,7 +1392,7 @@ impl Ctx {
     fn run_worker_core(&self) {
         let result = self.run_worker_inner();
         if let Err(e) = result {
-            self.set_phase("failed");
+            self.set_phase(if e.contains("model routing blocked:") { "blocked" } else { "failed" });
             self.log_event("error", &format!("run failed: {e}"));
         }
         self.set_step(None, "");
@@ -1366,8 +1401,7 @@ impl Ctx {
 
     fn run_worker_inner(&self) -> Result<(), String> {
         let loaded = self.load_plan().ok_or("no plan")?;
-        let mut plan = self.publish_plan(&loaded, false)?;
-        plan = self.architect_publish(plan.clone(), Some(&plan), "stage run")?;
+        let mut plan = self.architect_publish(loaded.clone(), Some(&loaded), "stage run").map_err(|e| format!("model routing blocked: {e}"))?;
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {

@@ -290,6 +290,9 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     let mut settings = app.settings.lock().unwrap();
     let mut candidate = settings.clone();
     for (k,v) in obj { if candidate.get(k).is_some() { candidate[k] = v.clone(); } }
+    if !candidate["automatic_routing"].is_boolean() || !(candidate["routing_billing_basis"].is_null() || candidate["routing_billing_basis"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) {
+        return (400, json!({"error":"automatic_routing must be boolean; routing_billing_basis must be null or an exact billing basis (max 64 bytes)"}));
+    }
     let policy = match crate::catalogue::Policy::from_settings(&candidate) {
         Ok(p) => p, Err(e) => return (400,json!({"error":e})),
     };
@@ -522,9 +525,12 @@ fn api_plan_edit(ctx: &Ctx, body: &Value) -> (u32, Value) {
     let Some(plan) = ctx.load_plan() else {
         return (400, json!({"error": "no plan"}));
     };
+    if ctx.acquire_busy().is_err() { return (409, json!({"error":"busy"})); }
+    let _worker = crate::app::WorkerGuard(&ctx.session);
+    drop(_queue_guard);
     match edit_plan(&plan, body) {
         Ok(edited) => {
-            if let Err(error) = ctx.save_plan(&edited) { return (500, json!({"error": error})); }
+            if let Err(error) = ctx.architect_publish(edited.clone(), Some(&plan), "manual edit") { return (400, json!({"error": error})); }
             {
                 let mut s = ctx.session.state.lock().unwrap();
                 s.phase = "plan_ready".into();
@@ -545,15 +551,20 @@ fn api_approve(ctx: &Ctx) -> (u32, Value) {
     let Some(mut plan) = ctx.load_plan() else {
         return (400, json!({"error": "no plan"}));
     };
+    if ctx.acquire_busy().is_err() { return (409, json!({"error":"busy"})); }
+    let _approval_guard = crate::app::WorkerGuard(&ctx.session);
+    drop(_queue_guard);
+    plan = match ctx.architect_publish(plan.clone(), Some(&plan), "approval") {
+        Ok(plan) => plan,
+        Err(error) => return (400, json!({"error":error})),
+    };
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
     let mut queue = ctx.load_queue();
     let awaiting = queue["items"].as_array().unwrap().iter()
         .find(|item| !matches!(item["status"].as_str(), Some("done" | "failed" | "blocked")))
         .filter(|item| item["status"] == "awaiting_approval")
         .and_then(|item| item["id"].as_u64());
     if let Some(id) = awaiting {
-        if ctx.acquire_busy().is_err() {
-            return (409, json!({"error": "busy"}));
-        }
         ctx.session.stop_requested.store(false, Ordering::SeqCst);
         ctx.session.queue_active.store(true, Ordering::SeqCst);
         if let Err(error) = ctx.start_queue_run(&mut queue, id, &mut plan) {
@@ -562,6 +573,7 @@ fn api_approve(ctx: &Ctx) -> (u32, Value) {
             return (500, json!({"error": error}));
         }
         ctx.log_event("queue", &format!("goal {id}: approved by user"));
+        std::mem::forget(_approval_guard);
         let ctx2 = ctx.clone();
         std::thread::spawn(move || ctx2.queue_worker(Some(id)));
     } else {

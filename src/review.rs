@@ -875,7 +875,8 @@ impl Ctx {
         idx: usize,
     ) -> Result<&'static str, String> {
         let budget = plan["stages"][idx]["review_budget"].as_u64().unwrap_or(0);
-        let implementer = self.setting("implementer");
+        let assignment = self.validated_assignment(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
+        let implementer = assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?.to_string();
         let (reviewer, reviewer_model) = match self.reviewer_config(&implementer) {
             Ok(config) => config,
             Err(error) => {
@@ -931,13 +932,34 @@ impl Ctx {
             let prompt = self.stage_prompt(template, plan, &stage)?;
             let role = if round == 0 { "implementer" } else { "fixer" };
             plan["stages"][idx]["implementer_provider"] = json!(implementer);
-            let usage = self.fresh_agent(
-                role,
-                &implementer,
-                &prompt,
-                &self.setting("implementer_model"),
-            )?;
-            self.record_stage_usage(plan, idx, role, &implementer, usage)?;
+            let assignment = self.validated_assignment(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
+            let effective = &assignment["effective"];
+            let model = effective["model"].as_str().ok_or("missing agreed model")?;
+            let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
+            let invocation = json!({"agreement_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
+            if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
+            plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
+            self.save_plan(plan)?;
+            let result = self.run_agent(&crate::agent::AgentRequest { role, provider:&implementer, model, effort, session:None, prompt:&prompt });
+            let record = plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().last_mut().unwrap();
+            match &result {
+                Ok(output) => {
+                    record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
+                    record["unexpected_substitution"] = json!(output.effective_model != model);
+                    record["status"] = json!("completed");
+                    record["verification_state"] = json!(if output.effective_model == model { "execution_verified" } else { "unexpected_substitution" });
+                }
+                Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); }
+            }
+            self.save_plan(plan)?;
+            let output = result?;
+            if output.effective_model != model {
+                let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
+                plan["stages"][idx]["model_block"] = json!(error);
+                self.save_plan(plan)?;
+                return Err(error.into());
+            }
+            self.record_stage_usage(plan, idx, role, &implementer, output.usage)?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }

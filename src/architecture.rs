@@ -177,7 +177,7 @@ fn validate_checkpoint(cp: &Value, plan: &Value) -> Result<(), String> {
                 .position(|stage| stage["id"] == stage_id);
             if record["valid"] == true {
                 let index = index.ok_or("active checkpoint record for missing stage")?;
-                if *inputs != crate::plan::stage_inputs(plan, index) {
+                if plan["stages"][index]["status"] != "committed" && *inputs != crate::plan::stage_inputs(plan, index) {
                     return Err("active checkpoint record inputs are stale".into());
                 }
             } else if index.is_none()

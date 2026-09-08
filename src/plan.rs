@@ -9,6 +9,8 @@ pub(crate) fn default_settings() -> Value {
         "architect": "codex",
         "architect_model": "",
         "implementer": "codex",
+        "automatic_routing": true,
+        "routing_billing_basis": null,
         "reviewer": "claude",
         "planner_model": "",
         "implementer_model": "",
@@ -81,6 +83,10 @@ pub(crate) fn edit_plan(plan: &Value, body: &Value) -> Result<Value, &'static st
             .cloned().unwrap_or_else(|| json!({"id": id, "status": "pending", "rounds": 0}));
         for key in ["title", "instructions", "acceptance", "commit"] {
             updated[key] = stage[key].clone();
+        }
+        if let Some(c) = stage.get("model_constraint") {
+            crate::routing::validate_constraint(c).map_err(|_| "invalid stage model constraint")?;
+            updated["model_constraint"] = c.clone();
         }
         if let Some(deps) = stage.get("depends_on") { updated["depends_on"] = deps.clone(); }
         edited_stages.push(updated);
@@ -176,8 +182,11 @@ fn direct_stage_inputs(plan: &Value, index: usize) -> Value {
     let stage = &stages[index];
     let dependencies = stage.get("depends_on").cloned().unwrap_or_else(||
         json!(stages[..index].iter().map(|s| s["id"].clone()).collect::<Vec<_>>()));
-    json!({"goal": plan["goal"], "title": stage["title"], "instructions": stage["instructions"],
-        "acceptance": stage["acceptance"], "commit": stage["commit"].as_str().unwrap_or("forge: stage"), "dependencies": dependencies})
+    let mut inputs = json!({"goal": plan["goal"], "title": stage["title"], "instructions": stage["instructions"],
+        "acceptance": stage["acceptance"], "commit": stage["commit"].as_str().unwrap_or("forge: stage"), "dependencies": dependencies});
+    // Keep pre-routing checkpoint fingerprints byte-compatible when no constraint exists.
+    if !stage["model_constraint"].is_null() { inputs["model_constraint"] = stage["model_constraint"].clone(); }
+    inputs
 }
 
 pub(crate) fn affected_stages(old: &Value, new: &Value) -> Result<Vec<Value>, &'static str> {

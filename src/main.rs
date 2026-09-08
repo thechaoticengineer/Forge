@@ -19,6 +19,7 @@ mod contracts;
 mod app;
 mod http;
 mod plan;
+mod routing;
 mod prompts;
 mod util;
 
@@ -98,6 +99,31 @@ mod tests {
         ctx.mock_agent("planner").unwrap();
         let plan: Value = serde_json::from_slice(&fs::read(ctx.forge_path("plan-candidate.json")).unwrap()).unwrap();
         ctx.publish_plan(&plan, true).unwrap();
+    }
+
+    #[test]
+    fn approval_and_queue_approval_reuse_actual_selection_calls() {
+        let count = |ctx: &Ctx| {
+            let s = ctx.app.settings.lock().unwrap();
+            (s["mock_routing_planner_requests"].as_array().map_or(0, Vec::len), s["mock_routing_architect_requests"].as_array().map_or(0, Vec::len))
+        };
+        let test = QueueTest::new(false);
+        test.start();
+        assert_eq!(count(&test.app), (1,1));
+        // User approval starts the first queue goal, then drafts the second goal.
+        assert_eq!(api_request(&test.app.app,"POST","/api/approve",json!({})).0,200);
+        wait_for_worker(&test.app);
+        assert_eq!(count(&test.app), (2,2));
+        let p = test.app.load_plan().unwrap();
+        assert_eq!(p["status"],"draft");
+        let solo = QueueTest::new(false);
+        solo.app.plan_worker("one plan", &PlanMode::Standard);
+        let before = count(&solo.app);
+        assert_eq!(api_request(&solo.app.app,"POST","/api/approve",json!({})).0,200);
+        assert_eq!(count(&solo.app),before);
+        let p = solo.app.load_plan().unwrap();
+        assert_eq!(p["status"],"approved");
+        assert!(p["stages"].as_array().unwrap().iter().all(|s| s["model_agreement"]["agreed"] == true));
     }
 
     #[test]
@@ -374,7 +400,7 @@ mod tests {
             assert!(prompt.contains("USER FOCUS (may be empty — if empty, choose the most valuable refactorings yourself):\n\n\nWrite"));
             assert!(prompt.contains("Rules: 2 to 8 stages, each independently committable, ordered by dependency."));
             assert!(prompt.contains("Every stage's acceptance criteria must require that observable behavior is preserved and builds/tests still pass."));
-            assert!(prompt.ends_with("Do NOT implement anything, do not modify any other file. Only write .forge/plan-candidate.json."));
+            assert!(prompt.contains("Do NOT implement anything, do not modify any other file. Only write .forge/plan-candidate.json."));
             let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
                 .split_once("\n\nRules:").unwrap().0;
             assert!(prompt.contains(schema));
@@ -400,7 +426,7 @@ mod tests {
             let settings = test.app.app.settings.lock().unwrap();
             let prompt = settings["mock_planner_prompt"].as_str().unwrap();
             assert!(prompt.contains(&format!("yourself):\n{focus}\n\nWrite")));
-            assert!(prompt.ends_with("Only write .forge/plan-candidate.json."));
+            assert!(prompt.contains("Only write .forge/plan-candidate.json."));
             assert_eq!(test.app.read_history()[0]["text"], format!("planning started for goal: {goal}"));
         }
     }
@@ -452,8 +478,8 @@ mod tests {
                 let goal = goal.unwrap_or("").trim();
                 assert_eq!(test.app.load_plan().unwrap()["goal"], goal);
                 assert_eq!(test.app.load_plan().unwrap()["status"], "draft");
-                assert_eq!(test.app.app.settings.lock().unwrap()["mock_planner_prompt"],
-                    PLANNER_PROMPT.replace("{goal}", goal).replace("{plan_path}", ".forge/plan-candidate.json"));
+                assert!(test.app.app.settings.lock().unwrap()["mock_planner_prompt"].as_str().unwrap().starts_with(
+                    &PLANNER_PROMPT.replace("{goal}", goal).replace("{plan_path}", ".forge/plan-candidate.json")));
             }
         }
     }
@@ -952,9 +978,13 @@ mod tests {
         let mut expected = edit_plan(&second_original, &json!({"plan": {
             "goal": "Edited goal", "stages": [editable_stage(1)]}})).unwrap();
         expected["architecture"] = state["plan"]["architecture"].clone();
+        for key in ["model_agreement", "model_proposal", "model_proposal_inputs", "model_proposer"] {
+            expected["stages"][0][key] = state["plan"]["stages"][0][key].clone();
+        }
+        assert_eq!(state["plan"]["stages"][0]["model_agreement"]["agreed"], true);
         assert_eq!(state["plan"], expected);
         assert_eq!(first.app.load_plan().unwrap(), first_plan);
-        let history = second.app.read_history();
+        let history: Vec<_> = second.app.read_history().as_array().unwrap().iter().filter(|h| h["kind"] == "plan").cloned().collect();
         assert_eq!(history[0]["kind"], "plan");
         assert_eq!(history[0]["text"], "plan edited by user");
         assert_eq!(history[0]["goal"], "Edited goal");
@@ -1691,7 +1721,7 @@ mod tests {
         let mut invalid=policy.clone(); invalid["entries"][0]["tier"]=json!("magic");
         assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":invalid,"auto_push":false})).0,400);
         assert_eq!(app.settings.lock().unwrap()["auto_push"],true);
-        let mut invalid=changed.clone(); invalid["entries"][0]["effort"]=json!("high");
+        let mut invalid=changed.clone(); invalid["entries"][0]["effort"]=json!("hallucinated");
         assert_eq!(api_request(&app,"POST","/api/settings",json!({"model_catalogue":invalid})).0,400);
         app.catalogue.observe(&Policy::from_settings(&app.settings.lock().unwrap()).unwrap(),Provider::Codex,"exact-id",Err(Failure::new(FailureKind::Auth)));
         let (_,option)=api_request(&app,"GET","/api/models?provider=codex&model=exact-id",json!({}));

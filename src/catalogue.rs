@@ -1147,10 +1147,13 @@ fn selection(
                 })
         }) {
             error = Some("native effort was rejected during execution; use provider_default");
-        } else if !s.is_some_and(|s| s.status == "discovered")
-            || !m
-                .and_then(|m| m.supported_efforts.as_ref())
-                .is_some_and(|list| list.iter().any(|e| e == effort))
+        } else if !m.and_then(|m| m.supported_efforts.as_ref()).is_some_and(|list| list.iter().any(|e| e == effort))
+            && !(m.and_then(|m| m.supported_efforts.as_ref()).is_none()
+                && entry.is_some_and(|e| e.effort == effort)
+                && match provider {
+                    Provider::Codex => ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort),
+                    Provider::Claude => ["low", "medium", "high", "xhigh", "max"].contains(&effort),
+                })
         {
             error = Some("unsupported or unknown native effort; use provider_default");
         } else if identifier(effort)
