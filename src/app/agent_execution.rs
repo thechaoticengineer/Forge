@@ -7,10 +7,24 @@ use serde_json::json;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+struct PreparedAgentCommand {
+    command: Command,
+    prompt_stdin: bool,
+    codex_home: Option<PathBuf>,
+}
+
+/// Results stay unevaluated until process cleanup, thread joins and activity clearing finish.
+struct SupervisionResults {
+    stdout: Result<AgentResult, String>,
+    stderr: Result<String, String>,
+    status: std::io::Result<ExitStatus>,
+    prompt_input: Result<(), String>,
+}
 
 impl Ctx {
     fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<fs::File>>, String> {
@@ -53,63 +67,7 @@ impl Ctx {
             settings["test_fake_providers"] == true && settings["test_real_implementation_cli"] != true
         });
         if mock_execution {
-            #[cfg(test)]
-            if role == "planner" {
-                let mut settings = self.app.settings.lock().unwrap();
-                settings["mock_planner_prompt"] = json!(prompt);
-                settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
-                settings["mock_planner_had_plan"] = json!(self.forge_path("plan-candidate.json").exists());
-            }
-            #[cfg(test)]
-            if role == "chat" {
-                let mut settings = self.app.settings.lock().unwrap();
-                let state = self.session.state.lock().unwrap();
-                settings["mock_chat_prompt"] = json!(prompt);
-                settings["mock_chat_model"] = json!(model);
-                settings["mock_chat_phase"] = json!(state.phase);
-                settings["mock_chat_step"] = json!(state.current_step);
-                settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
-            }
-            #[cfg(test)]
-            if role == "fixer" || role == "reviewer" {
-                let mut settings = self.app.settings.lock().unwrap();
-                // Reviewer capture is opt-in to keep unrelated API test settings small.
-                let key = format!("mock_{role}_prompts");
-                if role == "fixer" || settings.get(&key).is_some() {
-                    settings.as_object_mut().unwrap().entry(key)
-                        .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(prompt));
-                }
-            }
-            self.mock_agent(role)?;
-            #[cfg(test)]
-            if matches!(role, "implementer" | "fixer") {
-                let mut settings = self.app.settings.lock().unwrap();
-                if let Some(error) = settings["mock_implementation_errors"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)).and_then(|v| v.as_str().map(str::to_owned)) { return Err(error); }
-            }
-            let usage = self.app.settings.lock().unwrap().get("mock_usage")
-                .filter(|usage| usage.is_object()).map(|usage| AgentUsage {
-                    input_tokens: usage["input"].as_i64().unwrap_or(0),
-                    output_tokens: usage["output"].as_i64().unwrap_or(0),
-                    total_tokens: usage["total"].as_i64().unwrap_or(0),
-                    model: usage["model"].as_str().filter(|model| !model.is_empty())
-                        .unwrap_or(model).to_string(),
-                });
-            if usage.is_some() {
-                self.log_agent_finished(role, tool, "", usage.as_ref());
-            }
-            let effective_model = model.to_string();
-            #[cfg(test)]
-            let effective_model = if matches!(role, "implementer" | "fixer") {
-                self.app.settings.lock().unwrap()["mock_effective_models"].as_array_mut().filter(|a| !a.is_empty())
-                    .map(|a| a.remove(0).as_str().unwrap().to_string()).unwrap_or(effective_model)
-            } else { effective_model };
-            #[allow(unused_mut)]
-            let mut output = String::new();
-            #[cfg(test)]
-            if matches!(role, "implementer" | "fixer") {
-                output = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0).to_string()).unwrap_or_default();
-            }
-            return Ok(AgentResult { output, usage, effective_model, model_reported:true, completed: true, ..AgentResult::default() });
+            return self.mock_agent_result(request);
         }
         let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
         let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
@@ -127,32 +85,8 @@ impl Ctx {
             }
         }
         let requested_model = model.to_string();
-        let executable = tool.to_string();
-        #[cfg(test)]
-        let executable = self.app.settings.lock().unwrap()[format!("test_cli_{tool}")].as_str().unwrap_or(&executable).to_string();
-        crate::agent::verify_capabilities(request, self.project(), &executable)?;
-        let built = crate::agent::command(request)?;
-        let mut cmd = Command::new(&executable);
-        // Linux limits each argv entry independently of ARG_MAX. Large saved
-        // architecture contexts travel through stdin, never a shell or argv.
-        let prompt_stdin = request.prompt.len() > 32 * 1024;
-        let args: Vec<_> = built.get_args().collect();
-        if prompt_stdin {
-            cmd.args(&args[..args.len() - 1]);
-            if tool == "codex" { cmd.arg("-"); }
-        } else {
-            cmd.args(args);
-        }
-        let codex_home = crate::agent::codex_session::home();
-        #[cfg(test)]
-        let codex_home = self.app.settings.lock().unwrap()["test_codex_home"].as_str()
-            .map(std::path::PathBuf::from).or(codex_home);
-        let codex_home = codex_home.map(|home| if home.is_absolute() { home } else {
-            std::path::Path::new(self.project()).join(home)
-        });
-        if matches!(role, "reviewer" | "architect_review") { cmd = crate::agent::review_sandbox(&cmd, self.project(), tool)?; }
-        #[cfg(test)]
-        if let Some(home) = &codex_home { cmd.env("CODEX_HOME", home); }
+        let PreparedAgentCommand { command: mut cmd, prompt_stdin, codex_home } =
+            self.prepare_agent_command(request)?;
         self.log_event("model", &format!("[{role}] {tool}/{} · {} · policy {} · effort {}",
             if model.is_empty() { "provider default" } else { model }, selection["availability"].as_str().unwrap_or("unverified"),
             policy.policy_revision, selection["effort"].as_str().unwrap_or("provider_default")));
@@ -180,7 +114,7 @@ impl Ctx {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
-        let mut child = match child {
+        let child = match child {
             Ok(child) => child,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -196,58 +130,20 @@ impl Ctx {
                 return Err(self.agent_error(role, format!("failed to launch {tool}: {e}")));
             }
         };
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let stdin = child.stdin.take();
-        let stderr_log = Arc::clone(&log);
-        let pid = child.id() as i32;
-        let failed_reader = AtomicBool::new(false);
-        let (stdout_result, stderr_result, status_result, input_result) = std::thread::scope(|scope| {
-            let input_writer = scope.spawn(|| {
-                let result = stdin.map_or(Ok(()), |mut input| input.write_all(request.prompt.as_bytes()));
-                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
-                result.map_err(|e| format!("agent prompt input failed: {e}"))
-            });
-            let stdout_reader = scope.spawn(|| {
-                let result = stream_agent_result(stdout, &log, &self.session.state, 1500, tool == "claude");
-                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
-                result
-            });
-            let stderr_reader = scope.spawn(|| {
-                let result = stream_agent_result(stderr, &stderr_log, &self.session.state, 1500, false).map(|r| r.output);
-                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
-                result
-            });
-            let status = loop {
-                if self.session.stop_requested.load(Ordering::SeqCst) || failed_reader.load(Ordering::SeqCst) {
-                    unsafe { libc::kill(-pid, libc::SIGKILL); }
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => break Ok(status),
-                    Err(e) => break Err(e),
-                    _ => std::thread::sleep(Duration::from_millis(25)),
-                }
-            };
-            // Descendants must not keep pipes open or survive a completed/failed invocation.
-            unsafe { libc::kill(-pid, libc::SIGKILL); }
-            let _ = child.wait();
-            (stdout_reader.join().unwrap_or_else(|_| Err("agent stdout reader panicked".into())),
-             stderr_reader.join().unwrap_or_else(|_| Err("agent stderr reader panicked".into())), status,
-             input_writer.join().unwrap_or_else(|_| Err("agent prompt writer panicked".into())))
-        });
+        let results = self.supervise_agent(child, request, &log);
         self.clear_agent_activity();
-        input_result.map_err(|e| self.agent_error(role, e))?;
-        let mut result = stdout_result?;
+        results.prompt_input.map_err(|e| self.agent_error(role, e))?;
+        let mut result = results.stdout?;
         let tail = result.output.clone();
         let mut usage = result.usage.take();
-        let etail = match stderr_result {
+        let etail = match results.stderr {
             Ok(tail) => tail,
             Err(e) => {
                 self.agent_error(role, format!("{tool} output failed: {e}"));
                 return Err(e);
             }
         };
-        let status = match status_result {
+        let status = match results.status {
             Ok(status) => status,
             Err(e) => {
                 return Err(self.agent_error(role, format!("failed to wait for {tool}: {e}")));
@@ -311,6 +207,151 @@ impl Ctx {
         }
         result.usage = usage;
         Ok(result)
+    }
+
+    fn mock_agent_result(&self, request: &AgentRequest<'_>) -> Result<AgentResult, String> {
+        let AgentRequest { role, provider: tool, model, .. } = *request;
+        #[cfg(test)]
+        let prompt = request.prompt;
+        #[cfg(test)]
+        if role == "planner" {
+            let mut settings = self.app.settings.lock().unwrap();
+            settings["mock_planner_prompt"] = json!(prompt);
+            settings["mock_planner_phase"] = json!(self.session.state.lock().unwrap().phase);
+            settings["mock_planner_had_plan"] = json!(self.forge_path("plan-candidate.json").exists());
+        }
+        #[cfg(test)]
+        if role == "chat" {
+            let mut settings = self.app.settings.lock().unwrap();
+            let state = self.session.state.lock().unwrap();
+            settings["mock_chat_prompt"] = json!(prompt);
+            settings["mock_chat_model"] = json!(model);
+            settings["mock_chat_phase"] = json!(state.phase);
+            settings["mock_chat_step"] = json!(state.current_step);
+            settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
+        }
+        #[cfg(test)]
+        if role == "fixer" || role == "reviewer" {
+            let mut settings = self.app.settings.lock().unwrap();
+            // Reviewer capture is opt-in to keep unrelated API test settings small.
+            let key = format!("mock_{role}_prompts");
+            if role == "fixer" || settings.get(&key).is_some() {
+                settings.as_object_mut().unwrap().entry(key)
+                    .or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(prompt));
+            }
+        }
+        self.mock_agent(role)?;
+        #[cfg(test)]
+        if matches!(role, "implementer" | "fixer") {
+            let mut settings = self.app.settings.lock().unwrap();
+            if let Some(error) = settings["mock_implementation_errors"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)).and_then(|v| v.as_str().map(str::to_owned)) { return Err(error); }
+        }
+        let usage = self.app.settings.lock().unwrap().get("mock_usage")
+            .filter(|usage| usage.is_object()).map(|usage| AgentUsage {
+                input_tokens: usage["input"].as_i64().unwrap_or(0),
+                output_tokens: usage["output"].as_i64().unwrap_or(0),
+                total_tokens: usage["total"].as_i64().unwrap_or(0),
+                model: usage["model"].as_str().filter(|model| !model.is_empty())
+                    .unwrap_or(model).to_string(),
+            });
+        if usage.is_some() {
+            self.log_agent_finished(role, tool, "", usage.as_ref());
+        }
+        let effective_model = model.to_string();
+        #[cfg(test)]
+        let effective_model = if matches!(role, "implementer" | "fixer") {
+            self.app.settings.lock().unwrap()["mock_effective_models"].as_array_mut().filter(|a| !a.is_empty())
+                .map(|a| a.remove(0).as_str().unwrap().to_string()).unwrap_or(effective_model)
+        } else { effective_model };
+        #[allow(unused_mut)]
+        let mut output = String::new();
+        #[cfg(test)]
+        if matches!(role, "implementer" | "fixer") {
+            output = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0).to_string()).unwrap_or_default();
+        }
+        Ok(AgentResult { output, usage, effective_model, model_reported:true, completed: true, ..AgentResult::default() })
+    }
+
+    fn prepare_agent_command(&self, request: &AgentRequest<'_>) -> Result<PreparedAgentCommand, String> {
+        let AgentRequest { role, provider: tool, .. } = *request;
+        let executable = tool.to_string();
+        #[cfg(test)]
+        let executable = self.app.settings.lock().unwrap()[format!("test_cli_{tool}")].as_str().unwrap_or(&executable).to_string();
+        crate::agent::verify_capabilities(request, self.project(), &executable)?;
+        let built = crate::agent::command(request)?;
+        let mut cmd = Command::new(&executable);
+        // Linux limits each argv entry independently of ARG_MAX. Large saved
+        // architecture contexts travel through stdin, never a shell or argv.
+        let prompt_stdin = request.prompt.len() > 32 * 1024;
+        let args: Vec<_> = built.get_args().collect();
+        if prompt_stdin {
+            cmd.args(&args[..args.len() - 1]);
+            if tool == "codex" { cmd.arg("-"); }
+        } else {
+            cmd.args(args);
+        }
+        let codex_home = crate::agent::codex_session::home();
+        #[cfg(test)]
+        let codex_home = self.app.settings.lock().unwrap()["test_codex_home"].as_str()
+            .map(std::path::PathBuf::from).or(codex_home);
+        let codex_home = codex_home.map(|home| if home.is_absolute() { home } else {
+            std::path::Path::new(self.project()).join(home)
+        });
+        if matches!(role, "reviewer" | "architect_review") { cmd = crate::agent::review_sandbox(&cmd, self.project(), tool)?; }
+        #[cfg(test)]
+        if let Some(home) = &codex_home { cmd.env("CODEX_HOME", home); }
+        Ok(PreparedAgentCommand { command: cmd, prompt_stdin, codex_home })
+    }
+
+    fn supervise_agent(
+        &self,
+        mut child: Child,
+        request: &AgentRequest<'_>,
+        log: &Arc<Mutex<fs::File>>,
+    ) -> SupervisionResults {
+        let tool = request.provider;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stdin = child.stdin.take();
+        let stderr_log = Arc::clone(log);
+        let pid = child.id() as i32;
+        let failed_reader = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let input_writer = scope.spawn(|| {
+                let result = stdin.map_or(Ok(()), |mut input| input.write_all(request.prompt.as_bytes()));
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result.map_err(|e| format!("agent prompt input failed: {e}"))
+            });
+            let stdout_reader = scope.spawn(|| {
+                let result = stream_agent_result(stdout, log, &self.session.state, 1500, tool == "claude");
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result
+            });
+            let stderr_reader = scope.spawn(|| {
+                let result = stream_agent_result(stderr, &stderr_log, &self.session.state, 1500, false).map(|r| r.output);
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result
+            });
+            let status = loop {
+                if self.session.stop_requested.load(Ordering::SeqCst) || failed_reader.load(Ordering::SeqCst) {
+                    unsafe { libc::kill(-pid, libc::SIGKILL); }
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Err(e) => break Err(e),
+                    _ => std::thread::sleep(Duration::from_millis(25)),
+                }
+            };
+            // Descendants must not keep pipes open or survive a completed/failed invocation.
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            let _ = child.wait();
+            SupervisionResults {
+                stdout: stdout_reader.join().unwrap_or_else(|_| Err("agent stdout reader panicked".into())),
+                stderr: stderr_reader.join().unwrap_or_else(|_| Err("agent stderr reader panicked".into())),
+                status,
+                prompt_input: input_writer.join().unwrap_or_else(|_| Err("agent prompt writer panicked".into())),
+            }
+        })
     }
 
     pub(super) fn log_agent_finished(&self, role: &str, tool: &str, tail: &str, usage: Option<&AgentUsage>) {

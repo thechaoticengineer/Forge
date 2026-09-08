@@ -88,6 +88,102 @@ fn pair(args: &[String], a: &str, b: &str) -> bool {
     args.windows(2).any(|p| p[0] == a && p[1] == b)
 }
 
+// Own the request in an unscoped worker so a pipe-cleanup regression cannot
+// trap the test in a scoped thread join. Only fixture-recorded PIDs are killed.
+fn run_bounded(fixture: &Cli, provider: &str, prompt: String) -> AgentResult {
+    let ctx = fixture.ctx.clone();
+    let provider = provider.to_string();
+    let (send, receive) = std::sync::mpsc::channel();
+    let task = std::thread::spawn(move || {
+        let result = ctx.run_agent(&AgentRequest { prompt: &prompt, ..request(&provider) });
+        let _ = send.send(result);
+    });
+    match receive.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => {
+            task.join().unwrap();
+            result.unwrap()
+        }
+        Err(error) => {
+            fixture.ctx.session.stop_requested.store(true, Ordering::SeqCst);
+            for (file, group) in [("parent.pid", true), ("descendant.pid", false)] {
+                if let Some(pid) = fs::read_to_string(fixture.root.join(file)).ok()
+                    .and_then(|pid| pid.parse::<i32>().ok()).filter(|pid| *pid > 0)
+                {
+                    unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL); }
+                }
+            }
+            // Give cleanup a bounded chance to finish, even on a failing test.
+            let _ = receive.recv_timeout(Duration::from_secs(2));
+            panic!("fake CLI did not finish within five seconds: {error}");
+        }
+    }
+}
+
+fn successful_result_script(provider: &str) -> String {
+    if provider == "codex" {
+        format!(r#"print(json.dumps({{'type':'thread.started','thread_id':'{ID}'}}))
+print(json.dumps({{'type':'turn.completed'}}))"#)
+    } else {
+        format!(r#"print(json.dumps({{'type':'result','subtype':'success','session_id':'{ID}','result':'ok'}}))"#)
+    }
+}
+
+#[test]
+fn prompt_stdin_threshold_is_strictly_greater_than_32768_bytes() {
+    for provider in ["codex", "claude"] {
+        for bytes in [32768, 32769] {
+            let fixture = Cli::new(provider, &format!(r#"
+with open('parent.pid','w') as f: f.write(str(os.getpid()))
+with open('received-stdin','wb') as f: f.write(sys.stdin.buffer.read())
+{}
+"#, successful_result_script(provider)));
+            // Multibyte text verifies the threshold measures bytes, not characters.
+            let prompt = format!("{}{}", "ż".repeat(16384), if bytes == 32769 { "x" } else { "" });
+            assert_eq!(prompt.len(), bytes);
+            let result = run_bounded(&fixture, provider, prompt.clone());
+            assert!(result.completed);
+            assert_eq!(result.session.as_deref(), Some(ID));
+            let mut expected: Vec<String> = command(&request(provider)).unwrap().get_args()
+                .map(|arg| arg.to_str().unwrap().to_string()).collect();
+            expected.pop();
+            let input = fs::read(fixture.root.join("received-stdin")).unwrap();
+            if bytes == 32768 {
+                expected.push(prompt);
+                assert!(input.is_empty());
+            } else {
+                if provider == "codex" { expected.push("-".into()); }
+                assert_eq!(input, prompt.as_bytes());
+            }
+            assert_eq!(fixture.args(), expected);
+        }
+    }
+}
+
+#[test]
+fn successful_parent_exit_kills_descendants_holding_output_pipes() {
+    for provider in ["codex", "claude"] {
+        let fixture = Cli::new(provider, &format!(r#"
+with open('parent.pid','w') as f: f.write(str(os.getpid()))
+# The descendant inherits both output pipes and outlives its successful parent.
+child = subprocess.Popen(['sleep','60'])
+with open('descendant.pid','w') as f: f.write(str(child.pid))
+{}
+"#, successful_result_script(provider)));
+        let result = run_bounded(&fixture, provider, request(provider).prompt.into());
+        assert!(result.completed);
+        assert_eq!(result.session.as_deref(), Some(ID));
+        assert!(fixture.ctx.session.state.lock().unwrap().agent_role.is_empty());
+        let pid = fs::read_to_string(fixture.root.join("descendant.pid")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z") { break; }
+            assert!(Instant::now() < deadline, "descendant survived successful parent exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[test]
 fn large_prompts_use_stdin_while_output_is_drained() {
     for provider in ["codex", "claude"] {
