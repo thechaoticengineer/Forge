@@ -821,9 +821,21 @@ A fresh, exhausted applicable window prevents a Claude launch when usage credits
 are explicitly disabled. Scoped windows use the selected/resolved model family;
 an unresolved provider default cannot establish a scoped blocker. After reset,
 with stale/missing evidence, or when credits may allow continued usage, the CLI
-decides availability. Forge never enables credits or changes models automatically.
+decides availability. Forge never enables credits automatically.
 Unavailable readings remain unknown; failed refreshes label the previous reading
 as stale. Unsupported CLI/SDK versions degrade to unavailable usage information.
+
+With automatic routing and an empty `reviewer_model`, independent review selects
+the first eligible configured strong model whose quota is not known to be
+exhausted. Registry order supplies the preference: configure Fable followed by
+Opus to use Opus when the Fable pool is depleted. If the pre-launch quota check
+discovers exhaustion after selection, review switches to another eligible model
+without spending a review/fix round or retrying the same model twice. The actual
+review records retain the selected provider/model and a fresh session, and the
+switch is logged. Explicit model choices remain constraints. Review still uses
+the other provider: Codex implementations use Claude review, while Claude
+implementations use Codex review. If all adequate independent choices are
+unavailable, Forge preserves the work and blocks instead of using self-review.
 
 `cargo test` uses fake discovery/process protocols and isolated temporary
 caches, including HTTP responsiveness tests. The optional bridge's no-prompt

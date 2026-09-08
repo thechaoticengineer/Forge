@@ -563,9 +563,21 @@ impl Ctx {
             let policy =
                 crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
             if model.is_empty() {
+                let mut blockers = Vec::new();
                 model = policy.entries.iter().filter(|e| e.provider.name() == provider && e.tier == crate::catalogue::Tier::Strong)
-                    .find(|e| self.app.catalogue.execution_input(&policy, e.provider, &e.model)["eligible"] == true)
-                    .map(|e| e.model.clone()).ok_or("no eligible strong independent reviewer model")?;
+                    .find(|e| {
+                        let selected = self.app.catalogue.execution_input(&policy, e.provider, &e.model);
+                        if selected["eligible"] != true { return false; }
+                        if automatic && provider == "claude"
+                            && let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
+                                selected["resolved_id"].as_str().unwrap_or(&e.model)) {
+                            blockers.push(reason);
+                            return false;
+                        }
+                        true
+                    })
+                    .map(|e| e.model.clone()).ok_or_else(|| format!("no eligible strong independent reviewer model{}",
+                        if blockers.is_empty() { String::new() } else { format!(": {}", blockers.join("; ")) }))?;
             }
             let selected = self.app.catalogue.execution_input(
                 &policy,
@@ -577,24 +589,58 @@ impl Ctx {
                     "independent reviewer unavailable/incompatible: {selected}"
                 ));
             }
+            if provider == "claude"
+                && let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
+                    selected["resolved_id"].as_str().unwrap_or(&model)) {
+                return Err(reason);
+            }
         }
         Ok((provider.into(), model))
     }
 
     fn review_with_retry(&self, plan: &mut Value, idx: usize, base: &Value, role: &str, provider: &str, model: &str) -> Result<Value,String> {
+        let mut current = (provider.to_string(), model.to_string());
+        let mut visited = vec![current.clone()];
         loop {
-            match self.invoke_review(plan,idx,base,role,provider,model) {
+            match self.invoke_review(plan,idx,base,role,&current.0,&current.1) {
                 Ok(v) => {
                     plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
                     self.save_plan(plan)?;
                     return Ok(v);
                 },
                 Err(error) => {
+                    // A pre-launch quota check may have refreshed since selection.
+                    // Switch only the fresh independent reviewer; keep this exact
+                    // snapshot, round and required roles. Never loop over a model twice.
+                    if role == "reviewer"
+                        && let Some((next, reason)) = self.reviewer_quota_fallback(plan, idx, &current)
+                            .map_err(|e| format!("model routing blocked: {e}; work and checkpoint retained"))?
+                        && !visited.contains(&next) {
+                        self.log_event("model", &format!("[reviewer] quota fallback {}/{} -> {}/{}: {reason}",
+                            current.0, current.1, next.0, next.1));
+                        visited.push(next.clone());
+                        current = next;
+                        continue;
+                    }
                     if self.operational_retry(plan,idx,&error,role)? { continue; }
-                    return Err(format!("model routing blocked: {role}/{provider}: {error}; restore an eligible independent reviewer; work and checkpoint retained"));
+                    return Err(format!("model routing blocked: {role}/{}: {error}; restore an eligible independent reviewer; work and checkpoint retained", current.0));
                 }
             }
         }
+    }
+
+    fn reviewer_quota_fallback(&self, plan: &Value, idx: usize, current: &(String, String)) -> Result<Option<((String, String), String)>, String> {
+        let settings = self.app.settings.lock().unwrap().clone();
+        if settings["automatic_routing"] == false || !self.setting("reviewer_model").is_empty() || current.0 != "claude" {
+            return Ok(None);
+        }
+        let policy = crate::catalogue::Policy::from_settings(&settings)?;
+        let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::Claude, &current.1);
+        let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
+            selected["resolved_id"].as_str().unwrap_or(&current.1)) else { return Ok(None); };
+        let implementer = plan["stages"][idx]["implementer_provider"].as_str().ok_or("missing implementer provider for reviewer fallback")?;
+        let next = self.reviewer_config(implementer)?;
+        Ok((next != *current).then_some((next, reason)))
     }
     fn invoke_review(
         &self,

@@ -94,13 +94,22 @@ impl Service {
         // API reads only take the cache lock and stay responsive during this wait.
         let (c, _) = self.refreshed.wait_timeout_while(self.cache.lock().unwrap(),
             Duration::from_secs(16), |c| c.refreshing).unwrap();
-        if c.bridge != bridge || c.checked == 0 || unix_timestamp() - c.checked >= FRESH_SECONDS { return Ok(()); }
+        Self::blocker(&c, bridge, model).map_or(Ok(()), Err)
+    }
+
+    /// Read-only routing evidence; checking candidates never launches a process.
+    pub fn blocked_reason(&self, bridge: &str, model: &str) -> Option<String> {
+        Self::blocker(&self.cache.lock().unwrap(), bridge, model)
+    }
+
+    fn blocker(c: &Cache, bridge: &str, model: &str) -> Option<String> {
+        if c.bridge != bridge || c.checked == 0 || unix_timestamp() - c.checked >= FRESH_SECONDS { return None; }
         if let Some(usage) = &c.usage
             && let Some(window) = exhausted(usage, model, unix_timestamp()) {
-            return Err(format!("{} quota exhausted (0% remaining); resets {}. Change model or wait for the reset.",
+            return Some(format!("{} quota exhausted (0% remaining); resets {}. Change model or wait for the reset.",
                 window.name, window.resets_at.as_deref().unwrap_or("at the provider's reset time")));
         }
-        Ok(())
+        None
     }
 }
 

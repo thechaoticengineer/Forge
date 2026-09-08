@@ -111,3 +111,42 @@ fn exhausted_quota_prevents_agent_spawn_and_is_visible_through_state_api() {
     assert_eq!(code,202);
     assert_eq!(refresh["started"],false);
 }
+
+#[test]
+fn automatic_review_skips_exhausted_family_but_preserves_constraints_and_independence() {
+    let fixture = crate::test_support::QueueTest::new(false);
+    let mut app = crate::app::App::new(fixture.app.project(), crate::plan::default_settings());
+    app.quota = Service { launcher: Arc::new(FakeLauncher { calls: AtomicUsize::new(0), fail: false }), ..Service::default() };
+    {
+        let mut settings = app.settings.lock().unwrap();
+        settings["model_catalogue"]["claude_bridge"] = json!("/fake/bridge");
+        settings["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+            {"provider":"claude","model":"claude-opus-5[1m]","tier":"strong"},
+            {"provider":"codex","model":"gpt-6-astra","tier":"strong"}]);
+    }
+    let app = Arc::new(app);
+    let ctx = app.context(fixture.app.project());
+    // Unknown quota doesn't invent exhaustion. A later check redirects selection.
+    assert_eq!(ctx.reviewer_config("codex").unwrap().1,"claude-fable-5-1[1m]");
+    assert!(app.quota.check("/fake/bridge","claude-fable-5-1").is_err());
+    assert_eq!(ctx.reviewer_config("codex").unwrap(),("claude".into(),"claude-opus-5[1m]".into()));
+    assert_eq!(ctx.reviewer_config("claude").unwrap(),("codex".into(),"gpt-6-astra".into()));
+    // Explicit choices and non-automatic routing are not silently replaced.
+    app.settings.lock().unwrap()["reviewer_model"] = json!("claude-fable-5-1[1m]");
+    assert!(ctx.reviewer_config("codex").unwrap_err().contains("quota exhausted"));
+    app.settings.lock().unwrap()["reviewer_model"] = json!("");
+    app.settings.lock().unwrap()["automatic_routing"] = json!(false);
+    assert!(ctx.reviewer_config("codex").unwrap_err().contains("quota exhausted"));
+    app.settings.lock().unwrap()["automatic_routing"] = json!(true);
+    // A whole-provider limit cannot be escaped with another Claude model or self-review.
+    app.quota.cache.lock().unwrap().usage.as_mut().unwrap().windows[0].used_percent = Some(100.0);
+    app.quota.cache.lock().unwrap().usage.as_mut().unwrap().windows[0].resets_unix = Some(unix_timestamp()+3600);
+    assert!(ctx.reviewer_config("codex").unwrap_err().contains("no eligible strong independent reviewer"));
+    app.quota.cache.lock().unwrap().usage.as_mut().unwrap().windows[0].used_percent = Some(57.0);
+    app.settings.lock().unwrap()["model_catalogue"]["entries"][1]["tier"] = json!("standard");
+    assert!(ctx.reviewer_config("codex").is_err());
+    // Stale data doesn't lock a family out indefinitely; probe refreshes at launch.
+    app.quota.cache.lock().unwrap().checked -= FRESH_SECONDS;
+    assert_eq!(ctx.reviewer_config("codex").unwrap().1,"claude-fable-5-1[1m]");
+}
