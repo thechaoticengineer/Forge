@@ -1,6 +1,6 @@
 //! Codex exec JSONL can omit the model. Read provider-written turn metadata,
 //! restricted to the exact thread and bytes appended during this invocation.
-use serde_json::Value;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File, Metadata};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -57,24 +57,46 @@ fn files(root: &Path) -> Result<HashMap<PathBuf, Metadata>, String> {
     Ok(found)
 }
 
-fn line(reader: &mut impl BufRead) -> Result<Option<Value>, String> {
+// Deserialize only identity-bearing fields. Serde validates and skips unrelated
+// payloads (including compacted replacement/guardian histories) without building
+// a recursive Value tree. The append and per-event input budgets remain bounded.
+#[derive(Default, Deserialize)]
+struct Payload {
+    #[serde(rename = "type", default)]
+    kind: String,
+    id: Option<String>,
+    turn_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+}
+#[derive(Deserialize)]
+struct Event {
+    #[serde(rename = "type", default)]
+    kind: String,
+    payload: Option<Payload>,
+}
+fn line(reader: &mut impl BufRead) -> Result<Option<Event>, String> {
     let mut bytes = Vec::new();
     let size = reader
-        .take(MAX_LINE + 1)
+        .take(MAX_APPEND + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|e| e.to_string())?;
-    if size == 0 {
-        return Ok(None);
-    }
-    if size as u64 > MAX_LINE {
-        return Err("Codex session event exceeds 1 MiB".into());
+    if size == 0 { return Ok(None); }
+    if size as u64 > MAX_APPEND {
+        return Err("Codex session event exceeds 64 MiB".into());
     }
     if bytes.last() != Some(&b'\n') {
         return Err("incomplete Codex session event".into());
     }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| format!("invalid Codex session event: {e}"))
+    let event: Event = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid Codex session event: {e}"))?;
+    let identity_event = matches!(event.kind.as_str(), "session_meta" | "turn_context")
+        || (event.kind == "event_msg" && event.payload.as_ref().is_some_and(|p|
+            matches!(p.kind.as_str(), "task_started" | "task_complete" | "turn_aborted")));
+    if size as u64 > MAX_LINE && identity_event {
+        return Err("Codex session identity event exceeds 1 MiB".into());
+    }
+    Ok(Some(event))
 }
 
 impl Snapshot {
@@ -126,7 +148,7 @@ impl Snapshot {
         }
         let mut reader = BufReader::new(file);
         let meta = line(&mut reader)?.ok_or("empty Codex session")?;
-        if meta["type"] != "session_meta" || meta["payload"]["id"] != session {
+        if meta.kind != "session_meta" || meta.payload.as_ref().and_then(|p| p.id.as_deref()) != Some(session) {
             return Err("Codex session metadata identity mismatch".into());
         }
         reader
@@ -137,37 +159,37 @@ impl Snapshot {
         let mut model = None;
         let mut completed = false;
         while let Some(event) = line(&mut reader)? {
-            let payload = &event["payload"];
-            if event["type"] == "event_msg" && payload["type"] == "task_started" {
-                let id = payload["turn_id"]
-                    .as_str()
+            let payload = event.payload.unwrap_or_default();
+            if event.kind == "event_msg" && payload.kind == "task_started" {
+                let id = payload.turn_id
+                    .as_deref()
                     .filter(|id| super::session_id(id))
                     .ok_or("invalid Codex turn identity")?;
                 if turn.is_some() {
                     return Err("multiple Codex turns during invocation".into());
                 }
                 turn = Some(id.to_string());
-            } else if event["type"] == "turn_context" {
-                if turn.as_deref() != payload["turn_id"].as_str() || turn.is_none() || completed {
+            } else if event.kind == "turn_context" {
+                if turn.as_deref() != payload.turn_id.as_deref() || turn.is_none() || completed {
                     return Err("Codex context does not belong to the current turn".into());
                 }
-                if payload["cwd"].as_str() != Some(project) {
+                if payload.cwd.as_deref() != Some(project) {
                     return Err("Codex turn project mismatch".into());
                 }
-                let reported = payload["model"]
-                    .as_str()
+                let reported = payload.model
+                    .as_deref()
                     .filter(|s| crate::catalogue::identifier(s))
                     .ok_or("Codex turn model missing or invalid")?;
                 if model.as_deref().is_some_and(|old| old != reported) {
                     return Err("Codex model changed during turn".into());
                 }
                 model = Some(reported.to_string());
-            } else if event["type"] == "event_msg" && payload["type"] == "task_complete" {
-                if turn.is_none() || turn.as_deref() != payload["turn_id"].as_str() {
+            } else if event.kind == "event_msg" && payload.kind == "task_complete" {
+                if turn.is_none() || turn.as_deref() != payload.turn_id.as_deref() {
                     return Err("Codex completion turn mismatch".into());
                 }
                 completed = true;
-            } else if event["type"] == "event_msg" && payload["type"] == "turn_aborted" {
+            } else if event.kind == "event_msg" && payload.kind == "turn_aborted" {
                 return Err("Codex session turn aborted".into());
             }
         }

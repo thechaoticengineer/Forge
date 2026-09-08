@@ -922,7 +922,10 @@ and `task_complete` records. Old resume metadata and requested model names never
 count as a provider report. Missing, ambiguous, changed or oversized metadata
 leaves the report unverified, with a diagnostic in the model log; existing model
 verification gates still block publication. Lookup is capped at 100,000 entries,
-new session data at 64 MiB, and individual records at 1 MiB.
+new session data at 64 MiB, and identity-bearing records at 1 MiB. Large
+compaction histories and other unrelated records are validated within the
+64 MiB budget but only their identity-relevant fields are decoded; their
+contents cannot supply a model or substitute for current-turn metadata.
 Child process groups are cleaned up on completion, stop and reader failure.
 Neither adapter uses generic `--continue` or `--last`.
 

@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::io::Write;
 
 const SESSION: &str = "11111111-2222-4333-8444-555555555555";
@@ -154,11 +154,47 @@ fn malformed_partial_and_oversized_metadata_fail_closed() {
             "malformed" => writeln!(file, "not JSON").unwrap(),
             "partial" => write!(file, "{{}}").unwrap(),
             "large-line" => {
-                file.write_all(&vec![b' '; MAX_LINE as usize]).unwrap();
-                writeln!(file, "{{}}").unwrap();
+                writeln!(file, "{}", json!({"type":"turn_context","payload":{"padding":"x".repeat(MAX_LINE as usize)}})).unwrap();
             }
             "large-append" => file.set_len(MAX_APPEND + 1).unwrap(),
             _ => unreachable!(),
+        }
+        assert!(f.model(&snapshot).is_err(), "accepted {case}");
+    }
+}
+
+#[test]
+fn large_compaction_and_response_records_do_not_hide_current_turn_identity() {
+    for resumed in [false, true] {
+        let f = Fixture::new();
+        if resumed { f.write(&f.events("old-model")); }
+        let snapshot = Snapshot::capture(&f.0).unwrap();
+        let mut events = f.events("exact-model");
+        if resumed { events.remove(0); }
+        events.insert(events.len()-1, json!({"type":"compacted","payload":{
+            "replacement_history":[{"role":"user","content":"x".repeat(MAX_LINE as usize)}],
+            "guardian_history":[{"content":"y".repeat(MAX_LINE as usize)}]}}));
+        events.insert(events.len()-1, json!({"type":"response_item","payload":{
+            "type":"message","content":[{"text":"z".repeat(MAX_LINE as usize)}]}}));
+        f.write(&events);
+        assert_eq!(f.model(&snapshot).unwrap(), "exact-model");
+    }
+}
+
+#[test]
+fn ignored_large_records_still_require_valid_json_and_preserve_identity_checks() {
+    for case in ["malformed", "partial", "changed-model", "aborted"] {
+        let f = Fixture::new();
+        let snapshot = Snapshot::capture(&f.0).unwrap();
+        f.write(&f.events("exact-model")[..3]);
+        f.write(&[json!({"type":"compacted","payload":{"history":"x".repeat(MAX_LINE as usize)}})]);
+        if case == "changed-model" { f.write(&[f.events("other-model")[2].clone()]); }
+        if case == "aborted" { f.write(&[json!({"type":"event_msg","payload":{"type":"turn_aborted"}})]); }
+        f.write(&f.events("exact-model")[3..]);
+        if case == "malformed" || case == "partial" {
+            let mut file = File::options().append(true).open(f.path()).unwrap();
+            write!(file, "{{\"type\":\"compacted\",\"ignored\":\"{}", "x".repeat(MAX_LINE as usize)).unwrap();
+            if case == "malformed" { writeln!(file).unwrap(); }
         }
         assert!(f.model(&snapshot).is_err(), "accepted {case}");
     }

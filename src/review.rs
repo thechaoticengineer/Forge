@@ -775,7 +775,7 @@ impl Ctx {
             let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model);
             let expected = selected["resolved_id"].as_str().unwrap_or(model);
             if !result.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, expected, &result.effective_model) {
-                return Err(format!("model routing blocked: reviewer effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
+                return Err(format!("model routing blocked: {role} effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
                     result.effective_model, result.model_reported, selected["eligible"]));
             }
         }
