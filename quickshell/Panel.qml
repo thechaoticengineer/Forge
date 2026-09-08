@@ -138,6 +138,41 @@ Item {
     catalogueWasRefreshing = refreshing
   }
 
+  function architectActivityText(activity, architecture) {
+    const a = activity || {};
+    const cp = architecture || {};
+    let text = "Architect · " + (a.status || cp.context_status || "legacy");
+    if (a.error) text += " · " + a.error;
+    else if (a.reason) text += " · " + a.reason;
+    else if (cp.recovery && cp.recovery.reason) text += " · recovered: " + cp.recovery.reason;
+    if (cp.session && cp.session.reference) text += " · session " + cp.session.reference;
+    return text;
+  }
+  function architectGuidanceText(architecture) {
+    const cp = architecture || {};
+    const guidance = cp.guidance || {};
+    return Object.keys(guidance).map(function(id) {
+      const g = guidance[id];
+      return "Stage " + id + (g.valid ? "" : " (needs refresh)") + ": " + (g.text || "");
+    }).join("\n");
+  }
+  function architectDecisionText(d) {
+    let text = d.id + " · " + d.status + " · " + d.summary;
+    if (d.rationale) text += "\nWhy: " + d.rationale;
+    if (d.supersedes) text += "\nSupersedes: " + d.supersedes;
+    (d.alternatives || []).forEach(function(a) { text += "\nAlternative: " + a.description + " — " + a.tradeoffs; });
+    return text;
+  }
+  function architectUsageText(plan) {
+    const usage = plan && plan.role_usage ? plan.role_usage : {};
+    return Object.keys(usage).map(function(role) {
+      const tools = usage[role] || {};
+      let total = 0;
+      Object.keys(tools).forEach(function(tool) { total += tools[tool].total_tokens || 0; });
+      return role + ": " + total + " tokens";
+    }).join(" · ");
+  }
+
   function catalogueProviderText(provider) {
     return provider.provider + ": " + provider.status + " · " + provider.model_count + " models"
       + (provider.cached_stale ? " · cached/stale" : "")
@@ -1270,6 +1305,11 @@ Item {
             onClicked: root.cycleTool("planner")
           }
           PanelButton {
+            label: "architect: "
+              + (root.engineState ? (root.engineState.settings.architect || "codex") : "…")
+            onClicked: root.cycleTool("architect")
+          }
+          PanelButton {
             label: "implementer: "
               + (root.engineState ? root.engineState.settings.implementer : "…")
             onClicked: root.cycleTool("implementer")
@@ -1555,7 +1595,7 @@ Item {
         }
 
         Column {
-          visible: root.plan !== null || (root.architecture && root.architecture.context_status === "error")
+          visible: root.plan !== null || (root.engineState && root.engineState.architect_activity) || (root.architecture && root.architecture.context_status === "error")
           width: parent.width
           spacing: Style.space(4)
           Text {
@@ -1579,12 +1619,50 @@ Item {
             font.pixelSize: root.fs(12)
             wrapMode: Text.Wrap
           }
+          Text {
+            width: parent.width
+            text: root.architectActivityText(root.engineState ? root.engineState.architect_activity : null, root.architecture)
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
+            wrapMode: Text.Wrap
+          }
+          Text {
+            width: parent.width
+            text: root.architectGuidanceText(root.architecture)
+            visible: text !== ""
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
+            wrapMode: Text.Wrap
+          }
+          Text {
+            width: parent.width
+            text: root.architectUsageText(root.plan)
+            visible: text !== ""
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
+            wrapMode: Text.Wrap
+          }
+          Repeater {
+            model: root.architecture && root.architecture.unresolved_risks ? root.architecture.unresolved_risks : []
+            delegate: Text {
+              required property var modelData
+              width: parent.width
+              text: "Risk " + modelData.id + ": " + modelData.text
+              color: root.mutedForeground
+              font.family: root.fontFamily
+              font.pixelSize: root.fs(12)
+              wrapMode: Text.Wrap
+            }
+          }
           Repeater {
             model: root.architecture && root.architecture.recent_decisions ? root.architecture.recent_decisions : []
             delegate: Text {
               required property var modelData
               width: parent.width
-              text: modelData.id + " · " + modelData.status + " · " + modelData.summary
+              text: root.architectDecisionText(modelData)
               color: root.mutedForeground
               font.family: root.fontFamily
               font.pixelSize: root.fs(12)

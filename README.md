@@ -8,10 +8,10 @@ Rust engine + Quickshell (Omarchy) panel.
 ## The loop
 
 1. Point Forge at a git repository and describe a goal.
-2. A planner agent (Claude Code or Codex) writes a staged plan to
-   `.forge/plan-candidate.json`; Forge validates and publishes it to
-   `.forge/plan.json` — each stage has instructions, acceptance criteria,
-   and a proposed commit message.
+2. A planner returns a staged plan, and a persistent architect supplies
+   architectural context and stage guidance. Forge validates their output and
+   publishes `.forge/plan.json` — each stage has instructions, acceptance
+   criteria, and a proposed commit message.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
    - the **implementer** (one tool) implements the stage,
@@ -181,16 +181,15 @@ have stable IDs, rationale, alternatives/tradeoffs, status/supersession, stage,
 revision, and timestamps. Model records distinguish proposals, agreements, and
 effective provider/model/native effort; retain both participants' reasons,
 capability-policy/catalogue provenance, availability verification state, trigger,
-and superseded agreement. These are storage contracts only. Model discovery,
-architect invocation, routing, and dual review gates are **inactive** in this
-stage. The existing independent review path remains in use; the panel reports
-architecture context as `inactive` until later lifecycle work is implemented.
+and superseded agreement. Model discovery and architect guidance are active. Stage model routing and dual review gates remain
+reserved for later stages; independent reviews still start fresh.
 
 Publication uses an explicit commit protocol under a per-project persistence
 mutex (one engine writer per project):
 
-1. Keep the authoritative `plan.json` in place while a planner writes its
-   separate candidate. Validate/reconcile the candidate before publishing.
+1. Keep the authoritative `plan.json` in place while the planner returns its
+   separate candidate. Validate/reconcile the candidate and architect output
+   before publishing.
 2. Append and sync a versioned event. Write, sync, and read back any new review
    files/indexes, then write, sync, and read back an immutable checkpoint bundle. Sync parent directories as well. The proposed plan records
    the checkpoint ID and exact committed byte range in the event log.
@@ -210,13 +209,22 @@ outcome and retains the rollback file for recovery. Malformed, unsupported,
 truncated, or mismatched authoritative records fail closed and surface through
 API state; Forge does not silently pick an arbitrary checkpoint.
 
-Session references require `resume_policy: "fork_from_checkpoint"`: a later
-provider adapter must fork/recover from the exact saved provider checkpoint,
-never resume its mutable latest tail. Revision publication marks existing
-session context `needs_recovery`; a failed revision cannot publish its provider
-turns as valid architecture context. Providers without checkpoint-fork support
-must start a fresh session from the bounded checkpoint in the later session
-implementation.
+Architect sessions use `resume_policy: "exact_if_committed"`. Before a provider
+turn, Forge syncs a plan-owned `architect-pending.json` marker. The resulting
+checkpoint records the same turn ID, exact provider session UUID and effective
+model. Only publication of the plan/checkpoint makes that session tail resumable.
+Unchanged boundaries reuse saved guidance without an agent call. A direct plan
+edit invalidates only affected guidance and dependency inputs, while retaining
+the committed session identity.
+
+An interrupted or failed turn leaves the old plan, decisions and checkpoint
+authoritative. Its pending marker forces a fresh session reconstructed from that
+checkpoint, the full current plan, verified outcomes and retrievable decision
+history. A missing/expired session or provider change also triggers reconstruction;
+replacement identity and reason are recorded. Older `fork_from_checkpoint`
+references are reconstructed rather than resumed. Failed draft revisions never
+make their proposed plan or provider tail authoritative. A marker matching the
+published turn remains safe even if the engine stops immediately after publication.
 
 `GET /api/state` adds a bounded `architecture` summary (identity, revision,
 checkpoint/event position, context status, at most 2,000 summary characters and
@@ -270,16 +278,17 @@ input plus output. It uses `modelUsage` to select the model with the largest
 token count and attributes the entire invocation's total to that model.
 The full per-model breakdown is not retained.
 
-Codex's `tokens used` output supplies only `total_tokens`; its stored input
-and output counts are zero. When usage has no model, Forge uses the configured
-model for the call if known.
+Codex JSONL supplies input/output totals; cached input is already included in
+input tokens. Legacy `tokens used` text remains a total-only fallback. When usage
+has no model, Forge uses the reported effective model or configured model.
 
 Usage is accumulated in `.forge/plan.json`:
 
 - Each stage's `usage` includes implementation, review, and fix
-  calls; the plan's top-level `usage` holds the run's accumulated stage totals.
+  calls; the plan's top-level `usage` holds stage and architect totals.
 - Top-level `planner_usage` records planning usage separately; it is not
-  included in `usage`.
+  included in `usage`. `role_usage` additionally separates planner, architect,
+  implementer, fixer and reviewer totals.
 - Each usage map is keyed by tool (`claude` or `codex`). Each tool entry has
   `input_tokens`, `output_tokens`, `total_tokens`, `calls`, and `models`
   (a map from model name to attributed total tokens).
@@ -349,7 +358,7 @@ The engine serves a JSON API on `http://127.0.0.1:8734` for the panel
 PATH, logged in.
 
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
-widget and the Forge panel: pick planner/implementer/reviewer, set the
+widget and the Forge panel: pick planner/architect/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
 Each reviewed stage has a **last completed review** chip showing its own
 round and decision: a clean `approved`, amber `approved with optional notes`
@@ -493,7 +502,8 @@ Configured selection options independently carry `configured_unverified` when
 availability cannot be verified. An absent discovery mechanism is not proof
 that a model is unavailable. Exact registry entries and existing explicit role
 model settings can run with unverified availability, using provider-default
-reasoning. The run state and history retain that qualification until successful
+reasoning. Planner and architect bootstrap additionally require a configured
+strong tier (see the bootstrap section below). The run state and history retain that qualification until successful
 execution supplies evidence. Missing executables, observed authentication
 failures, rejected models and previously discovered models that were removed
 block selection. A transient refresh failure cannot clear an observed blocker.
@@ -668,3 +678,73 @@ contract and panel controls can be tested without installing its SDK:
 ```sh
 node --test bridges/claude-models/discovery.test.mjs tests/panel_catalogue.test.mjs
 ```
+
+
+### Architect bootstrap and session operation
+
+The planner and architect have separate provider/model settings: `planner` /
+`planner_model` (default provider `claude`) and `architect` / `architect_model`
+(default provider `codex`). Each selects an eligible `strong` entry from the
+configured model registry. An explicit model must match a strong registry entry;
+an empty model selects the first eligible strong entry for that provider. This
+uses configured tiers even when official comparative metadata is absent. An
+explicit registry model may remain `configured_unverified` under the existing
+fallback policy. Known unavailable models are blocked. An empty registry requires
+configuration before planning; Forge never silently substitutes an unclassified
+provider default for these two roles. `mock` remains available for offline tests.
+
+Configure both providers' strong entries through `model_catalogue.entries` in
+`POST /api/settings` (or the persisted model policy described above). Native
+reasoning effort comes from each entry's `effort`. `provider_default` sends no
+effort flag. Other values require discovered native support for that exact
+provider/model; Forge never translates effort names between providers.
+
+The planner inspects the repository and returns a candidate JSON plan. The
+architect receives the goal, full candidate and repository observations before
+publication, and returns a structured checkpoint, decisions/supersessions,
+guidance and unresolved risks tagged with the expected plan ID and revision.
+Forge validates the complete output and publishes plan and context together.
+Architect guidance is included in implementation and fix prompts. A reviewer
+may supply a nonempty `architecture_context_gap` (at most 2,000 bytes) in a
+rejected verdict to request refreshed guidance before a fix. Ordinary fix rounds,
+unchanged stage boundaries, stops and completion do not incur summary turns.
+Successful commits append engine-verified outcomes to durable history and a
+bounded recent checkpoint preview. The full plan retains all committed stages.
+
+Checkpoints are capped at 64 KiB and individual architect responses at 48 KiB.
+Saved constraints and completed interfaces cannot be silently dropped; unresolved
+risks require explicit resolution by ID. Recent decision details remain bounded,
+while the append-only history retains full rationale, alternatives and
+supersessions. Subsequent prompts include the saved checkpoint, at most 24 KiB of
+active decision details and the history path for further retrieval. Capacity or
+validation failures stop required work and expose a recoverable error, preserving
+the last good checkpoint.
+
+Read-only roles use enforceable provider permissions. Codex runs with the
+read-only sandbox, approval policy `never`, ignored user configuration/exec rules,
+empty MCP configuration and disabled hooks/apps/delegation/browser/computer/image
+tools. Claude uses safe mode, `dontAsk`, only `Read,Glob,Grep`, no MCP servers and
+disabled hooks. Claude can inspect files; checks requiring shell execution must
+be performed by another role. The engine writes validated planner, architect and
+Q&A artefacts. Unsupported permission flags produce a recoverable capability
+failure. Implementation permissions and the existing independent review gate
+are unchanged in this stage.
+
+Adapter flags were checked against installed Codex CLI **0.153.4** (`exec --help`
+and `exec resume --help`) and Claude Code **2.1.263** (`--help`), and the official
+[Codex CLI reference](https://developers.openai.com/codex/cli/reference),
+[Codex non-interactive output documentation](https://developers.openai.com/codex/noninteractive),
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference) and
+[Claude settings reference](https://code.claude.com/docs/en/settings).
+Codex JSONL and Claude stream-json are decoded defensively, including exact
+session IDs, terminal failures, effective model and usage. Codex cached input is
+a subset of input tokens; Claude cache creation/read tokens are added to input.
+Human-readable activity stays in `agent.log`; role usage is exposed separately.
+Child process groups are cleaned up on completion, stop and reader failure.
+Neither adapter uses generic `--continue` or `--last`.
+
+Q&A always uses a fresh read-only conversation with a snapshot of saved context.
+It writes chat answers but never mutates the plan, decisions, checkpoint or
+authoritative architect session. `GET /api/state` and the panel expose architect
+activity/recovery, exact session identity, current guidance, decision details,
+unresolved risks and usage per role, including legacy plans without context.

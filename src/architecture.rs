@@ -213,7 +213,27 @@ fn validate_checkpoint(cp: &Value, plan: &Value) -> Result<(), String> {
                 return Err("invalid exact session reference".into());
             }
         }
-        if s["resume_policy"] != "fork_from_checkpoint" {
+        if s["resume_policy"] == "exact_if_committed" {
+            if !s["reference"].as_str().is_some_and(crate::agent::session_id)
+                || !cp["last_turn"].as_str().is_some_and(safe_id)
+                || cp["last_turn"] != s["checkpoint_reference"]
+                || cp["effective_model"]["provider"] != s["provider"]
+                || !cp["effective_model"]["model"].as_str().is_some_and(|s| !s.is_empty()) {
+                return Err("invalid committed architect session".into());
+            }
+            for key in ["constraints", "completed_interfaces"] {
+                if !cp[key].as_array().is_some_and(|a| a.len() <= 64 && a.iter().all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 1000))) {
+                    return Err("invalid saved architect constraints/interfaces".into());
+                }
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            if !cp["unresolved_risks"].as_array().is_some_and(|a| a.len() <= 64 && a.iter().all(|r|
+                r["id"].as_str().is_some_and(|id| safe_id(id) && ids.insert(id.to_string())) &&
+                r["text"].as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 1000))) {
+                return Err("invalid saved architect risks".into());
+            }
+        }
+        if s["resume_policy"] != "fork_from_checkpoint" && s["resume_policy"] != "exact_if_committed" {
             return Err("unsafe session resume policy".into());
         }
     }
@@ -735,12 +755,21 @@ impl Store {
             );
         }
         let cp = self.checkpoint(plan)?;
+        let pending_path = self.directory(plan["plan_id"].as_str().unwrap())?.join("architect-pending.json");
+        let recovery_needed = match fs::read(&pending_path) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map(|p| p["turn"] != cp["last_turn"]).unwrap_or(true),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        };
         Ok(
             json!({"version": VERSION, "plan_id": plan["plan_id"], "revision": plan["revision"],
             "checkpoint": plan["architecture"]["checkpoint"], "event_end": plan["architecture"]["event_end"],
-            "context_status": cp["context_status"], "summary": cp["summary"].as_str().unwrap().chars().take(2000).collect::<String>(),
+            "context_status": if recovery_needed { json!("needs_recovery") } else { cp["context_status"].clone() },
+            "session":cp["session"], "recovery":cp["recovery"], "effective_model":cp["effective_model"],
+            "guidance":cp["guidance"], "unresolved_risks":cp["unresolved_risks"], "constraints":cp["constraints"],
+            "execution_outcomes":cp["execution_outcomes"], "role_usage":cp["role_usage"], "summary": cp["summary"].as_str().unwrap().chars().take(2000).collect::<String>(),
             "recent_decisions": cp["recent_decisions"].as_array().unwrap().iter().map(|d| json!({
-                "id": d["id"], "status": d["status"], "summary": d["summary"].as_str().unwrap_or("").chars().take(240).collect::<String>()
+                "id": d["id"], "status": d["status"], "summary": d["summary"].as_str().unwrap_or("").chars().take(240).collect::<String>(),
+                "rationale":d["rationale"],"alternatives":d["alternatives"],"supersedes":d["supersedes"]
             })).collect::<Vec<_>>() }),
         )
     }

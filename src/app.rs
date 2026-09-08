@@ -1,4 +1,4 @@
-use crate::agent::{AgentUsage, stream_agent_output};
+use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
@@ -34,6 +34,7 @@ pub(crate) struct Session {
     pub(crate) state: Mutex<State>,
     pub(crate) queue_lock: Mutex<()>,
     pub(crate) persistence_lock: Mutex<()>,
+    pub(crate) architect_lock: Mutex<()>,
     pub(crate) persistence_error: Mutex<Option<String>>,
     pub(crate) legacy_state_cache: Mutex<Option<(String, Value)>>,
     pub(crate) stop_requested: AtomicBool,
@@ -74,6 +75,8 @@ pub(crate) struct State {
     pub(crate) agent_tool: String,
     pub(crate) agent_model: String,
     pub(crate) model_selection: Value,
+    pub(crate) architect_activity: Value,
+    pub(crate) role_usage: Value,
     pub(crate) agent_started_unix: i64,
     pub(crate) agent_lines: i64,
     pub(crate) agent_last_line: String,
@@ -168,6 +171,7 @@ impl App {
             }),
             queue_lock: Mutex::new(()),
             persistence_lock: Mutex::new(()),
+            architect_lock: Mutex::new(()),
             persistence_error: Mutex::new(persistence_error),
             legacy_state_cache: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
@@ -432,8 +436,9 @@ impl Ctx {
                     next["revision"] = json!(old["revision"].as_u64().unwrap().checked_add(1).ok_or("revision limit reached")?);
                 }
                 if next["revision"] != old["revision"] {
-                    // Never resume the mutable tail of a session after a revision.
-                    if !cp["session"].is_null() { cp["context_status"] = json!("needs_recovery"); }
+                    // Legacy references cannot prove their mutable tails were committed.
+                    if cp["session"]["resume_policy"] == "fork_from_checkpoint" { cp["context_status"] = json!("needs_recovery"); }
+                    // Exact committed sessions remain usable after an engine-only edit.
                     for key in ["guidance", "agreements"] {
                         if let Some(records) = cp[key].as_object_mut() {
                             for (id, record) in records {
@@ -481,14 +486,27 @@ impl Ctx {
                     }
                 }
             }
+            let mut outcomes = Vec::new();
+            if let Some(old) = old.as_ref().filter(|_| same) {
+                for stage in next["stages"].as_array().unwrap() {
+                    let before = old["stages"].as_array().unwrap().iter().find(|s| s["id"] == stage["id"]);
+                    if stage["status"] == "committed" && before.is_none_or(|s| s["status"] != "committed") {
+                        let outcome = json!({"stage_id":stage["id"],"revision":next["revision"],"status":"committed","sha":stage["sha"],"acceptance":stage["acceptance"].as_str().unwrap_or("").chars().take(500).collect::<String>(),"unix":unix_timestamp()});
+                        outcomes.push(outcome.clone());
+                        if !cp["execution_outcomes"].is_array() { cp["execution_outcomes"] = json!([]); }
+                        let recent = cp["execution_outcomes"].as_array_mut().unwrap(); recent.push(outcome);
+                        if recent.len() > 8 { recent.remove(0); }
+                    }
+                }
+            }
             if old.as_ref() == Some(&next) { return Ok(next); }
-            store.publish(next, cp, json!({"kind": kind, "reviews": reviews, "removed_stage_ids": removed, "invalidations": invalidations}))
+            store.publish(next, cp, json!({"kind": kind, "reviews": reviews, "removed_stage_ids": removed, "invalidations": invalidations, "execution_outcomes":outcomes}))
         })();
         *self.session.persistence_error.lock().unwrap() = result.as_ref().err().cloned();
         result
     }
 
-    fn add_usage(parent: &mut Value, key: &str, tool: &str, usage: &AgentUsage) {
+    pub(crate) fn add_usage(parent: &mut Value, key: &str, tool: &str, usage: &AgentUsage) {
         if usage.is_empty() {
             return;
         }
@@ -520,10 +538,11 @@ impl Ctx {
         }
     }
 
-    fn record_stage_usage(&self, plan: &mut Value, idx: usize, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
+    fn record_stage_usage(&self, plan: &mut Value, idx: usize, role: &str, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
         if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
             Self::add_usage(&mut plan["stages"][idx], "usage", tool, &usage);
             Self::add_usage(plan, "usage", tool, &usage);
+            Self::add_usage(&mut plan["role_usage"], role, tool, &usage);
             self.save_plan(plan)?;
         }
         Ok(())
@@ -613,35 +632,17 @@ impl Ctx {
 
     // ---------------------------------------------------------- agents
 
-    fn agent_command(tool: &str, prompt: &str, model: &str) -> Result<Command, String> {
-        let cmd = match tool {
-            "claude" => {
-                let mut c = Command::new("claude");
-                c.args([
-                    "-p", prompt, "--dangerously-skip-permissions",
-                    "--verbose", "--output-format", "stream-json",
-                ]);
-                if !model.is_empty() {
-                    c.args(["--model", model]);
-                }
-                c
-            }
-            "codex" => {
-                let mut c = Command::new("codex");
-                c.args([
-                    "exec",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "--skip-git-repo-check",
-                ]);
-                if !model.is_empty() {
-                    c.args(["-m", model]);
-                }
-                c.arg(prompt);
-                c
-            }
-            other => return Err(format!("unknown tool {other}")),
+    fn agent_command(request: &AgentRequest<'_>) -> Result<Command, String> {
+        crate::agent::command(request)
+    }
+
+    fn fresh_agent(&self, role: &str, tool: &str, prompt: &str, model: &str) -> Result<Option<AgentUsage>, String> {
+        let effort = if tool == "mock" { "provider_default".into() } else {
+            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            policy.entries.iter().find(|e| e.provider.name() == tool && e.model == model)
+                .map(|e| e.effort.clone()).unwrap_or_else(|| "provider_default".into())
         };
-        Ok(cmd)
+        self.run_agent(&AgentRequest { role, provider: tool, prompt, model, effort: &effort, session: None }).map(|r| r.usage)
     }
 
     fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<fs::File>>, String> {
@@ -667,9 +668,9 @@ impl Ctx {
         message
     }
 
-    fn run_agent(&self, role: &str, tool: &str, prompt: &str, model: &str)
-        -> Result<Option<AgentUsage>, String>
-    {
+    pub(crate) fn run_agent(&self, request: &AgentRequest<'_>) -> Result<AgentResult, String> {
+        let AgentRequest { role, provider: tool, prompt, model, effort, session } = *request;
+        let _ = prompt;
         if tool == "mock" {
             #[cfg(test)]
             if role == "planner" {
@@ -710,18 +711,23 @@ impl Ctx {
             if usage.is_some() {
                 self.log_agent_finished(role, tool, "", usage.as_ref());
             }
-            return Ok(usage);
+            return Ok(AgentResult { usage, effective_model: model.into(), completed: true, ..AgentResult::default() });
         }
         let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
         let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-        let mut selection = self.app.catalogue.execution_input(&policy, provider, model);
+        let mut selection = self.app.catalogue.execution_with_effort(&policy, provider, model, effort);
         self.session.state.lock().unwrap().model_selection = selection.clone();
         if selection["eligible"] != true {
             return Err(self.agent_error(role, selection["error"].as_str().unwrap_or("model unavailable").into()));
         }
         let requested_model = model.to_string();
-        let mut cmd = Self::agent_command(tool, prompt, model)?;
-        for arg in selection["native_effort_args"].as_array().into_iter().flatten().filter_map(Value::as_str) { cmd.arg(arg); }
+        let executable = tool.to_string();
+        #[cfg(test)]
+        let executable = self.app.settings.lock().unwrap()[format!("test_cli_{tool}")].as_str().unwrap_or(&executable).to_string();
+        crate::agent::verify_capabilities(request, self.project(), &executable)?;
+        let built = Self::agent_command(request)?;
+        let mut cmd = Command::new(&executable);
+        cmd.args(built.get_args());
         self.log_event("model", &format!("[{role}] {tool}/{} · {} · policy {} · effort {}",
             if model.is_empty() { "provider default" } else { model }, selection["availability"].as_str().unwrap_or("unverified"),
             policy.policy_revision, selection["effort"].as_str().unwrap_or("provider_default")));
@@ -738,7 +744,10 @@ impl Ctx {
             s.agent_last_line.clear();
         }
 
+        use std::os::unix::process::CommandExt;
         let child = cmd
+            .process_group(0)
+            .stdin(Stdio::null())
             .current_dir(self.project())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -762,28 +771,39 @@ impl Ctx {
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stderr_log = Arc::clone(&log);
+        let pid = child.id() as i32;
+        let failed_reader = AtomicBool::new(false);
         let (stdout_result, stderr_result, status_result) = std::thread::scope(|scope| {
-            let stderr_reader = scope.spawn(|| {
-                stream_agent_output(stderr, &stderr_log, &self.session.state, 1500, false)
-                    .map(|(tail, _)| tail)
+            let stdout_reader = scope.spawn(|| {
+                let result = stream_agent_result(stdout, &log, &self.session.state, 1500, tool == "claude");
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result
             });
-            let stdout_result = stream_agent_output(stdout, &log, &self.session.state, 600, tool == "claude");
-            let status_result = child.wait();
-            let stderr_result = stderr_reader
-                .join()
-                .unwrap_or_else(|_| Err("agent stderr reader panicked".to_string()));
-            (stdout_result, stderr_result, status_result)
+            let stderr_reader = scope.spawn(|| {
+                let result = stream_agent_result(stderr, &stderr_log, &self.session.state, 1500, false).map(|r| r.output);
+                if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
+                result
+            });
+            let status = loop {
+                if self.session.stop_requested.load(Ordering::SeqCst) || failed_reader.load(Ordering::SeqCst) {
+                    unsafe { libc::kill(-pid, libc::SIGKILL); }
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Err(e) => break Err(e),
+                    _ => std::thread::sleep(Duration::from_millis(25)),
+                }
+            };
+            // Descendants must not keep pipes open or survive a completed/failed invocation.
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            let _ = child.wait();
+            (stdout_reader.join().unwrap_or_else(|_| Err("agent stdout reader panicked".into())),
+             stderr_reader.join().unwrap_or_else(|_| Err("agent stderr reader panicked".into())), status)
         });
-        let model = self.session.state.lock().unwrap().agent_model.clone();
         self.clear_agent_activity();
-
-        let (tail, mut usage) = match stdout_result {
-            Ok(result) => result,
-            Err(e) => {
-                self.agent_error(role, format!("{tool} output failed: {e}"));
-                return Err(e);
-            }
-        };
+        let mut result = stdout_result?;
+        let tail = result.output.clone();
+        let mut usage = result.usage.take();
         let etail = match stderr_result {
             Ok(tail) => tail,
             Err(e) => {
@@ -816,7 +836,14 @@ impl Ctx {
             selection["execution_status"] = json!("failed");
             self.session.state.lock().unwrap().model_selection = selection;
             self.log_event("error", &format!("[{role}] {tool} failed: {etail}"));
-            return Err(format!("{tool} exited with {status}: {etail}"));
+            return Err(format!("{tool} exited with {status}: {etail} {tail}"));
+        }
+        if let Some(error) = result.error { return Err(self.agent_error(role, error)); }
+        if matches!(role, "architect" | "chat" | "planner") && !result.completed {
+            return Err("provider ended without a successful structured result".into());
+        }
+        if session.is_some() && result.session.as_deref() != session {
+            return Err("resumed session identity mismatch".into());
         }
         self.app.catalogue.observe(&policy, provider, &requested_model, Ok(()));
         selection["availability"] = json!("execution_verified"); selection["availability_unverified"] = json!(false);
@@ -826,10 +853,16 @@ impl Ctx {
         if let Some(usage) = &mut usage
             && usage.model.is_empty()
         {
-            usage.model = model;
+            usage.model = if result.effective_model.is_empty() { model.into() } else { result.effective_model.clone() };
         }
         self.log_agent_finished(role, tool, &tail, usage.as_ref());
-        Ok(usage)
+        if result.effective_model.is_empty() { result.effective_model = model.into(); }
+        if let Some(u) = &usage {
+            let mut state = self.session.state.lock().unwrap();
+            Self::add_usage(&mut state.role_usage, role, tool, u);
+        }
+        result.usage = usage;
+        Ok(result)
     }
 
     fn log_agent_finished(&self, role: &str, tool: &str, tail: &str, usage: Option<&AgentUsage>) {
@@ -965,7 +998,8 @@ impl Ctx {
         let result = self.generate_plan(&prompt)
             .and_then(|plan| self.finalize_plan(plan, goal, Some(current_plan), "revised"));
         if let Err(error) = result {
-            self.set_phase("plan_ready");
+            let architecture_failed = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
+            self.set_phase(if architecture_failed { "blocked" } else { "plan_ready" });
             self.log_event("error", &format!("revision failed: {error}"));
         }
     }
@@ -986,13 +1020,17 @@ impl Ctx {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                 Err(e) => return Err(format!("could not remove previous answer: {e}")),
             }
-            self.run_agent("chat", &self.setting("planner"), &prompt, &self.setting("planner_model"))?;
-            let text = fs::read_to_string(self.forge_path("answer.json"))
-                .map_err(|e| format!("could not read answer file: {e}"))?;
+            let tool = self.setting("planner");
+            let model = self.setting("planner_model");
+            let context = if current_plan.get("architecture").is_some() { self.architecture_store().checkpoint(current_plan)? } else { crate::architecture::checkpoint_default() };
+            let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only Q&A in a fresh conversation. Do not write files or alter plan/decisions. Return ONLY {{\"answer\":\"your answer\"}}. Saved architecture context: {context}");
+            let result = self.run_agent(&AgentRequest { role:"chat", provider:&tool, model:&model, effort:"provider_default", session:None, prompt:if tool == "mock" {&prompt} else {&readonly_prompt} })?;
+            let text = if tool == "mock" { fs::read_to_string(self.forge_path("answer.json")).map_err(|e| format!("could not read answer file: {e}"))? } else { result.output };
             let output: Value = serde_json::from_str(&text)
                 .map_err(|e| format!("invalid answer JSON: {e}"))?;
             let answer = output["answer"].as_str().filter(|answer| !answer.trim().is_empty())
                 .ok_or_else(|| "agent did not produce a non-empty answer string".to_string())?;
+            crate::architecture::atomic_json(&self.forge_path("answer.json"), &output)?;
             let user = json!({"role": "user", "text": question, "unix": unix_timestamp()});
             let assistant = json!({"role": "assistant", "text": answer, "unix": unix_timestamp()});
             let mut file = fs::OpenOptions::new().create(true).append(true)
@@ -1005,7 +1043,7 @@ impl Ctx {
     }
 
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
-        let tool = self.setting("planner");
+        let (tool, model, effort) = self.bootstrap("planner")?;
         self.ensure_forge_dir();
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         let path = self.forge_path("plan-candidate.json");
@@ -1014,14 +1052,20 @@ impl Ctx {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
             Err(e) => return Err(format!("could not remove previous candidate: {e}")),
         }
-        let usage = self.run_agent("planner", &tool, prompt, &self.setting("planner_model"))?;
-        let mut plan: Value = serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("invalid candidate: {e}"))?;
+        let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.");
+        let result = self.run_agent(&AgentRequest { role:"planner", provider:&tool, model:&model, effort:&effort, session:None, prompt: if tool == "mock" {prompt} else {&readonly_prompt} })?;
+        let mut plan: Value = if tool == "mock" {
+            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| format!("invalid candidate: {e}"))?
+        } else { serde_json::from_str(&result.output).map_err(|e| format!("invalid candidate: {e}"))? };
+        let usage = result.usage;
         if !plan["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
         // Agent-authored usage may be an echo of the previous revision. Only
         // the invocation result contributes new planner usage.
         plan.as_object_mut().unwrap().remove("planner_usage");
+        plan.as_object_mut().unwrap().remove("role_usage");
         if let Some(usage) = usage { Self::add_usage(&mut plan, "planner_usage", &tool, &usage); }
+        if !plan["planner_usage"].is_null() { plan["role_usage"] = json!({"planner":plan["planner_usage"]}); }
+        crate::architecture::atomic_json(&path, &plan)?;
         Ok(plan)
     }
 
@@ -1065,13 +1109,18 @@ impl Ctx {
                     }
                 }
             }
-            self.publish_plan(&edited, false)?;
+            if !edited["planner_usage"].is_null() {
+                if !edited["role_usage"].is_object() { edited["role_usage"] = json!({}); }
+                edited["role_usage"]["planner"] = edited["planner_usage"].clone();
+            }
+            self.architect_publish(edited, Some(previous), "draft revision")?;
         } else {
             let base = json!({"stages": [], "goal": goal});
             let normalized = crate::plan::edit_plan(&base, &json!({"plan": plan})).map_err(str::to_owned)?;
             plan["stages"] = normalized["stages"].clone();
             plan["stage_id_high_water"] = normalized["stage_id_high_water"].clone();
-            self.publish_plan(&plan, true)?;
+            for key in ["plan_id", "revision", "architecture", "contract_version"] { plan.as_object_mut().unwrap().remove(key); }
+            self.architect_publish(plan, None, "initial plan guidance")?;
         }
         self.set_phase("plan_ready");
         self.log_event("plan", &format!("plan {action} with {n} stages"));
@@ -1238,7 +1287,7 @@ impl Ctx {
         context
     }
 
-    fn stage_prompt(&self, template: &str, plan: &Value, stage: &Value) -> String {
+    fn stage_prompt(&self, template: &str, plan: &Value, stage: &Value) -> Result<String, String> {
         let overview: String = plan["stages"]
             .as_array()
             .unwrap()
@@ -1250,7 +1299,7 @@ impl Ctx {
                 )
             })
             .collect();
-        fill_template(template, &[
+        let mut prompt = fill_template(template, &[
             ("{goal}", plan["goal"].as_str().unwrap_or("")),
             ("{plan_overview}", &overview),
             ("{sid}", &stage["id"].to_string()),
@@ -1260,7 +1309,18 @@ impl Ctx {
             ("{forge_dir}", FORGE_DIR),
             ("{verdict_path}", &format!("{FORGE_DIR}/verdict.json")),
             ("{review_context}", &Self::stage_review_context(stage)),
-        ])
+        ]);
+        if template != REVIEW_PROMPT {
+            let current = self.load_plan().ok_or("missing architectural plan")?;
+            let cp = self.architecture_store().checkpoint(&current)?;
+            let guidance = &cp["guidance"][stage["id"].to_string()];
+            let idx = current["stages"].as_array().unwrap().iter().position(|s| s["id"] == stage["id"]).ok_or("missing guidance stage")?;
+            if cp["context_status"] != "ready" || guidance["valid"] != true || guidance["relevant_inputs"] != crate::plan::stage_inputs(&current, idx) {
+                return Err("required architectural guidance is missing or stale".into());
+            }
+            prompt.push_str(&format!("\nARCHITECT GUIDANCE:\n{}\nSaved constraints: {}\nCompleted interfaces: {}\nOutstanding risks: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", guidance["text"].as_str().unwrap_or(""), cp["constraints"], cp["completed_interfaces"], cp["unresolved_risks"], current["plan_id"].as_str().unwrap_or("")));
+        }
+        Ok(prompt)
     }
 
     /// Implement + independent review + bounded fix loop for one stage.
@@ -1282,18 +1342,18 @@ impl Ctx {
             let usage = match round {
                 0 => {
                     self.set_step(Some(sid), "implementing");
-                    let p = self.stage_prompt(IMPLEMENT_PROMPT, plan, &stage);
-                    self.run_agent("implementer", &implementer, &p,
+                    let p = self.stage_prompt(IMPLEMENT_PROMPT, plan, &stage)?;
+                    self.fresh_agent("implementer", &implementer, &p,
                                    &self.setting("implementer_model"))?
                 }
                 _ => {
                     self.set_step(Some(sid), &format!("fixing (round {round})"));
-                    let p = self.stage_prompt(FIX_PROMPT, plan, &stage);
-                    self.run_agent("fixer", &implementer, &p,
+                    let p = self.stage_prompt(FIX_PROMPT, plan, &stage)?;
+                    self.fresh_agent("fixer", &implementer, &p,
                                    &self.setting("implementer_model"))?
                 }
             };
-            self.record_stage_usage(plan, idx, &implementer, usage)?;
+            self.record_stage_usage(plan, idx, if round == 0 {"implementer"} else {"fixer"}, &implementer, usage)?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1301,11 +1361,11 @@ impl Ctx {
             self.set_step(Some(sid), "reviewing");
             let verdict_path = self.forge_path("verdict.json");
             let _ = fs::remove_file(&verdict_path);
-            let p = self.stage_prompt(REVIEW_PROMPT, plan, &stage);
+            let p = self.stage_prompt(REVIEW_PROMPT, plan, &stage)?;
             let reviewer = self.setting("reviewer");
-            let usage = self.run_agent("reviewer", &reviewer, &p,
+            let usage = self.fresh_agent("reviewer", &reviewer, &p,
                                        &self.setting("reviewer_model"))?;
-            self.record_stage_usage(plan, idx, &reviewer, usage)?;
+            self.record_stage_usage(plan, idx, "reviewer", &reviewer, usage)?;
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
@@ -1367,6 +1427,20 @@ impl Ctx {
                 self.log_event("review", &message);
                 return Ok("approved");
             }
+            if round < max_rounds {
+                if let Some(gap) = verdict.as_ref().and_then(|v| v["architecture_context_gap"].as_str()).filter(|s| !s.trim().is_empty() && s.len() <= 2000) {
+                    let current = self.load_plan().ok_or("missing plan for architectural context gap")?;
+                    let mut cp = self.architecture_store().checkpoint(&current)?;
+                    cp["guidance"][sid.to_string()]["valid"] = json!(false);
+                    cp["guidance"][sid.to_string()]["invalidation_trigger"] = json!("reviewer_context_gap");
+                    cp["context_gap"] = json!({"stage_id":sid,"text":gap});
+                    let current = {
+                        let _guard = self.session.persistence_lock.lock().unwrap();
+                        self.architecture_store().publish(current, cp, json!({"kind":"architect_context_gap","stage_id":sid,"text":gap}))?
+                    };
+                    *plan = self.architect_publish(current.clone(), Some(&current), "reviewer identified architectural context gap")?;
+                }
+            }
             if verdict.is_none() {
                 self.log_event("error", "reviewer produced no readable verdict; retrying stage");
             } else {
@@ -1396,6 +1470,7 @@ impl Ctx {
     fn run_worker_inner(&self) -> Result<(), String> {
         let loaded = self.load_plan().ok_or("no plan")?;
         let mut plan = self.publish_plan(&loaded, false)?;
+        plan = self.architect_publish(plan.clone(), Some(&plan), "stage run")?;
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {

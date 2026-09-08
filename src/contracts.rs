@@ -1,5 +1,5 @@
-//! Inactive version-one boundary contracts for later architect/routing stages.
-//! These structs deliberately do not select models, invoke providers, or change gates.
+//! Version-one persistence and provider boundary contracts.
+//! Routing and dual-review policy records remain available for later stages.
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +16,7 @@ pub(crate) struct SessionReference {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResumePolicy {
     ForkFromCheckpoint,
+    ExactIfCommitted,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

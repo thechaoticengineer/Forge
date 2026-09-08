@@ -13,6 +13,7 @@ mod catalogue_process;
 mod metadata;
 mod agent;
 mod architecture;
+mod architect;
 mod review_history;
 mod contracts;
 mod app;
@@ -669,7 +670,7 @@ mod tests {
         assert_eq!(history[0]["kind"], "plan");
         assert_eq!(history[0]["text"], format!("revision started: {}",
             feedback.chars().take(300).collect::<String>()));
-        assert_eq!(history[1]["text"], "plan revised with 2 stages");
+        assert!(history.as_array().unwrap().iter().any(|e| e["text"] == "plan revised with 2 stages"));
     }
 
     #[test]
@@ -2571,6 +2572,8 @@ mod tests {
             agent_tool: String::new(),
             agent_model: String::new(),
             model_selection: Value::Null,
+            architect_activity: Value::Null,
+            role_usage: Value::Null,
             agent_started_unix: 0,
             agent_lines: 0,
             agent_last_line: String::new(),
@@ -2614,4 +2617,51 @@ mod tests {
         assert_eq!(state.agent_lines, 4);
         assert_eq!(state.agent_last_line, "Done");
     }
+    #[test]
+    fn architect_guidance_spans_real_stage_loop_without_boundary_summary_turns() {
+        let test = QueueTest::new(true);
+        seed_mock_plan(&test.app);
+        test.app.app.settings.lock().unwrap()["mock_reviewer_prompts"] = json!([]);
+        test.app.run_worker();
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+        let plan = test.app.load_plan().unwrap();
+        let cp = test.app.architecture_store().checkpoint(&plan).unwrap();
+        let settings = test.app.app.settings.lock().unwrap();
+        let turns = settings["mock_architect_requests"].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0]["session"].is_null());
+        assert_eq!(cp["execution_outcomes"].as_array().unwrap().len(), 2);
+        assert_eq!(cp["guidance"].as_object().unwrap().len(), 2);
+        assert!(settings["mock_reviewer_prompts"].as_array().unwrap().iter().all(|p|
+            !p.as_str().unwrap().contains("ARCHITECT GUIDANCE")));
+        let reference = cp["session"]["reference"].clone();
+        drop(settings);
+        test.app.run_worker();
+        let completed = test.app.load_plan().unwrap();
+        assert_eq!(test.app.architecture_store().checkpoint(&completed).unwrap()["session"]["reference"], reference);
+        assert_eq!(test.app.app.settings.lock().unwrap()["mock_architect_requests"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_reviewer_context_gap_refreshes_only_affected_guidance_before_fix() {
+        let test = QueueTest::new(true);
+        seed_mock_plan(&test.app);
+        test.app.app.settings.lock().unwrap()["mock_verdicts"] = json!([
+            {"approved":false,"issues":["Clarify serialization compatibility"],
+             "architecture_context_gap":"Which identifiers must remain stable?"},
+            {"approved":true,"issues":[]},{"approved":true,"issues":[]}]);
+        test.app.run_worker();
+        assert_eq!(test.app.session.state.lock().unwrap().phase, "done");
+        let plan = test.app.load_plan().unwrap();
+        let cp = test.app.architecture_store().checkpoint(&plan).unwrap();
+        let settings = test.app.app.settings.lock().unwrap();
+        let turns = settings["mock_architect_requests"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1]["session"], cp["session"]["reference"]);
+        assert!(turns[1]["prompt"].as_str().unwrap().contains("Which identifiers must remain stable?"));
+        assert!(turns[1]["prompt"].as_str().unwrap().contains("\"required_stage_ids\":[1]"));
+        assert!(cp["context_gap"].is_null());
+        assert!(settings["mock_fixer_prompts"][0].as_str().unwrap().contains("ARCHITECT GUIDANCE"));
+    }
+
 }

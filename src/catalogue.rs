@@ -949,6 +949,12 @@ impl Catalogue {
             true,
         )
     }
+    pub fn execution_with_effort(&self, policy: &Policy, provider: Provider, model: &str, effort: &str) -> Value {
+        let state = self.state.lock().unwrap();
+        let entry = policy.entries.iter().find(|e| e.provider == provider && e.model == model);
+        selection(state.providers.get(&provider).filter(|s| s.scope == scope(provider, policy)),
+            provider, model, effort, entry, &policy.policy_revision, true)
+    }
     /// Execution supplies stronger evidence than a discovery failure. Never infer an auth or
     /// model rejection merely from an arbitrary non-zero process exit.
     pub fn reject_effort(&self, policy: &Policy, provider: Provider, model: &str, effort: &str) {

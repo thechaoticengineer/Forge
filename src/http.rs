@@ -132,6 +132,8 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
             "current_step": s.current_step,
             "run_started_unix": s.run_started_unix,
             "model_selection": s.model_selection,
+            "architect_activity":s.architect_activity,
+            "role_usage":s.role_usage,
             "agent": {
                 "role": s.agent_role,
                 "tool": s.agent_tool,
@@ -454,6 +456,8 @@ fn api_plan(ctx: &Ctx, body: &Value) -> (u32, Value) {
             let mut s = ctx.session.state.lock().unwrap();
             s.goal = goal.clone();
             s.phase = "planning".into();
+            s.architect_activity = Value::Null;
+            s.role_usage = Value::Null;
         }
         let short: String = goal.chars().take(300).collect();
         ctx.log_event("plan", &format!("planning started for goal: {short}"));
@@ -613,7 +617,7 @@ fn api_stop(ctx: &Ctx) -> (u32, Value) {
         ctx.set_queue_status(&mut queue, id, "blocked");
     }
     ctx.log_event("queue", "queue stopped by user");
-    ctx.log_event("run", "stop requested; finishing current agent session");
+    ctx.log_event("run", "stop requested; stopping current agent and retaining saved progress");
     (200, json!({"ok": true}))
 }
 
@@ -626,6 +630,11 @@ fn api_reset_plan(ctx: &Ctx) -> (u32, Value) {
         if let Err(error) = ctx.architecture_store().reset() { return (500, json!({"error": error})); }
         let _ = fs::remove_file(ctx.forge_path("chat.jsonl"));
         ctx.set_phase("idle");
+        {
+            let mut state = ctx.session.state.lock().unwrap();
+            state.architect_activity = Value::Null;
+            state.role_usage = Value::Null;
+        }
         ctx.log_event("plan", "plan discarded");
         (200, json!({"ok": true}))
     }

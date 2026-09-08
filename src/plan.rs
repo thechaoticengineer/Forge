@@ -6,6 +6,8 @@ pub(crate) fn default_settings() -> Value {
         "projects_root": "",
         "model_catalogue": crate::catalogue::Policy::default(),
         "planner": "claude",
+        "architect": "codex",
+        "architect_model": "",
         "implementer": "codex",
         "reviewer": "claude",
         "planner_model": "",
@@ -175,7 +177,7 @@ fn direct_stage_inputs(plan: &Value, index: usize) -> Value {
     let dependencies = stage.get("depends_on").cloned().unwrap_or_else(||
         json!(stages[..index].iter().map(|s| s["id"].clone()).collect::<Vec<_>>()));
     json!({"goal": plan["goal"], "title": stage["title"], "instructions": stage["instructions"],
-        "acceptance": stage["acceptance"], "commit": stage["commit"], "dependencies": dependencies})
+        "acceptance": stage["acceptance"], "commit": stage["commit"].as_str().unwrap_or("forge: stage"), "dependencies": dependencies})
 }
 
 pub(crate) fn affected_stages(old: &Value, new: &Value) -> Result<Vec<Value>, &'static str> {
