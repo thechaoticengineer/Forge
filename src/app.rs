@@ -1,4 +1,6 @@
 mod agent_execution;
+mod history;
+mod persistence;
 mod planning;
 mod queue;
 #[path = "review.rs"]
@@ -8,11 +10,11 @@ mod reassessment;
 use crate::agent::{AgentUsage, AgentRequest, AgentResult};
 use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
 use crate::usage::accumulate_invocation_usage;
-use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
+use crate::util::{canonical_project, fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -177,7 +179,7 @@ impl App {
             let _ = fs::remove_file(&marker);
             let requested = text.trim().parse::<i64>().unwrap_or(0);
             if unix_timestamp() - requested <= 900 {
-                log_project_event(&project, "update",
+                history::log_project_event(&project, "update",
                     "self-update finished; engine restarted on the new build");
             }
         }
@@ -317,26 +319,6 @@ impl App {
 
 }
 
-/// Append a history event for a project without a live session; used for
-/// events that must outlive an engine restart, like self-update completion.
-fn log_project_event(project: &str, kind: &str, text: &str) {
-    let dir = PathBuf::from(project).join(FORGE_DIR);
-    let _ = fs::create_dir_all(&dir);
-    let entry = json!({"t": clock_hms(), "unix": unix_timestamp(), "kind": kind, "text": text});
-    append_history_event(project, &entry, kind, text);
-}
-
-fn append_history_event(project: &str, entry: &Value, kind: &str, text: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(PathBuf::from(project).join(FORGE_DIR).join("history.jsonl"))
-    {
-        let _ = writeln!(f, "{entry}");
-    }
-    println!("[{kind}] {text}");
-}
-
 impl Ctx {
     pub(crate) fn project(&self) -> &str {
         &self.project
@@ -348,173 +330,6 @@ impl Ctx {
 
     pub(crate) fn ensure_forge_dir(&self) {
         let _ = fs::create_dir_all(self.forge_path(""));
-    }
-
-    pub(crate) fn log_event(&self, kind: &str, text: &str) {
-        self.ensure_forge_dir();
-        let t = clock_hms();
-        let mut entry = json!({"t": t, "unix": unix_timestamp(), "kind": kind, "text": text});
-        {
-            // Callers release the session state lock before logging.
-            let s = self.session.state.lock().unwrap();
-            if !s.goal.is_empty() {
-                entry["goal"] = json!(s.goal.chars().take(120).collect::<String>());
-            }
-            if let Some(stage) = s.current_stage {
-                entry["stage"] = json!(stage);
-            }
-        }
-        append_history_event(self.project(), &entry, kind, text);
-    }
-
-    fn read_jsonl_tail(&self, name: &str, keep: usize) -> Value {
-        let text = (|| -> std::io::Result<String> {
-            let mut file = fs::File::open(self.forge_path(name))?;
-            let size = file.metadata()?.len();
-            let start = size.saturating_sub(2 * 1024 * 1024);
-            file.seek(SeekFrom::Start(start))?;
-            let mut bytes = Vec::new(); file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
-            if start > 0 {
-                let boundary = bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |p| p + 1);
-                bytes.drain(..boundary);
-            }
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        })().unwrap_or_default();
-        let items: Vec<Value> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        let skip = items.len().saturating_sub(keep);
-        Value::Array(items.into_iter().skip(skip).collect())
-    }
-
-    pub(crate) fn read_history(&self) -> Value {
-        self.read_jsonl_tail("history.jsonl", 400)
-    }
-
-    pub(crate) fn read_chat(&self) -> Value {
-        self.read_jsonl_tail("chat.jsonl", 100)
-    }
-
-    pub(crate) fn read_reports(&self) -> Value {
-        self.read_jsonl_tail("reports.jsonl", 100)
-    }
-
-    pub(crate) fn architecture_store(&self) -> crate::architecture::Store {
-        crate::architecture::Store::new(self.forge_path(""))
-    }
-
-    pub(crate) fn load_plan(&self) -> Option<Value> {
-        let _guard = self.session.persistence_lock.lock().unwrap();
-        match self.architecture_store().load() {
-            Ok(plan) => plan,
-            Err(error) => {
-                *self.session.persistence_error.lock().unwrap() = Some(error);
-                None
-            }
-        }
-    }
-
-    pub(crate) fn save_plan(&self, plan: &Value) -> Result<(), String> {
-        self.publish_plan(plan, false).map(|_| ())
-    }
-
-    pub(crate) fn publish_plan(&self, plan: &Value, replacement: bool) -> Result<Value, String> {
-        let _guard = self.session.persistence_lock.lock().unwrap();
-        let result = (|| {
-            let store = self.architecture_store();
-            let mut old = store.load()?;
-            if let Some(legacy) = old.as_ref().filter(|p| p.get("architecture").is_none()) {
-                old = Some(store.publish(legacy.clone(), crate::architecture::checkpoint_default(),
-                    json!({"kind": "legacy_import"}))?);
-            }
-            let mut next = plan.clone();
-            // Import legacy metadata on first mutation, never on a read.
-            let same = !replacement && old.as_ref().is_some_and(|p|
-                next["plan_id"].is_null() || next["plan_id"] == p["plan_id"]);
-            if !replacement && old.is_some() && !same { return Err("plan identity does not match the active project plan".into()); }
-            let mut cp = crate::architecture::checkpoint_default();
-            let mut invalidations = Vec::new();
-            if same {
-                let old = old.as_ref().unwrap();
-                if old.get("architecture").is_some() {
-                    cp = store.checkpoint(old)?;
-                    for key in ["plan_id", "contract_version", "architecture"] { next[key] = old[key].clone(); }
-                    if next["revision"].is_null() { next["revision"] = old["revision"].clone(); }
-                }
-                let affected = crate::plan::affected_stages(old, &next).map_err(str::to_owned)?;
-                if !affected.is_empty() && next["revision"] == old["revision"] {
-                    next["revision"] = json!(old["revision"].as_u64().unwrap().checked_add(1).ok_or("revision limit reached")?);
-                }
-                if next["revision"] != old["revision"] {
-                    // Legacy references cannot prove their mutable tails were committed.
-                    if cp["session"]["resume_policy"] == "fork_from_checkpoint" { cp["context_status"] = json!("needs_recovery"); }
-                    // Exact committed sessions remain usable after an engine-only edit.
-                    for key in ["guidance", "agreements"] {
-                        if let Some(records) = cp[key].as_object_mut() {
-                            for (id, record) in records {
-                                let valid = next["stages"].as_array().unwrap().iter().any(|s|
-                                    s["id"].to_string() == *id && (s["status"] == "committed" || !affected.contains(&s["id"])));
-                                if !valid && record.is_object() {
-                                    let trigger = if old["goal"] != next["goal"] { "goal_changed" }
-                                        else if !next["stages"].as_array().unwrap().iter().any(|s| s["id"].to_string() == *id) { "stage_removed" }
-                                        else { "stage_or_dependency_changed" };
-                                    invalidations.push(json!({"kind": key, "stage_id": id, "record_id": record["id"],
-                                        "trigger": trigger, "previous_revision": old["revision"], "revision": next["revision"]}));
-                                    record["valid"] = json!(false);
-                                    record["invalidation_trigger"] = json!(trigger);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                for key in ["plan_id", "revision", "architecture", "contract_version"] { next.as_object_mut().ok_or("invalid plan")?.remove(key); }
-            }
-            let kind = if replacement { "plan_created" } else if old.as_ref().is_some_and(|p| p.get("architecture").is_none()) { "legacy_import" } else { "plan_saved" };
-            let mut reviews = Vec::new();
-            let mut removed = Vec::new();
-            if let Some(old) = old.as_ref().filter(|_| same) {
-                for stage in old["stages"].as_array().unwrap() {
-                    if !next["stages"].as_array().unwrap().iter().any(|s| s["id"] == stage["id"]) {
-                        removed.push(stage["id"].clone());
-                    }
-                }
-            }
-            for stage in next["stages"].as_array().ok_or("invalid stages")? {
-                let count = old.as_ref().filter(|_| same).and_then(|p| p["stages"].as_array())
-                    .and_then(|stages| stages.iter().find(|s| s["id"] == stage["id"]))
-                    .and_then(|s| s["reviews"].as_array()).map_or(0, Vec::len);
-                for review in stage["reviews"].as_array().into_iter().flatten().skip(count) {
-                    let mut record = review.clone();
-                    if record.is_object() {
-                        record["version"] = json!(crate::architecture::VERSION);
-                        if record["id"].is_null() { record["id"] = json!(crate::architecture::identity()); }
-                        if record["policy"].is_null() { record["policy"] = cp["review_policy"].clone(); }
-                        record["stage_id"] = stage["id"].clone();
-                        if record["role"].is_null() { record["role"] = json!("reviewer"); }
-                        reviews.push(record);
-                    }
-                }
-            }
-            let mut outcomes = Vec::new();
-            if let Some(old) = old.as_ref().filter(|_| same) {
-                for stage in next["stages"].as_array().unwrap() {
-                    let before = old["stages"].as_array().unwrap().iter().find(|s| s["id"] == stage["id"]);
-                    if stage["status"] == "committed" && before.is_none_or(|s| s["status"] != "committed") {
-                        let outcome = json!({"stage_id":stage["id"],"revision":next["revision"],"status":"committed","sha":stage["sha"],"review_gate":stage["review_gate"],"review_policy":stage["review_policy"],"acceptance":stage["acceptance"].as_str().unwrap_or("").chars().take(500).collect::<String>(),"unix":unix_timestamp()});
-                        outcomes.push(outcome.clone());
-                        if !cp["execution_outcomes"].is_array() { cp["execution_outcomes"] = json!([]); }
-                        let recent = cp["execution_outcomes"].as_array_mut().unwrap(); recent.push(outcome);
-                        if recent.len() > 8 { recent.remove(0); }
-                    }
-                }
-            }
-            if old.as_ref() == Some(&next) { return Ok(next); }
-            store.publish(next, cp, json!({"kind": kind, "reviews": reviews, "removed_stage_ids": removed, "invalidations": invalidations, "execution_outcomes":outcomes}))
-        })();
-        *self.session.persistence_error.lock().unwrap() = result.as_ref().err().cloned();
-        result
     }
 
     fn record_stage_usage(&self, plan: &mut Value, idx: usize, role: &str, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
