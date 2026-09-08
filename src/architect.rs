@@ -4,6 +4,7 @@ use crate::app::Ctx;
 use crate::architecture::{atomic_json, checkpoint_default, identity};
 use crate::catalogue::{Policy, Provider, Tier};
 use crate::util::unix_timestamp;
+use crate::usage::accumulate_invocation_usage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -554,9 +555,9 @@ impl Ctx {
                 json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
             next["recovery"] = json!({"reason":recovery_reason,"previous_session":cp["session"],"replacement_session":reference});
             if let Some(usage) = &output.usage {
-                Self::add_usage(&mut next, "role_usage", "architect", usage);
-                Self::add_usage(&mut candidate, "usage", &provider, usage);
-                Self::add_usage(&mut candidate["role_usage"], "architect", &provider, usage);
+                accumulate_invocation_usage(&mut next, "role_usage", "architect", usage);
+                accumulate_invocation_usage(&mut candidate, "usage", &provider, usage);
+                accumulate_invocation_usage(&mut candidate["role_usage"], "architect", &provider, usage);
             }
             let _guard = self.session.persistence_lock.lock().unwrap();
             if store.load()? != old {

@@ -23,6 +23,7 @@ mod plan;
 mod routing;
 mod prompts;
 mod util;
+mod usage;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

@@ -231,6 +231,10 @@ fn revision_usage_adds_only_new_invocation_and_ignores_echoed_totals() {
     {
         let mut settings = test.app.app.settings.lock().unwrap();
         settings["mock_plan_output"] = original;
+        settings["mock_plan_output"]["role_usage"] = json!({
+            "planner": {"mock": {"total_tokens": 1000, "calls": 100}},
+            "echoed": {"mock": {"total_tokens": 1000}},
+        });
         settings["mock_usage"] = json!({"total": 5, "model": "model"});
     }
     let previous = test.app.load_plan().unwrap();
@@ -239,6 +243,21 @@ fn revision_usage_adds_only_new_invocation_and_ignores_echoed_totals() {
     assert_eq!(updated["planner_usage"]["mock"]["total_tokens"], 15);
     assert_eq!(updated["planner_usage"]["mock"]["calls"], 2);
     assert_eq!(updated["planner_usage"]["mock"]["models"]["model"], 15);
+    let expected = json!({"mock": {"input_tokens": 0, "output_tokens": 0,
+        "total_tokens": 15, "calls": 2, "models": {"model": 15}}});
+    assert_eq!(updated["planner_usage"], expected);
+    assert_eq!(updated["role_usage"]["planner"], expected);
+    assert!(updated["role_usage"].get("echoed").is_none());
+    // A subsequent empty invocation must not re-add the echoed previous totals.
+    {
+        let mut settings = test.app.app.settings.lock().unwrap();
+        settings["mock_plan_output"] = updated.clone();
+        settings["mock_usage"] = json!({"total": 0, "model": "model"});
+    }
+    test.app.revise_worker(&updated, "Keep the stage again");
+    let revised = test.app.load_plan().unwrap();
+    assert_eq!(revised["planner_usage"], expected);
+    assert_eq!(revised["role_usage"]["planner"], expected);
 }
 
 #[test]

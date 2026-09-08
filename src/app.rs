@@ -4,6 +4,7 @@ mod review;
 mod reassessment;
 use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
 use crate::prompts::{CHAT_PROMPT, FIX_PROMPT, IMPLEMENT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVIEW_PROMPT, REVISE_PROMPT};
+use crate::usage::{accumulate_invocation_usage, merge_planner_revision_totals};
 use crate::util::{canonical_project, clock_hms, fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -512,43 +513,11 @@ impl Ctx {
         result
     }
 
-    pub(crate) fn add_usage(parent: &mut Value, key: &str, tool: &str, usage: &AgentUsage) {
-        if usage.is_empty() {
-            return;
-        }
-        if !parent.is_object() {
-            *parent = json!({});
-        }
-        let target = &mut parent[key];
-        if !target.is_object() {
-            *target = json!({});
-        }
-        let totals = &mut target[tool];
-        if !totals.is_object() {
-            *totals = json!({});
-        }
-        for (field, amount) in [
-            ("input_tokens", usage.input_tokens),
-            ("output_tokens", usage.output_tokens),
-            ("total_tokens", usage.total_tokens),
-            ("calls", 1),
-        ] {
-            totals[field] = json!(totals[field].as_i64().unwrap_or(0) + amount);
-        }
-        if !totals["models"].is_object() {
-            totals["models"] = json!({});
-        }
-        if !usage.model.is_empty() {
-            let model_total = &mut totals["models"][&usage.model];
-            *model_total = json!(model_total.as_i64().unwrap_or(0) + usage.total_tokens);
-        }
-    }
-
     fn record_stage_usage(&self, plan: &mut Value, idx: usize, role: &str, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
         if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
-            Self::add_usage(&mut plan["stages"][idx], "usage", tool, &usage);
-            Self::add_usage(plan, "usage", tool, &usage);
-            Self::add_usage(&mut plan["role_usage"], role, tool, &usage);
+            accumulate_invocation_usage(&mut plan["stages"][idx], "usage", tool, &usage);
+            accumulate_invocation_usage(plan, "usage", tool, &usage);
+            accumulate_invocation_usage(&mut plan["role_usage"], role, tool, &usage);
             self.save_plan(plan)?;
         }
         Ok(())
@@ -911,7 +880,7 @@ impl Ctx {
         if result.effective_model.is_empty() { result.effective_model = model.into(); }
         if let Some(u) = &usage {
             let mut state = self.session.state.lock().unwrap();
-            Self::add_usage(&mut state.role_usage, role, tool, u);
+            accumulate_invocation_usage(&mut state.role_usage, role, tool, u);
         }
         result.usage = usage;
         Ok(result)
@@ -1125,7 +1094,7 @@ impl Ctx {
         // the invocation result contributes new planner usage.
         plan.as_object_mut().unwrap().remove("planner_usage");
         plan.as_object_mut().unwrap().remove("role_usage");
-        if let Some(usage) = usage { Self::add_usage(&mut plan, "planner_usage", &tool, &usage); }
+        if let Some(usage) = usage { accumulate_invocation_usage(&mut plan, "planner_usage", &tool, &usage); }
         if !plan["planner_usage"].is_null() { plan["role_usage"] = json!({"planner":plan["planner_usage"]}); }
         crate::architecture::atomic_json(&path, &plan)?;
         Ok(plan)
@@ -1170,19 +1139,7 @@ impl Ctx {
                 if stage["status"] != "committed" { stage["model_proposal"] = plan["stages"][idx]["model_proposal"].clone(); }
             }
             if let Some(usage) = plan.get("planner_usage") {
-                // Preserve previous planning totals; the new invocation is additive.
-                for (tool, value) in usage.as_object().into_iter().flatten() {
-                    let target = &mut edited["planner_usage"];
-                    if !target.is_object() { *target = json!({}); }
-                    if !target[tool].is_object() { target[tool] = json!({}); }
-                    for (key, count) in value.as_object().into_iter().flatten() {
-                        if let Some(n) = count.as_i64() { target[tool][key] = json!(target[tool][key].as_i64().unwrap_or(0) + n); }
-                        else if key == "models" {
-                            if !target[tool][key].is_object() { target[tool][key] = json!({}); }
-                            for (model, n) in count.as_object().into_iter().flatten() { target[tool][key][model] = json!(target[tool][key][model].as_i64().unwrap_or(0) + n.as_i64().unwrap_or(0)); }
-                        }
-                    }
-                }
+                merge_planner_revision_totals(&mut edited, usage);
             }
             if !edited["planner_usage"].is_null() {
                 if !edited["role_usage"].is_object() { edited["role_usage"] = json!({}); }
@@ -1604,40 +1561,5 @@ impl Ctx {
         }
         self.log_event("run", &text);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn usage_accumulates_separate_tools_and_models_and_skips_empty_values() {
-        let mut target = Value::Null;
-        Ctx::add_usage(&mut target, "usage", "codex", &AgentUsage::default());
-        assert!(target.is_null());
-        target = json!({"goal": "Test goal"});
-        Ctx::add_usage(&mut target, "usage", "codex", &AgentUsage::default());
-        assert_eq!(target, json!({"goal": "Test goal"}));
-        let mut usage = AgentUsage {
-            input_tokens: 80, output_tokens: 20, total_tokens: 100, model: "model-a".into(),
-        };
-        Ctx::add_usage(&mut target, "usage", "codex", &usage);
-        Ctx::add_usage(&mut target, "usage", "codex", &usage);
-        usage.model = "model-b".into();
-        Ctx::add_usage(&mut target, "usage", "codex", &usage);
-        usage.model.clear();
-        Ctx::add_usage(&mut target, "usage", "claude", &usage);
-        Ctx::add_usage(&mut target, "usage", "unused", &AgentUsage::default());
-        Ctx::add_usage(&mut target, "planner_usage", "codex", &AgentUsage::default());
-        assert_eq!(target, json!({
-            "goal": "Test goal",
-            "usage": {
-                "codex": {"input_tokens": 240, "output_tokens": 60, "total_tokens": 300,
-                    "calls": 3, "models": {"model-a": 200, "model-b": 100}},
-                "claude": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100,
-                    "calls": 1, "models": {}},
-            },
-        }));
     }
 }

@@ -4,6 +4,7 @@ use crate::{
     app::Ctx,
     catalogue::{Policy, Provider},
 };
+use crate::usage::accumulate_invocation_usage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -474,8 +475,8 @@ impl Ctx {
             self.routing_dialogue("planner", &provider, &model, &effort, &prompt, plan, ids)?;
         if let Some(u) = output.get("_engine_usage") {
             let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
-            Self::add_usage(plan,"usage",&provider,&usage);
-            Self::add_usage(&mut plan["role_usage"],"planner",&provider,&usage);
+            accumulate_invocation_usage(plan,"usage",&provider,&usage);
+            accumulate_invocation_usage(&mut plan["role_usage"],"planner",&provider,&usage);
         }
         let rows = output["proposals"]
             .as_array()
@@ -653,8 +654,8 @@ impl Ctx {
                 )?;
                 if let Some(u) = output.get("_engine_usage") {
                     let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
-                    Self::add_usage(plan,"usage",&provider,&usage);
-                    Self::add_usage(&mut plan["role_usage"],"architect",&provider,&usage);
+                    accumulate_invocation_usage(plan,"usage",&provider,&usage);
+                    accumulate_invocation_usage(&mut plan["role_usage"],"architect",&provider,&usage);
                 }
                 let replacements = output["model_evaluations"]
                     .as_array()
