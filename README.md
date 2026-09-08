@@ -778,7 +778,7 @@ check, then paginated `model/list` with hidden entries included. Interleaved
 notifications and unknown optional metadata are tolerated; no thread or turn is
 started.
 
-Claude Code **2.1.261** has no supported `claude models` command. The optional
+Claude Code **2.1.263** has no supported `claude models` command. The optional
 bridge uses the official
 [TypeScript Agent SDK initialization API](https://code.claude.com/docs/en/agent-sdk/typescript),
 verified against the publisher's **0.3.261** package types and implementation.
@@ -799,12 +799,31 @@ npm install --omit=optional
 Set `claude_bridge` to the absolute path of `bridges/claude-models/bridge.mjs`
 (and change `policy_revision`). The SDK's bundled CLI is unnecessary: Forge
 uses the existing `claude` executable. Protocol v1 deliberately accepts only
-SDK 0.3.261 / Claude Code 2.1.261; a different version requires rechecking the
+SDK 0.3.261 / Claude Code 2.1.263; a different version requires rechecking the
 SDK/CLI schema and updating the bridge and fixtures. Missing Node, bridge or
 SDK, or an unsupported version reports unsupported discovery. It never falls
 back to an API-key request or a generation turn. Without the bridge, explicit
 Claude entries continue to work with unverified availability and provider-default
 effort.
+
+The same pinned bridge reads Claude subscription limits through the SDK's
+experimental structured `/usage` control request (`--forge-usage-v1`), with
+transcript analysis disabled and no user prompt or generation. The panel shows
+remaining percentages and local reset times separately for the overall windows
+and model windows such as Fable. These are subscription limits, not Forge's
+per-run token counters. The engine caches readings across projects, refreshes
+every five minutes and checks before Claude launches (at most once a minute).
+`POST /api/quota/refresh` requests a refresh; `/api/state` includes the cached
+`claude_quota` reading and never invokes the provider. Manual checks have a
+15-second cooldown, and each probe has a 15-second deadline.
+
+A fresh, exhausted applicable window prevents a Claude launch when usage credits
+are explicitly disabled. Scoped windows use the selected/resolved model family;
+an unresolved provider default cannot establish a scoped blocker. After reset,
+with stale/missing evidence, or when credits may allow continued usage, the CLI
+decides availability. Forge never enables credits or changes models automatically.
+Unavailable readings remain unknown; failed refreshes label the previous reading
+as stale. Unsupported CLI/SDK versions degrade to unavailable usage information.
 
 `cargo test` uses fake discovery/process protocols and isolated temporary
 caches, including HTTP responsiveness tests. The optional bridge's no-prompt

@@ -689,6 +689,24 @@ Item {
     }) : []
   }
 
+  function quotaSummary(quota) {
+    if (!quota || quota.status === "pending") return "Claude limits: checking…"
+    const windows = quota.windows || []
+    if (quota.status === "unavailable") return "Claude limits: unavailable" + (quota.error ? " · " + quota.error : "")
+    const rows = windows.map(function(window) {
+      const expired = window.resets_unix && window.resets_unix * 1000 <= Date.now()
+      const remaining = expired ? "awaiting refresh" : typeof window.used_percent === "number"
+        ? Math.max(0, 100 - window.used_percent).toFixed(0) + "% remaining" : "remaining unknown"
+      const reset = window.resets_at ? " · reset " + new Date(window.resets_at).toLocaleString() : ""
+      return window.name + ": " + remaining + reset
+    })
+    if (!rows.length) rows.push("Claude limits: no usage windows reported")
+    if (quota.status === "stale") rows.push("Previous reading · " + (quota.error || "refresh pending"))
+    if (quota.extra_usage_enabled === true) rows.push("Usage credits enabled")
+    if (quota.refreshing) rows.push("Refreshing…")
+    return rows.join("\n")
+  }
+
   function usageSummary(usage) {
     return usageTools(usage).map(function(tool) {
       return tool + " " + formatTokens(usage[tool].total_tokens) + " tok"
@@ -1500,9 +1518,24 @@ Item {
               onClicked: root.act("/api/models/cancel", {})
             }
             PanelButton {
+              label: root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing
+                ? "Limits: checking…" : "Refresh Claude limits"
+              enabled: root.engineOnline && !(root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing)
+              onClicked: root.act("/api/quota/refresh", {})
+            }
+            PanelButton {
               label: root.catalogueOpen ? "Close model settings" : "Model settings & options"
               onClicked: { if (root.catalogueOpen) root.catalogueOpen = false; else root.openCatalogue() }
             }
+          }
+          Text {
+            width: parent.width
+            text: root.quotaSummary(root.engineState ? root.engineState.claude_quota : null)
+            textFormat: Text.PlainText
+            color: root.foreground
+            wrapMode: Text.Wrap
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(12)
           }
           Text {
             width: parent.width
