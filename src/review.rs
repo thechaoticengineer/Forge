@@ -552,76 +552,10 @@ fn aggregate(identity: &Value, records: &[Value]) -> Value {
     json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if approved {"approved"} else {"blocked"},"requests":requests})
 }
 
-// Only a failed Claude process explicitly naming the selected family establishes
-// a model-scoped quota refusal. Generic rate limits, auth and verdict errors do not.
-fn claude_model_limit(error: &str, model: &str) -> Option<String> {
-    if !error.starts_with("claude exited with exit status:") { return None; }
-    let error = error.to_lowercase();
-    let family = ["fable", "opus", "sonnet", "haiku"].into_iter().find(|family|
-        model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part.eq_ignore_ascii_case(family))
-            && error.contains(&format!("you've reached your {family} limit.")))?;
-    Some(format!("Claude CLI reports {family} quota exhausted"))
-}
+#[cfg(test)]
+use crate::model_selection::claude_model_limit;
 
 impl Ctx {
-    pub(crate) fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
-        self.reviewer_config_excluding(implementer, &[])
-    }
-
-    fn reviewer_config_excluding(&self, implementer: &str, excluded: &[(String, String)]) -> Result<(String, String), String> {
-        let provider = match implementer {
-            "codex" => "claude",
-            "claude" => "codex",
-            "mock" if self.setting("reviewer") == "mock" => "mock",
-            _ => return Err("cannot resolve independent reviewer provider".into()),
-        };
-        let automatic = self.app.settings.lock().unwrap()["automatic_routing"] != false;
-        if self.setting("reviewer") != provider && (!automatic || !self.setting("reviewer_model").is_empty()) {
-            return Err(format!(
-                "independent reviewer must be configured as {provider}, the other provider relative to {implementer}"
-            ));
-        }
-        let mut model = self.setting("reviewer_model");
-        if provider != "mock" {
-            let policy =
-                crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-            if model.is_empty() {
-                let mut blockers = Vec::new();
-                model = policy.entries.iter().filter(|e| e.provider.name() == provider && e.tier == crate::catalogue::Tier::Strong)
-                    .find(|e| {
-                        if excluded.iter().any(|(p, m)| p == provider && m == &e.model) { return false; }
-                        let selected = self.app.catalogue.execution_input(&policy, e.provider, &e.model);
-                        if selected["eligible"] != true { return false; }
-                        if automatic && provider == "claude"
-                            && let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
-                                selected["resolved_id"].as_str().unwrap_or(&e.model)) {
-                            blockers.push(reason);
-                            return false;
-                        }
-                        true
-                    })
-                    .map(|e| e.model.clone()).ok_or_else(|| format!("no eligible strong independent reviewer model{}",
-                        if blockers.is_empty() { String::new() } else { format!(": {}", blockers.join("; ")) }))?;
-            }
-            let selected = self.app.catalogue.execution_input(
-                &policy,
-                crate::catalogue::Provider::parse(provider).unwrap(),
-                &model,
-            );
-            if selected["eligible"] != true {
-                return Err(format!(
-                    "independent reviewer unavailable/incompatible: {selected}"
-                ));
-            }
-            if provider == "claude"
-                && let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
-                    selected["resolved_id"].as_str().unwrap_or(&model)) {
-                return Err(reason);
-            }
-        }
-        Ok((provider.into(), model))
-    }
-
     fn review_with_retry(&self, plan: &mut Value, idx: usize, base: &Value, role: &str, provider: &str, model: &str) -> Result<Value,String> {
         let mut current = (provider.to_string(), model.to_string());
         let mut visited = vec![current.clone()];
@@ -637,11 +571,9 @@ impl Ctx {
                     // Switch only the fresh independent reviewer; keep this exact
                     // snapshot, round and required roles. Never loop over a model twice.
                     if role == "reviewer"
-                        && let Some((next, reason)) = self.reviewer_quota_fallback(plan, idx, &current, &error, &visited)
+                        && let Some(next) = self.reviewer_quota_fallback(plan, idx, &current, &error, &visited)
                             .map_err(|e| format!("model routing blocked: {e}; work and checkpoint retained"))?
                         && !visited.contains(&next) {
-                        self.log_event("model", &format!("[reviewer] quota fallback {}/{} -> {}/{}: {reason}",
-                            current.0, current.1, next.0, next.1));
                         visited.push(next.clone());
                         current = next;
                         continue;
@@ -653,19 +585,31 @@ impl Ctx {
         }
     }
 
-    fn reviewer_quota_fallback(&self, plan: &Value, idx: usize, current: &(String, String), error: &str, visited: &[(String, String)]) -> Result<Option<((String, String), String)>, String> {
-        let settings = self.app.settings.lock().unwrap().clone();
-        if settings["automatic_routing"] == false || !self.setting("reviewer_model").is_empty() || current.0 != "claude" {
-            return Ok(None);
-        }
-        let policy = crate::catalogue::Policy::from_settings(&settings)?;
-        let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::Claude, &current.1);
-        let resolved = selected["resolved_id"].as_str().unwrap_or(&current.1);
-        let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge, resolved)
-            .or_else(|| claude_model_limit(error, resolved)) else { return Ok(None); };
+    fn reviewer_quota_fallback(&self, plan: &Value, idx: usize, current: &(String, String), error: &str, visited: &[(String, String)]) -> Result<Option<(String, String)>, String> {
         let implementer = plan["stages"][idx]["implementer_provider"].as_str().ok_or("missing implementer provider for reviewer fallback")?;
-        let next = self.reviewer_config_excluding(implementer, visited)?;
-        Ok((next != *current).then_some((next, reason)))
+        let requirements = self.model_requirements("reviewer",Some(implementer))?;
+        let choice = (current.0.clone(),current.1.clone(),"provider_default".into());
+        Ok(self.model_fallback(&requirements,&choice,error,visited)?.map(|next| (next.0,next.1)))
+    }
+
+    fn architect_review_with_selection(&self, plan: &mut Value, idx: usize, base: &Value) -> Result<Value,String> {
+        let requirements = self.model_requirements("architect",None)?;
+        let (verdict,_) = self.with_selected_model(&requirements,None, |choice| {
+            *plan = self.load_plan().ok_or("missing current review plan")?;
+            let cp = self.architecture_store().checkpoint(plan)?;
+            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            let changed = crate::catalogue::Provider::parse(&choice.0).is_some_and(|provider| {
+                let facts = self.model_facts(&policy,provider,&choice.1,Some(&choice.2));
+                !crate::agent::same_model(&choice.0,facts["resolved_id"].as_str().unwrap_or(&choice.1),
+                    cp["effective_model"]["model"].as_str().unwrap_or(""))
+            });
+            if changed || cp["session"]["provider"] != choice.0 || cp["context_status"] != "ready" {
+                *plan = self.architect_publish_selected(plan.clone(),Some(plan),
+                    "review model recovery",Some(choice.clone()))?;
+            }
+            self.invoke_review(plan,idx,base,"architect",&choice.0,&choice.1)
+        })?;
+        Ok(verdict)
     }
     fn invoke_review(
         &self,
@@ -760,18 +704,9 @@ impl Ctx {
         let result = if mock {
             self.mock_review(&identity, &prompt, &plan["stages"][idx])
         } else {
-            let effort = if role == "architect" {
-                self.bootstrap("architect")?.2
-            } else {
-                let policy =
-                    crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-                policy
-                    .entries
-                    .iter()
-                    .find(|e| e.provider.name() == provider && e.model == model)
-                    .map(|e| e.effort.clone())
-                    .unwrap_or_else(|| "provider_default".into())
-            };
+            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+            let facts = self.model_facts(&policy,crate::catalogue::Provider::parse(provider).ok_or("invalid review provider")?,model,None);
+            let effort = facts["effort"].as_str().unwrap_or("provider_default");
             self.run_agent(&AgentRequest {
                 role: if role == "architect" {
                     "architect_review"
@@ -797,7 +732,7 @@ impl Ctx {
         }
         if !mock {
             let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-            let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model);
+            let selected = self.model_facts(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model, None);
             let expected = selected["resolved_id"].as_str().unwrap_or(model);
             if !result.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, expected, &result.effective_model) {
                 return Err(format!("model routing blocked: {role} effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
@@ -1140,15 +1075,7 @@ impl Ctx {
                     continue;
                 }
                 if policy["scope"] != "ordinary_documentation" {
-                    let (provider, model, _) = self.bootstrap("architect")?;
-                    records.push(self.invoke_review(
-                        plan,
-                        idx,
-                        &base,
-                        "architect",
-                        &provider,
-                        &model,
-                    )?);
+                    records.push(self.architect_review_with_selection(plan, idx, &base)?);
                 }
                 break;
             }

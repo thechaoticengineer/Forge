@@ -341,10 +341,6 @@ impl Ctx {
         s.current_step = step.to_string();
     }
 
-    fn setting(&self, key: &str) -> String {
-        self.app.setting(key)
-    }
-
     /// Atomically claim the busy flag; Err means other work is in flight.
     /// Prevents two requests that both saw busy=false from racing to spawn.
     pub(crate) fn acquire_busy(&self) -> Result<(), ()> {

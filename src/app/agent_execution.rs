@@ -60,18 +60,13 @@ impl Ctx {
         }
         let provider = crate::catalogue::Provider::parse(tool).ok_or_else(|| format!("unknown tool {tool}"))?;
         let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-        let mut selection = self.app.catalogue.execution_with_effort(&policy, provider, model, effort);
+        let mut selection = self.execution_selection(&policy, provider, model, effort);
         self.session.state.lock().unwrap().model_selection = selection.clone();
         if selection["eligible"] != true {
             return Err(self.agent_error(role, selection["error"].as_str().unwrap_or("model unavailable").into()));
         }
-        if tool == "claude" {
-            let quota_model = selection["resolved_id"].as_str().unwrap_or(model);
-            self.app.quota.check(&policy.claude_bridge, quota_model)
-                .map_err(|error| self.agent_error(role, error))?;
-            if self.session.stop_requested.load(Ordering::SeqCst) {
-                return Err("provider launch stopped; saved work retained".into());
-            }
+        if self.session.stop_requested.load(Ordering::SeqCst) {
+            return Err("provider launch stopped; saved work retained".into());
         }
         let requested_model = model.to_string();
         let PreparedAgentCommand { command: mut cmd, prompt_stdin, codex_home } =
@@ -140,7 +135,8 @@ impl Ctx {
         };
 
         if !status.success() {
-            let diagnostic = format!("{etail}\n{tail}").to_lowercase();
+            let provider_error = result.error.as_deref().unwrap_or("");
+            let diagnostic = format!("{etail}\n{tail}\n{provider_error}").to_lowercase();
             if selection["effort"] != "provider_default" && diagnostic.contains("effort")
                 && ["unsupported", "invalid value", "unknown option", "not supported"].iter().any(|s| diagnostic.contains(s)) {
                 self.app.catalogue.reject_effort(&policy, provider, &requested_model, selection["effort"].as_str().unwrap());
@@ -156,8 +152,8 @@ impl Ctx {
             }
             selection["execution_status"] = json!("failed");
             self.session.state.lock().unwrap().model_selection = selection;
-            self.log_event("error", &format!("[{role}] {tool} failed: {etail}"));
-            return Err(format!("{tool} exited with {status}: {etail} {tail}"));
+            self.log_event("error", &format!("[{role}] {tool} failed: {etail} {provider_error}"));
+            return Err(format!("{tool} exited with {status}: {etail} {tail} {provider_error}"));
         }
         if let Some(error) = result.error { return Err(self.agent_error(role, error)); }
         if !result.completed {

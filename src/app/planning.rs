@@ -73,11 +73,12 @@ impl Ctx {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                 Err(e) => return Err(format!("could not remove previous answer: {e}")),
             }
-            let tool = self.setting("planner");
-            let model = self.setting("planner_model");
             let context = if current_plan.get("architecture").is_some() { self.architecture_store().checkpoint(current_plan)? } else { crate::architecture::checkpoint_default() };
             let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only Q&A in a fresh conversation. Do not write files or alter plan/decisions. Return ONLY {{\"answer\":\"your answer\"}}. Saved architecture context: {context}");
-            let result = self.run_agent(&AgentRequest { role:"chat", provider:&tool, model:&model, effort:"provider_default", session:None, prompt:if tool == "mock" {&prompt} else {&readonly_prompt} })?;
+            let requirements = self.model_requirements("chat",None)?;
+            let (result,(tool,_,_)) = self.with_selected_model(&requirements,None, |(tool,model,effort)|
+                self.run_agent(&AgentRequest {role:"chat",provider:tool,model,effort,session:None,
+                    prompt:if tool == "mock" {&prompt} else {&readonly_prompt}}))?;
             let text = if tool == "mock" { fs::read_to_string(self.forge_path("answer.json")).map_err(|e| format!("could not read answer file: {e}"))? } else { result.output };
             let output: Value = serde_json::from_str(&text)
                 .map_err(|e| format!("invalid answer JSON: {e}"))?;
@@ -96,7 +97,6 @@ impl Ctx {
     }
 
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {
-        let (tool, model, effort) = self.bootstrap("planner")?;
         self.ensure_forge_dir();
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         let path = self.forge_path("plan-candidate.json");
@@ -107,7 +107,10 @@ impl Ctx {
         }
         let prompt = format!("{prompt}\n{}", self.routing_prompt()?);
         let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.");
-        let result = self.run_agent(&AgentRequest { role:"planner", provider:&tool, model:&model, effort:&effort, session:None, prompt: if tool == "mock" {&prompt} else {&readonly_prompt} })?;
+        let requirements = self.model_requirements("planner",None)?;
+        let (result,(tool,_,effort)) = self.with_selected_model(&requirements,None, |(tool,model,effort)|
+            self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,
+                prompt:if tool == "mock" {&prompt} else {&readonly_prompt} }))?;
         let mut plan: Value = if tool == "mock" {
             serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| format!("invalid candidate: {e}"))?
         } else { serde_json::from_str(&result.output).map_err(|e| format!("invalid candidate: {e}"))? };

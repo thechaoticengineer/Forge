@@ -26,27 +26,7 @@ struct Escalation {
     required_capability: String,
 }
 
-pub(crate) fn failure_kind(error: &str) -> &'static str {
-    let e = error.to_lowercase();
-    if crate::catalogue::auth_error(&e) {
-        "auth"
-    } else if [
-        "rate limit",
-        "rate_limit",
-        "429",
-        "overloaded",
-        "503",
-        "timeout",
-        "temporarily unavailable",
-    ]
-    .iter()
-    .any(|s| e.contains(s))
-    {
-        "transient"
-    } else {
-        "tool_process"
-    }
-}
+pub(crate) use crate::model_selection::failure_kind;
 fn signature(kind: &str, evidence: &Value) -> String {
     crate::metadata::fingerprint(format!("{kind}:{evidence}").as_bytes())
 }

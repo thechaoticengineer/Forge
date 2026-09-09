@@ -300,6 +300,67 @@ answer = json.dumps({'version':1,'plan_id':plan['plan_id'],'revision':plan['revi
 }
 
 #[test]
+fn architect_quota_fallback_reconstructs_session_from_checkpoint() {
+    let fixture = Cli::new("claude", r#"
+import uuid
+from pathlib import Path
+model = sys.argv[sys.argv.index('--model')+1]
+resumed = sys.argv[sys.argv.index('--resume')+1] if '--resume' in sys.argv else None
+with open('calls.jsonl','a') as f: f.write(json.dumps({'model':model,'resume':resumed})+'\n')
+if Path('exhausted').exists() and 'fable' in model:
+    print(json.dumps({'type':'result','subtype':'error_during_execution','is_error':True,'result':"You've reached your Fable limit. Switch to another model."}))
+    sys.exit(1)
+context = json.JSONDecoder().raw_decode(sys.argv[-1].split('Context:\n',1)[1])[0]
+plan = context['plan']
+answer = {'version':1,'plan_id':plan['plan_id'],'revision':plan['revision'],
+    'checkpoint':{'summary':'Preserve contracts.','constraints':[],'completed_interfaces':[]},
+    'decisions':[],'guidance':[{'stage_id':i,'text':'Check interfaces.'} for i in context['required_stage_ids']],
+    'unresolved_risks':[],'resolved_risks':[],
+    'model_evaluations':[dict(stage_id=s['id'],agree=True,rationale='Checked interfaces.',
+        **{k:s['model_proposal'][k] for k in ('risk','complexity','task')})
+        for s in plan['stages'] if s['id'] in context['required_model_stage_ids']]}
+session = resumed or str(uuid.uuid4())
+print(json.dumps({'type':'system','subtype':'init','session_id':session,'model':model}))
+print(json.dumps({'type':'result','subtype':'success','session_id':session,'structured_output':answer}))
+"#);
+    {
+        let mut settings = fixture.ctx.app.settings.lock().unwrap();
+        settings["architect"] = json!("claude");
+        settings["planner"] = json!("claude");
+        settings["implementer"] = json!("mock");
+        settings["reviewer"] = json!("mock");
+        settings["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+            {"provider":"claude","model":"opus[1m]","tier":"strong"}]);
+        // Supply a valid proposal without calling a second paid-role fixture.
+        settings["planner"] = json!("mock");
+        settings["architect_model"] = json!("claude-fable-5-1[1m]");
+    }
+    let candidate = json!({"goal":"Keep context","status":"draft","stages":[
+        {"id":1,"title":"API","instructions":"Preserve API","acceptance":"tests pass","commit":"fix: API","status":"pending"}]});
+    let plan = fixture.ctx.architect_publish(candidate,None,"initial").unwrap();
+    let checkpoint = fixture.ctx.architecture_store().checkpoint(&plan).unwrap();
+    {
+        let mut settings = fixture.ctx.app.settings.lock().unwrap();
+        settings["planner"] = json!("claude");
+        settings["architect_model"] = json!("");
+    }
+    fs::write(fixture.root.join("exhausted"),"").unwrap();
+    let mut needs_guidance = checkpoint.clone();
+    needs_guidance["guidance"]["1"]["valid"] = json!(false);
+    let plan = fixture.ctx.architecture_store().publish(plan,needs_guidance,json!({"kind":"fixture_guidance_gap"})).unwrap();
+    let plan = fixture.ctx.architect_publish(plan.clone(),Some(&plan),"resume").unwrap();
+    let recovered = fixture.ctx.architecture_store().checkpoint(&plan).unwrap();
+    assert_eq!(recovered["effective_model"]["model"],"opus[1m]");
+    assert_ne!(recovered["session"]["reference"],checkpoint["session"]["reference"]);
+    let calls: Vec<Value> = fs::read_to_string(fixture.root.join("calls.jsonl")).unwrap().lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+    assert_eq!(calls.len(),3);
+    assert_eq!(calls[1]["resume"],checkpoint["session"]["reference"]);
+    assert!(calls[2]["resume"].is_null());
+    assert_eq!(calls[2]["model"],"opus[1m]");
+}
+
+#[test]
 fn codex_fixture_exact_resume_effort_permissions_decoding_usage_and_readable_logs() {
     let fixture = Cli::new(
         "codex",
@@ -424,6 +485,25 @@ fn failed_result_wrong_session_and_incomplete_stream_fail_closed() {
         "print('a diagnostic without a result')".into(),
     ] {
         let f = Cli::new("claude", &body); assert!(f.ctx.run_agent(&request("claude")).is_err());
+    }
+}
+
+#[test]
+fn capacity_error_survives_nonzero_exit_and_partial_output() {
+    for status in [0, 1] {
+        let f = Cli::new("codex", &format!(r#"
+print(json.dumps({{'type':'thread.started','thread_id':'{ID}'}}))
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':'Partial implementation retained'}}}}))
+print(json.dumps({{'type':'turn.failed','error':{{'message':'Selected model is at capacity. Please try a different model.'}}}}))
+print('Reading additional input from stdin...',file=sys.stderr)
+sys.exit({status})
+"#));
+        let error = f.ctx.run_agent(&request("codex")).unwrap_err();
+        assert!(error.contains("Selected model is at capacity"), "{error}");
+        assert_eq!(crate::model_selection::failure_kind(&error), "transient");
+        if status == 1 { assert!(error.contains("Partial implementation retained")); }
+        let policy = Policy::from_settings(&f.ctx.app.settings.lock().unwrap()).unwrap();
+        assert_eq!(f.ctx.model_facts(&policy,Provider::Codex,"exact-model",Some("high"))["eligible"],true);
     }
 }
 

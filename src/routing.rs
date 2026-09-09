@@ -325,7 +325,7 @@ impl Ctx {
         let stage = &plan["stages"][idx];
         let old: Proposal = serde_json::from_value(stage["model_agreement"]["validated_proposal"].clone()).map_err(|e| e.to_string())?;
         let settings = self.app.settings.lock().unwrap().clone();
-        let options = self.routing_options()?;
+        let options = self.routing_candidates()?;
         for o in &options {
             let mut p = old.clone();
             p.provider = o["provider"].as_str().unwrap_or("").into(); p.model = o["model"].as_str().unwrap_or("").into(); p.native_effort = o["effort"].as_str().unwrap_or("").into();
@@ -337,72 +337,11 @@ impl Ctx {
         let settings = self.app.settings.lock().unwrap();
         json!({"stage":crate::plan::stage_inputs(plan, idx),"constraint":constraint(&settings, &plan["stages"][idx])})
     }
-    pub(crate) fn routing_options(&self) -> Result<Vec<Value>, String> {
-        let settings = self.app.settings.lock().unwrap().clone();
-        #[cfg(test)]
-        if let Some(options) = settings["mock_routing_options"].as_array() {
-            return Ok(options.clone());
-        }
-        if settings["implementer"] == "mock" {
-            return Ok(vec![
-                json!({"provider":"mock","model":settings["implementer_model"].as_str().filter(|s| !s.is_empty()).unwrap_or("mock-implementer"),"availability":"configured_unverified","effort":"provider_default","eligible":true,"tier":"strong","provenance":"configured","availability_unverified":true}),
-            ]);
-        }
-        let policy = Policy::from_settings(&settings)?;
-        let details = self.app.catalogue.details(&policy);
-        let mut options = details["options"].as_array().unwrap().clone();
-        for entry in &policy.entries {
-            let efforts = details["providers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|p| p["provider"] == entry.provider.name())
-                .flat_map(|p| p["models"].as_array().into_iter().flatten())
-                .filter(|m| {
-                    m["id"] == entry.model
-                        || m["aliases"]
-                            .as_array()
-                            .is_some_and(|a| a.contains(&json!(entry.model)))
-                })
-                .flat_map(|m| m["supported_efforts"].as_array().into_iter().flatten())
-                .filter_map(Value::as_str);
-            for effort in std::iter::once("provider_default").chain(efforts) {
-                if effort != entry.effort {
-                    options.push(self.app.catalogue.select(
-                        &policy,
-                        entry.provider,
-                        &entry.model,
-                        effort,
-                    ));
-                }
-            }
-        }
-        let metadata = self
-            .app
-            .metadata
-            .details(&self.app.catalogue.metadata_snapshot(&policy));
-        for option in &mut options {
-            if let Some(record) = metadata["records"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|r| {
-                    r["provider"] == option["provider"]
-                        && (r["model"] == option["model"] || r["model"] == option["resolved_id"])
-                        && r["removed"] != true
-                })
-            {
-                option["pricing"] = record["pricing"].clone();
-                option["official_source"] = record["source_url"].clone();
-            }
-        }
-        Ok(options)
-    }
     pub(crate) fn routing_prompt(&self) -> Result<String, String> {
         let settings = self.app.settings.lock().unwrap().clone();
         Ok(format!(
             "{CONTRACT}\nOptions: {}\nRouting settings: {}",
-            json!(self.routing_options()?),
+            json!(self.routing_candidates()?),
             json!({"automatic_routing":settings["automatic_routing"],"implementer":settings["implementer"],"implementer_model":settings["implementer_model"],"reviewer":settings["reviewer"],"billing_basis":settings["routing_billing_basis"]})
         ))
     }
@@ -470,9 +409,9 @@ impl Ctx {
             self.routing_prompt()?
         );
         let prompt = prompt + &self.routing_handoff(plan)?;
-        let (provider, model, effort) = self.bootstrap("planner")?;
-        let output =
-            self.routing_dialogue("planner", &provider, &model, &effort, &prompt, plan, ids)?;
+        let requirements = self.model_requirements("planner",None)?;
+        let (output,(provider,model,effort)) = self.with_selected_model(&requirements,None,
+            |(provider,model,effort)| self.routing_dialogue("planner",provider,model,effort,&prompt,plan,ids))?;
         if let Some(u) = output.get("_engine_usage") {
             let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
             accumulate_invocation_usage(plan,"usage",&provider,&usage);
@@ -537,7 +476,7 @@ impl Ctx {
                 return Ok(json!({"model_evaluations":mock_evaluations(plan, ids)}));
             }
             let option = self
-                .routing_options()?
+                .routing_candidates()?
                 .into_iter()
                 .find(|o| o["eligible"] == true)
                 .ok_or("no eligible model")?;
@@ -558,7 +497,7 @@ impl Ctx {
         })?;
         if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
         let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
-        let selected = self.app.catalogue.execution_with_effort(&policy, Provider::parse(provider).ok_or("invalid selection provider")?, model, effort);
+        let selected = self.model_facts(&policy, Provider::parse(provider).ok_or("invalid selection provider")?, model, Some(effort));
         if !output.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, selected["resolved_id"].as_str().unwrap_or(model), &output.effective_model) { return Err("selection effective-model mismatch or missing report".into()); }
         if output.output.len() > 48 * 1024 {
             return Err("routing output exceeds 48 KiB".into());
@@ -634,7 +573,6 @@ impl Ctx {
                     .map(|d| d["stage_id"].as_i64().unwrap())
                     .collect();
                 self.propose_routing(plan, &affected, &json!(disagreements))?;
-                let (provider, model, effort) = self.bootstrap("architect")?;
                 let context_plan = selection_plan(plan);
                 let prompt = format!(
                     "{}\n{}\nPlan: {context_plan}\nSaved architecture: {cp}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
@@ -643,15 +581,9 @@ impl Ctx {
                     json!(disagreements)
                 );
                 let prompt = prompt + &self.routing_handoff(plan)?;
-                let output = self.routing_dialogue(
-                    "architect",
-                    &provider,
-                    &model,
-                    &effort,
-                    &prompt,
-                    plan,
-                    &affected,
-                )?;
+                let requirements = self.model_requirements("architect",None)?;
+                let (output,(provider,_,_)) = self.with_selected_model(&requirements,None,
+                    |(provider,model,effort)| self.routing_dialogue("architect",provider,model,effort,&prompt,plan,&affected))?;
                 if let Some(u) = output.get("_engine_usage") {
                     let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
                     accumulate_invocation_usage(plan,"usage",&provider,&usage);
@@ -673,7 +605,7 @@ impl Ctx {
                 continue;
             }
             let settings = self.app.settings.lock().unwrap().clone();
-            let options = self.routing_options()?;
+            let options = self.routing_candidates()?;
             for id in ids {
                 let idx = plan["stages"]
                     .as_array()

@@ -150,3 +150,34 @@ fn automatic_review_skips_exhausted_family_but_preserves_constraints_and_indepen
     app.quota.cache.lock().unwrap().checked -= FRESH_SECONDS;
     assert_eq!(ctx.reviewer_config("codex").unwrap().1,"claude-fable-5-1[1m]");
 }
+
+#[test]
+fn quota_policy_is_shared_across_roles_candidates_and_fixed_execution() {
+    let fixture = crate::test_support::QueueTest::new(false);
+    let mut app = crate::app::App::new(fixture.app.project(), crate::plan::default_settings());
+    app.quota = Service { launcher: Arc::new(FakeLauncher { calls: AtomicUsize::new(0), fail: false }), ..Service::default() };
+    {
+        let mut settings = app.settings.lock().unwrap();
+        for role in ["planner","architect","reviewer"] { settings[role] = json!("claude"); }
+        settings["model_catalogue"]["claude_bridge"] = json!("/fake/bridge");
+        settings["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+            {"provider":"claude","model":"opus[1m]","tier":"strong"}]);
+    }
+    let app = Arc::new(app);
+    let ctx = app.context(fixture.app.project());
+    assert!(app.quota.check("/fake/bridge","claude-fable-5-1").is_err());
+    for role in ["planner","architect","chat","reviewer"] {
+        let requirements = ctx.model_requirements(role,Some("codex")).unwrap();
+        assert_eq!(ctx.select_model(&requirements,&[]).unwrap().1,"opus[1m]", "{role}");
+    }
+    let candidates = ctx.routing_candidates().unwrap();
+    assert_eq!(candidates[0]["eligible"],false);
+    assert_eq!(candidates[1]["eligible"],true);
+    // Quota does not invalidate a saved agreement or silently replace its model.
+    assert_eq!(ctx.routing_options().unwrap()[0]["eligible"],true);
+    let policy = crate::catalogue::Policy::from_settings(&app.settings.lock().unwrap()).unwrap();
+    let fixed = ctx.execution_selection(&policy,crate::catalogue::Provider::Claude,"claude-fable-5-1[1m]","provider_default");
+    assert_eq!(fixed["eligible"],false);
+    assert!(fixed["error"].as_str().unwrap().contains("quota exhausted"));
+}

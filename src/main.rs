@@ -23,6 +23,7 @@ mod http;
 mod plan;
 mod candidate_draft;
 mod routing;
+mod model_selection;
 mod prompts;
 mod util;
 mod usage;

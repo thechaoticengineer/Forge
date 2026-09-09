@@ -2,7 +2,7 @@
 use crate::agent::{AgentRequest, AgentResult};
 use crate::app::Ctx;
 use crate::architecture::{atomic_json, checkpoint_default, identity};
-use crate::catalogue::{Policy, Provider, Tier};
+use crate::catalogue::{Policy, Provider};
 use crate::util::unix_timestamp;
 use crate::usage::accumulate_invocation_usage;
 use serde::Deserialize;
@@ -215,54 +215,6 @@ fn apply_turn(
 }
 
 impl Ctx {
-    /// Strong configured tiers are sufficient evidence; official comparative metadata is optional.
-    pub(crate) fn bootstrap(&self, role: &str) -> Result<(String, String, String), String> {
-        let settings = self.app.settings.lock().unwrap();
-        // Preserve the offline fixture provider without requiring real credentials.
-        if settings[role] == "mock"
-            || (role == "architect"
-                && settings["planner"] == "mock"
-                && settings["architect_model"]
-                    .as_str()
-                    .unwrap_or("")
-                    .is_empty())
-        {
-            return Ok((
-                "mock".into(),
-                settings[format!("{role}_model")]
-                    .as_str()
-                    .unwrap_or("")
-                    .into(),
-                "provider_default".into(),
-            ));
-        }
-        let policy = Policy::from_settings(&settings)?;
-        let provider = settings[role].as_str().unwrap_or("codex");
-        let provider = Provider::parse(provider).ok_or("invalid bootstrap provider")?;
-        let explicit = settings[format!("{role}_model")].as_str().unwrap_or("");
-        let options = policy.entries.iter().filter(|e| {
-            e.provider == provider
-                && e.tier == Tier::Strong
-                && (explicit.is_empty() || e.model == explicit)
-        });
-        for entry in options {
-            let selection = self
-                .app
-                .catalogue
-                .execution_input(&policy, provider, &entry.model);
-            if selection["eligible"] == true {
-                return Ok((
-                    provider.name().into(),
-                    entry.model.clone(),
-                    entry.effort.clone(),
-                ));
-            }
-        }
-        Err(format!(
-            "recoverable bootstrap failure: configure an eligible strong {provider:?} registry model for {role}"
-        ))
-    }
-
     fn decision_context(
         &self,
         previous: Option<&Value>,
@@ -308,9 +260,19 @@ impl Ctx {
     /// Candidate and architectural output cross the same publication boundary.
     pub(crate) fn architect_publish(
         &self,
+        candidate: Value,
+        previous: Option<&Value>,
+        reason: &str,
+    ) -> Result<Value, String> {
+        self.architect_publish_selected(candidate, previous, reason, None)
+    }
+
+    pub(crate) fn architect_publish_selected(
+        &self,
         mut candidate: Value,
         previous: Option<&Value>,
         reason: &str,
+        selected: Option<crate::model_selection::ModelChoice>,
     ) -> Result<Value, String> {
         let _turn_guard = self.session.architect_lock.lock().unwrap();
         let result = (|| {
@@ -382,7 +344,11 @@ impl Ctx {
                     }
                 }
             }
-            let (provider, model, effort) = self.bootstrap("architect")?;
+            let pinned = selected.is_some();
+            let (provider, model, effort) = match selected {
+                Some(choice) => choice,
+                None => self.bootstrap("architect")?,
+            };
             let dir = self
                 .forge_path("architecture")
                 .join(candidate["plan_id"].as_str().ok_or("missing plan id")?);
@@ -398,10 +364,17 @@ impl Ctx {
             let contaminated = pending
                 .as_ref()
                 .is_some_and(|p| p["turn"] != cp["last_turn"]);
+            let changed_model = if let (Some(provider_id),Some(old)) = (Provider::parse(&provider),cp["effective_model"]["model"].as_str()) {
+                let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
+                let facts = self.model_facts(&policy,provider_id,&model,Some(&effort));
+                !crate::agent::same_model(&provider,facts["resolved_id"].as_str().unwrap_or(&model),old)
+            } else { false };
             let recovery = if contaminated {
                 Some("uncommitted or failed architect turn")
             } else if !cp["session"].is_null() && cp["session"]["provider"] != provider {
                 Some("provider changed")
+            } else if changed_model {
+                Some("model changed; reconstruct from saved checkpoint")
             } else if cp["context_status"] == "needs_recovery"
                 || cp["session"]["resume_policy"] == "fork_from_checkpoint"
             {
@@ -470,49 +443,60 @@ impl Ctx {
                     recovery_reason.as_deref().unwrap_or("guidance turn")
                 ),
             );
-            let invoke = |session: Option<&str>| -> Result<AgentResult, String> {
+            let requirements = self.model_requirements("architect",None)?;
+            let requirements = if pinned { requirements.pinned() } else { requirements };
+            let initial = (provider,model,effort);
+            let invoke = |choice: &crate::model_selection::ModelChoice, session: Option<&str>| -> Result<AgentResult, String> {
+                let (provider,model,effort) = choice;
                 if provider == "mock" {
                     return self.mock_architect(&candidate, &cp, &required, &routing_ids, &prompt, session);
                 }
                 self.run_agent(&AgentRequest {
                     role: "architect",
-                    provider: &provider,
-                    model: &model,
-                    effort: &effort,
+                    provider,
+                    model,
+                    effort,
                     session,
                     prompt: &prompt,
                 })
             };
-            let mut output = invoke(session.as_deref());
-            if let Err(error) = &output {
-                let lower = error.to_lowercase();
-                if session.is_some()
-                    && [
-                        "session not found",
-                        "no conversation found",
-                        "session expired",
-                        "thread not found",
-                        "no rollout found",
-                        "no saved session found",
-                        "could not find session",
-                    ]
-                    .iter()
-                    .any(|s| lower.contains(s))
-                {
-                    recovery_reason = Some(format!(
-                        "missing/expired session: {}",
-                        crate::util::last_chars(error, 500)
-                    ));
+            let (output,(provider,model,effort)) = self.with_selected_model(&requirements,Some(initial.clone()), |choice| {
+                if choice != &initial {
                     session = None;
-                    self.session.state.lock().unwrap().architect_activity =
-                        json!({"status":"recovering","reason":recovery_reason});
-                    output = invoke(None);
+                    recovery_reason = Some("model quota fallback; reconstruct from saved checkpoint".into());
+                    self.session.state.lock().unwrap().architect_activity = json!({"status":"recovering","reason":recovery_reason});
                 }
-            }
-            let output = output?;
+                let mut output = invoke(choice,session.as_deref());
+                if let Err(error) = &output {
+                    let lower = error.to_lowercase();
+                    if session.is_some()
+                        && [
+                            "session not found",
+                            "no conversation found",
+                            "session expired",
+                            "thread not found",
+                            "no rollout found",
+                            "no saved session found",
+                            "could not find session",
+                        ]
+                        .iter()
+                        .any(|s| lower.contains(s))
+                    {
+                        recovery_reason = Some(format!(
+                            "missing/expired session: {}",
+                            crate::util::last_chars(error, 500)
+                        ));
+                        session = None;
+                        self.session.state.lock().unwrap().architect_activity =
+                            json!({"status":"recovering","reason":recovery_reason});
+                        output = invoke(choice,None);
+                    }
+                }
+                output
+            })?;
             if provider != "mock" {
                 let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
-                let selected = self.app.catalogue.execution_input(&policy, Provider::parse(&provider).ok_or("invalid architect provider")?, &model);
+                let selected = self.model_facts(&policy, Provider::parse(&provider).ok_or("invalid architect provider")?, &model, None);
                 if !output.model_reported {
                     return Err("architect effective model missing: provider did not report a model in the stream or current session metadata; see model log".into());
                 }

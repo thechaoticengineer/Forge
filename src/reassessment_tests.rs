@@ -482,7 +482,7 @@ fn operational_budget_is_restored_and_review_retry_uses_fresh_sessions() {
     let ctx = app.context(f.root.to_str().unwrap());
     let mut p = ctx.load_plan().unwrap();
     assert!(
-        ctx.operational_retry(&mut p, 0, "503 overloaded", "implementer")
+        ctx.operational_retry(&mut p, 0, "Selected model is at capacity. Please try a different model.", "implementer")
             .unwrap()
     );
     assert!(

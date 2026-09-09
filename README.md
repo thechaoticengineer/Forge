@@ -832,20 +832,38 @@ Unavailable readings remain unknown; failed refreshes label the previous reading
 as stale. Incompatible CLI protocols or unsupported SDK versions degrade to
 unavailable usage information.
 
-With automatic routing and an empty `reviewer_model`, independent review selects
-the first eligible configured strong model whose quota is not known to be
-exhausted. Registry order supplies the preference: configure Fable followed by
-Opus to use Opus when the Fable pool is depleted. If the pre-launch quota check
-discovers exhaustion after selection, or the CLI itself refuses the selected
-model with an explicit model-family limit message, review switches to another eligible model
-without spending a review/fix round or retrying the same model twice. The actual
-review records retain the selected provider/model and a fresh session, and the
-switch is logged. CLI refusal fallback also works when usage discovery is
-unavailable after a CLI update; generic rate limits and authentication errors do
-not establish a model-specific limit. Explicit model choices remain constraints. Review still uses
-the other provider: Codex implementations use Claude review, while Claude
-implementations use Codex review. If all adequate independent choices are
-unavailable, Forge preserves the work and blocks instead of using self-review.
+All roles use the shared resolver in `src/model_selection.rs`: planner, chat,
+architect (including review), independent reviewer, and fixed stage execution.
+Roles supply constraints; the resolver owns catalogue facts, quota availability,
+and replacement decisions. Chat uses the planner configuration. Stage routing
+uses the same candidate pool, with its stage risk/task requirements layered on top.
+
+With automatic routing and an empty role model setting, selection skips known
+exhausted models. Registry order supplies preference within a capability class:
+configure Fable followed by Opus to use Opus when the Fable pool is depleted.
+If the pre-launch probe discovers exhaustion after selection, or the CLI explicitly
+reports the selected family's quota limit, the same resolver chooses another
+eligible model without revisiting one already attempted. This also works when
+usage discovery is unavailable. Generic capacity, rate-limit, and authentication
+errors do not establish a model-family limit. Structured provider errors survive
+nonzero process exits; `model is at capacity` receives the existing bounded
+operational retries rather than immediately triggering reassessment.
+
+The existing capability classes are `basic`, `standard`, and `strong`. A class is
+a minimum: a stronger model can serve a lower class. A provider with one basic and
+one strong model can therefore cover all three classes. Native effort remains a
+separate provider setting. Planner, architect, chat, and automatic independent
+review require strong models. Adding models changes the registry; adding a new
+provider still requires its CLI adapter and catalogue discovery support.
+
+Actual choices are logged and retained in provenance. Fresh roles start fresh
+sessions; an architect model change reconstructs its context from the checkpoint
+before continuing guidance or review. Explicit model settings remain constraints.
+An agreed implementation model is checked by the common resolver and retains its
+assignment until the stage's reassessment lifecycle replaces it. Temporary quota
+does not itself invalidate an agreement. Review continues to use the other
+provider, without spending a review/fix round on model-family quota fallback.
+If no adequate independent model remains, Forge preserves the work and blocks.
 
 Model identity checks recognize Claude's exact `[1m]` context suffix: the CLI may
 report it at initialization while assistant messages report the same model ID
