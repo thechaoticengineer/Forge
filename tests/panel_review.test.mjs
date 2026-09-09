@@ -8,7 +8,8 @@ vm.runInNewContext(qml.slice(qml.indexOf('  function reviewGateText('), qml.inde
 test('documentation architect is explicitly not required, never approved', () => {
   const text = context.reviewGateText({review_policy:{scope:'ordinary_documentation',rationale:'Prose only'},review_gate:{status:'approved',roles:{architect:'not_required',reviewer:'approved'}}});
   assert.match(text,/Architect: review not required/); assert.match(text,/Independent: approved/);
-  assert.doesNotMatch(text,/Architect: approved/); assert.match(text,/Prose only/);
+  assert.doesNotMatch(text,/Architect: approved/); assert.doesNotMatch(text,/Prose only/);
+  assert.match(qml, /originalText: \(stageRow.modelData.review_policy \|\| \{\}\).rationale/);
 });
 test('current gate is independent of historical approval and partial outcomes', () => {
   const stage = {last_verdict:{approved:true,issues:[],notes:[]}, review_gate:{status:'error',roles:{reviewer:'approved',architect:'pending'}}};

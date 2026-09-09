@@ -369,6 +369,13 @@ impl Store {
     pub(crate) fn state_plan(&self, mut plan: Value) -> Value {
         let refs = plan["architecture"]["review_history"].clone();
         for stage in plan["stages"].as_array_mut().into_iter().flatten() {
+            let reference = &refs[stage["id"].to_string()];
+            // Add only to the polling projection, never to saved records.
+            stage["review_snapshot"] = if reference["file"].is_string() {
+                reference["file"].clone()
+            } else {
+                crate::review_history::legacy_snapshot(stage).map(Value::String).unwrap_or(Value::Null)
+            };
             stage.as_object_mut().unwrap().remove("model_proposal_inputs");
             // Full selection dialogue and transitive inputs are archived events,
             // not polling data. Preserve the current choice and both rationales.
@@ -862,6 +869,7 @@ impl Store {
             plan = prior["plan"].clone();
         }
         let reference = &plan["architecture"]["review_history"][stage_id.to_string()];
+        let mut snapshot = reference["file"].clone();
         let mut page = if !reference.is_null() {
             crate::review_history::page(&self.review_dir(&plan)?, reference, cursor, limit)?
         } else {
@@ -871,7 +879,8 @@ impl Store {
                 .iter()
                 .find(|s| s["id"] == stage_id)
                 .ok_or("unknown review stage")?;
-            let records = stage["reviews"].as_array().cloned().unwrap_or_default();
+            snapshot = json!(crate::review_history::legacy_snapshot(stage)?);
+            let records = crate::review_history::legacy_records(stage);
             let start = usize::try_from(cursor).map_err(|_| "invalid review cursor")?;
             if start > records.len() {
                 return Err("cursor past review history".into());
@@ -889,6 +898,8 @@ impl Store {
             json!({"items": records[start..end], "count": records.len(),
                 "next_cursor": if end < records.len() { json!(end) } else { Value::Null }})
         };
+        page["snapshot"] = snapshot;
+        page["revision"] = plan["revision"].clone();
         page["plan_id"] = plan["plan_id"].clone();
         page["stage_id"] = json!(stage_id);
         page["checkpoint"] = plan["architecture"]["checkpoint"].clone();

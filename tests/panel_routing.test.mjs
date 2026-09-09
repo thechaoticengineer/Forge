@@ -13,7 +13,7 @@ const stage = {model_agreement: {id:'agreed-1', valid:true, availability:'unveri
 test('collapsed drafts show both reasons, native effort, unverified availability and configured tier provenance', () => {
   const text = ctx.stageModelText(stage, false);
   for (const part of ['codex/configured-model', 'high', 'unverified', 'strong (configured)', 'Planner: Complex storage', 'Architect: A failure']) assert.ok(text.includes(part));
-  assert.match(qml, /text: root.stageModelText\(stageRow.modelData, stageRow.expanded\)/);
+  assert.match(qml, /text: root.stageModelStatus\(stageRow.modelData\)/);
 });
 test('expanded details distinguish relative preferences from prices and handle unknowns', () => {
   assert.match(ctx.stageModelText(stage,true), /configured relative preference 2 \(not a price\)/);
@@ -40,4 +40,26 @@ test('routing status shows bounded retry counts, trigger evidence and both decis
     history:[{kind:'repeated_reasoning_failure',evidence:['[reviewer] same failing test'],planner_reason:'Stronger capability needed',architect_reason:'Preserve the invariant'}]};
   const text = ctx.stageModelText(routed,true);
   for (const expected of ['blocked','reassessments 2/3','operational retries 1/2','repeated_reasoning_failure','same failing test','Stronger capability needed','Preserve the invariant','No adequate eligible model']) assert.ok(text.includes(expected));
+});
+
+test('stage status remains visible while both exact rationale sources are independently expandable', () => {
+  const multiline = structuredClone(stage);
+  multiline.model_agreement.planner_reason = '\n  planner first\r\nplanner tail  ';
+  multiline.model_agreement.architect_reason = '\rarchitect first\narchitect tail\t';
+  const status = ctx.stageModelStatus(multiline);
+  for (const value of ['codex/configured-model', 'high', 'unverified', 'strong (configured)']) assert.ok(status.includes(value));
+  assert.ok(!status.includes('planner tail'));
+  const fields = ctx.stageModelDetails(multiline, false);
+  assert.equal(fields.find(f => f.label === 'Planner').text, multiline.model_agreement.planner_reason);
+  assert.equal(fields.find(f => f.label === 'Architect').text, multiline.model_agreement.architect_reason);
+  multiline.model_block = 'blocked\nfull error';
+  assert.equal(ctx.stageModelErrors(multiline), multiline.model_block);
+  assert.match(qml, /model: root.stageModelDetails\(stageRow.modelData, stageRow.expanded\)/);
+  assert.match(qml, /text: root.stageModelErrors\(stageRow.modelData\)/);
+});
+
+test('pending model agreements still expose routing outcomes and execution identity', () => {
+  const pending={reassessment:{status:'blocked',count:2},model_invocations:[{status:'failed',effective:{provider:'claude',model:'review-model'}}]};
+  const text=ctx.stageModelStatus(pending);
+  for (const value of ['pending','Routing: blocked','reassessments 2/3','Execution: claude/review-model','failed']) assert.ok(text.includes(value),value);
 });

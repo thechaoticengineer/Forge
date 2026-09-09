@@ -306,3 +306,84 @@ fn architect_guidance_spans_real_stage_loop_without_boundary_summary_turns() {
     assert_eq!(test.app.architecture_store().checkpoint(&completed).unwrap()["session"]["reference"], reference);
     assert_eq!(test.app.app.settings.lock().unwrap()["mock_architect_requests"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn review_detail_snapshots_retrieve_large_feedback_and_pin_same_revision_publications() {
+    let test = QueueTest::new(false);
+    let records: Vec<_> = (0..13).map(|i| json!({
+        "round": 1, "role": if i % 2 == 0 { "architect" } else { "reviewer" },
+        "approved": false, "summary": format!("\r\n identical preview\n{}\nsummary END  \t", "界🙂".repeat(3000)),
+        "issues": [format!("\nrequest {i}\r\n{}\nrequest END  ", "x".repeat(5000)), "second request\nlast  "],
+        "notes": ["legacy note\r\nlast  "], "checks": ["check one\nlast  ", "check two"], "legacy_position": i
+    })).collect();
+    test.app.architecture_store().publish(json!({"goal":"complete reviews", "revision":1,
+        "stages":[{"id":1,"title":"one","reviews":records}]}),
+        crate::architecture::checkpoint_default(), json!({"kind":"legacy_import"})).unwrap();
+    let published = test.app.load_plan().unwrap();
+    let (_, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    let stage = &state["plan"]["stages"][0];
+    assert_eq!(stage["review_count"],13);
+    assert_eq!(stage["reviews"].as_array().unwrap().len(),8);
+    assert!(stage["reviews"].as_array().unwrap().iter().all(|r| r["truncated"] == true && r.to_string().len() <= 4096));
+    let checkpoint = published["architecture"]["checkpoint"].as_str().unwrap();
+    let id = published["plan_id"].as_str().unwrap();
+    let mut revised = published.clone();
+    revised["stages"][0]["reviews"][12]["issues"][1] = json!("a different publication at the same revision");
+    test.app.architecture_store().publish(revised.clone(),
+        test.app.architecture_store().checkpoint(&published).unwrap(), json!({"kind":"fixture_review"})).unwrap();
+    let newer = test.app.load_plan().unwrap();
+    assert_eq!(published["revision"],newer["revision"]);
+    assert_ne!(published["architecture"]["checkpoint"],newer["architecture"]["checkpoint"]);
+    let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+    let mut cursor=0; let mut collected=Vec::new();
+    loop {
+        let path=format!("/api/architecture/reviews?project={}&plan_id={id}&checkpoint={checkpoint}&stage_id=1&cursor={cursor}&limit=3",test.app.project());
+        let (code,page)=api_request(&test.app.app,"GET",&path,json!({}));
+        assert_eq!(code,200,"{page}");
+        assert_eq!(page["project"],test.app.project());
+        assert_eq!(page["checkpoint"],checkpoint);
+        assert_eq!(page["snapshot"],stage["review_snapshot"]);
+        assert_eq!(page["revision"],published["revision"]);
+        collected.extend(page["items"].as_array().unwrap().iter().cloned());
+        if let Some(next)=page["next_cursor"].as_u64() { cursor=next; } else { break; }
+    }
+    assert_eq!(collected,records);
+    assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(),before);
+    let (_,current)=api_request(&test.app.app,"GET","/api/architecture/reviews?stage_id=1&cursor=12&limit=1",json!({}));
+    assert_ne!(current["snapshot"],stage["review_snapshot"]);
+    assert_eq!(current["items"][0]["issues"][1],revised["stages"][0]["reviews"][12]["issues"][1]);
+}
+
+#[test]
+fn legacy_review_snapshots_detect_hidden_changes_and_last_verdict_only_is_readable() {
+    let test=QueueTest::new(false); test.app.ensure_forge_dir();
+    let record=json!({"summary":format!("same first line\n{}", "x".repeat(5000)),
+        "issues":["same request", "hidden original"],"checks":["check\nlast  "]});
+    let mut legacy=json!({"revision":3,"goal":"legacy","stages":[{"id":1,"reviews":vec![record.clone();10]}]});
+    let path=test.app.forge_path("plan.json");
+    fs::write(&path,legacy.to_string()).unwrap();
+    let (_,first)=api_request(&test.app.app,"GET","/api/state",json!({}));
+    let (_,cached)=api_request(&test.app.app,"GET","/api/state",json!({}));
+    assert_eq!(cached["plan"]["stages"][0]["review_snapshot"],first["plan"]["stages"][0]["review_snapshot"]);
+    let (_,page)=api_request(&test.app.app,"GET","/api/architecture/reviews?stage_id=1&cursor=2&limit=1",json!({}));
+    assert!(page["checkpoint"].is_null());
+    assert_eq!(page["snapshot"],first["plan"]["stages"][0]["review_snapshot"]);
+    legacy["stages"][0]["reviews"][2]["issues"][1]=json!("hidden replacement");
+    fs::write(&path,legacy.to_string()).unwrap();
+    let (_,changed)=api_request(&test.app.app,"GET","/api/architecture/reviews?stage_id=1&cursor=3&limit=1",json!({}));
+    assert_eq!(changed["count"],page["count"]);
+    assert_eq!(changed["revision"],page["revision"]);
+    assert_ne!(changed["snapshot"],page["snapshot"]);
+    let (_,state)=api_request(&test.app.app,"GET","/api/state",json!({}));
+    assert_eq!(state["plan"]["stages"][0]["review_snapshot"],changed["snapshot"]);
+    assert_eq!(state["plan"]["stages"][0]["reviews"],first["plan"]["stages"][0]["reviews"]);
+    legacy["stages"][0].as_object_mut().unwrap().remove("reviews");
+    legacy["stages"][0]["last_verdict"]=record.clone();
+    fs::write(&path,legacy.to_string()).unwrap();
+    let before=fs::read(&path).unwrap();
+    let (code,page)=api_request(&test.app.app,"GET","/api/architecture/reviews?stage_id=1&cursor=0&limit=8",json!({}));
+    assert_eq!(code,200,"{page}"); assert_eq!(page["items"],json!([record]));
+    assert_eq!(page["count"],1); assert!(page["next_cursor"].is_null());
+    assert_eq!(fs::read(&path).unwrap(),before);
+    assert!(!test.app.forge_path("architecture").exists());
+}

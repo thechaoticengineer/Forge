@@ -98,3 +98,81 @@ leaving and revisiting a project. Rust history tests cover duplicate records,
 tail movement, rotation, absolute byte offsets, and incomplete records. These
 fixtures do not load the panel into the user's live shell and do not constitute
 full-panel live polling validation.
+
+## Stage details and complete reviews
+
+Stage cards reuse `CompactDetail` separately for commit text, instructions,
+acceptance, review-policy rationale, both model-selection rationales and model
+explanations. Current aggregate gate, separate architect/independent outcomes,
+activity, model identity/availability, routing failures and historical labels
+remain independent, wrapping status text. Clicking the stage header or using the
+existing stage shortcut reveals acceptance and review history; each prose field
+has its own expansion. Only the header owns the stage pointer handler, so text
+selection and nested controls do not collapse the card. Committed editors stay
+locked, including while editing the rest of a plan.
+
+Prose expansion uses project, project visit, plan identity, revision, stage and
+field identity. Checkpoint publications and appended reviews therefore preserve
+open commit, instructions, acceptance, policy and model details even when stage
+delegates are recreated. Review rows retain their separate snapshot scope so an
+open review cannot transfer to a different publication.
+
+`ReviewView.js` owns lazy review retrieval through the existing
+`/api/architecture/reviews` endpoint. Requests include explicit `project`,
+`stage_id`, available `plan_id` and `checkpoint`, `cursor`, and `limit`. Revision
+is a client scope/response guard, not an endpoint query parameter. Loading a
+shortened review seeks to its absolute position; older reviews load eight at a
+time, following `next_cursor` if the byte budget ends a page early. A failed
+continuation does not advance the contiguous older-page boundary past a gap.
+
+The additive response fields `project`, `revision`, and `snapshot` identify the
+returned publication. The read-only state projection adds `review_snapshot` to
+each stage. Indexed histories use their immutable file identifier. Legacy
+histories use SHA-256 over all complete records (including unknown fields); an
+empty history has the marker `empty`. Both readers use the existing SHA-256
+utility. Cached legacy state retains its original marker without hashing the
+shortened projection again. No records are rewritten by reads. The existing
+8-record / 4096-serialized-byte preview bounds and whole-record page budgets
+remain unchanged. Last-verdict-only legacy histories are also readable through
+the endpoint.
+
+Cache and request ownership include project visit, plan, revision, stage,
+checkpoint and history marker. Durable record identities are checked when
+available; otherwise the recent preview at index `i` maps to
+`review_count - preview_count + i` only after the endpoint verifies the same
+snapshot. Summary strings and shared round numbers never establish identity.
+With no checkpoint, a changed full-history marker rejects the response and
+refreshes state; assembly restarts in the new scope. An old server without either
+a checkpoint or a snapshot marker cannot authorize positional mapping. The panel
+reports that it cannot verify the history rather than attaching full text to an
+unverified preview. Stale success and failure callbacks cannot modify the view.
+
+A shortened preview explicitly says it is a preview. Expansion displays loading,
+failure and retry controls, with no editor or full-copy action until a complete,
+verified record arrives. Each full summary, individual request, legacy note and
+check then has a separate selectable editor and an exact original copy source.
+Current gates remain independent of historical review approvals.
+
+Additional verification:
+
+```sh
+node --test tests/panel_review_details.test.mjs tests/panel_review.test.mjs \
+  tests/panel_routing.test.mjs tests/panel_lifecycle.test.mjs
+python3 tests/run_stage_details.py
+```
+
+The stage fixture extracts the current Panel stage-content subtree, compact
+wrapper and request/status helpers, substituting only theme, clipboard and
+viewport services. It executes actual delegates and controls offscreen: narrow
+widths, independent expansion, selection/copy, lazy loading, failure/retry,
+complete long reviews and individual requests, older pagination, stale callbacks,
+and committed read-only presentation. Stage delegates are recreated on plan
+replacement; regression checks preserve expanded prose across checkpoint-only
+publication and appended reviews, and reset it for project, visit, plan, revision
+or stage changes. Clipboard signal data is asserted there;
+`run_compact_clipboard.py` separately verifies the actual Quickshell clipboard.
+This is isolated stage-subtree evidence, not a running Omarchy-shell interaction
+or validation of the remaining stage-4 panel surfaces. Rust endpoint tests pin
+same-revision publications, reconstruct large complete histories, detect hidden
+legacy changes with identical previews, preserve cached markers, and confirm
+that reads leave saved records unchanged.

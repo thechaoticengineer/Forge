@@ -8,6 +8,23 @@ use std::path::Path;
 pub(crate) const PREVIEW_COUNT: usize = 8;
 const PAGE_BYTES: usize = 256 * 1024;
 
+// Read-only snapshot identity for pre-checkpoint histories. Include every record,
+// including unknown legacy fields, so publication changes cannot reuse positions.
+pub(crate) fn legacy_records(stage: &Value) -> Vec<Value> {
+    let records = stage["reviews"].as_array().cloned().unwrap_or_default();
+    if records.is_empty() && stage["last_verdict"].is_object() {
+        vec![stage["last_verdict"].clone()]
+    } else {
+        records
+    }
+}
+
+pub(crate) fn legacy_snapshot(stage: &Value) -> Result<String, String> {
+    let records = legacy_records(stage);
+    if records.is_empty() { return Ok("empty".into()); }
+    crate::util::digest(&serde_json::to_vec(&records).map_err(|e| e.to_string())?)
+}
+
 fn preview(record: &Value) -> Value {
     if record.to_string().len() <= 4096 {
         return record.clone();

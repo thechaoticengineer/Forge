@@ -169,11 +169,14 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
         });
         let mut cache = ctx.session.legacy_state_cache.lock().unwrap();
         let cached = cache.as_ref().filter(|(key, _)| Some(key) == stamp.as_ref()).map(|(_, p)| p.clone());
+        let was_cached = cached.is_some();
         let loaded = match cached { Some(p) => Ok(Some(p)), None => store.load_raw() };
         match loaded {
             Ok(plan) => {
                 snap["architecture"] = store.summary(plan.as_ref()).unwrap_or(Value::Null);
-                let bounded = plan.map(|p| store.state_plan(p));
+                // Cached data is already a projection; hashing its shortened
+                // reviews again would manufacture a different snapshot identity.
+                let bounded = plan.map(|p| if was_cached { p } else { store.state_plan(p) });
                 if let Some(p) = bounded.as_ref().filter(|p| p.get("architecture").is_none()) {
                     if let Some(stamp) = stamp { *cache = Some((stamp, p.clone())); }
                 } else { *cache = None; }
@@ -762,7 +765,9 @@ fn api_architecture_reviews(ctx: &Ctx, query: &str) -> (u32, Value) {
         let limit = query_value(query, "limit")?.unwrap_or_else(|| "20".into())
             .parse::<usize>().map_err(|_| "invalid limit")?;
         let _guard = ctx.session.persistence_lock.lock().unwrap();
-        ctx.architecture_store().reviews(id.as_deref(), stage, checkpoint.as_deref(), cursor, limit)
+        let mut page = ctx.architecture_store().reviews(id.as_deref(), stage, checkpoint.as_deref(), cursor, limit)?;
+        page["project"] = json!(ctx.project());
+        Ok::<Value, String>(page)
     })();
     match result { Ok(page) => (200, page), Err(error) => (400, json!({"error": error})) }
 }

@@ -7,6 +7,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "DetailView.js" as DetailView
+import "ReviewView.js" as ReviewView
 
 Item {
   id: root
@@ -140,16 +141,22 @@ Item {
     catalogueWasRefreshing = refreshing
   }
 
+  // Reports keep their complete composite text; stage cards render status and
+  // prose independently so compact previews cannot conceal routing outcomes.
   function stageModelText(stage, detail) {
-    const a = stage && stage.model_agreement
-    if (!a) return "Model agreement pending — reconcile before approval"
-    const e = a.effective || {}, p = a.policy_inputs || {}
-    const proposed = a.validated_proposal || {}
-    let text = (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
+    return stageModelStatus(stage) + "\n" + stageModelDetails(stage, detail).map(function(field) {
+      return field.label + ": " + field.text
+    }).join("\n") + (stageModelErrors(stage) ? "\n" + stageModelErrors(stage) : "")
+  }
+
+  function stageModelStatus(stage) {
+    const a = stage.model_agreement || {}
+    const e = a.effective || {}, p = a.policy_inputs || {}, proposed = a.validated_proposal || {}
+    let text = !stage.model_agreement ? "Model agreement pending — reconcile before approval"
+      : (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
       + e.provider + "/" + e.model + " · " + e.native_effort
       + " · " + (a.verification_state || a.availability || "unverified")
       + " · " + (p.tier || "unclassified") + " (" + (p.tier_provenance || "unknown provenance") + ")"
-      + "\nPlanner: " + a.planner_reason + "\nArchitect: " + a.architect_reason
     if (proposed.provider && proposed.model)
       text += "\nProposed: " + proposed.provider + "/" + proposed.model + " · " + proposed.native_effort
     const calls = stage.model_invocations || []
@@ -160,31 +167,46 @@ Item {
         + " · " + (last.verification_state || last.status)
     }
     const routing = stage.reassessment || {}, history = routing.history || []
-    if (routing.status) {
-      text += "\nRouting: " + routing.status + " · reassessments " + (routing.count || 0)
-        + "/" + ((routing.limits || {}).max_reassessments ?? 3)
-        + " · operational retries " + (routing.operational_retries || 0)
-        + "/" + ((routing.limits || {}).max_operational_retries ?? 2)
-      const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
-      if (trigger) text += "\nTrigger: " + trigger.kind + " · " + JSON.stringify(trigger.evidence || trigger.error || "")
-      if (routing.error) text += "\n" + routing.error
-      if (detail) history.slice(-4).forEach(function(h) {
-        text += "\n" + h.kind
-        if (h.planner_reason) text += "\nPlanner: " + h.planner_reason + "\nArchitect: " + h.architect_reason
-      })
-    }
-    if (stage.model_block) text += "\n" + stage.model_block
-    if (detail) {
-      text += "\nRisk: " + (a.validated_proposal || {}).risk + " · complexity: " + (a.validated_proposal || {}).complexity
-        + "\nConstraint: " + JSON.stringify(p.constraint || {})
-        + "\nCost: " + (p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
-          ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
-          : "unknown / no comparable billing data used")
-        + "\nRouting price: " + (p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing) : "unavailable / no comparable rate used")
-        + "\nAgreement: " + a.id + " · policy: " + p.policy
-      if (calls.length) text += "\nLatest invocation: " + JSON.stringify(calls[calls.length - 1])
-    }
+    if (routing.status) text += "\nRouting: " + routing.status + " · reassessments " + (routing.count || 0)
+      + "/" + ((routing.limits || {}).max_reassessments ?? 3)
+      + " · operational retries " + (routing.operational_retries || 0)
+      + "/" + ((routing.limits || {}).max_operational_retries ?? 2)
+    const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
+    if (trigger) text += "\nTrigger: " + trigger.kind
     return text
+  }
+
+  function stageModelErrors(stage) {
+    return [(stage.reassessment || {}).error, stage.model_block].filter(Boolean).join("\n")
+  }
+
+  function stageModelDetails(stage, detail) {
+    const a = stage.model_agreement || {}, p = a.policy_inputs || {}
+    const fields = []
+    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
+    add("Planner", a.planner_reason)
+    add("Architect", a.architect_reason)
+    const routing = stage.reassessment || {}, history = routing.history || []
+    const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
+    if (trigger) add("Trigger evidence", typeof trigger.evidence === "string" ? trigger.evidence
+      : JSON.stringify(trigger.evidence || trigger.error || ""))
+    if (detail) {
+      history.slice(-4).forEach(function(h, i) {
+        add(h.kind + " · Planner " + (i + 1), h.planner_reason)
+        add(h.kind + " · Architect " + (i + 1), h.architect_reason)
+      })
+      add("Risk", ((a.validated_proposal || {}).risk || "pending") + " · complexity: " + ((a.validated_proposal || {}).complexity || "pending"))
+      add("Constraint", JSON.stringify(p.constraint || {}))
+      add("Cost", p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
+        ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
+        : "unknown / no comparable billing data used")
+      add("Routing price", p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing)
+        : "unavailable / no comparable rate used")
+      add("Agreement", (a.id || "pending") + " · policy: " + (p.policy || "pending"))
+      const calls = stage.model_invocations || []
+      if (calls.length) add("Latest invocation", JSON.stringify(calls[calls.length - 1]))
+    }
+    return fields
   }
 
   function changeModelConstraint(index, key, value) {
@@ -385,11 +407,13 @@ Item {
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) { syncHistory(); return }
+    if (project === lastProject) { syncHistory(); syncReviewViews(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
     projectViewRevision++
+    reviewViews = ({})
+    stageDetailExpanded = ({})
     cancelPlanEdit()
     goalField.text = goalDrafts[project] || ""
     feedbackField.text = ""
@@ -757,6 +781,76 @@ Item {
     return JSON.stringify([report.unix, report.goal, index])
   }
 
+  property var reviewViews: ({})
+  property int reviewViewVersion: 0
+  property var stageDetailExpanded: ({})
+
+  function reviewScope(stage) {
+    return ReviewView.scope(lastProject, projectViewRevision, plan, stage)
+  }
+  function stageDetailScope(stage) {
+    // Execution publications change review snapshots without revising prose.
+    // Keep open fields readable when those publications recreate stage delegates.
+    const p = plan || {}
+    return JSON.stringify([lastProject, projectViewRevision, p.plan_id || "",
+      p.revision === undefined ? null : p.revision, stage.id])
+  }
+  function reviewView(stage) {
+    const version = reviewViewVersion
+    const scope = reviewScope(stage)
+    // Retain even already-complete state records, so unchanged polls do not
+    // replace their delegates and interrupt selection before any network load.
+    if (!reviewViews[scope.key]) reviewViews[scope.key] = ReviewView.create(scope)
+    return Object.assign({}, reviewViews[scope.key])
+  }
+  function syncReviewViews() {
+    const kept = {}
+    const stages = plan && plan.stages ? plan.stages : []
+    stages.forEach(function(stage) {
+      const scope = root.reviewScope(stage)
+      if (root.reviewViews[scope.key]) kept[scope.key] = root.reviewViews[scope.key]
+    })
+    reviewViews = kept
+  }
+  function loadStageReviews(stageId, cursor, end) {
+    const stage = plan && plan.stages ? plan.stages.find(function(s) { return s.id === stageId }) : null
+    if (!stage || !lastProject) return
+    const scope = reviewScope(stage)
+    const view = reviewViews[scope.key] || ReviewView.create(scope)
+    reviewViews[scope.key] = view
+    const request = ReviewView.begin(view, cursor, end)
+    if (!request) return
+    reviewViewVersion++
+    api("GET", ReviewView.path(view, request), null, function(resp, status) {
+      const current = root.plan && root.plan.stages ? root.plan.stages.find(function(s) { return s.id === stageId }) : null
+      if (!current || root.reviewViews[scope.key] !== view) return
+      const result = ReviewView.finish(view, request, root.reviewScope(current), resp, status)
+      if (result === "stale") return
+      root.reviewViewVersion++
+      if (result === "more") root.loadStageReviews(stageId, view.retry.cursor, view.retry.end)
+      if (result === "changed") root.refresh()
+    }, true)
+  }
+
+  component StageDetail: CompactDetail {
+    property string detailKey: ""
+    expanded: root.stageDetailExpanded[detailKey] === true
+    foreground: root.mutedForeground
+    mutedForeground: root.mutedForeground
+    background: root.background
+    fontFamily: root.fontFamily
+    fontSize: root.fs(11)
+    onExpansionRequested: value => {
+      const next = Object.assign({}, root.stageDetailExpanded)
+      next[detailKey] = value
+      root.stageDetailExpanded = next
+      if (value && !textComplete) loadRequested()
+    }
+    onCopyRequested: original => Quickshell.clipboardText = original
+    onLeaveRequested: keyHandler.forceActiveFocus()
+    onFocusRevealed: control => panelScroll.reveal(control)
+  }
+
   function reviewGateText(stage) {
     const gate = stage.review_gate || {}
     const policy = stage.review_policy || {}
@@ -765,7 +859,6 @@ Item {
       + " · gate: " + (gate.status || "pending")
       + "\nArchitect: " + (roles.architect === "not_required" ? "review not required" : (roles.architect || "pending"))
       + " · Independent: " + (roles.reviewer || "pending")
-      + (policy.rationale ? "\n" + policy.rationale : "")
   }
 
   function reviewStrings(values) {
@@ -777,6 +870,18 @@ Item {
       }
     }
     return strings
+  }
+
+  function reviewFields(verdict) {
+    const fields = []
+    for (const kind of ["issues", "notes", "checks"]) {
+      reviewStrings(verdict[kind]).forEach(function(text, i) {
+        const label = kind === "issues" ? "Change request" : kind === "checks" ? "Verified check"
+          : verdict.approved === true ? "Legacy optional note" : "Legacy note (change request)"
+        fields.push({kind: kind, label: label + " " + (i + 1), text: text})
+      })
+    }
+    return fields
   }
 
   function stageReviews(stage) {
@@ -2152,7 +2257,10 @@ Item {
                 ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
                 : typeof modelData.duration_secs === "number"
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
-              readonly property var reviewHistory: root.stageReviews(modelData)
+              readonly property var reviewView: root.reviewView(modelData)
+              readonly property var reviewHistory: reviewView.rows
+              readonly property string detailScope: root.stageDetailScope(modelData)
+              readonly property string reviewDetailScope: root.reviewScope(modelData).key
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
               readonly property var lastDecision: lastReview
@@ -2163,17 +2271,16 @@ Item {
               radius: 3
               color: index === root.selectedStageIndex
                 ? Qt.darker(root.accent, 2.8) : "transparent"
-              TapHandler {
-                enabled: !stageRow.editable
-                onTapped: root.expandedStageId = stageRow.expanded
-                  ? -1 : stageRow.modelData.id
-              }
               Column {
                 id: stageContent
                 visible: !stageRow.editable
                 width: stageRow.width
                 spacing: 2
                 Flow {
+                  TapHandler {
+                    enabled: !stageRow.editable
+                    onTapped: root.expandedStageId = stageRow.expanded ? -1 : stageRow.modelData.id
+                  }
                   width: stageRow.width
                   spacing: Style.space(8)
                   Row {
@@ -2243,7 +2350,7 @@ Item {
                   Text {
                     visible: stageRow.reviewHistory.length > 0
                     width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.lastReview
+                    text: stageRow.lastReview && stageRow.lastDecision
                       ? "historical review · " + root.reviewRoundLabel(stageRow.lastReview)
                         + ": " + stageRow.lastDecision.label
                         + (stageRow.modelData.last_verdict_valid === false ? " · obsolete for current work" : "")
@@ -2266,16 +2373,15 @@ Item {
                     font.pixelSize: root.fs(11)
                   }
                 }
-                Text {
-                  text: stageRow.modelData.commit
-                  color: root.mutedForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                  font.italic: true
+                StageDetail {
+                  width: stageRow.width
+                  metadata: "Commit"
+                  detailKey: stageRow.detailScope + "/commit"
+                  originalText: stageRow.modelData.commit || ""
                 }
                 Text {
                   width: stageRow.width
-                  text: root.stageModelText(stageRow.modelData, stageRow.expanded)
+                  text: root.stageModelStatus(stageRow.modelData)
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap
@@ -2283,46 +2389,87 @@ Item {
                   font.pixelSize: root.fs(11)
                 }
                 Text {
-                  visible: !stageRow.expanded
-                  width: stageList.width
-                  text: stageRow.modelData.instructions
-                  color: root.mutedForeground
+                  visible: text !== ""
+                  width: stageRow.width
+                  text: root.stageModelErrors(stageRow.modelData)
+                  textFormat: Text.PlainText
+                  color: root.urgent
                   wrapMode: Text.Wrap
-                  maximumLineCount: 3
-                  elide: Text.ElideRight
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
-                Text {
+                Repeater {
+                  model: root.stageModelDetails(stageRow.modelData, stageRow.expanded)
+                  delegate: StageDetail {
+                    required property var modelData
+                    width: stageRow.width
+                    detailKey: stageRow.detailScope + "/model/" + modelData.label
+                    metadata: modelData.label
+                    originalText: modelData.text
+                  }
+                }
+                StageDetail {
+                  visible: originalText !== ""
+                  width: stageRow.width
+                  detailKey: stageRow.detailScope + "/policy"
+                  metadata: "Review policy rationale"
+                  originalText: (stageRow.modelData.review_policy || {}).rationale || ""
+                }
+                StageDetail {
+                  width: stageRow.width
+                  detailKey: stageRow.detailScope + "/instructions"
+                  metadata: "Instructions"
+                  originalText: stageRow.modelData.instructions || ""
+                }
+                StageDetail {
                   visible: stageRow.expanded
                   width: stageRow.width
-                  text: "instructions:\n" + (stageRow.modelData.instructions || "")
+                  detailKey: stageRow.detailScope + "/acceptance"
+                  metadata: "Acceptance criteria"
+                  originalText: stageRow.modelData.acceptance || ""
+                }
+                Text {
+                  visible: stageRow.expanded && stageRow.reviewHistory.length > 0
+                  width: stageRow.width
+                  text: "Historical reviews · showing " + stageRow.reviewHistory.length
+                    + " of " + stageRow.reviewView.scope.count
+                    + (stageRow.reviewHistory.some(function(r) { return !r.complete }) ? " · previews require full-text loading" : "")
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
-                Text {
-                  visible: stageRow.expanded
+                Flow {
+                  visible: stageRow.expanded && (stageRow.reviewView.older > 0 || !!stageRow.reviewView.pending || !!stageRow.reviewView.error)
                   width: stageRow.width
-                  text: "acceptance criteria:\n" + (stageRow.modelData.acceptance || "")
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Text {
-                  visible: stageRow.expanded && stageRow.modelData.reviews_truncated === true
-                  width: stageRow.width
-                  text: "Recent review previews · showing " + stageRow.reviewHistory.length
-                    + " of " + (stageRow.modelData.review_count || 0) + " reviews"
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
+                  spacing: Style.space(6)
+                  Button {
+                    visible: stageRow.reviewView.older > 0
+                    width: Math.min(implicitWidth, stageRow.width)
+                    text: "Load older reviews (" + stageRow.reviewView.older + ")"
+                    enabled: !stageRow.reviewView.pending
+                    onClicked: root.loadStageReviews(stageRow.modelData.id,
+                      Math.max(0, stageRow.reviewView.older - 8), stageRow.reviewView.older)
+                  }
+                  Text {
+                    visible: !!stageRow.reviewView.pending || !!stageRow.reviewView.error
+                    width: stageRow.width
+                    text: stageRow.reviewView.pending ? "Loading complete reviews…" : stageRow.reviewView.error
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: stageRow.reviewView.error ? root.urgent : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Button {
+                    visible: !!stageRow.reviewView.error && !!stageRow.reviewView.retry
+                    width: Math.min(implicitWidth, stageRow.width)
+                    text: "Retry reviews"
+                    enabled: !stageRow.reviewView.pending
+                    onClicked: root.loadStageReviews(stageRow.modelData.id,
+                      stageRow.reviewView.retry.cursor, stageRow.reviewView.retry.end)
+                  }
                 }
                 Repeater {
                   model: stageRow.reviewHistory
@@ -2331,15 +2478,12 @@ Item {
                     required property var modelData
                     readonly property var verdict: modelData.verdict
                     readonly property var decision: root.reviewDecision(verdict)
-                    readonly property var issues: root.reviewStrings(verdict.issues)
-                    readonly property var notes: root.reviewStrings(verdict.notes)
-                    readonly property var checks: root.reviewStrings(verdict.checks)
                     visible: stageRow.expanded
                     width: stageRow.width
                     spacing: 2
                     Text {
                       width: stageRow.width
-                      text: (reviewRound.verdict.role || "reviewer") + " review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
+                      text: "Historical · " + (reviewRound.verdict.role || "reviewer") + " review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
                         + reviewRound.decision.label
                       textFormat: Text.PlainText
                       color: reviewRound.decision.optionalNotes ? root.working
@@ -2359,46 +2503,30 @@ Item {
                       font.family: root.fontFamily
                       font.pixelSize: root.fs(11)
                     }
-                    Text {
-                      visible: text !== ""
+                    StageDetail {
                       width: stageRow.width
-                      text: reviewRound.verdict.summary || ""
-                      textFormat: Text.PlainText
-                      color: root.mutedForeground
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
+                      metadata: textComplete ? "Summary" : "Summary preview · feedback may be omitted"
+                      detailKey: stageRow.reviewDetailScope + "/review/" + reviewRound.modelData.key + "/summary"
+                      originalText: reviewRound.verdict.summary || ""
+                      textComplete: reviewRound.modelData.complete
+                      loading: !!stageRow.reviewView.pending
+                      detailError: stageRow.reviewView.error
+                      onLoadRequested: root.loadStageReviews(stageRow.modelData.id,
+                        reviewRound.modelData.position, reviewRound.modelData.position + 1)
                     }
-                    Text {
-                      visible: reviewRound.issues.length > 0
-                      width: stageRow.width
-                      text: "change requests:\n• " + reviewRound.issues.join("\n• ")
-                      textFormat: Text.PlainText
-                      color: root.urgent
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                    }
-                    Text {
-                      visible: reviewRound.notes.length > 0
-                      width: stageRow.width
-                      text: "legacy notes (change requests):"
-                        + "\n• " + reviewRound.notes.join("\n• ")
-                      textFormat: Text.PlainText
-                      color: reviewRound.decision.optionalNotes ? root.working : root.mutedForeground
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                    }
-                    Text {
-                      visible: reviewRound.checks.length > 0
-                      width: stageRow.width
-                      text: "verified: " + reviewRound.checks.join("; ")
-                      textFormat: Text.PlainText
-                      color: root.mutedForeground
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
+                    Repeater {
+                      // Shortened feedback is never offered as complete. Each full
+                      // request, legacy note and check gets its own copy source.
+                      model: reviewRound.modelData.complete ? root.reviewFields(reviewRound.verdict) : []
+                      delegate: StageDetail {
+                        required property var modelData
+                        required property int index
+                        width: stageRow.width
+                        detailKey: stageRow.reviewDetailScope + "/review/" + reviewRound.modelData.key + "/field/" + index
+                        metadata: modelData.label
+                        foreground: modelData.kind === "issues" ? root.urgent : root.mutedForeground
+                        originalText: modelData.text
+                      }
                     }
                   }
                 }

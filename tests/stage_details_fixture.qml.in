@@ -1,0 +1,280 @@
+pragma ComponentBehavior: Bound
+import QtQuick
+import QtQuick.Controls
+import QtTest
+import "components"
+import "components/ReviewView.js" as ReviewView
+Item {
+    id: root
+    width: 440
+    height: 700
+    property color foreground: "white"
+    property color mutedForeground: "#cccccc"
+    property color background: "#202020"
+    property color success: "green"
+    property color urgent: "red"
+    property color working: "yellow"
+    property string fontFamily: "monospace"
+    property string lastProject: "/fixture"
+    property int projectViewRevision: 1
+    property var reviewViews: ({})
+    property int reviewViewVersion: 0
+    property var stageDetailExpanded: ({})
+    property bool editingPlan: false
+    property int expandedStageId: -1
+    property bool busy: true
+    property var engineState: ({current_stage:1,current_step:"reviewing"})
+    property var plan: ({})
+    property var calls: []
+    property var fullRecords: []
+    property var currentStageRow: null
+    property int refreshes: 0
+    function fs(n) { return n }
+    function usageSummary(u) { return "" }
+    function refresh() { refreshes++ }
+    function api(method, path, body, done, scoped) { calls.push({path:path,done:done,scoped:scoped}) }
+    function respond(index, status) {
+        const call = calls[index], cursor = Number(call.path.match(/cursor=(\d+)/)[1])
+        const limit = Number(call.path.match(/limit=(\d+)/)[1])
+        const items = fullRecords.slice(cursor, cursor + limit)
+        call.done(status === 200 ? {project:lastProject,plan_id:plan.plan_id,revision:plan.revision,
+            checkpoint:plan.architecture.checkpoint, snapshot:"snapshot-1",stage_id:1,count:fullRecords.length,
+            items:items,next_cursor:cursor+items.length < fullRecords.length ? cursor+items.length : null}
+            : {error:"Fixture offline"},status)
+    }
+    QtObject { id: style; function space(n) { return n } }
+    QtObject { id: clipboard; property string clipboardText: "" }
+    Item { id: keyHandler }
+    // PANEL_HELPERS
+    Flickable {
+        id: panelScroll
+        anchors.fill: parent
+        contentHeight: root.currentStageRow ? root.currentStageRow.height : 0
+        clip: true
+        function reveal(control) {
+            const y = control.mapToItem(contentItem,0,0).y
+            contentY = Math.max(0,Math.min(contentHeight-height,y-20))
+        }
+        Repeater {
+          id: stageRows
+          model: root.plan.stages || []
+          onItemAdded: (index, item) => root.currentStageRow = item
+          onItemRemoved: (index, item) => { if (root.currentStageRow === item) root.currentStageRow = null }
+          delegate: Item {
+            id: stageRow
+            width: root.width
+            height: stageContent.implicitHeight
+            required property var modelData
+            property bool expanded: root.expandedStageId === modelData.id
+            property bool editable: root.editingPlan && modelData.status !== "committed"
+            property real elapsedSecs: -1
+            // PANEL_STAGE_PROPERTIES
+            // PANEL_STAGE_CONTENT
+          }
+        }
+    }
+    TestCase {
+        name: "ActualStageDetails"
+        when: windowShown
+        readonly property var stageRow: root.currentStageRow
+        function all(name) {
+            const found=[]
+            function walk(item) {
+                if (item.objectName === name) found.push(item)
+                for (const child of item.children || []) walk(child)
+            }
+            walk(stageRow)
+            return found
+        }
+        function details() {
+            const found=[]
+            function walk(item) {
+                if (item.compactDetailFocusScope === true) found.push(item)
+                for (const child of item.children || []) walk(child)
+            }
+            walk(stageRow)
+            return found
+        }
+        function field(label) { return details().find(d => d.metadata === label) }
+        function control(item,name) {
+            if (item.objectName === name) return item
+            for (const child of item.children || []) {
+                const found=control(child,name)
+                if (found) return found
+            }
+            return null
+        }
+        function click(item) {
+            verify(!!item,"control exists")
+            panelScroll.reveal(item)
+            wait(20)
+            mouseClick(item,Math.min(item.width-1,20),Math.min(item.height-1,12))
+            wait(20)
+        }
+        function openDetail(detail) { click(control(detail,"detailToggle")); return control(detail,"detailFullText") }
+        function init() {
+            root.lastProject="/fixture"; root.projectViewRevision=1
+            root.calls=[]; root.reviewViews=({}); root.stageDetailExpanded=({}); root.reviewViewVersion++
+            root.expandedStageId=-1; root.editingPlan=false; root.width=440
+            root.fullRecords=Array.from({length:10},function(_,i) {
+                return {round:1,role:i%2 ? "reviewer" : "architect",approved:false,
+                    summary:"\n same preview\r\n" + "界🙂".repeat(2500) + "\nsummary " + i + " END  \t",
+                    issues:["request " + i + "\n" + "x".repeat(5000) + " END  ","request two\r\nlast  "],
+                    notes:["note\nlast  "],checks:["check\r\nlast  "]}
+            })
+            root.plan={plan_id:"fixture",revision:5,architecture:{checkpoint:"checkpoint-1"},stages:[{
+                id:1,title:"Stage title stays visible",status:"in_progress",rounds:2,
+                instructions:"\n instructions first\r\nfull instructions  ",acceptance:"\r\nacceptance first\nacceptance tail  ",
+                commit:"\ncommit first\ncommit tail  ", review_snapshot:"snapshot-1",review_count:10,reviews_truncated:true,
+                review_policy:{scope:"code_or_contract",rationale:"\npolicy first\npolicy tail  "},
+                review_gate:{status:"error",roles:{architect:"pending",reviewer:"approved"}},last_verdict_valid:false,
+                model_agreement:{valid:true,effective:{provider:"codex",model:"configured-model",native_effort:"high"},
+                    availability:"unverified",planner_reason:"\nplanner first\nplanner tail  ",architect_reason:"\narchitect first\narchitect tail  "},
+                reviews:root.fullRecords.slice(-8).map(function(r) { return {round:r.round,role:r.role,approved:false,
+                    truncated:true,summary:r.summary.slice(0,240),issues:[r.issues[0].slice(0,100)]} })
+            }]}
+            clipboard.clipboardText=""
+            wait(80)
+        }
+        function test_status_prose_and_nested_selection() {
+            compare(root.calls.length,0)
+            for (const label of ["Commit","Instructions","Planner","Architect","Review policy rationale"]) {
+                const d=field(label)
+                verify(!!d,label)
+                compare(d.expanded,false)
+                const p=control(d,"detailPreview")
+                compare(p.maximumLineCount,1); compare(p.elide,Text.ElideRight); compare(p.wrapMode,Text.NoWrap)
+                const editor=openDetail(d)
+                verify(!!editor); verify(editor.readOnly); verify(editor.selectByMouse)
+                editor.select(0,editor.length)
+                verify(editor.selectedText.length>0)
+                click(control(d,"detailCopy"))
+                compare(clipboard.clipboardText,d.originalText)
+                compare(root.expandedStageId,-1,"nested controls do not toggle the card")
+                editor.forceActiveFocus()
+                keyClick(Qt.Key_Escape)
+                verify(keyHandler.activeFocus,"Escape returns to the panel shortcut handler")
+                click(control(d,"detailToggle"))
+            }
+            const status=root.stageModelStatus(stageRow.modelData)
+            verify(status.indexOf("configured-model")>=0); verify(status.indexOf("unverified")>=0)
+            verify(root.reviewGateText(stageRow.modelData).indexOf("Independent: approved")>=0)
+            verify(root.reviewGateText(stageRow.modelData).indexOf("Architect: pending")>=0)
+            verify(stageRow.activity.indexOf("reviewing")>=0)
+            root.width=240; wait(40)
+            verify(control(field("Instructions"),"detailPreview").width>=0)
+        }
+        function test_loading_failure_retry_complete_copy_and_older_pages() {
+            root.expandedStageId=1; wait(60)
+            compare(root.calls.length,0)
+            const preview=details().find(d=>!d.textComplete)
+            openDetail(preview)
+            compare(root.calls.length,1)
+            verify(preview.loading)
+            compare(control(preview,"detailFullText"),null)
+            compare(control(preview,"detailCopy"),null)
+            root.respond(0,500); wait(40)
+            verify(!preview.loading); compare(preview.detailError,"Fixture offline")
+            compare(control(preview,"detailCopy"),null)
+            preview.loadRequested(); root.respond(1,200); wait(80)
+            const loaded=details().find(d=>d.originalText===root.fullRecords[2].summary)
+            verify(!!loaded); verify(loaded.expanded)
+            const editor=control(loaded,"detailFullText")
+            verify(!!editor); editor.select(0,20); verify(editor.selectedText.length>0)
+            click(control(loaded,"detailCopy"))
+            compare(clipboard.clipboardText,root.fullRecords[2].summary)
+            editor.select(1,20)
+            const selection=editor.selectedText
+            root.syncReviewViews(); root.width=360; wait(30)
+            compare(control(loaded,"detailFullText"),editor)
+            compare(editor.selectedText,selection)
+            const request=field("Change request 1")
+            openDetail(request); click(control(request,"detailCopy"))
+            compare(clipboard.clipboardText,root.fullRecords[2].issues[0])
+            compare(root.expandedStageId,1)
+            root.loadStageReviews(1,0,2); root.respond(2,200); wait(80)
+            compare(stageRow.reviewHistory.length,10); compare(stageRow.reviewView.older,0)
+            compare(stageRow.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
+            root.syncReviewViews(); wait(30)
+            compare(stageRow.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
+            const obsolete=root.calls[2]
+            root.projectViewRevision++;root.reviewViews=({});root.lastProject="/another";wait(30)
+            obsolete.done({error:"stale"},500);wait(30)
+            compare(stageRow.reviewView.error,"")
+            verify(stageRow.reviewHistory.every(r=>!r.complete))
+        }
+        function test_complete_state_review_retains_selection_without_fetching() {
+            const p=JSON.parse(JSON.stringify(root.plan))
+            p.stages[0].reviews=[{summary:"short first\nfull tail  ",approved:true,round:1}]
+            p.stages[0].review_count=1; p.stages[0].reviews_truncated=false;root.plan=p
+            root.expandedStageId=1;wait(40)
+            const summary=field("Summary"), editor=openDetail(summary)
+            editor.select(2,16);const selection=editor.selectedText
+            root.syncReviewViews();root.syncReviewViews();wait(40)
+            compare(control(field("Summary"),"detailFullText"),editor)
+            compare(editor.selectedText,selection)
+            compare(root.calls.length,0)
+        }
+        function test_publications_preserve_prose_expansion() {
+            root.expandedStageId=1; wait(40)
+            const labels=["Commit","Instructions","Acceptance criteria","Review policy rationale","Planner","Architect"]
+            const originals={}, keys={}
+            for (const label of labels) {
+                openDetail(field(label))
+                originals[label]=field(label).originalText
+                keys[label]=field(label).detailKey
+            }
+            const preview=details().find(d=>!d.textComplete)
+            openDetail(preview)
+            const reviewKey=preview.detailKey
+            let p=JSON.parse(JSON.stringify(root.plan))
+            p.architecture.checkpoint="checkpoint-2"
+            root.plan=p;root.syncReviewViews();wait(60)
+            for (const label of labels) {
+                compare(field(label).detailKey,keys[label],label+" key survives checkpoint publication")
+                verify(field(label).expanded,label+" stays expanded after delegate recreation")
+            }
+            const changedPreview=details().find(d=>!d.textComplete)
+            verify(changedPreview.detailKey!==reviewKey,"reviews retain publication scope")
+            compare(changedPreview.expanded,false)
+            p=JSON.parse(JSON.stringify(root.plan))
+            p.stages[0].reviews.push(p.stages[0].reviews[0])
+            p.stages[0].reviews.shift()
+            p.stages[0].review_count++
+            p.stages[0].review_snapshot="snapshot-2"
+            root.plan=p;root.syncReviewViews();wait(60)
+            for (const label of labels) {
+                compare(field(label).detailKey,keys[label],label+" key survives appended review")
+                verify(field(label).expanded,label+" remains readable")
+                verify(!!control(field(label),"detailFullText"))
+                click(control(field(label),"detailCopy"))
+                compare(clipboard.clipboardText,originals[label])
+            }
+        }
+        function test_prose_expansion_scope_changes_data() {
+            return ["project","visit","plan","revision","stage"].map(s=>({tag:s,scope:s}))
+        }
+        function test_prose_expansion_scope_changes(data) {
+            root.expandedStageId=1;wait(40)
+            for (const label of ["Instructions","Acceptance criteria"]) openDetail(field(label))
+            const p=JSON.parse(JSON.stringify(root.plan))
+            if (data.scope==="project") root.lastProject="/different"
+            if (data.scope==="visit") root.projectViewRevision++
+            if (data.scope==="plan") p.plan_id="different-plan"
+            if (data.scope==="revision") p.revision++
+            if (data.scope==="stage") { p.stages[0].id=2; root.expandedStageId=2 }
+            root.plan=p;root.syncReviewViews();wait(60)
+            for (const label of ["Instructions","Acceptance criteria"]) {
+                compare(field(label).expanded,false,label+" resets for "+data.scope)
+                compare(control(field(label),"detailFullText"),null)
+            }
+        }
+        function test_committed_lock_preserves_read_only_details() {
+            const p=JSON.parse(JSON.stringify(root.plan));p.stages[0].status="committed";root.plan=p
+            root.editingPlan=true;wait(30)
+            compare(stageRow.editable,false)
+            verify(field("Instructions").visible)
+            const editor=openDetail(field("Instructions")); verify(editor.readOnly)
+        }
+    }
+}

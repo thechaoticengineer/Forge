@@ -199,7 +199,7 @@ test('leaving and revisiting a project resets both lists and strands the earlier
     liveOutput: {...view0}, historyList: {...view0}, reportList: {...view0},
     chatList: {...view0}, goalFlick: {contentY: 0}, goalField: {text: 'draft'},
     feedbackField: {text: ''}, questionField: {text: ''}, goalDrafts: {},
-    cancelPlanEdit(){}, calls: [], Qt: {callLater(){}},
+    cancelPlanEdit(){}, syncReviewViews(){}, calls: [], Qt: {callLater(){}},
     logFeed: view.newFeed(), logError: '', lastProject: '/a', projectViewRevision: 1,
     agentSession: 'agent', busy: false, historyFilter: 'errors', engineState: null };
   ctx.root = ctx;

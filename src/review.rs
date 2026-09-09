@@ -2,13 +2,12 @@
 use super::Ctx;
 use crate::agent::{AgentRequest, AgentResult, AgentUsage};
 use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
-use crate::util::unix_timestamp;
+use crate::util::{digest, unix_timestamp};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 fn git_bytes(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -21,28 +20,6 @@ fn git_bytes(root: &str, args: &[&str]) -> Result<Vec<u8>, String> {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     Ok(out.stdout)
-}
-fn digest(bytes: &[u8]) -> Result<String, String> {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(bytes)
-        .map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err("snapshot hashing failed".into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .ok_or("missing digest")?
-        .into())
 }
 fn paths(bytes: &[u8]) -> Result<Vec<String>, String> {
     bytes

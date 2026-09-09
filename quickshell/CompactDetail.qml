@@ -6,6 +6,11 @@ FocusScope {
     id: detail
     property string originalText: ""
     property string metadata: ""
+    // Shortened server previews must never enter the selectable/copyable editor.
+    property bool textComplete: true
+    property bool loading: false
+    property string detailError: ""
+    signal loadRequested()
     property bool expanded: false
     property color foreground: "#dddddd"
     property color mutedForeground: "#aaaaaa"
@@ -13,7 +18,7 @@ FocusScope {
     property string fontFamily: "monospace"
     property real fontSize: 12
     readonly property bool compactDetailFocusScope: true
-    readonly property bool hasSelection: expanded && body.item !== null && body.item.selectedText !== ""
+    readonly property bool hasSelection: textComplete && expanded && body.item !== null && body.item.selectedText !== ""
     readonly property string previewText: DetailText.preview(originalText)
     signal expansionRequested(bool value)
     signal copyRequested(string original)
@@ -76,10 +81,11 @@ FocusScope {
             objectName: "detailToggle"
             anchors.right: parent.right
             width: Math.min(parent.width, implicitWidth)
-            text: detail.expanded ? "Collapse" : "Expand"
+            text: detail.expanded ? "Collapse" : detail.textComplete ? "Expand" : "Load full text"
             font.pixelSize: detail.fontSize
             focusPolicy: Qt.StrongFocus
-            Accessible.name: (detail.expanded ? "Collapse" : "Expand") + " full text"
+            Accessible.name: detail.expanded ? "Collapse full text"
+                : detail.textComplete ? "Expand full text" : "Load complete text and feedback"
             onActiveFocusChanged: if (activeFocus) detail.revealFocus(toggle, focusReason)
             onClicked: {
                 detail.inspecting()
@@ -134,7 +140,32 @@ FocusScope {
         y: heading.height + 4
         width: parent.width
         active: detail.expanded
-        sourceComponent: expansion
+        sourceComponent: detail.textComplete ? expansion : unloaded
+    }
+    Component {
+        id: unloaded
+        Column {
+            width: body.width
+            spacing: 4
+            Text {
+                width: parent.width
+                text: detail.loading ? "Loading complete text…" : detail.detailError
+                    || "Preview only · complete text and feedback have not been loaded."
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: detail.foreground
+                font.family: detail.fontFamily
+                font.pixelSize: detail.fontSize
+            }
+            Button {
+                id: loadButton
+                text: detail.detailError ? "Retry full text" : "Load full text"
+                enabled: !detail.loading
+                focusPolicy: Qt.StrongFocus
+                onActiveFocusChanged: if (activeFocus) detail.revealFocus(loadButton, focusReason)
+                onClicked: detail.loadRequested()
+            }
+        }
     }
     Component {
         id: expansion
