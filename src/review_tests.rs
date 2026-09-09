@@ -799,3 +799,76 @@ fn commit_recovery_requires_clean_exact_tree_parent_message_and_current_approval
         assert_ne!(f.plan()["stages"][0]["status"],"committed");
     }
 }
+
+#[test]
+fn cli_limit_fallback_keeps_review_identity_budget_and_fresh_independent_session() {
+    for blocked in [false, true] {
+        let f = Fixture::new("Fix prose spelling", 0);
+        f.docs();
+        let mut plan = f.reviewed();
+        plan["stages"][0]["implementer_provider"] = json!("codex");
+        f.ctx.save_plan(&plan).unwrap();
+        let base = plan["stages"][0]["review_gate"]["identity"].clone();
+        let rounds = plan["stages"][0]["rounds"].clone();
+        let retry_count = plan["stages"][0]["reassessment"]["operational_retries"].clone();
+        f.setting("test_fake_providers", json!(true));
+        f.setting("reviewer", json!("claude"));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+            {"provider":"claude","model":"opus[1m]","tier":"strong"}]);
+        f.setting("test_review_sessions", json!([]));
+        let refusal = |family: &str| json!({"error":format!("claude exited with exit status: 1: You've reached your {family} limit. Switch to another model.")});
+        f.setting("mock_reviewer_actions", if blocked { json!([refusal("Fable"),refusal("Opus")]) } else { json!([refusal("Fable")]) });
+        // No usage reading: this reproduces a bridge unsupported after a CLI update.
+        assert_eq!(f.ctx.app.quota.snapshot()["status"], "pending");
+        let result = f.ctx.review_with_retry(&mut plan, 0, &base, "reviewer", "claude", "claude-fable-5-1[1m]");
+        if blocked {
+            assert!(result.unwrap_err().contains("no eligible strong independent reviewer"));
+        } else {
+            let verdict = result.unwrap();
+            assert_eq!(verdict["model"], "opus[1m]");
+            assert_eq!(verdict["provider"], "claude");
+            let mut expected = base.clone(); expected["role"] = json!("reviewer");
+            assert_eq!(verdict["identity"], expected);
+        }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let sessions = settings["test_review_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["model"], "claude-fable-5-1[1m]");
+        assert_eq!(sessions[1]["model"], "opus[1m]");
+        assert!(sessions.iter().all(|s| s["provider"] == "claude" && s["session"].is_null()));
+        assert_eq!(plan["stages"][0]["rounds"], rounds);
+        assert_eq!(plan["stages"][0]["reassessment"]["operational_retries"], retry_count);
+    }
+}
+
+#[test]
+fn cli_model_limit_requires_a_failed_process_and_the_selected_family() {
+    let error = "claude exited with exit status: 1: You've reached your Fable limit. Switch to another model.";
+    assert!(claude_model_limit(error, "claude-fable-5-1[1m]").is_some());
+    for model in ["opus[1m]", "", "claude-notfable-5"] {
+        assert!(claude_model_limit(error, model).is_none());
+    }
+    for unrelated in ["You've reached your Fable limit.", "claude exited with exit status: 1: authentication failed", "claude exited with exit status: 1: rate limit exceeded", "invalid verdict: You've reached your Fable limit."] {
+        assert!(claude_model_limit(unrelated, "claude-fable-5-1[1m]").is_none());
+    }
+}
+
+#[test]
+fn cli_limit_fallback_preserves_explicit_choices_and_capability_floor() {
+    let f = Fixture::new("Fix prose spelling", 0);
+    f.setting("reviewer", json!("claude"));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+        {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+        {"provider":"claude","model":"opus[1m]","tier":"standard"}]);
+    let plan = json!({"stages":[{"implementer_provider":"codex"}]});
+    let current = ("claude".into(), "claude-fable-5-1[1m]".into());
+    let visited = vec![current.clone()];
+    let error = "claude exited with exit status: 1: You've reached your Fable limit.";
+    assert!(f.ctx.reviewer_quota_fallback(&plan,0,&current,error,&visited).is_err());
+    f.setting("reviewer_model",json!("claude-fable-5-1[1m]"));
+    assert!(f.ctx.reviewer_quota_fallback(&plan,0,&current,error,&visited).unwrap().is_none());
+    f.setting("reviewer_model",json!(""));
+    f.setting("automatic_routing",json!(false));
+    assert!(f.ctx.reviewer_quota_fallback(&plan,0,&current,error,&visited).unwrap().is_none());
+}

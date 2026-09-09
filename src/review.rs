@@ -552,8 +552,23 @@ fn aggregate(identity: &Value, records: &[Value]) -> Value {
     json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if approved {"approved"} else {"blocked"},"requests":requests})
 }
 
+// Only a failed Claude process explicitly naming the selected family establishes
+// a model-scoped quota refusal. Generic rate limits, auth and verdict errors do not.
+fn claude_model_limit(error: &str, model: &str) -> Option<String> {
+    if !error.starts_with("claude exited with exit status:") { return None; }
+    let error = error.to_lowercase();
+    let family = ["fable", "opus", "sonnet", "haiku"].into_iter().find(|family|
+        model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| part.eq_ignore_ascii_case(family))
+            && error.contains(&format!("you've reached your {family} limit.")))?;
+    Some(format!("Claude CLI reports {family} quota exhausted"))
+}
+
 impl Ctx {
     pub(crate) fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
+        self.reviewer_config_excluding(implementer, &[])
+    }
+
+    fn reviewer_config_excluding(&self, implementer: &str, excluded: &[(String, String)]) -> Result<(String, String), String> {
         let provider = match implementer {
             "codex" => "claude",
             "claude" => "codex",
@@ -574,6 +589,7 @@ impl Ctx {
                 let mut blockers = Vec::new();
                 model = policy.entries.iter().filter(|e| e.provider.name() == provider && e.tier == crate::catalogue::Tier::Strong)
                     .find(|e| {
+                        if excluded.iter().any(|(p, m)| p == provider && m == &e.model) { return false; }
                         let selected = self.app.catalogue.execution_input(&policy, e.provider, &e.model);
                         if selected["eligible"] != true { return false; }
                         if automatic && provider == "claude"
@@ -617,11 +633,11 @@ impl Ctx {
                     return Ok(v);
                 },
                 Err(error) => {
-                    // A pre-launch quota check may have refreshed since selection.
+                    // Quota can be learned from the pre-launch probe or a CLI refusal.
                     // Switch only the fresh independent reviewer; keep this exact
                     // snapshot, round and required roles. Never loop over a model twice.
                     if role == "reviewer"
-                        && let Some((next, reason)) = self.reviewer_quota_fallback(plan, idx, &current)
+                        && let Some((next, reason)) = self.reviewer_quota_fallback(plan, idx, &current, &error, &visited)
                             .map_err(|e| format!("model routing blocked: {e}; work and checkpoint retained"))?
                         && !visited.contains(&next) {
                         self.log_event("model", &format!("[reviewer] quota fallback {}/{} -> {}/{}: {reason}",
@@ -637,17 +653,18 @@ impl Ctx {
         }
     }
 
-    fn reviewer_quota_fallback(&self, plan: &Value, idx: usize, current: &(String, String)) -> Result<Option<((String, String), String)>, String> {
+    fn reviewer_quota_fallback(&self, plan: &Value, idx: usize, current: &(String, String), error: &str, visited: &[(String, String)]) -> Result<Option<((String, String), String)>, String> {
         let settings = self.app.settings.lock().unwrap().clone();
         if settings["automatic_routing"] == false || !self.setting("reviewer_model").is_empty() || current.0 != "claude" {
             return Ok(None);
         }
         let policy = crate::catalogue::Policy::from_settings(&settings)?;
         let selected = self.app.catalogue.execution_input(&policy, crate::catalogue::Provider::Claude, &current.1);
-        let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge,
-            selected["resolved_id"].as_str().unwrap_or(&current.1)) else { return Ok(None); };
+        let resolved = selected["resolved_id"].as_str().unwrap_or(&current.1);
+        let Some(reason) = self.app.quota.blocked_reason(&policy.claude_bridge, resolved)
+            .or_else(|| claude_model_limit(error, resolved)) else { return Ok(None); };
         let implementer = plan["stages"][idx]["implementer_provider"].as_str().ok_or("missing implementer provider for reviewer fallback")?;
-        let next = self.reviewer_config(implementer)?;
+        let next = self.reviewer_config_excluding(implementer, visited)?;
         Ok((next != *current).then_some((next, reason)))
     }
     fn invoke_review(

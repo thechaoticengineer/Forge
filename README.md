@@ -801,9 +801,10 @@ npm install --omit=optional
 
 Set `claude_bridge` to the absolute path of `bridges/claude-models/bridge.mjs`
 (and change `policy_revision`). The SDK's bundled CLI is unnecessary: Forge
-uses the existing `claude` executable. Protocol v1 deliberately accepts only
-SDK 0.3.261 / Claude Code 2.1.263; a different version requires rechecking the
-SDK/CLI schema and updating the bridge and fixtures. Missing Node, bridge or
+uses the existing `claude` executable. Protocol v1 accepts SDK 0.3.261 with
+Claude Code 2.1.263 or 2.1.265, verified for model discovery and usage control;
+a different version requires rechecking the SDK/CLI schema and updating the
+bridge and fixtures. Missing Node, bridge or
 SDK, or an unsupported version reports unsupported discovery. It never falls
 back to an API-key request or a generation turn. Without the bridge, explicit
 Claude entries continue to work with unverified availability and provider-default
@@ -832,10 +833,13 @@ With automatic routing and an empty `reviewer_model`, independent review selects
 the first eligible configured strong model whose quota is not known to be
 exhausted. Registry order supplies the preference: configure Fable followed by
 Opus to use Opus when the Fable pool is depleted. If the pre-launch quota check
-discovers exhaustion after selection, review switches to another eligible model
+discovers exhaustion after selection, or the CLI itself refuses the selected
+model with an explicit model-family limit message, review switches to another eligible model
 without spending a review/fix round or retrying the same model twice. The actual
 review records retain the selected provider/model and a fresh session, and the
-switch is logged. Explicit model choices remain constraints. Review still uses
+switch is logged. CLI refusal fallback also works when usage discovery is
+unavailable after a CLI update; generic rate limits and authentication errors do
+not establish a model-specific limit. Explicit model choices remain constraints. Review still uses
 the other provider: Codex implementations use Claude review, while Claude
 implementations use Codex review. If all adequate independent choices are
 unavailable, Forge preserves the work and blocks instead of using self-review.

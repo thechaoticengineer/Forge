@@ -7,7 +7,8 @@ const [protocol, executable, cliVersion] = process.argv.slice(2);
 const usage = protocol === '--forge-usage-v1';
 const envelope = { bridge_version: 1, source: usage ? 'claude_code_usage' : 'claude_code_initialization', cli_version: cliVersion, sdk_version: '0.3.261' };
 try {
-  if ((!usage && protocol !== '--forge-discovery-v1') || executable !== 'claude' || cliVersion !== '2.1.263 (Claude Code)')
+  if ((!usage && protocol !== '--forge-discovery-v1') || executable !== 'claude' ||
+      !['2.1.263 (Claude Code)', '2.1.265 (Claude Code)'].includes(cliVersion))
     throw new Error('unsupported CLI/bridge version');
   const require = createRequire(import.meta.url);
   if (JSON.parse(readFileSync(join(dirname(require.resolve('@anthropic-ai/claude-agent-sdk')), 'package.json'), 'utf8')).version !== envelope.sdk_version)
