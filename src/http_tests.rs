@@ -221,3 +221,105 @@ fn api_routes_projects_while_another_session_is_busy() {
     assert_eq!(post("/api/stop", json!({"project": 42})), 400);
     assert_eq!(api_request(engine, "GET", "/api/state?project=%ZZ", json!({})).0, 400);
 }
+
+#[test]
+fn agent_records_api_is_project_scoped_additive_and_reset_aware() {
+    use crate::agent_log::{InvocationLog, Message, Sink};
+    let first = QueueTest::new(false);
+    let engine = &first.app.app;
+    let second = QueueTest::with_engine(false, Some(engine.clone()));
+    let get = |suffix: &str| api_request(engine, "GET", &format!("/api/agent_records{suffix}"), json!({}));
+    let legacy = format!("\n  {}\r\nlast \t", "界".repeat(20_000));
+    fs::write(second.app.forge_path("agent.log"), &legacy).unwrap();
+    let (_, old) = get(&format!("?project={}", second.app.project()));
+    assert_eq!(old["project"], second.app.project());
+    assert_eq!(old["entries"][0]["text"], legacy);
+    assert_eq!(old["entries"][0]["kind"], "legacy");
+    let mut a = InvocationLog::start(&first.app.forge_path(""), "A\n").unwrap();
+    let mut b = InvocationLog::start(&second.app.forge_path(""), "B\n").unwrap();
+    a.append(&Message::new("message", "stdout", "", "A only\nsecret")).unwrap();
+    b.append(&Message::new("message", "stdout", "", "B first\n  exact \t")).unwrap();
+    b.append(&Message::new("error", "stderr", "", "B second\r\nline")).unwrap();
+    let (status, page) = get(&format!("?project={}&limit=1", second.app.project()));
+    assert_eq!(status, 200);
+    assert_eq!(page["version"], 1);
+    assert_eq!(page["project"], second.app.project());
+    assert_eq!(page["entries"][0]["text"], "B first\n  exact \t");
+    assert_eq!(page["next_cursor"], 1);
+    assert_eq!(page["more"], true);
+    let id = page["session"].as_str().unwrap();
+    let (status, next) = get(&format!("?project={}&session={id}&cursor=1", second.app.project()));
+    assert_eq!(status, 200);
+    assert_eq!(next["entries"][0]["stream"], "stderr");
+    assert_eq!(next["next_cursor"], 2);
+    assert_eq!(next["more"], false);
+    assert_eq!(get("").1["entries"][0]["text"], "A only\nsecret");
+    assert_eq!(get(&format!("?archive={id}")).0, 500); // B archive cannot escape A
+    assert_eq!(get("?archive=../agent.log").0, 400);
+    for query in ["?project=%ZZ", "?project=/not-a-repository", "?cursor=nope", "?limit=nope", "?cursor=1"] {
+        assert_eq!(get(query).0, 400, "{query}");
+    }
+    // Existing byte-offset clients retain the exact log/size contract.
+    let full = fs::read(second.app.forge_path("agent.log")).unwrap();
+    for offset in [0, 2, full.len(), full.len()+1] {
+        let (status, old_api) = api_request(engine, "GET", &format!("/api/agent_log?project={}&offset={offset}", second.app.project()), json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(old_api["size"], full.len());
+        let expected = if offset <= full.len() { String::from_utf8_lossy(&full[offset..]).into_owned() }
+            else { crate::util::last_chars(&String::from_utf8_lossy(&full), 30_000) };
+        assert_eq!(old_api["log"], expected);
+    }
+    let _replacement = InvocationLog::start(&second.app.forge_path(""), "replacement with a much longer header\n").unwrap();
+    let reset = get(&format!("?project={}&session={id}&cursor=2", second.app.project())).1;
+    assert_eq!(reset["reset"], true);
+    assert_eq!(reset["next_cursor"], 0);
+    assert_ne!(reset["session"], id);
+    let history = get(&format!("?project={}&history=true", second.app.project())).1;
+    let legacy_id = history["sources"].as_array().unwrap().iter().find(|s| s["legacy"] == true).unwrap()["session"].as_str().unwrap();
+    assert_eq!(get(&format!("?project={}&archive={legacy_id}", second.app.project())).1["entries"][0]["text"], legacy);
+    // A fresh engine reads the same on-disk session without provider identity.
+    let restarted = Arc::new(App::new(second.app.project(), default_settings()));
+    let (_, resumed) = api_request(&restarted, "GET", "/api/agent_records", json!({}));
+    assert_eq!(resumed["session"], reset["session"]);
+    assert_eq!(resumed["reset"], false);
+}
+
+#[test]
+fn agent_records_api_recovers_startup_without_hiding_incomplete_history() {
+    use crate::agent_log::{InvocationLog, Message, Sink};
+    let first = QueueTest::new(false);
+    let engine = &first.app.app;
+    let second = QueueTest::with_engine(false, Some(engine.clone()));
+    let forge = second.app.forge_path("");
+    let get = |endpoint: &str, suffix: &str| api_request(engine, "GET",
+        &format!("/api/{endpoint}?project={}{suffix}", second.app.project()), json!({}));
+    let mut writer = InvocationLog::start(&forge, "old\n").unwrap();
+    writer.append(&Message::new("message", "stdout", "", "exact old\r\n  text\t")).unwrap();
+    let old = get("agent_records", "").1;
+    let id = old["session"].as_str().unwrap();
+    let root = forge.join("agent-records");
+    fs::write(root.join(id).join("pending.json"), r#"{"publication":"incomplete"}"#).unwrap();
+    fs::write(root.join("pending.json"), r#"{"publication":"incomplete"}"#).unwrap();
+    fs::hard_link(root.join(id).join("readable.log"), root.join("agent.log.next")).unwrap();
+    assert_eq!(get("agent_records", "").0, 500);
+    let readable = "old\nexact old\r\n  text\t\n";
+    assert_eq!(get("agent_log", "&offset=0"), (200, json!({"log":readable, "size":readable.len()})));
+    // The active project's healthy feed is unaffected by B's interrupted startup.
+    assert_eq!(api_request(engine, "GET", "/api/agent_records", json!({})).0, 200);
+    let mut next = InvocationLog::start(&forge, "new\n").unwrap();
+    next.append(&Message::new("message", "stdout", "", "new 界\n  full\t")).unwrap();
+    let (status, reset) = get("agent_records", &format!("&session={id}&cursor=1"));
+    assert_eq!(status, 200);
+    assert_eq!(reset["reset"], true);
+    assert_eq!(reset["entries"][0]["text"], "new 界\n  full\t");
+    assert_eq!(reset["next_cursor"], 1);
+    let empty = get("agent_records", &format!("&session={}&cursor=1", reset["session"].as_str().unwrap())).1;
+    assert_eq!(empty["reset"], false);
+    assert_eq!(empty["entries"], json!([]));
+    assert_eq!(get("agent_records", &format!("&archive={id}")).0, 500);
+    let history = get("agent_records", "&history=true").1;
+    let source = history["sources"].as_array().unwrap().iter().find(|s| s["session"] == id).unwrap();
+    assert_eq!(source["incomplete"], true);
+    assert_eq!(source["count"], 1);
+    assert_eq!(fs::read_to_string(root.join(id).join("readable.log")).unwrap(), "old\nexact old\r\n  text\t\n");
+}

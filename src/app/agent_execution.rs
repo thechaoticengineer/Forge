@@ -1,6 +1,6 @@
 //! Agent subprocess execution, activity logging, and production mock support.
 use super::Ctx;
-use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result};
+use crate::agent::{AgentUsage, AgentRequest, AgentResult, stream_agent_result_on};
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{clock_hms, unix_timestamp};
 use serde_json::json;
@@ -27,21 +27,10 @@ struct SupervisionResults {
 }
 
 impl Ctx {
-    fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<fs::File>>, String> {
-        fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(self.forge_path("agent.log"))
-            .and_then(|mut file| {
-                writeln!(
-                    file,
-                    "=== [{role}] {tool} ({model}) started {} ===",
-                    clock_hms()
-                )?;
-                file.flush()?;
-                Ok(Arc::new(Mutex::new(file)))
-            })
+    fn open_agent_log(&self, role: &str, tool: &str, model: &str) -> Result<Arc<Mutex<crate::agent_log::InvocationLog>>, String> {
+        crate::agent_log::InvocationLog::start(&self.forge_path(""),
+            &format!("=== [{role}] {tool} ({model}) started {} ===\n", clock_hms()))
+            .map(|log| Arc::new(Mutex::new(log)))
             .map_err(|e| self.agent_error(role, format!("failed to initialize agent log: {e}")))
     }
 
@@ -307,7 +296,7 @@ impl Ctx {
         &self,
         mut child: Child,
         request: &AgentRequest<'_>,
-        log: &Arc<Mutex<fs::File>>,
+        log: &Arc<Mutex<crate::agent_log::InvocationLog>>,
     ) -> SupervisionResults {
         let tool = request.provider;
         let stdout = child.stdout.take().expect("piped stdout");
@@ -323,12 +312,12 @@ impl Ctx {
                 result.map_err(|e| format!("agent prompt input failed: {e}"))
             });
             let stdout_reader = scope.spawn(|| {
-                let result = stream_agent_result(stdout, log, &self.session.state, 1500, tool == "claude");
+                let result = stream_agent_result_on(stdout, log, &self.session.state, 1500, tool == "claude", "stdout");
                 if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
                 result
             });
             let stderr_reader = scope.spawn(|| {
-                let result = stream_agent_result(stderr, &stderr_log, &self.session.state, 1500, false).map(|r| r.output);
+                let result = stream_agent_result_on(stderr, &stderr_log, &self.session.state, 1500, false, "stderr").map(|r| r.output);
                 if result.is_err() { failed_reader.store(true, Ordering::SeqCst); }
                 result
             });

@@ -54,7 +54,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let mut body_text = String::new();
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-    let project_endpoint = matches!(path, "/api/state" | "/api/architecture/history" | "/api/architecture/reviews" | "/api/agent_log" | "/api/diff"
+    let project_endpoint = matches!(path, "/api/state" | "/api/architecture/history" | "/api/architecture/reviews" | "/api/agent_log" | "/api/agent_records" | "/api/diff"
         | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
@@ -99,6 +99,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Post, "/api/models/metadata/refresh") =>
             (202, json!({"ok":true,"started":app.refresh_metadata()})),
         (tiny_http::Method::Get, "/api/state") => api_state(app, &ctx, &active_project),
+        (tiny_http::Method::Get, "/api/agent_records") => api_agent_records(&ctx, query),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(&ctx, query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(&ctx),
         (tiny_http::Method::Get, "/api/projects") => api_projects(app),
@@ -213,6 +214,25 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
     snap["reports"] = ctx.read_reports();
     snap["git_log"] = json!(ctx.git(&["log", "--oneline", "-12"]).unwrap_or_default());
     (200, snap)
+}
+
+fn api_agent_records(ctx: &Ctx, query: &str) -> (u32, Value) {
+    let parameters = (|| {
+        let session = query_value(query, "session")?;
+        let archive = query_value(query, "archive")?;
+        let cursor = query_value(query, "cursor")?.map(|s| s.parse::<u64>()).transpose().map_err(|_| "invalid agent log cursor")?.unwrap_or(0);
+        let limit = query_value(query, "limit")?.map(|s| s.parse::<usize>()).transpose().map_err(|_| "invalid agent log limit")?.unwrap_or(50);
+        let history = query_value(query, "history")?.is_some_and(|s| s == "true");
+        Ok::<_, &str>((session, archive, cursor, limit, history))
+    })();
+    let (session, archive, cursor, limit, history) = match parameters {
+        Ok(values) => values,
+        Err(error) => return (400, json!({"error":error})),
+    };
+    match crate::agent_log::page(&ctx.forge_path(""), ctx.project(), session.as_deref(), archive.as_deref(), cursor, limit, history) {
+        Ok(page) => (200, page),
+        Err(error) => (if error.starts_with("invalid agent log cursor") || error.starts_with("agent log cursor") || error == "invalid agent log archive" {400} else {500}, json!({"error":error})),
+    }
 }
 
 fn api_agent_log(ctx: &Ctx, query: &str) -> (u32, Value) {

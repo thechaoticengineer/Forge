@@ -1,4 +1,5 @@
 use crate::app::State;
+use crate::agent_log::{Message, Sink};
 use crate::util::last_chars;
 use serde_json::Value;
 use std::io::{BufRead as _, BufReader};
@@ -276,6 +277,7 @@ impl AgentUsage {
 
 #[derive(Default)]
 pub(crate) struct ClaudeActivity {
+    #[cfg(test)]
     pub(crate) lines: Vec<String>,
     pub(crate) result: Option<String>,
     pub(crate) usage: Option<AgentUsage>,
@@ -286,6 +288,7 @@ pub(crate) fn claude_activity(line: &str) -> ClaudeActivity {
         Ok(event) => event,
         Err(_) => {
             return ClaudeActivity {
+                #[cfg(test)]
                 lines: vec![line.to_string()],
                 result: None,
                 usage: None,
@@ -294,40 +297,6 @@ pub(crate) fn claude_activity(line: &str) -> ClaudeActivity {
     };
     let mut activity = ClaudeActivity::default();
     match event["type"].as_str() {
-        Some("assistant") => {
-            if let Some(contents) = event["message"]["content"].as_array() {
-                for content in contents {
-                    match content["type"].as_str() {
-                        Some("text") => {
-                            if let Some(text) = content["text"].as_str() {
-                                activity.lines.push(text.chars().take(400).collect());
-                            }
-                        }
-                        Some("tool_use") => {
-                            let name = content["name"].as_str().unwrap_or("tool");
-                            let input = &content["input"];
-                            let summary = ["file_path", "command", "pattern", "description", "url"]
-                                .iter()
-                                .find_map(|key| input.get(*key))
-                                .unwrap_or(input);
-                            let summary = summary
-                                .as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| summary.to_string());
-                            let summary: String = summary
-                                .split_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                                .chars()
-                                .take(160)
-                                .collect();
-                            activity.lines.push(format!("» {name}: {summary}"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
         Some("result") => {
             if let Some(usage) = event["usage"].as_object() {
                 let tokens = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0).max(0);
@@ -365,28 +334,109 @@ pub(crate) fn claude_activity(line: &str) -> ClaudeActivity {
                 });
             }
             activity.result = event["result"].as_str().map(str::to_string);
-            let result = if event["is_error"].as_bool() == Some(true) {
-                event["subtype"].as_str()
-            } else {
-                activity
-                    .result
-                    .as_deref()
-                    .or_else(|| event["subtype"].as_str())
-            };
-            if let Some(result) = result {
-                let result: String = result.chars().take(400).collect();
-                activity.lines.push(format!("✔ result: {result}"));
-            }
-        }
-        Some("system") if event["subtype"] == "init" => {
-            let model = event["model"].as_str().unwrap_or("unknown");
-            activity
-                .lines
-                .push(format!("session started (model {model})"));
         }
         _ => {}
     }
+    #[cfg(test)]
+    { activity.lines = retained_messages(Some(&event), line, true, "stdout").iter()
+        .map(|m| m.readable().strip_suffix('\n').unwrap_or(&m.text).to_string()).collect(); }
     activity
+}
+
+/// Presentation retention deliberately does not participate in outcome parsing.
+pub(crate) fn retained_messages(event: Option<&Value>, raw: &str, claude: bool, stream: &str) -> Vec<Message> {
+    let plain = || {
+        let mut message = Message::new(if stream == "stderr" { "error" } else { "plain" }, stream, "", raw);
+        message.verbatim = true;
+        vec![message]
+    };
+    if stream == "stderr" { return plain(); }
+    let Some(event) = event else { return plain(); };
+    let mut records = Vec::new();
+    let mut add = |kind: &str, label: &str, text: &str| records.push(Message::new(kind, stream, label, text));
+    if claude {
+        match event["type"].as_str() {
+            Some("assistant" | "user") => {
+                for content in event["message"]["content"].as_array().into_iter().flatten() {
+                    match content["type"].as_str() {
+                        Some("text" | "thinking") => {
+                            let key = if content["type"] == "thinking" { "thinking" } else { "text" };
+                            if let Some(text) = content[key].as_str() { add("message", "", text); }
+                        }
+                        Some("tool_use") => {
+                            let name = content["name"].as_str().unwrap_or("tool");
+                            // Preserve every distinct input string, including less familiar
+                            // fields. Nested inputs remain complete JSON, never summaries.
+                            if let Some(input) = content["input"].as_object() {
+                                for (key, value) in input {
+                                    let text = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                                    add("tool_input", &format!("» {name} ({key}): "), &text);
+                                }
+                            } else if !content["input"].is_null() {
+                                let text = content["input"].as_str().map(str::to_string).unwrap_or_else(|| content["input"].to_string());
+                                add("tool_input", &format!("» {name}: "), &text);
+                            }
+                        }
+                        Some("tool_result") => {
+                            let kind = if content["is_error"] == true { "error" } else { "tool_output" };
+                            if let Some(text) = content["content"].as_str() { add(kind, "« tool: ", text); }
+                            else if let Some(parts) = content["content"].as_array() {
+                                for part in parts {
+                                    let text = part["text"].as_str().map(str::to_string).unwrap_or_else(|| part.to_string());
+                                    add(kind, "« tool: ", &text);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("result") => {
+                let error = event["is_error"] == true || event["subtype"].as_str().is_some_and(|s| s != "success");
+                let kind = if error { "error" } else { "result" };
+                let label = if error { "✗ result: " } else { "✔ result: " };
+                if (error || event["result"].is_null()) && let Some(subtype) = event["subtype"].as_str() { add(kind, label, subtype); }
+                if let Some(text) = event["result"].as_str() { add(kind, label, text); }
+                if let Some(text) = event["errors"].as_str() { add("error", "✗ diagnostic: ", text); }
+                for diagnostic in event["errors"].as_array().into_iter().flatten() {
+                    let text = diagnostic.as_str().map(str::to_string).unwrap_or_else(|| diagnostic.to_string());
+                    add("error", "✗ diagnostic: ", &text);
+                }
+                if !event["structured_output"].is_null() { add(kind, "structured result: ", &event["structured_output"].to_string()); }
+            }
+            Some("error") => {
+                if let Some(text) = event["error"]["message"].as_str().or_else(|| event["message"].as_str()).or_else(|| event["error"].as_str()) { add("error", "", text); }
+                else { add("error", "", raw); }
+            }
+            Some("system") if event["subtype"] == "init" => {
+                add("status", "", &format!("session started (model {})", event["model"].as_str().unwrap_or("unknown")));
+            }
+            _ => {}
+        }
+    } else {
+        match event["type"].as_str() {
+            Some("thread.started") => add("status", "", "session started"),
+            Some("turn.completed") => add("status", "", "turn completed"),
+            Some("turn.failed" | "error") => {
+                let text = event["message"].as_str().or_else(|| event["error"]["message"].as_str()).or_else(|| event["error"].as_str()).unwrap_or(raw);
+                add("error", "", text);
+            }
+            Some("item.started" | "item.completed") => {
+                let item = &event["item"];
+                for (key, kind, label) in [("text", "message", ""), ("message", "error", ""), ("command", "tool_input", "» command: "),
+                    ("aggregated_output", "tool_output", "« output: "), ("output", "tool_output", "« output: "),
+                    ("input", "tool_input", "» input: "), ("arguments", "tool_input", "» arguments: "),
+                    ("result", "tool_output", "« result: "), ("error", "error", "✗ error: ")] {
+                    if let Some(value) = item.get(key) {
+                        let text = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                        add(if item["type"] == "error" { "error" } else { kind }, label, &text);
+                    }
+                }
+            }
+            _ => return plain(),
+        }
+    }
+    records
 }
 
 fn codex_usage(line: &str) -> Option<AgentUsage> {
@@ -412,12 +462,13 @@ fn codex_usage(line: &str) -> Option<AgentUsage> {
     })
 }
 
-pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
+pub(crate) fn stream_agent_result_on<R: std::io::Read, W: Sink>(
     input: R,
     log: &Arc<Mutex<W>>,
     state: &Mutex<State>,
     tail_limit: usize,
     claude: bool,
+    stream: &str,
 ) -> Result<AgentResult, String> {
     let mut decoded = AgentResult::default();
     let mut reader = BufReader::new(input);
@@ -466,7 +517,7 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
                 decoded.effective_model = model.into();
             }
         }
-        let lines = if claude {
+        if claude {
             let activity = claude_activity(line);
             if let Some(result) = activity.result {
                 result_tail = Some(result);
@@ -490,10 +541,8 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
                     }
                 }
             }
-            activity.lines
         } else if let Some(event) = &event {
             match event["type"].as_str() {
-                Some("thread.started") => vec!["session started".into()],
                 Some("item.started" | "item.completed") => {
                     let item = &event["item"];
                     if item["type"] == "agent_message" && event["type"] == "item.completed" {
@@ -501,11 +550,6 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
                             result_tail = Some(text.into());
                         }
                     }
-                    item["text"]
-                        .as_str()
-                        .or_else(|| item["command"].as_str())
-                        .map(|s| vec![s.chars().take(400).collect()])
-                        .unwrap_or_default()
                 }
                 Some("turn.completed") => {
                     decoded.completed = true;
@@ -520,7 +564,6 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
                             model: String::new(),
                         });
                     }
-                    vec!["turn completed".into()]
                 }
                 Some("turn.failed" | "error") => {
                     let error = event["message"]
@@ -528,28 +571,21 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
                         .or_else(|| event["error"]["message"].as_str())
                         .unwrap_or("provider turn failed");
                     decoded.error = Some(error.into());
-                    vec![error.into()]
                 }
-                _ => vec![line.to_string()],
+                _ => {},
             }
         } else {
             if let Some(candidate) = codex_usage(line) {
                 usage = Some(candidate);
             }
-            vec![line.to_string()]
         };
         if result_tail.as_ref().is_some_and(|s| s.len() > 128 * 1024) {
             return Err("agent result exceeds 128 KiB".into());
         }
-        for line in lines {
-            {
-                let mut file = log
-                    .lock()
-                    .map_err(|_| "agent log lock was poisoned".to_string())?;
-                writeln!(file, "{line}").map_err(|e| format!("failed to write agent log: {e}"))?;
-                file.flush()
-                    .map_err(|e| format!("failed to flush agent log: {e}"))?;
-            }
+        for message in retained_messages(event.as_ref(), &lossy, claude, stream) {
+            log.lock().map_err(|_| "agent log lock was poisoned".to_string())?
+                .append(&message).map_err(|e| format!("failed to persist agent log: {e}"))?;
+            let line = message.readable();
 
             let mut s = state.lock().unwrap();
             s.agent_lines += 1;
@@ -570,7 +606,14 @@ pub(crate) fn stream_agent_result<R: std::io::Read, W: std::io::Write>(
 }
 
 #[cfg(test)]
-pub(crate) fn stream_agent_output<R: std::io::Read, W: std::io::Write>(
+pub(crate) fn stream_agent_result<R: std::io::Read, W: Sink>(
+    input: R, log: &Arc<Mutex<W>>, state: &Mutex<State>, tail_limit: usize, claude: bool,
+) -> Result<AgentResult, String> {
+    stream_agent_result_on(input, log, state, tail_limit, claude, "stdout")
+}
+
+#[cfg(test)]
+pub(crate) fn stream_agent_output<R: std::io::Read, W: Sink>(
     input: R,
     log: &Arc<Mutex<W>>,
     state: &Mutex<State>,
@@ -683,7 +726,7 @@ mod tests {
         assert_eq!(usage.unwrap().total_tokens, 1_234_567);
         let expected = input.replace("\r\n", "\n");
         assert_eq!(tail, expected.trim());
-        assert_eq!(*log.lock().unwrap(), expected.as_bytes());
+        assert_eq!(*log.lock().unwrap(), input.as_bytes());
         assert_eq!(state.lock().unwrap().agent_lines, 6);
         assert_eq!(state.lock().unwrap().agent_last_line, "Done");
     }

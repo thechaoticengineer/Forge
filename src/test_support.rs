@@ -89,21 +89,28 @@ pub(crate) fn api_request(engine: &Arc<App>, method: &str, path: &str, body: Val
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let body = body.to_string();
         write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        // Chunk boundaries are byte boundaries and may split a UTF-8 character.
+        // Decode transfer framing before interpreting the JSON as text.
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let boundary = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let headers = std::str::from_utf8(&response[..boundary]).unwrap();
+        let body = &response[boundary + 4..];
         let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
         let decoded = if headers.to_lowercase().contains("transfer-encoding: chunked") {
-            let mut rest = body; let mut decoded = String::new();
+            let mut rest = body;
+            let mut decoded = Vec::new();
             loop {
-                let (size, tail) = rest.split_once("\r\n").unwrap();
-                let size = usize::from_str_radix(size, 16).unwrap();
+                let boundary = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                let size = usize::from_str_radix(std::str::from_utf8(&rest[..boundary]).unwrap(), 16).unwrap();
                 if size == 0 { break; }
-                decoded.push_str(&tail[..size]); rest = &tail[size + 2..];
+                let tail = &rest[boundary + 2..];
+                decoded.extend_from_slice(&tail[..size]);
+                rest = &tail[size + 2..];
             }
             decoded
-        } else { body.to_string() };
-        (status, serde_json::from_str(&decoded).unwrap())
+        } else { body.to_vec() };
+        (status, serde_json::from_slice(&decoded).unwrap())
     })
 }
 
