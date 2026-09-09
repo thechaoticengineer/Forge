@@ -898,11 +898,21 @@ impl Ctx {
     ) -> Result<&'static str, String> {
         let budget = plan["stages"][idx]["review_budget"].as_u64().unwrap_or(0);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap();
-        if plan["stages"][idx]["attempt_head"].is_null() {
-            plan["stages"][idx]["attempt_head"] = json!(self.git(&["rev-parse", "HEAD"])?);
+        // The anchor exists so a review judges the diff against the base the
+        // attempt started from. A HEAD that moved while nothing is in flight —
+        // clean worktree, nothing committed by this attempt — carries no such
+        // diff, so re-anchor rather than wedging the stage until the plan is
+        // revised: an unrelated commit between attempts is ordinary.
+        let head = self.git(&["rev-parse", "HEAD"])?;
+        let idle = plan["stages"][idx]["sha"].is_null()
+            && self.git(&["status", "--porcelain"])?.trim().is_empty();
+        if plan["stages"][idx]["attempt_head"].is_null()
+            || (plan["stages"][idx]["attempt_head"] != head && idle)
+        {
+            plan["stages"][idx]["attempt_head"] = json!(head);
             self.save_plan(plan)?;
         }
-        if plan["stages"][idx]["attempt_head"] != self.git(&["rev-parse", "HEAD"])? {
+        if plan["stages"][idx]["attempt_head"] != head {
             return Err("HEAD changed during stage attempt".into());
         }
         let start = plan["stages"][idx]["rounds"].as_u64().unwrap_or(0);
