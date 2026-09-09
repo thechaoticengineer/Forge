@@ -1,7 +1,11 @@
 //! Plan generation, revision, and plan-question chat workflows.
+
+/// Repair rounds allowed before a rejected candidate is abandoned.
+const REPAIR_ATTEMPTS: u32 = 2;
 use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
-use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVISE_PROMPT};
+use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT};
+use crate::candidate_draft::prepare_candidate_draft;
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{fill_template, json_payload, unix_timestamp};
 use serde_json::{Value, json};
@@ -136,10 +140,71 @@ impl Ctx {
         }
     }
 
+    /// A rejected candidate is usually one missing or malformed field in an
+    /// otherwise complete plan. Hand the rejection back to the planner instead
+    /// of discarding a whole planning run over it.
+    fn prepared_candidate(&self, candidate: Value, goal: &str, previous: Option<&Value>)
+        -> Result<(Value, usize), String>
+    {
+        let mut candidate = candidate;
+        let mut error = match prepare_candidate_draft(candidate.clone(), goal, previous) {
+            Ok(prepared) => return Ok(prepared),
+            Err(error) => error,
+        };
+        for attempt in 1..=REPAIR_ATTEMPTS {
+            self.log_event("plan", &format!(
+                "candidate rejected: {error} — asking the planner to repair it ({attempt}/{REPAIR_ATTEMPTS})"));
+            candidate = match self.repair_candidate(&candidate, &error) {
+                Ok(repaired) => repaired,
+                // The rejection, not the failed repair, is what has to be reported.
+                Err(failure) => {
+                    self.log_event("error", &format!("candidate repair failed: {failure}"));
+                    return Err(error);
+                },
+            };
+            match prepare_candidate_draft(candidate.clone(), goal, previous) {
+                Ok(prepared) => {
+                    self.log_event("plan", "repaired candidate accepted");
+                    return Ok(prepared);
+                },
+                Err(next) => error = next,
+            }
+        }
+        Err(error)
+    }
+
+    /// The repair round never explores the repository, so it keeps the engine's
+    /// own bookkeeping and only replaces planner-authored content.
+    fn repair_candidate(&self, candidate: &Value, error: &str) -> Result<Value, String> {
+        let rejected = serde_json::to_string(candidate).map_err(|e| e.to_string())?;
+        let prompt = fill_template(REPAIR_PROMPT, &[("{error}", error), ("{candidate}", &rejected)]);
+        let requirements = self.model_requirements("planner", None)?;
+        let (result, (tool, _, _)) = self.with_selected_model(&requirements, None, |(tool, model, effort)|
+            self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,prompt:&prompt }))?;
+        let path = self.forge_path("plan-candidate.json");
+        let mut plan: Value = if tool == "mock" {
+            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("invalid repaired candidate: {e}"))?
+        } else {
+            serde_json::from_str(json_payload(&result.output))
+                .map_err(|e| format!("invalid repaired candidate: {e}"))?
+        };
+        if !plan["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
+        plan["planner_selection_actor"] = candidate["planner_selection_actor"].clone();
+        // Repair usage adds to the run that produced the rejected candidate;
+        // an agent-authored echo of either is never trusted.
+        plan["planner_usage"] = candidate["planner_usage"].clone();
+        plan.as_object_mut().unwrap().remove("role_usage");
+        if let Some(usage) = result.usage { accumulate_invocation_usage(&mut plan, "planner_usage", &tool, &usage); }
+        if !plan["planner_usage"].is_null() { plan["role_usage"] = json!({"planner":plan["planner_usage"]}); }
+        crate::architecture::atomic_json(&path, &plan)?;
+        Ok(plan)
+    }
+
     fn finalize_plan(&self, plan: Value, goal: &str, previous: Option<&Value>, action: &str)
         -> Result<(), String>
     {
-        let (mut plan, n) = crate::candidate_draft::prepare_candidate_draft(plan, goal, previous)?;
+        let (mut plan, n) = self.prepared_candidate(plan, goal, previous)?;
         self.bind_planner_proposals(&mut plan);
         if let Some(previous) = previous {
             self.architect_publish(plan, Some(previous), "draft revision")?;

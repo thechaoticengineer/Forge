@@ -48,6 +48,37 @@ fn plan_refactor_without_focus_replaces_plan_and_exposes_draft_in_state() {
 }
 
 #[test]
+fn a_rejected_candidate_is_repaired_instead_of_discarding_the_planning_run() {
+    let mut rejected = editable_stage(1);
+    rejected.as_object_mut().unwrap().remove("title");
+    let test = QueueTest::new(false);
+    test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!([
+        {"goal": "Planner's goal", "status": "draft", "stages": [rejected]},
+        {"goal": "Planner's goal", "status": "draft", "stages": [editable_stage(1)]}]);
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"goal": "Ship it"})),
+        (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["phase"], "plan_ready");
+    assert_eq!(state["plan"]["stages"][0]["title"], editable_stage(1)["title"]);
+    let history = test.app.read_history();
+    let events: Vec<&str> = history.as_array().unwrap().iter()
+        .filter_map(|event| event["text"].as_str()).collect();
+    assert!(events.iter().any(|text| text.starts_with(
+        "candidate rejected: stage content fields must be strings — asking the planner to repair it (1/2)")));
+    assert!(events.contains(&"repaired candidate accepted"));
+    assert!(events.contains(&"plan ready with 1 stages"));
+    assert!(!events.iter().any(|text| text.starts_with("planning failed")));
+    // The repair round is a correction, not a fresh planning run.
+    let settings = test.app.app.settings.lock().unwrap();
+    let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+    assert!(prompt.contains("The plan candidate below was rejected by Forge's validator."));
+    assert!(prompt.contains("stage content fields must be strings"));
+    assert!(prompt.contains("Do not explore the repository"));
+}
+
+#[test]
 fn plan_refactor_trims_focus_and_keeps_user_placeholders_literal() {
     for focus in ["split main.rs into modules", "Keep {plan_path}, {focus}, {goal}, and {nested: {}} literal 界🙂"] {
         let test = QueueTest::new(false);

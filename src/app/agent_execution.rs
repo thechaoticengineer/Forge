@@ -361,14 +361,25 @@ impl Ctx {
         match role {
             "planner" => {
                 #[cfg(test)]
-                if let Some(output) = self.app.settings.lock().unwrap().get("mock_plan_output") {
-                    // Null simulates an agent exiting successfully without writing a plan.
-                    if !output.is_null() {
-                        fs::write(self.forge_path("plan-candidate.json"),
-                            output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
-                            .map_err(|e| e.to_string())?;
+                {
+                    let mut settings = self.app.settings.lock().unwrap();
+                    if let Some(output) = settings.get_mut("mock_plan_output") {
+                        // An array scripts successive candidates, so a rejected
+                        // one followed by a repair round can be exercised.
+                        let output = match output.as_array_mut() {
+                            Some(queue) if queue.len() > 1 => queue.remove(0),
+                            Some(queue) => queue.first().cloned().unwrap_or(serde_json::Value::Null),
+                            None => output.clone(),
+                        };
+                        drop(settings);
+                        // Null simulates an agent exiting successfully without writing a plan.
+                        if !output.is_null() {
+                            fs::write(self.forge_path("plan-candidate.json"),
+                                output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
                 let goal = self.session.state.lock().unwrap().goal.clone();
                 crate::architecture::atomic_json(&self.forge_path("plan-candidate.json"), &json!({
