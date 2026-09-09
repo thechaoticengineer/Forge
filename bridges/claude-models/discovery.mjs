@@ -21,7 +21,14 @@ export async function discover(query, executable, operation = 'models') {
 
 // Explicit allowlist: never forward account details, session costs or raw errors.
 export function normalizeUsage(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result) ||
+      typeof result.rate_limits_available !== 'boolean')
+    throw new Error('unsupported usage response');
   const limits = result.rate_limits;
+  if (result.rate_limits_available && (!limits || typeof limits !== 'object' || Array.isArray(limits)))
+    throw new Error('unsupported usage limits');
+  if (limits?.model_scoped != null && !Array.isArray(limits.model_scoped))
+    throw new Error('unsupported model-scoped usage');
   const windows = [];
   function add(name, model, value) {
     if (!value) return;

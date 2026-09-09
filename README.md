@@ -801,11 +801,13 @@ npm install --omit=optional
 
 Set `claude_bridge` to the absolute path of `bridges/claude-models/bridge.mjs`
 (and change `policy_revision`). The SDK's bundled CLI is unnecessary: Forge
-uses the existing `claude` executable. Protocol v1 accepts SDK 0.3.261 with
-Claude Code 2.1.263 or 2.1.265, verified for model discovery and usage control;
-a different version requires rechecking the SDK/CLI schema and updating the
-bridge and fixtures. Missing Node, bridge or
-SDK, or an unsupported version reports unsupported discovery. It never falls
+uses the existing `claude` executable. Protocol v1 pins SDK 0.3.261 but does not
+restrict Claude Code to a list of versions. CLI version is recorded as provenance;
+each probe checks the actual control protocol and validates its response schema.
+Compatible CLI upgrades continue working without a Forge update. An incompatible
+protocol or malformed response reports unavailable discovery/usage, never a zero
+balance. The integration was verified locally with Claude Code 2.1.265.
+Missing Node, bridge or SDK, or an unsupported SDK reports unsupported discovery. It never falls
 back to an API-key request or a generation turn. Without the bridge, explicit
 Claude entries continue to work with unverified availability and provider-default
 effort.
@@ -827,7 +829,8 @@ an unresolved provider default cannot establish a scoped blocker. After reset,
 with stale/missing evidence, or when credits may allow continued usage, the CLI
 decides availability. Forge never enables credits automatically.
 Unavailable readings remain unknown; failed refreshes label the previous reading
-as stale. Unsupported CLI/SDK versions degrade to unavailable usage information.
+as stale. Incompatible CLI protocols or unsupported SDK versions degrade to
+unavailable usage information.
 
 With automatic routing and an empty `reviewer_model`, independent review selects
 the first eligible configured strong model whose quota is not known to be
