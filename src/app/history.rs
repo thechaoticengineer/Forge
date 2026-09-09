@@ -4,6 +4,7 @@ use crate::util::{clock_hms, unix_timestamp};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 /// Append a history event for a project without a live session; used for
@@ -45,22 +46,41 @@ impl Ctx {
     }
 
     fn read_jsonl_tail(&self, name: &str, keep: usize) -> Value {
-        let text = (|| -> std::io::Result<String> {
+        let items = (|| -> std::io::Result<Vec<Value>> {
             let mut file = fs::File::open(self.forge_path(name))?;
-            let size = file.metadata()?.len();
+            let metadata = file.metadata()?;
+            let size = metadata.len();
+            // history.jsonl is append-only. Source identity survives append and
+            // restart; replacement/rotation gets a new inode/birth generation.
+            // Byte offsets distinguish even byte-identical adjacent records.
+            let birth = metadata.created().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |t| t.as_nanos());
+            let source = format!("{:x}-{:x}-{birth:x}", metadata.dev(), metadata.ino());
             let start = size.saturating_sub(2 * 1024 * 1024);
             file.seek(SeekFrom::Start(start))?;
-            let mut bytes = Vec::new(); file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
+            let mut bytes = Vec::new();
+            file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
+            let mut offset = start;
             if start > 0 {
                 let boundary = bytes.iter().position(|b| *b == b'\n').map_or(bytes.len(), |p| p + 1);
                 bytes.drain(..boundary);
+                offset += boundary as u64;
             }
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
+            let mut items = Vec::new();
+            for line in bytes.split_inclusive(|b| *b == b'\n') {
+                // Preserve legacy readers' acceptance of a complete final JSON
+                // object without a newline; incomplete JSON is never published.
+                if let Ok(mut entry) = serde_json::from_str::<Value>(&String::from_utf8_lossy(line)) {
+                    if name == "history.jsonl" && entry.is_object() {
+                        entry["id"] = json!(format!("history:{source}:{offset:x}"));
+                    }
+                    items.push(entry);
+                }
+                offset += line.len() as u64;
+            }
+            Ok(items)
         })().unwrap_or_default();
-        let items: Vec<Value> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
         let skip = items.len().saturating_sub(keep);
         Value::Array(items.into_iter().skip(skip).collect())
     }

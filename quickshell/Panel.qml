@@ -6,6 +6,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "DetailView.js" as DetailView
 
 Item {
   id: root
@@ -365,14 +366,26 @@ Item {
   onReportsChanged: {
     if (reports.length === 0 && historyFilter === "reports") historyFilter = "all"
   }
-  property string agentLog: ""
-  property double agentLogOffset: 0
-  property string logSession: ""
-  property bool agentLogPending: false
+  property var logFeed: DetailView.newFeed()
+  property string logError: ""
+  ListModel { id: liveEntries }
+  ListModel { id: historyEntries }
+
+  function syncHistory() {
+    historyList.beginUpdate()
+    DetailView.reconcile(historyEntries, engineState ? engineState.history || [] : [], lastProject, "history")
+    DetailView.filterRows(historyEntries, historyFilter)
+    historyList.endUpdate()
+  }
+  onHistoryFilterChanged: {
+    historyList.beginUpdate()
+    DetailView.filterRows(historyEntries, historyFilter)
+    historyList.endUpdate()
+  }
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) return
+    if (project === lastProject) { syncHistory(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
@@ -394,11 +407,13 @@ Item {
     diffError = ""
     diffPending = false
     localError = ""
-    agentLog = ""
-    agentLogOffset = 0
-    agentLogPending = false
-    logSession = agentSession
-    liveOutput.followTail = true
+    DetailView.invalidate(logFeed)
+    logFeed = DetailView.newFeed()
+    logError = ""
+    liveEntries.clear()
+    historyEntries.clear()
+    liveOutput.resetView()
+    historyList.resetView()
     liveTab = busy
     historyFilter = "all"
     historyList.positionViewAtBeginning()
@@ -406,20 +421,20 @@ Item {
     expandedReportKey = ""
     reportList.readingY = 0
     reportList.positionViewAtBeginning()
+    syncHistory()
+    Qt.callLater(refreshAgentLog)
   }
 
   onBusyChanged: {
-    liveTab = busy
+    // Keep an inspected live entry visible when the agent finishes.
+    if (busy) liveTab = true
     if (!busy) chatPending = false
+    Qt.callLater(refreshAgentLog)
   }
   onAgentSessionChanged: {
-    if (agentSession !== "" && agentSession !== logSession) {
-      logSession = agentSession
-      agentLog = ""
-      agentLogOffset = 0
-      liveOutput.followTail = true
-    }
+    DetailView.invalidate(logFeed)
     agentNow = Date.now() / 1000
+    Qt.callLater(refreshAgentLog)
   }
 
   function agentElapsed() {
@@ -443,21 +458,21 @@ Item {
     closingFromHost = false
   }
 
-  function api(method, path, body, done) {
+  function api(method, path, body, done, scopedErrors) {
     const xhr = new XMLHttpRequest()
     xhr.open(method, apiBase + path)
     xhr.setRequestHeader("Content-Type", "application/json")
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
       if (xhr.status === 0) {
-        root.engineOnline = false
+        if (!scopedErrors) root.engineOnline = false
         if (done) done(null, xhr.status)
         return
       }
-      root.engineOnline = true
+      if (!scopedErrors) root.engineOnline = true
       let parsed = null
       try { parsed = JSON.parse(xhr.responseText) } catch (e) {}
-      if (parsed && parsed.error) root.localError = parsed.error
+      if (parsed && parsed.error && !scopedErrors) root.localError = parsed.error
       if (done) done(parsed, xhr.status)
     }
     xhr.send(body ? JSON.stringify(body) : null)
@@ -484,25 +499,32 @@ Item {
   }
 
   function refreshAgentLog() {
-    if (!window.visible || !busy || agentLogPending) return
-    agentLogPending = true
-    const session = logSession
-    const revision = projectViewRevision
-    api("GET", "/api/agent_log?offset=" + agentLogOffset
-        + "&project=" + encodeURIComponent(lastProject), null, function(resp) {
-      if (revision !== root.projectViewRevision) return
-      root.agentLogPending = false
-      if (session !== root.logSession || !resp
-          || typeof resp.log !== "string" || typeof resp.size !== "number") return
-      // Offsets are bytes supplied by the engine, not JavaScript string lengths.
-      if (resp.size < root.agentLogOffset) {
-        liveOutput.followTail = true
-        root.agentLog = resp.log
-      } else {
-        root.agentLog += resp.log
+    if (!window.visible) return
+    const request = DetailView.begin(logFeed, lastProject, projectViewRevision, agentSession)
+    if (!request) return
+    let path = "/api/agent_records?cursor=" + request.cursor
+      + "&project=" + encodeURIComponent(request.project)
+    if (request.session) path += "&session=" + encodeURIComponent(request.session)
+    // Handle errors here only after validating the request's view identity.
+    api("GET", path, null, function(resp) {
+      const ownsRequest = root.logFeed.pending === request
+      const page = DetailView.finish(root.logFeed, request, root.lastProject,
+        root.projectViewRevision, root.agentSession, resp)
+      if (!page) {
+        if (ownsRequest && root.logFeed.pending === null)
+          root.logError = resp && resp.error ? resp.error : "Could not load agent output"
+        return
       }
-      root.agentLogOffset = resp.size
-    })
+      root.logError = ""
+      liveOutput.beginUpdate()
+      if (page.reset) {
+        liveEntries.clear()
+        liveOutput.resetView()
+      }
+      DetailView.reconcile(liveEntries, page.entries, request.project, root.logFeed.session)
+      liveOutput.endUpdate()
+      if (page.more) Qt.callLater(root.refreshAgentLog)
+    }, true)
   }
 
   function act(path, body, done) {
@@ -834,40 +856,6 @@ Item {
     return lines.join("\n")
   }
 
-  function historyRows(history, filter) {
-    const rows = []
-    const entries = history || []
-    let previousGoal = ""
-    entries.forEach(function(entry) {
-      const matches = filter === "all"
-        || (filter === "runs"
-            && ["run", "stage", "plan", "queue", "update"].indexOf(entry.kind) !== -1)
-        || (filter === "git" && entry.kind === "git")
-        || (filter === "reviews" && (entry.kind === "review" || entry.kind === "check"))
-        || (filter === "errors" && entry.kind === "error")
-      if (!matches) return
-      if (entry.goal && entry.goal !== previousGoal)
-        rows.push({ kind: "sep", goal: entry.goal })
-      rows.push({ kind: "entry", event: entry })
-      previousGoal = entry.goal || ""
-    })
-    return rows
-  }
-
-  function historyTime(entry, now) {
-    let prefix = ""
-    if (typeof entry.unix === "number") {
-      const date = new Date(entry.unix * 1000)
-      const today = new Date(now * 1000)
-      const day = new Date(date.getFullYear(), date.getMonth(), date.getDate())
-      const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate())
-      if (day < todayStart)
-        prefix = (date.getMonth() < 9 ? "0" : "") + (date.getMonth() + 1)
-          + "-" + (date.getDate() < 10 ? "0" : "") + date.getDate() + " "
-    }
-    return prefix + entry.t
-  }
-
   function chooserRows(data, filter) {
     if (!data) return []
     const f = filter.toLowerCase()
@@ -929,7 +917,9 @@ Item {
   Timer {
     interval: 1000
     repeat: true
-    running: window.visible && root.busy
+    // Poll through idle as well: the terminal page can arrive after busy clears.
+    running: window.visible
+    triggeredOnStart: true
     onTriggered: root.refreshAgentLog()
   }
 
@@ -1003,7 +993,7 @@ Item {
             view.followTail = true
             view.scrollToTail()
           }
-          if (view === historyList) historyList.readingY = view.contentY
+          if (view !== reportList) view.captureReading()
           if (view === reportList) reportList.readingY = view.contentY
           panelScroll.reveal(outputFrame)
         }
@@ -2544,40 +2534,37 @@ Item {
           height: Math.max(Style.space(180), panelScroll.height * 0.3)
           color: root.surface
           radius: 4
-          Flickable {
+          DetailList {
             id: liveOutput
             visible: root.liveTab
             anchors.fill: parent
             anchors.margins: Style.space(8)
-            clip: true
-            contentWidth: width
-            contentHeight: liveText.height
-            flickableDirection: Flickable.VerticalFlick
-            boundsBehavior: Flickable.StopAtBounds
-            property bool followTail: true
-
-            function scrollToTail() {
-              if (followTail && !moving)
-                contentY = Math.max(0, contentHeight - height)
-            }
-            onContentYChanged: {
-              if (moving) followTail = atYEnd
-            }
-            onMovementEnded: followTail = atYEnd
-            onContentHeightChanged: Qt.callLater(scrollToTail)
-            onHeightChanged: Qt.callLater(scrollToTail)
-            onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
-
-            Text {
-              id: liveText
-              width: liveOutput.width
-              text: root.agentLog
-              textFormat: Text.PlainText
-              color: root.mutedForeground
-              wrapMode: Text.Wrap
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(10)
-            }
+            anchors.topMargin: logErrorText.visible ? logErrorText.height + Style.space(12) : Style.space(8)
+            model: liveEntries
+            foreground: root.mutedForeground
+            mutedForeground: root.mutedForeground
+            background: root.surface
+            urgent: root.urgent
+            accent: root.accent
+            success: root.success
+            working: root.working
+            fontFamily: root.fontFamily
+            fontSize: root.fs(10)
+            onCopyRequested: original => Quickshell.clipboardText = original
+            onLeaveRequested: keyHandler.forceActiveFocus()
+          }
+          Text {
+            id: logErrorText
+            visible: root.liveTab && root.logError !== ""
+            x: Style.space(8)
+            y: Style.space(8)
+            width: Math.max(0, parent.width - Style.space(16))
+            text: root.logError
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(10)
           }
           Row {
             id: historyFilters
@@ -2598,7 +2585,7 @@ Item {
               }
             }
           }
-          ListView {
+          DetailList {
             id: historyList
             visible: !root.liveTab && !root.reportsVisible
             anchors.top: historyFilters.bottom
@@ -2606,59 +2593,20 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.margins: Style.space(8)
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            model: root.historyRows(root.engineState ? root.engineState.history : [],
-                                    root.historyFilter)
-            property bool followTail: true
-            property real readingY: 0
-
-            function scrollToTail() {
-              if (followTail && !moving) positionViewAtEnd()
-            }
-            function restoreReadingPosition() {
-              // Replacing a JavaScript array resets ListView's position on every poll.
-              if (!followTail && !moving)
-                contentY = Math.max(originY, Math.min(readingY,
-                  originY + contentHeight - height))
-            }
-            onContentYChanged: {
-              if (moving) {
-                followTail = atYEnd
-                readingY = contentY
-              }
-            }
-            onMovementEnded: {
-              followTail = atYEnd
-              readingY = contentY
-            }
-            onModelChanged: Qt.callLater(restoreReadingPosition)
-            onCountChanged: Qt.callLater(scrollToTail)
-            onContentHeightChanged: Qt.callLater(scrollToTail)
-            onHeightChanged: Qt.callLater(scrollToTail)
-            onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
-
-            delegate: Text {
-              id: historyRow
-              required property var modelData
-              readonly property bool separator: modelData.kind === "sep"
-              readonly property var event: separator ? null : modelData.event
-              width: historyList.width
-              topPadding: separator ? Style.space(6) : 0
-              bottomPadding: separator ? Style.space(4) : 0
-              text: separator ? "— goal: " + modelData.goal
-                : root.historyTime(event, root.agentNow) + "  [" + event.kind + "]  "
-                  + event.text
-              textFormat: Text.PlainText
-              color: separator ? root.accent
-                : event.kind === "error" ? root.urgent
-                : event.kind === "git" ? root.success
-                : (event.kind === "review" || event.kind === "check") ? root.working
-                : root.mutedForeground
-              wrapMode: Text.Wrap
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(10)
-            }
+            model: historyEntries
+            history: true
+            now: root.agentNow
+            foreground: root.mutedForeground
+            mutedForeground: root.mutedForeground
+            background: root.surface
+            urgent: root.urgent
+            accent: root.accent
+            success: root.success
+            working: root.working
+            fontFamily: root.fontFamily
+            fontSize: root.fs(10)
+            onCopyRequested: original => Quickshell.clipboardText = original
+            onLeaveRequested: keyHandler.forceActiveFocus()
           }
           ListView {
             id: reportList

@@ -86,7 +86,12 @@ fn history_keeps_last_400_parsed_entries_and_preserves_legacy_shape() {
     let history = test.app.read_history();
     let entries = history.as_array().unwrap();
     assert_eq!(entries.len(), 400);
-    assert_eq!(&entries[..399], &legacy[3..]);
+    let originals: Vec<_> = entries[..399].iter().cloned().map(|mut entry| {
+        assert!(entry["id"].as_str().unwrap().starts_with("history:"));
+        entry.as_object_mut().unwrap().remove("id");
+        entry
+    }).collect();
+    assert_eq!(&originals, &legacy[3..]);
     assert!(entries[399]["unix"].is_i64());
     assert_eq!(entries[399]["text"], "new event");
     assert!(fs::read_to_string(path).unwrap().starts_with(&text));
@@ -381,4 +386,51 @@ fn completion_suffix_requires_nonempty_usage_and_formats_zero_one_many_commits()
         assert_eq!(completion_message(&report), format!(
             "all stages committed — run complete in 4m 12s — {suffix} — alpha: 0 tokens, claude: 200 tokens, codex: 0 tokens, empty: 0 tokens, large: 0 tokens, zeta: 0 tokens"));
     }
+}
+
+#[test]
+fn history_identity_distinguishes_duplicates_survives_tail_roll_and_changes_on_rotation() {
+    use std::io::Write;
+    let test = QueueTest::new(true);
+    let path = test.app.forge_path("history.jsonl");
+    let original = "\n\r\n  identical 界🙂\rsecond line  \t";
+    let line = format!("{}\n", json!({"t":"12:00:00", "kind":"error", "text":original}));
+    fs::write(&path, line.repeat(400)).unwrap();
+    let before = test.app.read_history();
+    let ids: std::collections::HashSet<_> = before.as_array().unwrap().iter()
+        .map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), 400);
+    assert_eq!(before[0]["text"], original);
+    assert_eq!(before, test.app.read_history());
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(line.as_bytes()).unwrap();
+    let after = test.app.read_history();
+    assert_eq!(&before.as_array().unwrap()[1..], &after.as_array().unwrap()[..399]);
+    assert!(!ids.contains(after[399]["id"].as_str().unwrap()));
+    // Replace with duplicate-looking contents: every identity must change.
+    let replacement = path.with_extension("replacement");
+    fs::write(&replacement, line.repeat(400)).unwrap();
+    fs::rename(replacement, &path).unwrap();
+    let rotated = test.app.read_history();
+    assert!(rotated.as_array().unwrap().iter().all(|e| !ids.contains(e["id"].as_str().unwrap())));
+    assert_eq!(rotated[0]["text"], original);
+}
+
+#[test]
+fn history_identity_uses_absolute_byte_offsets_and_waits_for_complete_records() {
+    use std::io::Write;
+    let test = QueueTest::new(true);
+    let path = test.app.forge_path("history.jsonl");
+    let line = format!("{}\n", json!({"kind":"plain", "text":"界".repeat(4000)}));
+    fs::write(&path, line.repeat(180)).unwrap();
+    let before = test.app.read_history();
+    let last = before.as_array().unwrap().last().unwrap().clone();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&line.as_bytes()[..line.len()-2]).unwrap();
+    assert_eq!(test.app.read_history().as_array().unwrap().last().unwrap(), &last);
+    file.write_all(&line.as_bytes()[line.len()-2..]).unwrap();
+    let after = test.app.read_history();
+    let entries = after.as_array().unwrap();
+    assert_eq!(entries[entries.len()-2], last);
+    assert_ne!(entries.last().unwrap()["id"], last["id"]);
 }
