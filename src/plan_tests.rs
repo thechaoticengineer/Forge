@@ -517,9 +517,14 @@ fn candidate_publication_preserves_selection_counts_and_failure_effects() {
                     test.app.plan_worker("Goal", &PlanMode::Standard);
                 }
                 let expected_calls = usize::from(outcome != "malformed candidate");
+                // A turn the engine rejects is handed back for correction before
+                // it is abandoned, so each attempt is one more architect call.
+                let architect_calls = if outcome == "failed publication" {
+                    expected_calls + crate::architect::REPAIR_ATTEMPTS as usize
+                } else { expected_calls };
                 let settings = test.app.app.settings.lock().unwrap();
                 for key in ["mock_architect_requests", "mock_routing_architect_requests"] {
-                    assert_eq!(settings[key].as_array().map_or(0, Vec::len), expected_calls, "{revision}/{supplied_proposal}/{outcome}/{key}");
+                    assert_eq!(settings[key].as_array().map_or(0, Vec::len), architect_calls, "{revision}/{supplied_proposal}/{outcome}/{key}");
                 }
                 assert_eq!(settings["mock_routing_planner_requests"].as_array().map_or(0, Vec::len),
                     if supplied_proposal { 0 } else { expected_calls });

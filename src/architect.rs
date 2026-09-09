@@ -66,6 +66,8 @@ struct Turn {
     model_evaluations: Value,
 }
 fn contract_version() -> u64 { crate::architecture::VERSION }
+/// Corrections allowed before a rejected architect turn is abandoned.
+pub(crate) const REPAIR_ATTEMPTS: u32 = 2;
 fn text_ok(s: &str, max: usize) -> bool {
     !s.trim().is_empty() && s.len() <= max
 }
@@ -539,9 +541,40 @@ impl Ctx {
             if recovery_reason.is_some() && cp["session"]["reference"] == reference {
                 return Err("recovery did not create a replacement session identity".into());
             }
-            let (mut next, records) =
-                apply_turn(&candidate, &cp, &output.output, &decisions, &required)?;
-            let evaluation_output: Value = serde_json::from_str(&output.output).map_err(|e| e.to_string())?;
+            // A rejected turn is usually one field, not bad architecture. Hand the
+            // rejection back inside the same session, where the agent still has
+            // its context, rather than discarding the whole turn.
+            let mut turn_output = output.output.clone();
+            let mut repairs = 0;
+            let (mut next, records) = loop {
+                let error = match apply_turn(&candidate, &cp, &turn_output, &decisions, &required) {
+                    Ok(applied) => break applied,
+                    Err(error) => error,
+                };
+                if repairs == REPAIR_ATTEMPTS { return Err(error); }
+                repairs += 1;
+                self.log_event("architect", &format!(
+                    "turn rejected: {error} — asking for a correction ({repairs}/{REPAIR_ATTEMPTS})"));
+                let prompt = format!("Your last turn was rejected by the engine: {error}\n\nReturn the \
+                    corrected complete JSON for the same turn, in the same shape, with no prose and no \
+                    markdown fences. Change only what the rejection requires and keep every other field \
+                    exactly as you produced it.");
+                let repaired = if provider == "mock" {
+                    self.mock_architect(&candidate, &cp, &required, &routing_ids, &prompt, Some(reference))
+                } else {
+                    self.run_agent(&AgentRequest { role:"architect", provider:&provider, model:&model,
+                        effort:&effort, session:Some(reference), prompt:&prompt })
+                };
+                match repaired {
+                    Ok(repaired) => turn_output = repaired.output,
+                    // The rejection, not the failed correction, is what has to be reported.
+                    Err(failure) => {
+                        self.log_event("error", &format!("architect correction failed: {failure}"));
+                        return Err(error);
+                    },
+                }
+            };
+            let evaluation_output: Value = serde_json::from_str(&turn_output).map_err(|e| e.to_string())?;
             next["routing_evaluator"] = json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
             self.agree_routing(&mut candidate, &mut next, &routing_ids, &evaluation_output["model_evaluations"])?;
             next["session"] = json!({"provider":provider,"reference":reference,"checkpoint_reference":turn,"resume_policy":"exact_if_committed"});
@@ -561,7 +594,7 @@ impl Ctx {
                 return Err("plan changed during architect turn".into());
             }
             let published = store.publish(candidate, next.clone(), json!({"kind":"architect_turn","turn":turn,"reason":reason,
-                "model_agreements":next["agreements"],"decisions":records,"resolved_risks":serde_json::from_str::<Value>(&output.output).unwrap()["resolved_risks"],
+                "model_agreements":next["agreements"],"decisions":records,"resolved_risks":serde_json::from_str::<Value>(&turn_output).unwrap()["resolved_risks"],
                 "recovery_reason":recovery_reason,"previous_session":cp["session"],"session":reference}))?;
             self.session.state.lock().unwrap().architect_activity =
                 json!({"status":"ready","reason":recovery_reason,"session":reference});
@@ -614,7 +647,17 @@ impl Ctx {
             &raw[16..20],
             &format!("{raw:0<32}")[20..32]
         );
-        let output = settings.get("mock_architect_output").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_else(|| json!({
+        // An array scripts successive turns, so a rejection followed by a
+        // correction can be exercised.
+        let scripted = match settings.get_mut("mock_architect_output").and_then(Value::as_array_mut) {
+            Some(queue) if queue.len() > 1 => Some(queue.remove(0)),
+            Some(queue) => queue.first().cloned(),
+            None => settings.get("mock_architect_output").cloned(),
+        };
+        // Null selects the built-in valid turn, so a script can mix rejected and
+        // accepted outputs without restating the whole contract.
+        let output = scripted.filter(|v| !v.is_null())
+            .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_else(|| json!({
             "version":1,"plan_id":plan["plan_id"],"revision":plan["revision"],"checkpoint":{"summary":"Keep stage interfaces and acceptance constraints.",
             "constraints":strings(&cp["constraints"]),"completed_interfaces":strings(&cp["completed_interfaces"])},"decisions":[],
             "guidance":required.iter().map(|id| json!({"stage_id":id,"text":"Preserve existing interfaces and verify the stage acceptance checks."})).collect::<Vec<_>>(),

@@ -326,6 +326,28 @@ fn qa_is_read_only_and_does_not_touch_authoritative_session_or_decisions() {
 }
 
 #[test]
+fn a_rejected_turn_is_corrected_in_the_same_session_before_being_abandoned() {
+    let f = Fixture::new();
+    let published = f.initial();
+    let before = f.requests().len();
+    // The first turn is unusable; the correction that follows is accepted.
+    f.ctx.app.settings.lock().unwrap()["mock_architect_output"] =
+        json!(["not JSON", Value::Null]);
+    let next = f.ctx.architect_publish(f.revision(&published), Some(&published), "revision").unwrap();
+    let requests = f.requests();
+    assert_eq!(requests.len(), before + 2, "one turn plus one correction");
+    let correction = requests.last().unwrap()["prompt"].as_str().unwrap();
+    assert!(correction.contains("rejected by the engine: invalid architect output"), "{correction}");
+    assert!(correction.contains("no prose and no markdown fences"), "{correction}");
+    // The correction continues the same session rather than starting a new one.
+    assert_eq!(requests[requests.len() - 2]["session"], requests.last().unwrap()["session"]);
+    assert_eq!(f.cp(&next)["context_status"], "ready");
+    assert!(f.ctx.read_history().as_array().unwrap().iter().any(|event|
+        event["text"].as_str().is_some_and(|t| t.starts_with("turn rejected")
+            && t.contains("asking for a correction (1/2)"))));
+}
+
+#[test]
 fn an_omitted_version_echo_or_empty_collection_does_not_discard_the_turn() {
     let f = Fixture::new();
     let p = f.initial();
