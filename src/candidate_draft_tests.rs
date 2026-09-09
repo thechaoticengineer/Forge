@@ -195,6 +195,23 @@ fn revised_draft_reconciles_transitive_dependencies_and_retains_history() {
 }
 
 #[test]
+fn omitted_acceptance_and_commit_become_empty_without_discarding_the_plan() {
+    let mut stage = editable_stage(1);
+    let object = stage.as_object_mut().unwrap();
+    object.remove("acceptance");
+    object.remove("commit");
+    let (draft, count) = prepare_candidate_draft(json!({"stages": [stage]}), "Goal", None).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(draft["stages"][0]["acceptance"], json!(""));
+    assert_eq!(draft["stages"][0]["commit"], json!(""));
+    // A present but non-textual field is still a defect, not a slip to paper over.
+    let mut typed = editable_stage(1);
+    typed["commit"] = json!(7);
+    assert_eq!(prepare_candidate_draft(json!({"stages": [typed]}), "Goal", None),
+        Err("stage content fields must be strings".into()));
+}
+
+#[test]
 fn malformed_candidates_keep_stage_object_and_reconciliation_error_order() {
     let mut invalid_constraint = json!({"stages": [editable_stage(1)]});
     invalid_constraint["stages"][0]["model_constraint"] = json!({});
@@ -218,3 +235,4 @@ fn malformed_candidates_keep_stage_object_and_reconciliation_error_order() {
     limit["stages"] = json!([editable_stage(i64::MAX)]);
     assert_eq!(prepare_candidate_draft(json!({"stages": [editable_stage(i64::MAX)]}), "Goal", Some(&limit)), Err("revision limit reached".into()));
 }
+

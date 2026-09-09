@@ -30,6 +30,12 @@ fn sanitize_candidate_stages(stages: &mut [Value], previous: Option<&Value>) -> 
         let saved_constraint = previous.and_then(|p| p["stages"].as_array()).and_then(|stages| stages.iter().find(|s| s["id"] == stage["id"]))
             .map(|s| s["model_constraint"].clone()).unwrap_or(Value::Null);
         stage.as_object_mut().unwrap().retain(|key, _| ["id", "title", "instructions", "acceptance", "commit", "depends_on", "model_proposal"].contains(&key.as_str()));
+        // An omitted acceptance or commit is a planner slip, not a defective
+        // plan: both are already accepted empty from the panel's own edits.
+        // Title and instructions stay required, so real gaps are still refused.
+        for field in ["acceptance", "commit"] {
+            if stage[field].is_null() { stage[field] = json!(""); }
+        }
         if !saved_constraint.is_null() { stage["model_constraint"] = saved_constraint; }
         stage["status"] = json!("pending");
         stage["rounds"] = json!(0);
