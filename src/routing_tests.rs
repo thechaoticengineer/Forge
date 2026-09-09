@@ -596,3 +596,19 @@ fn explanatory_docs_and_unknown_incomparable_prices_work_through_both_roles() {
         assert_eq!(f.counts(), (1, 1));
     }
 }
+
+#[test]
+fn routing_input_is_bounded_by_the_selected_model_context_not_a_fixed_ceiling() {
+    use super::context_budget_error;
+    let million = 1_000_000;
+    // Four bytes per token: 3.6 MB is ~900k tokens, exactly 90% of a 1M window.
+    assert_eq!(context_budget_error(3_600_000, million, 90, "claude", "opus[1m]"), None);
+    let over = context_budget_error(3_600_008, million, 90, "claude", "opus[1m]").unwrap();
+    assert!(over.contains("roughly 900002 tokens"), "{over}");
+    assert!(over.contains("over 90% of claude/opus[1m]'s 1000000-token context"), "{over}");
+    // The old fixed 256 KiB ceiling rejected prompts every configured model reads.
+    assert_eq!(context_budget_error(512 * 1024, million, 85, "claude", "opus[1m]"), None);
+    // A small window still bounds the input, and an unknown one imposes nothing.
+    assert!(context_budget_error(512 * 1024, 100_000, 85, "codex", "small").is_some());
+    assert_eq!(context_budget_error(64 * 1024 * 1024, 0, 85, "codex", "unknown"), None);
+}

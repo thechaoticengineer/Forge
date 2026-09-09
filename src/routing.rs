@@ -308,6 +308,19 @@ fn policy_inputs(
     )
 }
 
+/// Tokens are estimated from length at four bytes each, which errs towards
+/// letting a borderline prompt through to be answered by the provider. An
+/// unknown context window means no engine-side bound at all.
+fn context_budget_error(bytes: usize, window: u64, percent: u64, provider: &str, model: &str)
+    -> Option<String>
+{
+    let estimate = bytes as u64 / 4;
+    (window > 0 && estimate > window.saturating_mul(percent) / 100).then(|| format!(
+        "routing input is roughly {estimate} tokens, over {percent}% of {provider}/{model}'s \
+         {window}-token context; raise reassessment_limits.context_percent, choose a model with \
+         a larger context, or shorten the pending plan"))
+}
+
 fn selection_plan(plan: &Value) -> Value {
     json!({"goal":plan["goal"],"plan_id":plan["plan_id"],"revision":plan["revision"],
         "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":s["reassessment"]["pending"],"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
@@ -485,8 +498,23 @@ impl Ctx {
                 json!({"proposals":ids.iter().map(|id| json!({"stage_id":id,"proposal":{"risk":"standard","complexity":"standard","task":"functionality","provider":option["provider"],"model":option["model"],"native_effort":option["effort"],"rationale":"Planner: configured adequacy for this stage."}})).collect::<Vec<_>>()}),
             );
         }
-        if prompt.len() > 256 * 1024 {
-            return Err("routing input exceeds 256 KiB; shorten the pending plan".into());
+        // The selected model's own context window is the real bound, so the
+        // budget follows the catalogue rather than a fixed ceiling. Tokens are
+        // estimated from length at four bytes each, which errs towards letting
+        // a borderline prompt through and being answered by the provider.
+        let (window, percent) = {
+            let settings = self.app.settings.lock().unwrap();
+            let policy = Policy::from_settings(&settings)?;
+            let percent = settings["reassessment_limits"]["context_percent"].as_u64().unwrap_or(85);
+            drop(settings);
+            let window = Provider::parse(provider)
+                .map(|parsed| self.model_facts(&policy, parsed, model, Some(effort)))
+                .and_then(|facts| facts["limits"]["context_window"].as_u64())
+                .unwrap_or(0);
+            (window, percent)
+        };
+        if let Some(error) = context_budget_error(prompt.len(), window, percent, provider, model) {
+            return Err(error);
         }
         let output = self.run_agent(&AgentRequest {
             role,
