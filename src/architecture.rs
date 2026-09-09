@@ -18,6 +18,21 @@ const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 const EVENT_LIMIT: usize = 64 * 1024;
 static IDS: AtomicU64 = AtomicU64::new(0);
 
+/// Guidance and agreement records carry a `relevant_inputs` fingerprint that
+/// copies the stage text a prompt already contains, and it grows with every
+/// dependency. Strip it before a checkpoint enters a provider turn; storage
+/// and every validity comparison keep the complete value.
+pub(crate) fn prompt_checkpoint(checkpoint: &Value) -> Value {
+    let mut checkpoint = checkpoint.clone();
+    for group in ["guidance", "agreements"] {
+        let Some(records) = checkpoint.get_mut(group).and_then(Value::as_object_mut) else { continue };
+        for record in records.values_mut() {
+            if let Some(record) = record.as_object_mut() { record.remove("relevant_inputs"); }
+        }
+    }
+    checkpoint
+}
+
 pub(crate) fn identity() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -999,6 +1014,22 @@ pub(crate) fn agreement_fixture(plan: &Value, index: usize) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_checkpoints_drop_input_fingerprints_and_keep_everything_else() {
+        let inputs = json!({"instructions": "copied stage text"});
+        let checkpoint = json!({"summary": "keep", "guidance": {"1": {"text": "g", "relevant_inputs": inputs}},
+            "agreements": {"1": {"dialogue": ["keep"], "relevant_inputs": inputs}},
+            "recent_decisions": [{"relevant_inputs": inputs}]});
+        let stripped = super::prompt_checkpoint(&checkpoint);
+        assert_eq!(stripped["guidance"]["1"], json!({"text": "g"}));
+        assert_eq!(stripped["agreements"]["1"], json!({"dialogue": ["keep"]}));
+        assert_eq!(stripped["summary"], "keep");
+        // Only the two record groups are rewritten; nothing else is inspected.
+        assert_eq!(stripped["recent_decisions"], checkpoint["recent_decisions"]);
+        // A checkpoint without those groups gains no keys.
+        assert_eq!(super::prompt_checkpoint(&json!({"summary": "only"})), json!({"summary": "only"}));
+    }
+
     use super::*;
     struct Temp(PathBuf);
     impl Temp {

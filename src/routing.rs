@@ -318,6 +318,7 @@ impl Ctx {
         let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
             .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
         if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
+        let cp = crate::architecture::prompt_checkpoint(&cp);
         Ok(format!("\nArchitecture checkpoint and referenced decisions: {cp}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. Higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
             self.git(&["status","--short"]).unwrap_or_else(|e| e) , self.git(&["diff","HEAD","--",".",":(exclude).forge"] ).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>()))
     }
@@ -575,9 +576,10 @@ impl Ctx {
                 self.propose_routing(plan, &affected, &json!(disagreements))?;
                 let context_plan = selection_plan(plan);
                 let prompt = format!(
-                    "{}\n{}\nPlan: {context_plan}\nSaved architecture: {cp}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
+                    "{}\n{}\nPlan: {context_plan}\nSaved architecture: {}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
                     self.routing_prompt()?,
                     EVALUATION_CONTRACT,
+                    crate::architecture::prompt_checkpoint(cp),
                     json!(disagreements)
                 );
                 let prompt = prompt + &self.routing_handoff(plan)?;

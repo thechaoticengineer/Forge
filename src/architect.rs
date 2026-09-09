@@ -421,7 +421,7 @@ impl Ctx {
                     stage.as_object_mut().unwrap().remove(key);
                 }
             }
-            let context = json!({"plan":context_plan,"checkpoint":cp,"decisions":included,
+            let context = json!({"plan":context_plan,"checkpoint":crate::architecture::prompt_checkpoint(&cp),"decisions":included,
                 "history_path":dir.join("events.jsonl"),"repository_observations":observations,
                 "unfinished_diff_preview":self.git(&["diff","HEAD","--",".",":(exclude).forge"]).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>(),
                 "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
