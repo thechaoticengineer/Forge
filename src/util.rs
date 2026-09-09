@@ -87,3 +87,98 @@ pub(crate) fn digest(bytes: &[u8]) -> Result<String, String> {
         .ok_or("missing digest")?
         .into())
 }
+
+/// Agents sometimes surround their final JSON with prose or a Markdown fence.
+/// Return the first balanced value that actually parses, so a faithful answer
+/// is not discarded over its wrapper. Falls back to the trimmed output so a
+/// genuinely malformed response still produces a diagnosable parse error.
+pub(crate) fn json_payload(output: &str) -> &str {
+    let output = output.trim();
+    if parses(output) {
+        return output;
+    }
+    let bytes = output.as_bytes();
+    let mut attempts = 0;
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' && bytes[start] != b'[' {
+            continue;
+        }
+        attempts += 1;
+        if attempts > 32 {
+            break;
+        }
+        if let Some(end) = balanced_end(bytes, start)
+            && parses(&output[start..end])
+        {
+            return &output[start..end];
+        }
+    }
+    output
+}
+
+fn parses(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
+/// Index just past the bracket closing the value that opens at `start`,
+/// ignoring brackets inside strings.
+fn balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let (mut depth, mut string, mut escaped) = (0usize, false, false);
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        if string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => string = false,
+                _ => {},
+            }
+            continue;
+        }
+        match byte {
+            b'"' => string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx + 1);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_payload;
+
+    #[test]
+    fn plain_json_and_whitespace_are_returned_unchanged() {
+        assert_eq!(json_payload("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(json_payload("\n  [1,2]\t "), "[1,2]");
+    }
+
+    #[test]
+    fn prose_preamble_and_fences_are_stripped_around_the_payload() {
+        assert_eq!(json_payload("I explored the card.\n\n{\"stages\":[]}"), "{\"stages\":[]}");
+        assert_eq!(json_payload("Done:\n```json\n{\"stages\":[]}\n```\n"), "{\"stages\":[]}");
+        assert_eq!(json_payload("{\"stages\":[]}\n\nThat is the plan."), "{\"stages\":[]}");
+    }
+
+    #[test]
+    fn braces_in_prose_and_strings_do_not_truncate_the_payload() {
+        assert_eq!(
+            json_payload("Replaced `{key}` with a value.\n{\"text\":\"a } inside\",\"n\":[1]}"),
+            "{\"text\":\"a } inside\",\"n\":[1]}"
+        );
+        assert_eq!(json_payload("{\"escaped\":\"\\\"}\"}"), "{\"escaped\":\"\\\"}\"}");
+    }
+
+    #[test]
+    fn malformed_output_falls_back_to_the_trimmed_text() {
+        assert_eq!(json_payload("  no json here  "), "no json here");
+        assert_eq!(json_payload("{\"unclosed\": 1"), "{\"unclosed\": 1");
+    }
+}
+

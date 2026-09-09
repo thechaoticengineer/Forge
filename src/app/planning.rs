@@ -3,7 +3,7 @@ use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
 use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVISE_PROMPT};
 use crate::usage::accumulate_invocation_usage;
-use crate::util::{fill_template, unix_timestamp};
+use crate::util::{fill_template, json_payload, unix_timestamp};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
@@ -80,7 +80,7 @@ impl Ctx {
                 self.run_agent(&AgentRequest {role:"chat",provider:tool,model,effort,session:None,
                     prompt:if tool == "mock" {&prompt} else {&readonly_prompt}}))?;
             let text = if tool == "mock" { fs::read_to_string(self.forge_path("answer.json")).map_err(|e| format!("could not read answer file: {e}"))? } else { result.output };
-            let output: Value = serde_json::from_str(&text)
+            let output: Value = serde_json::from_str(json_payload(&text))
                 .map_err(|e| format!("invalid answer JSON: {e}"))?;
             let answer = output["answer"].as_str().filter(|answer| !answer.trim().is_empty())
                 .ok_or_else(|| "agent did not produce a non-empty answer string".to_string())?;
@@ -113,7 +113,7 @@ impl Ctx {
                 prompt:if tool == "mock" {&prompt} else {&readonly_prompt} }))?;
         let mut plan: Value = if tool == "mock" {
             serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| format!("invalid candidate: {e}"))?
-        } else { serde_json::from_str(&result.output).map_err(|e| format!("invalid candidate: {e}"))? };
+        } else { serde_json::from_str(json_payload(&result.output)).map_err(|e| format!("invalid candidate: {e}"))? };
         plan["planner_selection_actor"] = json!({"provider":tool,"model":result.effective_model,"native_effort":effort});
         let usage = result.usage;
         if !plan["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
