@@ -130,9 +130,34 @@ Item {
                 for (const width of [280,800]) rows.push({tag:mode+"-"+width,mode:mode,width:width})
             return rows
         }
+        function test_architecture_overview_stays_compact_data() {
+            return [280,800,1880].map(width=>({tag:String(width),width:width}))
+        }
+        function test_architecture_overview_stays_compact(data) {
+            root.width=data.width
+            const cp=JSON.parse(JSON.stringify(root.architecture))
+            cp.context_status="ready";delete cp.error;delete cp.recovery
+            cp.recent_decisions=Array.from({length:40},(_,i)=>Object.assign({},cp.recent_decisions[0],{id:"d"+i}))
+            root.architecture=cp;root.engineState={architect_activity:{status:"ready"}};wait(30)
+            const card=group()
+            verify(card.height<260,"architecture leaves room for the actual plan")
+            compare(details(card).length,0,"unopened sections do not construct prose rows")
+            for (const section of ["guidance","risks","decisions"]) {
+                const toggle=named(card,section+"Toggle")
+                verify(toggle.visible);verify(toggle.width<=card.width)
+            }
+            click(named(card,"decisionsToggle"))
+            verify(details(card).length>=40,"every decision remains accessible")
+            root.projectViewRevision++;wait(30)
+            compare(details(card).length,0,"a project visit resets section expansion")
+            verify(card.height<260)
+        }
         function test_prose_matrix(data) {
             root.width=data.width;root.mode=data.mode;wait(50)
             if (data.mode==="reports") click(named(root,"reportToggle"))
+            if (data.mode==="architecture") {
+                for (const section of ["guidance", "risks", "decisions"]) click(named(group(),section+"Toggle"))
+            }
             const g=group(), ds=details(g)
             verify(ds.length>=values.length,"every record is retained")
             for (const source of values) {
@@ -245,6 +270,7 @@ Item {
         }
         function test_keyboard_traversal_and_polling() {
             root.mode="architecture";wait(30)
+            click(named(group(),"risksToggle"))
             let d=details(group()).find(x=>x.metadata==="Risk r0")
             const toggle=named(d,"detailToggle")
             root.revealDetail(toggle);toggle.forceActiveFocus();keyClick(Qt.Key_Space);wait(30)
@@ -253,6 +279,8 @@ Item {
             verify(named(d,"detailCopy").activeFocus,"Tab reaches copy control")
             keyClick(Qt.Key_Space);compare(clipboard.clipboardText,d.originalText)
             const editor=named(d,"detailFullText");editor.select(3,15);const selection=editor.selectedText
+            click(named(group(),"risksToggle"));click(named(group(),"risksToggle"))
+            compare(named(d,"detailFullText"),editor);compare(editor.selectedText,selection)
             for(let i=0;i<8;i++) {
                 const cp=JSON.parse(JSON.stringify(root.architecture));cp.context_status=i%2 ? "needs_recovery" : "error"
                 cp.unresolved_risks.push({id:"new"+i,text:values[5]});root.architecture=cp;wait(10)

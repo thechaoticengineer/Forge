@@ -30,6 +30,33 @@ FocusScope {
     implicitHeight: heading.height + (expanded ? body.height + 4 : 0)
     onActiveFocusChanged: if (activeFocus) inspecting()
 
+    component DetailButton: Button {
+        id: control
+        implicitWidth: buttonLabel.implicitWidth + 20
+        implicitHeight: Math.max(26, buttonLabel.implicitHeight + 10)
+        padding: 5
+        font.family: detail.fontFamily
+        font.pixelSize: detail.fontSize
+        contentItem: Text {
+            id: buttonLabel
+            text: control.text
+            textFormat: Text.PlainText
+            font: control.font
+            color: detail.foreground
+            opacity: control.enabled ? 1 : 0.5
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+        background: Rectangle {
+            radius: 4
+            color: control.down ? Qt.alpha(detail.foreground, 0.12)
+                : control.hovered ? Qt.alpha(detail.foreground, 0.06) : "transparent"
+            border.width: 1
+            border.color: Qt.alpha(detail.foreground, control.visualFocus ? 0.8 : 0.18)
+        }
+    }
+
     // How many characters of the preview line are handed to the renderer. Zero
     // width and combining characters make every character-count estimate a
     // lower bound only, so the estimate grows until the renderer reports the
@@ -76,7 +103,7 @@ FocusScope {
         id: heading
         width: parent.width
         height: Math.max(toggle.implicitHeight, metadataText.implicitHeight)
-        Button {
+        DetailButton {
             id: toggle
             objectName: "detailToggle"
             anchors.right: parent.right
@@ -157,7 +184,7 @@ FocusScope {
                 font.family: detail.fontFamily
                 font.pixelSize: detail.fontSize
             }
-            Button {
+            DetailButton {
                 id: loadButton
                 text: detail.detailError ? "Retry full text" : "Load full text"
                 enabled: !detail.loading
@@ -173,7 +200,7 @@ FocusScope {
             property alias selectedText: fullText.selectedText
             width: body.width
             spacing: 4
-            Button {
+            DetailButton {
                 id: copyButton
                 objectName: "detailCopy"
                 text: "Copy full text"

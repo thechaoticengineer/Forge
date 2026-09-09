@@ -179,6 +179,14 @@ that reads leave saved records unchanged.
 
 ## Remaining panel details
 
+The architecture overview is a bordered card with always-visible context,
+activity and recovery/error fields. Stage guidance, open risks and decisions
+have separate labelled disclosure controls with record counts and start
+collapsed, so a long decision history does not push the plan offscreen.
+Section contents are created on first opening and retained through collapse;
+project/plan scope changes reset them. Shared detail buttons use explicit theme
+colors and focus outlines instead of inheriting native desktop button chrome.
+
 `PanelDetails.js` presents architecture activity reasons, each guidance record,
 each risk, decision summaries/rationales/alternatives/tradeoffs, provider and
 catalogue descriptions/errors/provenance, report commits, lifecycle prose and

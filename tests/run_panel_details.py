@@ -53,7 +53,7 @@ helpers += between('  function reportTime(', '  function chooserRows(')
 helpers += between('  component PanelButton:', '\n}')
 fragments = {
     'LOCAL_ERROR': block('objectName: "localErrorDetail"', 'PanelDetail'),
-    'ARCHITECTURE': block('objectName: "architectureDetails"', 'PanelFields'),
+    'ARCHITECTURE': block('objectName: "architectureDetails"', 'ArchitectureDetails'),
     'PROVIDERS': block('objectName: "providerDetails"', 'PanelFields'),
     'OPTIONS': block('objectName: "catalogueOptions"', 'PanelFields'),
     'SOURCES': block('objectName: "catalogueSources"', 'PanelFields'),
@@ -69,7 +69,7 @@ fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.cl
 with tempfile.TemporaryDirectory(prefix='forge-panel-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js'):
+    for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_panel.qml').write_text(fixture)
     runtime = path / 'runtime'

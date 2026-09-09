@@ -1925,9 +1925,22 @@ Item {
           visible: root.plan !== null || (root.engineState && root.engineState.architect_activity) || (root.architecture && root.architecture.context_status === "error")
           width: parent.width
           spacing: Style.space(4)
-          PanelFields {
+          ArchitectureDetails {
+            id: architectureCard
             objectName: "architectureDetails"
             width: parent.width
+            scope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+            foreground: root.foreground
+            mutedForeground: root.mutedForeground
+            background: root.surface
+            accent: root.accent
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+            fontSize: root.fs(12)
+            onCopyRequested: original => Quickshell.clipboardText = original
+            onLeaveRequested: keyHandler.forceActiveFocus()
+            onFocusRevealed: control => root.revealDetail(control)
+            onInspecting: root.inspectDetail(architectureCard)
             entries: PanelDetails.architecture(root.architecture,
               root.engineState ? root.engineState.architect_activity : null,
               root.engineState ? root.engineState.persistence_error : "")
