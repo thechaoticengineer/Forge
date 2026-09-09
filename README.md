@@ -87,9 +87,9 @@ Alongside `approved`, `summary`, `issues`, `notes` and `checks`, output includes
 
 Every acceptance criterion must be individually verified. The independent
 reviewer must run all available required project builds/tests, including for
-documentation. Rust repositories with a root `Cargo.toml` additionally require
-successful `cargo build` and `cargo test` entries at the engine boundary.
-Other project-specific requirements are discovered and verified by the reviewer.
+documentation. Reviewing agents discover the project-specific requirements, run
+the appropriate commands, and verify their results. The engine validates the
+structure of their evidence without matching command names or shell syntax.
 An unavailable dependency or sandbox restriction preventing an available check
 from running is a rejection. Evidence is validated structurally and inspected
 by the reviewing agents; the engine does not infer correctness from a command

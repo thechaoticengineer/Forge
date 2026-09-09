@@ -248,14 +248,17 @@ fn offline_lifecycle_refresh_reuse_escalation_restart_reports_and_next_queue_pla
 }
 
 #[test]
-fn cheap_documentation_cannot_bypass_available_build_checks_or_buy_extra_selection_rounds() {
+fn reported_failed_checks_cannot_be_bypassed_or_buy_extra_selection_rounds() {
     let f = Fixture::new();
     f.set("max_fix_rounds",json!(0));
     f.set("mock_routing_planner_outputs",json!([{"proposals":[Fixture::proposal(1,"small","simple","documentation")]}]));
     f.ctx.architect_publish(json!({"goal":"Improve prose","status":"ready","stages":[Fixture::stage(1,"Fix prose spelling")]}),None,"draft").unwrap();
     f.set("mock_edits",json!([{"README.md":"The program prints a friendly greeting.\n"}]));
     let mut bad = Fixture::verdict(true);
-    bad["project_checks"] = json!([{"command":"cargo test","status":"passed","evidence":"Fixture tests passed"}]);
+    bad["project_checks"] = json!([
+        {"command":"./scripts/build.sh","status":"failed","evidence":"Fixture build exited 1"},
+        {"command":"cargo test","status":"passed","evidence":"Fixture tests passed"}
+    ]);
     f.set("mock_verdicts",json!([bad]));
     f.ctx.run_worker();
     let p = f.ctx.load_plan().unwrap();

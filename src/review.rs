@@ -809,24 +809,6 @@ impl Ctx {
             &identity,
             plan["stages"][idx]["acceptance"].as_str().unwrap_or(""),
         )?;
-        if verdict["approved"] == true && PathBuf::from(self.project()).join("Cargo.toml").is_file()
-        {
-            for command in ["cargo build", "cargo test"] {
-                if !verdict["project_checks"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|c| {
-                        c["status"] == "passed"
-                            && c["command"].as_str().is_some_and(|s| {
-                                s == command || s.starts_with(&format!("{command} "))
-                            })
-                    })
-                {
-                    return Err(format!("missing required successful {command} evidence"));
-                }
-            }
-        }
         verdict["version"] = json!(1);
         verdict["id"] = json!(crate::architecture::identity());
         verdict["plan_id"] = base["plan_id"].clone();

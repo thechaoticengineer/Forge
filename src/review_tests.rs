@@ -501,19 +501,35 @@ fn reviewer_provider_is_opposite_and_known_unavailability_blocks() {
     }
 }
 #[test]
-fn available_cargo_checks_cannot_be_omitted_even_for_documentation() {
-    let f = Fixture::new("Fix prose spelling", 0);
-    fs::write(
-        f.root.join("Cargo.toml"),
-        "[package]\nname='fixture'\nversion='0.1.0'\n",
-    )
-    .unwrap();
-    f.ctx.git(&["add", "Cargo.toml"]).unwrap();
-    f.ctx.git(&["commit", "-qm", "manifest"]).unwrap();
-    f.docs();
-    let p = f.run();
-    assert_eq!(p["stages"][0]["review_gate"]["status"], "error");
-    assert_eq!(f.count("architect"), 0);
+fn reviewers_verify_project_checks_without_engine_command_name_matching() {
+    for intent in ["Fix prose spelling", "Implement feature"] {
+        for commands in [
+            vec!["CARGO_TARGET_DIR=/tmp/forge-review3-l77ap2fa/target cargo build --offline",
+                 "CARGO_TARGET_DIR=/tmp/forge-review3-l77ap2fa/target cargo test --offline"],
+            vec!["cd /tmp/review && ./scripts/verify-project.sh"],
+        ] {
+            let f = Fixture::new(intent,0);
+            fs::write(f.root.join("Cargo.toml"),"[package]\nname='fixture'\nversion='0.1.0'\n").unwrap();
+            f.ctx.git(&["add","Cargo.toml"]).unwrap();
+            f.ctx.git(&["commit","-qm","manifest"]).unwrap();
+            f.docs();
+            let checks: Vec<_> = commands.iter().map(|command| json!({
+                "command":command,"status":"passed",
+                "evidence":"Fixture reviewer verified the required project build and tests; processes exited 0 and expected output matched."
+            })).collect();
+            let verdict = json!({"approved":true,"issues":[],"project_checks":checks});
+            f.setting("mock_verdicts",json!([verdict]));
+            f.setting("mock_architect_verdicts",json!([verdict]));
+            let plan = f.run();
+            let stage = &plan["stages"][0];
+            assert_eq!(stage["status"],"committed");
+            assert_eq!(stage["review_gate"]["status"],"approved");
+            assert_eq!(f.count("architect"),usize::from(intent == "Implement feature"));
+            for review in stage["reviews"].as_array().unwrap() {
+                assert_eq!(review["project_checks"],json!(checks));
+            }
+        }
+    }
 }
 
 #[test]
