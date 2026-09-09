@@ -14,7 +14,9 @@ use std::fs;
 #[serde(deny_unknown_fields)]
 struct Checkpoint {
     summary: String,
+    #[serde(default)]
     constraints: Vec<String>,
+    #[serde(default)]
     completed_interfaces: Vec<String>,
 }
 #[derive(Debug, Deserialize)]
@@ -42,17 +44,28 @@ struct Decision {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Turn {
+    // The engine knows the contract version and the prompt asks the agent to
+    // echo it; an omitted echo is a slip, not a different contract. Collection
+    // fields are documented as allowed to be empty, so an omitted key means
+    // empty rather than a discarded turn. plan_id and revision stay required:
+    // they are the proof that the turn addressed the current plan.
+    #[serde(default = "contract_version")]
     version: u64,
     plan_id: String,
     revision: u64,
     checkpoint: Checkpoint,
+    #[serde(default)]
     decisions: Vec<Decision>,
+    #[serde(default)]
     guidance: Vec<Guidance>,
+    #[serde(default)]
     unresolved_risks: Vec<Risk>,
+    #[serde(default)]
     resolved_risks: Vec<String>,
     #[serde(default)]
     model_evaluations: Value,
 }
+fn contract_version() -> u64 { crate::architecture::VERSION }
 fn text_ok(s: &str, max: usize) -> bool {
     !s.trim().is_empty() && s.len() <= max
 }

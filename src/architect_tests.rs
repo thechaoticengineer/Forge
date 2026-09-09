@@ -326,6 +326,34 @@ fn qa_is_read_only_and_does_not_touch_authoritative_session_or_decisions() {
 }
 
 #[test]
+fn an_omitted_version_echo_or_empty_collection_does_not_discard_the_turn() {
+    let f = Fixture::new();
+    let p = f.initial();
+    let cp = f.cp(&p);
+    let good = f.ctx.mock_architect(&p, &cp, &[1], &[], "", None).unwrap().output;
+    let base: Value = serde_json::from_str(&good).unwrap();
+    // Fields the engine already knows, or that the contract allows to be empty.
+    for field in ["version", "decisions", "unresolved_risks", "resolved_risks"] {
+        let mut slip = base.clone();
+        slip.as_object_mut().unwrap().remove(field);
+        assert!(apply_turn(&p, &cp, &slip.to_string(), &BTreeMap::new(), &[1]).is_ok(),
+            "an omitted {field} must not discard the turn");
+    }
+    // A wrong version is still a different contract, and the echoes that prove
+    // which plan the turn addressed stay required.
+    let mut wrong = base.clone();
+    wrong["version"] = json!(2);
+    assert_eq!(apply_turn(&p, &cp, &wrong.to_string(), &BTreeMap::new(), &[1]),
+        Err("stale architect plan/revision".into()));
+    for field in ["plan_id", "revision", "checkpoint"] {
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(apply_turn(&p, &cp, &missing.to_string(), &BTreeMap::new(), &[1]).is_err(),
+            "{field} must stay required");
+    }
+}
+
+#[test]
 fn architect_turn_validation_preserves_constraints_and_requires_risk_resolution() {
     let f = Fixture::new();
     let p = f.initial();
