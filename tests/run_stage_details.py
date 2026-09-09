@@ -15,7 +15,8 @@ def between(start, end):
     offset = panel.index(start)
     return panel[offset:panel.index(end, offset)]
 
-helpers = between('  function stageModelText(', '  function changeModelConstraint(')
+helpers = between('  function revealDetail(', '  function reviewScope(')
+helpers += between('  function stageModelText(', '  function changeModelConstraint(')
 helpers += between('  function reviewScope(', '  component StageDetail:')
 helpers += between('  component StageDetail:', '  function reviewGateText(')
 helpers += between('  function reviewGateText(', '  function reportTime(')
@@ -23,13 +24,14 @@ helpers += between('  function nonNegativeInt(', '  function formatTokens(')
 content = between('              Column {\n                id: stageContent', '              Loader {\n                id: stageEditor')
 properties = between('              readonly property var reviewView:', '              width: stageList.width')
 fixture = (repo / 'tests/stage_details_fixture.qml.in').read_text()
+fixture = fixture.replace('import QtTest', 'import QtTest\nimport "components/PanelDetails.js" as PanelDetails')
 fixture = fixture.replace('// PANEL_HELPERS', helpers).replace('// PANEL_STAGE_CONTENT', content)
 fixture = fixture.replace('// PANEL_STAGE_PROPERTIES', properties)
 fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.clipboardText', 'clipboard.clipboardText')
 with tempfile.TemporaryDirectory(prefix='forge-stage-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('CompactDetail.qml', 'DetailText.js', 'ReviewView.js'):
+    for name in ('CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_stage.qml').write_text(fixture)
     runtime = path / 'runtime'

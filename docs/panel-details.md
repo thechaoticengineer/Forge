@@ -176,3 +176,77 @@ or validation of the remaining stage-4 panel surfaces. Rust endpoint tests pin
 same-revision publications, reconstruct large complete histories, detect hidden
 legacy changes with identical previews, preserve cached markers, and confirm
 that reads leave saved records unchanged.
+
+## Remaining panel details
+
+`PanelDetails.js` presents architecture activity reasons, each guidance record,
+each risk, decision summaries/rationales/alternatives/tradeoffs, provider and
+catalogue descriptions/errors/provenance, report commits, lifecycle prose and
+usage per tool as separate original fields. Their status rows remain wrapping
+plain text: recovery/context, decision status/supersessions, source failures,
+model identity/availability, report metadata and archived stage titles and
+aggregate/architect/independent outcomes. Quota readings and warnings remain
+visible separately from expandable error bodies. Errors carry a red `!` marker.
+The latest-output summary uses the complete retained feed, because the state
+heartbeat's `agent.last_line` is intentionally bounded to 200 characters.
+
+`DetailFields.qml` reuses `CompactDetail` with a retained flat model. Unchanged
+polls do not rebind editors; reordered fields retain their delegates. A changed
+open original is held until collapse. An inspected field omitted by a later
+snapshot remains labelled `previously shown` until collapse; scope changes still
+clear it. Chat keys include plan scope, original record and position (duplicates
+remain distinct). Each report collection update serializes each immutable record
+once, matching its occurrence among exact duplicates to a cached short identity.
+Navigation uses an index lookup without serializing records. The identity cache
+releases absent originals on the next update. Lightweight report headers stay
+alive while scrolling; lifecycle/detail fields are created only on first report
+expansion, then retained so outer collapse and polling preserve inspected editors.
+A record/offset anchor restores reading after new reports arrive. Report expansion
+uses an explicit button. Keyboard focus reveals controls inside nested viewports.
+
+Goal, queue, local/policy/quota/load/discovery errors and policy explanations also
+use the compact wrapper. Input editors, structured diff rows and keyboard help
+keep their existing purposes. The compact behavior does not change persisted
+strings or storage/API boundaries. Legacy opaque logs cannot recover boundaries
+or characters discarded before complete records were introduced.
+
+### Stage-4 verification and scope
+
+`python3 tests/run_panel_details.py` extracts the current Panel local-error,
+architecture, provider, catalogue, chat, report and queue subtrees and their real helpers and
+adapters. Only theme, host, API actions and clipboard services are substituted.
+Its offscreen QtTest matrix uses 280- and 800-pixel widths with LF, CRLF, CR,
+whitespace-only, Unicode/combining characters, markup-like text and 5,000-character
+unbroken originals. It checks actual `Text.truncated`, full-copy signal data,
+keyboard focus/traversal, selection, nested controls, independent statuses and
+buttons, unchanged editors during repeated polls, chat expansion, report prepend
+anchors, and project-scope resets. It also exercises real mouse drag selection
+and retaining an inspected error that disappears from a later snapshot.
+The local-error regression places the exact production row inside a Column with
+no fixture-supplied row width. At both widths it requires a nonzero error preview,
+visible red `! Error` indicator, usable expansion/copy buttons and keyboard access.
+The report-cap regression loads 100 full multiline reports, requires zero unopened
+detail trees and bounded header object counts, and measures assignment, 1,000
+cached navigation lookups and five capped prepend polls. It also preserves an
+interior report's selected editor and actual viewport anchor through scrolling,
+polling and outer collapse/re-expansion. A Node regression separately counts
+exactly one serialization per report per update and none during navigation.
+Warnings from the extracted subtrees fail the runner.
+
+The re-review run passed all 24 panel runtime checks on Qt 6.11.2 (offscreen,
+software rendering). At 280/800 pixels respectively, assigning the 100 reports
+took 16/15 ms, 1,000 cached navigation lookups took 2/2 ms, and the slowest of five
+prepend polls took 23/22 ms. Each collapsed list had 2,203 visual objects and zero
+report detail trees. These are fixture measurements, not live-shell benchmarks.
+
+The existing `tests/qml` runtime suite separately validates live/history component
+behavior (including 400 loaded rows, filtering, reading anchors and Unicode
+elision). `run_compact_clipboard.py` separately verifies exact Quickshell clipboard
+round trips for five originals in an offscreen process; the subtree fixtures
+assert clipboard signal data, not the desktop clipboard. `run_stage_details.py`
+continues to test the stage/review subtree, lazy loading and stale responses.
+These are applicable isolated runtime checks, not JavaScript/parsing substitutes.
+No live Omarchy shell was restarted or installed into, and no Forge engine was
+started or stopped. Full-panel live polling across every concurrent publication,
+rotation and project/session transition remains separately unverified; the broader
+`compact-risk-view-stability` is not closed by these subtree/component results.

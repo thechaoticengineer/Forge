@@ -438,7 +438,7 @@ completed plan can append another report for the same plan/revision.
 token totals per tool. Expand a task to see commit SHAs and messages, input/output/total
 counts, call counts, model totals, separate planner and role usage, architecture,
 routing reasons and recorded review gates. Older reports without these fields
-retain their original rendering. The reports
+remain readable with the available fields. The reports
 filter appears once reports exist. The plan header and expanded stage rows
 also show token summaries when available.
 
@@ -508,6 +508,26 @@ use the same fallback record for both the chip and expanded feedback. Missing
 notes, checks, or history are supported; unavailable timestamps are omitted and
 unknown review rounds are labeled `round unknown`, rather than borrowing the
 active round.
+
+### Compact details
+
+Read-only panel details show the first non-empty line, with an ellipsis when it
+exceeds the available width. Each message or field stays separate, including
+Plan Q&A, architecture guidance, decisions, risks, reports and model descriptions.
+**Expand** opens selectable plain text; **Copy full text** copies the original,
+including blank lines and whitespace. Use Tab and Space/Enter for the controls;
+Escape returns to panel shortcuts. Empty text has an explicit empty preview.
+Stage/report expansion and their individual text expansions remain separate.
+Statuses, errors, quota warnings, metadata and actions stay visible. Goal/plan/
+model-policy editors, structured diffs and keyboard help keep their existing uses.
+
+Inspecting chat or output suspends following new messages. Polling preserves
+unchanged selections and open text; changed fields refresh on collapse. An open
+field removed from the current snapshot stays labelled **previously shown** until
+collapsed. Large review previews load complete text before offering full copying.
+Legacy unstructured logs remain accessible as a single full-text entry: old
+message boundaries and text discarded before this upgrade cannot be reconstructed.
+See [panel detail implementation and isolated runtime checks](docs/panel-details.md).
 
 ### Updating and troubleshooting
 
@@ -1189,11 +1209,17 @@ node --test tests/*.test.mjs bridges/claude-models/discovery.test.mjs
 omarchy plugin validate "$PWD"
 /usr/lib/qt6/bin/qmlformat quickshell/Panel.qml > /dev/null
 /usr/lib/qt6/bin/qmlformat quickshell/BarWidget.qml > /dev/null
+/usr/lib/qt6/bin/qmlformat quickshell/DetailFields.qml > /dev/null
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+  /usr/lib/qt6/bin/qmltestrunner -input tests/qml
+python3 tests/run_compact_clipboard.py
+python3 tests/run_stage_details.py
+python3 tests/run_panel_details.py
 ```
 
 Use an already installed Node binary if a version-manager shim has no selected
-version. Qt tool locations depend on the distribution. QML parsing, JavaScript
-rendering tests and plugin manifest validation pass in the stage-8 environment.
+version. Qt tool locations depend on the distribution. QML parsing and JavaScript
+helper tests are separate from the isolated Qt runtime fixtures above.
 Standalone `qmllint` cannot fully resolve the runtime `qs.Commons`/`qs.Ui` imports
 and reports the resulting unresolved widget types, plus an existing `enabled`
 property shadow warning. Live shell rendering is not validated because that would

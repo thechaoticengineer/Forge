@@ -55,7 +55,7 @@ test('stage status remains visible while both exact rationale sources are indepe
   multiline.model_block = 'blocked\nfull error';
   assert.equal(ctx.stageModelErrors(multiline), multiline.model_block);
   assert.match(qml, /model: root.stageModelDetails\(stageRow.modelData, stageRow.expanded\)/);
-  assert.match(qml, /text: root.stageModelErrors\(stageRow.modelData\)/);
+  assert.match(qml, /PanelDetails.field\("routing", "Routing error", \(stageRow.modelData.reassessment \|\| \{\}\).error, true\)/);
 });
 
 test('pending model agreements still expose routing outcomes and execution identity', () => {

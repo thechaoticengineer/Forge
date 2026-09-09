@@ -8,6 +8,7 @@ import qs.Commons
 import qs.Ui
 import "DetailView.js" as DetailView
 import "ReviewView.js" as ReviewView
+import "PanelDetails.js" as PanelDetails
 
 Item {
   id: root
@@ -141,8 +142,7 @@ Item {
     catalogueWasRefreshing = refreshing
   }
 
-  // Reports keep their complete composite text; stage cards render status and
-  // prose independently so compact previews cannot conceal routing outcomes.
+  // Status and prose are separate in stage cards and archived reports.
   function stageModelText(stage, detail) {
     return stageModelStatus(stage) + "\n" + stageModelDetails(stage, detail).map(function(field) {
       return field.label + ": " + field.text
@@ -511,7 +511,7 @@ Item {
         // Preserve view models across unchanged polls; replacing ListView and
         // Repeater models can rebuild delegates and reset the reading position.
         if (root.engineState && resp.project === root.engineState.project) {
-          for (const key of ["plan", "architecture"]) {
+          for (const key of ["plan", "architecture", "chat", "reports", "queue", "model_catalogue"]) {
             if (JSON.stringify(resp[key]) === JSON.stringify(root.engineState[key]))
               resp[key] = root.engineState[key]
           }
@@ -777,13 +777,66 @@ Item {
     }).join("\n")
   }
 
+  property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
+  readonly property var reportIndex: PanelDetails.indexReports(reports, reportIdentityCache)
+
   function reportKey(report, index) {
-    return JSON.stringify([report.unix, report.goal, index])
+    return reportIndex.keys[index] || ""
+  }
+
+  function selectedReportIndex() {
+    const index = reportIndex.positions[selectedReportKey]
+    return index === undefined ? -1 : index
   }
 
   property var reviewViews: ({})
   property int reviewViewVersion: 0
   property var stageDetailExpanded: ({})
+
+  function revealDetail(control) {
+    // Reveal inside every enclosing scroller, from the inner viewport outward.
+    for (let item = control.parent; item; item = item.parent) {
+      if (item.contentY === undefined || !item.contentItem || !item.height) continue
+      const top = control.mapToItem(item.contentItem, 0, 0).y
+      const bottom = top + control.height
+      if (top < item.contentY) item.contentY = Math.max(item.originY || 0, top)
+      else if (bottom > item.contentY + item.height)
+        item.contentY = Math.max(item.originY || 0, Math.min(top, bottom - item.height))
+      if (item.followTail !== undefined) item.followTail = false
+      if (typeof item.captureReading === "function") item.captureReading()
+      else if (item.readingY !== undefined) item.readingY = item.contentY
+    }
+  }
+
+  function inspectDetail(control) {
+    for (let item = control.parent; item; item = item.parent) {
+      if (item.followTail !== undefined) item.followTail = false
+      if (typeof item.captureReading === "function") item.captureReading()
+      else if (item.readingY !== undefined) item.readingY = item.contentY
+    }
+  }
+
+  component PanelFields: DetailFields {
+    id: panelFields
+    scope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+    foreground: root.mutedForeground
+    mutedForeground: root.mutedForeground
+    background: root.background
+    urgent: root.urgent
+    fontFamily: root.fontFamily
+    fontSize: root.fs(11)
+    onCopyRequested: original => Quickshell.clipboardText = original
+    onLeaveRequested: keyHandler.forceActiveFocus()
+    onFocusRevealed: control => root.revealDetail(control)
+    onInspecting: root.inspectDetail(panelFields)
+  }
+
+  component PanelDetail: PanelFields {
+    property string originalText: ""
+    property string metadata: ""
+    property bool error: false
+    entries: [PanelDetails.field("text", metadata, originalText, error)]
+  }
 
   function reviewScope(stage) {
     return ReviewView.scope(lastProject, projectViewRevision, plan, stage)
@@ -1082,7 +1135,7 @@ Item {
           const selected = Math.max(0, Math.min(index, root.reports.length - 1))
           root.selectedReportKey = root.reportKey(root.reports[selected], selected)
           reportList.positionViewAtIndex(selected, ListView.Contain)
-          reportList.readingY = reportList.contentY
+          reportList.captureReading()
           panelScroll.reveal(outputFrame)
         }
 
@@ -1099,7 +1152,7 @@ Item {
             view.scrollToTail()
           }
           if (view !== reportList) view.captureReading()
-          if (view === reportList) reportList.readingY = view.contentY
+          if (view === reportList) reportList.captureReading()
           panelScroll.reveal(outputFrame)
         }
 
@@ -1237,9 +1290,7 @@ Item {
                 event.accepted = true
               } else if (event.key === Qt.Key_J || event.key === Qt.Key_K) {
                 if (root.reportsVisible) {
-                  const selected = root.reports.findIndex(function(report, index) {
-                    return root.reportKey(report, index) === root.selectedReportKey
-                  })
+                  const selected = root.selectedReportIndex()
                   selectReport(selected < 0 ? 0 : selected + (event.key === Qt.Key_J ? 1 : -1))
                 } else selectStage(root.selectedStageIndex < 0 ? 0
                     : root.selectedStageIndex + (event.key === Qt.Key_J ? 1 : -1))
@@ -1254,9 +1305,7 @@ Item {
               } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
                          || event.key === Qt.Key_O || event.key === Qt.Key_Space) {
                 if (root.reportsVisible) {
-                  if (!root.reports.some(function(report, index) {
-                    return root.reportKey(report, index) === root.selectedReportKey
-                  })) selectReport(0)
+                  if (root.selectedReportIndex() < 0) selectReport(0)
                   root.expandedReportKey = root.expandedReportKey === root.selectedReportKey
                     ? "" : root.selectedReportKey
                 } else if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
@@ -1401,17 +1450,10 @@ Item {
             anchors.right: parent.right
             anchors.margins: Style.space(8)
             spacing: Style.space(4)
-            Text {
+            PanelDetail {
               width: parent.width
-              text: root.engineState ? root.engineState.goal : ""
-              textFormat: Text.PlainText
-              color: root.foreground
-              wrapMode: Text.Wrap
-              maximumLineCount: 2
-              elide: Text.ElideRight
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              font.bold: true
+              originalText: root.engineState ? root.engineState.goal : ""
+              metadata: "Goal"
             }
             Row {
               width: parent.width
@@ -1484,15 +1526,16 @@ Item {
                 font.pixelSize: root.fs(11)
               }
             }
-            Text {
-              visible: root.agentActive
+            PanelDetail {
+              // The state heartbeat's last_line is bounded to 200 characters.
+              // Full-text actions must use the complete retained feed instead.
+              visible: root.agentActive && liveEntries.count > 0
+              scope: JSON.stringify([root.lastProject, root.projectViewRevision, root.agentSession])
               width: parent.width
-              text: root.agentActive ? root.agent.last_line : ""
-              textFormat: Text.PlainText
-              color: root.mutedForeground
-              elide: Text.ElideRight
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
+              originalText: liveEntries.count > 0 ? liveEntries.get(liveEntries.count - 1).originalText : ""
+              metadata: "Latest retained output"
+              error: liveEntries.count > 0 && (liveEntries.get(liveEntries.count - 1).kind === "error"
+                || liveEntries.get(liveEntries.count - 1).stream === "stderr")
             }
           }
         }
@@ -1625,12 +1668,20 @@ Item {
           }
           Text {
             width: parent.width
-            text: root.quotaSummary(root.engineState ? root.engineState.claude_quota : null)
+            text: root.quotaSummary(root.engineState && root.engineState.claude_quota
+              ? Object.assign({}, root.engineState.claude_quota, {error: ""}) : null)
             textFormat: Text.PlainText
             color: root.foreground
             wrapMode: Text.Wrap
             font.family: root.fontFamily
             font.pixelSize: root.fs(12)
+          }
+          PanelDetail {
+            width: parent.width
+            visible: originalText !== ""
+            metadata: "Quota error"
+            error: true
+            originalText: root.engineState && root.engineState.claude_quota ? root.engineState.claude_quota.error || "" : ""
           }
           Text {
             width: parent.width
@@ -1641,14 +1692,12 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.fs(11)
           }
-          Text {
+          PanelDetail {
             width: parent.width
             visible: !!root.catalogue && !!root.catalogue.policy_error
-            text: root.catalogue && root.catalogue.policy_error ? root.catalogue.policy_error : ""
-            color: root.urgent
-            wrapMode: Text.Wrap
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(11)
+            originalText: root.catalogue && root.catalogue.policy_error ? root.catalogue.policy_error : ""
+            metadata: "Model policy error"
+            error: true
           }
           Text {
             width: parent.width
@@ -1661,22 +1710,16 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.fs(11)
           }
-          Repeater {
-            model: root.catalogue ? root.catalogue.providers : []
-            delegate: Text {
-              required property var modelData
-              width: parent.width
-              text: root.catalogueProviderText(modelData)
-              color: modelData.status === "unavailable" ? root.urgent : root.mutedForeground
-              wrapMode: Text.Wrap
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
-            }
+          PanelFields {
+            objectName: "providerDetails"
+            width: parent.width
+            entries: PanelDetails.providers(root.catalogue ? root.catalogue.providers : [])
           }
           Text {
             width: parent.width
             visible: !!root.catalogue
-            text: root.catalogueMetadataSummaryText(root.catalogue ? root.catalogue.metadata : null)
+            text: root.catalogueMetadataSummaryText(root.catalogue && root.catalogue.metadata
+              ? Object.assign({}, root.catalogue.metadata, {store_error: ""}) : null)
             color: root.catalogue && root.catalogue.metadata
               && (root.catalogue.metadata.source_errors || root.catalogue.metadata.store_error)
               ? root.urgent : root.mutedForeground
@@ -1685,6 +1728,13 @@ Item {
             font.pixelSize: root.fs(11)
           }
 
+          PanelDetail {
+            width: parent.width
+            visible: originalText !== ""
+            metadata: "Metadata store error"
+            error: true
+            originalText: root.catalogue && root.catalogue.metadata ? root.catalogue.metadata.store_error || "" : ""
+          }
         }
 
         // ---------------------------------------------------- goal
@@ -1875,76 +1925,22 @@ Item {
           visible: root.plan !== null || (root.engineState && root.engineState.architect_activity) || (root.architecture && root.architecture.context_status === "error")
           width: parent.width
           spacing: Style.space(4)
-          Text {
+          PanelFields {
+            objectName: "architectureDetails"
             width: parent.width
-            text: "Architecture · revision "
-              + (root.architecture && root.architecture.revision ? root.architecture.revision : "legacy")
-              + " · context " + (root.architecture ? root.architecture.context_status : "legacy")
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            wrapMode: Text.Wrap
-          }
-          Text {
-            width: parent.width
-            visible: text !== ""
-            text: root.engineState && root.engineState.persistence_error
-              ? root.engineState.persistence_error
-              : root.architecture && root.architecture.error ? root.architecture.error : ""
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            wrapMode: Text.Wrap
-          }
-          Text {
-            width: parent.width
-            text: root.architectActivityText(root.engineState ? root.engineState.architect_activity : null, root.architecture)
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            wrapMode: Text.Wrap
-          }
-          Text {
-            width: parent.width
-            text: root.architectGuidanceText(root.architecture)
-            visible: text !== ""
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            wrapMode: Text.Wrap
+            entries: PanelDetails.architecture(root.architecture,
+              root.engineState ? root.engineState.architect_activity : null,
+              root.engineState ? root.engineState.persistence_error : "")
           }
           Text {
             width: parent.width
             text: root.architectUsageText(root.plan)
             visible: text !== ""
+            textFormat: Text.PlainText
             color: root.mutedForeground
             font.family: root.fontFamily
             font.pixelSize: root.fs(12)
             wrapMode: Text.Wrap
-          }
-          Repeater {
-            model: root.architecture && root.architecture.unresolved_risks ? root.architecture.unresolved_risks : []
-            delegate: Text {
-              required property var modelData
-              width: parent.width
-              text: "Risk " + modelData.id + ": " + modelData.text
-              color: root.mutedForeground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              wrapMode: Text.Wrap
-            }
-          }
-          Repeater {
-            model: root.architecture && root.architecture.recent_decisions ? root.architecture.recent_decisions : []
-            delegate: Text {
-              required property var modelData
-              width: parent.width
-              text: root.architectDecisionText(modelData)
-              color: root.mutedForeground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              wrapMode: Text.Wrap
-            }
           }
         }
 
@@ -2020,65 +2016,46 @@ Item {
             height: Math.min(chatList.contentHeight, Style.space(96)) + Style.space(16)
             color: root.surface
             radius: 4
-            ListView {
+            Flickable {
               id: chatList
               anchors.fill: parent
               anchors.margins: Style.space(8)
               clip: true
-              spacing: Style.space(6)
               boundsBehavior: Flickable.StopAtBounds
-              model: root.chat
+              contentHeight: chatDetails.height
               property bool followTail: true
               property real readingY: 0
-
-              function scrollToTail() {
-                if (followTail && !moving) positionViewAtEnd()
-              }
+              function scrollToTail() { if (followTail && !moving) contentY = Math.max(0, contentHeight - height) }
               function restoreReadingPosition() {
-                // Polling replaces the array; preserve older messages while reading.
-                if (!followTail && !moving)
-                  contentY = Math.max(originY, Math.min(readingY,
-                    originY + contentHeight - height))
+                if (!followTail && !moving) contentY = Math.max(0, Math.min(readingY, Math.max(0, contentHeight - height)))
               }
-              onContentYChanged: {
-                if (moving) {
-                  followTail = atYEnd
-                  readingY = contentY
-                }
-              }
-              onMovementEnded: {
-                followTail = atYEnd
-                readingY = contentY
-              }
-              onModelChanged: {
-                Qt.callLater(restoreReadingPosition)
-                Qt.callLater(scrollToTail)
-              }
-              onContentHeightChanged: Qt.callLater(scrollToTail)
-              onHeightChanged: Qt.callLater(scrollToTail)
+              onContentYChanged: if (moving) { followTail = atYEnd; readingY = contentY }
+              onMovementEnded: { followTail = atYEnd; readingY = contentY }
+              onContentHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
+              onHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
               onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
-
-              delegate: Text {
-                required property var modelData
+              PanelFields {
+                id: chatDetails
+                objectName: "chatDetails"
                 width: chatList.width
-                text: (modelData.role === "user" ? "You: " : "Forge: ") + modelData.text
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-                color: modelData.role === "user" ? root.accent : root.foreground
-                font.bold: modelData.role === "user"
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
+                entries: root.chat.map(function(message, i) {
+                  // Chat has no durable IDs. Scope by plan, position and the
+                  // entire original record, keeping identical adjacent messages distinct.
+                  return PanelDetails.field(JSON.stringify([i, message]),
+                    message.role === "user" ? "You" : "Forge", message.text)
+                })
+                onInspecting: { chatList.followTail = false; chatList.readingY = chatList.contentY }
               }
             }
           }
         }
-
-        Text {
+        PanelDetail {
+          objectName: "localErrorDetail"
+          width: parent.width
           visible: root.localError !== ""
-          text: root.localError
-          color: root.urgent
-          font.family: root.fontFamily
-          font.pixelSize: root.fs(11)
+          originalText: root.localError
+          metadata: "Error"
+          error: true
         }
 
         // -------------------------------------------------- queue
@@ -2149,19 +2126,12 @@ Item {
                 font.pixelSize: root.fs(12)
                 font.bold: true
               }
-              Text {
+              PanelDetail {
                 id: queueGoal
                 width: Math.max(0, parent.width - queueGlyph.width - parent.spacing
                   - (queueControls.visible ? queueControls.width + parent.spacing : 0))
-                anchors.verticalCenter: parent.verticalCenter
-                text: queueRow.modelData.goal
-                textFormat: Text.PlainText
-                elide: Text.ElideRight
-                maximumLineCount: 1
-                color: queueRow.active ? root.accent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-                font.bold: queueRow.active
+                metadata: "Goal"
+                originalText: queueRow.modelData.goal
               }
               Row {
                 id: queueControls
@@ -2388,15 +2358,12 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
-                Text {
-                  visible: text !== ""
+                PanelFields {
                   width: stageRow.width
-                  text: root.stageModelErrors(stageRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.urgent
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
+                  entries: [
+                    PanelDetails.field("routing", "Routing error", (stageRow.modelData.reassessment || {}).error, true),
+                    PanelDetails.field("model", "Model blocked", stageRow.modelData.model_block, true)
+                  ].filter(function(f) { return f.text !== "" })
                 }
                 Repeater {
                   model: root.stageModelDetails(stageRow.modelData, stageRow.expanded)
@@ -2453,14 +2420,21 @@ Item {
                       Math.max(0, stageRow.reviewView.older - 8), stageRow.reviewView.older)
                   }
                   Text {
-                    visible: !!stageRow.reviewView.pending || !!stageRow.reviewView.error
+                    visible: !!stageRow.reviewView.pending
                     width: stageRow.width
-                    text: stageRow.reviewView.pending ? "Loading complete reviews…" : stageRow.reviewView.error
+                    text: "Loading complete reviews…"
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     color: stageRow.reviewView.error ? root.urgent : root.mutedForeground
                     font.family: root.fontFamily
                     font.pixelSize: root.fs(11)
+                  }
+                  PanelDetail {
+                    visible: originalText !== ""
+                    width: stageRow.width
+                    metadata: "Review load error"
+                    error: true
+                    originalText: stageRow.reviewView.error
                   }
                   Button {
                     visible: !!stageRow.reviewView.error && !!stageRow.reviewView.retry
@@ -2656,6 +2630,15 @@ Item {
           }
         }
 
+        PanelDetail {
+          id: logErrorText
+          visible: root.liveTab && root.logError !== ""
+          width: parent.width
+          originalText: root.logError
+          metadata: "Log error"
+          error: true
+        }
+
         Rectangle {
           id: outputFrame
           width: parent.width
@@ -2667,7 +2650,6 @@ Item {
             visible: root.liveTab
             anchors.fill: parent
             anchors.margins: Style.space(8)
-            anchors.topMargin: logErrorText.visible ? logErrorText.height + Style.space(12) : Style.space(8)
             model: liveEntries
             foreground: root.mutedForeground
             mutedForeground: root.mutedForeground
@@ -2680,19 +2662,6 @@ Item {
             fontSize: root.fs(10)
             onCopyRequested: original => Quickshell.clipboardText = original
             onLeaveRequested: keyHandler.forceActiveFocus()
-          }
-          Text {
-            id: logErrorText
-            visible: root.liveTab && root.logError !== ""
-            x: Style.space(8)
-            y: Style.space(8)
-            width: Math.max(0, parent.width - Style.space(16))
-            text: root.logError
-            textFormat: Text.PlainText
-            wrapMode: Text.Wrap
-            color: root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(10)
           }
           Row {
             id: historyFilters
@@ -2747,52 +2716,83 @@ Item {
             clip: true
             spacing: Style.space(6)
             boundsBehavior: Flickable.StopAtBounds
-            model: root.reports
+            model: reportEntries
+            // Retain lightweight headers and inspected editors while scrolling.
+            // Unopened report detail trees are created lazily below.
+            cacheBuffer: contentHeight
             property real readingY: 0
+            property string readingKey: ""
+            property real readingOffset: 0
+            function captureReading() {
+              readingY = contentY
+              const index = indexAt(1, contentY + 1)
+              const row = itemAtIndex(index)
+              if (row) { readingKey = row.key; readingOffset = contentY - row.y }
+            }
+            function sync() {
+              PanelDetails.reconcile(reportEntries, root.reportIndex.rows)
+              Qt.callLater(restoreReadingPosition)
+            }
+            ListModel { id: reportEntries }
+            Connections {
+              target: root
+              function onReportIndexChanged() { reportList.sync() }
+              function onProjectViewRevisionChanged() { reportEntries.clear(); reportList.readingKey = ""; reportList.sync() }
+            }
+            Component.onCompleted: sync()
 
             function restoreReadingPosition() {
-              if (!moving) contentY = Math.max(originY, Math.min(readingY,
-                originY + Math.max(0, contentHeight - height)))
+              if (moving) return
+              let target = readingY
+              for (let i = 0; i < count; ++i) {
+                const row = itemAtIndex(i)
+                if (row && row.key === readingKey) { target = row.y + readingOffset; break }
+              }
+              contentY = Math.max(originY, Math.min(target, originY + Math.max(0, contentHeight - height)))
             }
-            onContentYChanged: if (moving) readingY = contentY
-            onMovementEnded: readingY = contentY
+            onContentYChanged: if (moving) captureReading()
+            onMovementEnded: captureReading()
             onModelChanged: Qt.callLater(restoreReadingPosition)
+            onContentHeightChanged: Qt.callLater(restoreReadingPosition)
+            onWidthChanged: Qt.callLater(restoreReadingPosition)
             onHeightChanged: Qt.callLater(restoreReadingPosition)
             onVisibleChanged: if (visible) Qt.callLater(restoreReadingPosition)
 
             delegate: Rectangle {
               id: reportRow
-              required property var modelData
+              required property var model
               required property int index
-              readonly property string key: root.reportKey(modelData, index)
+              readonly property var modelData: JSON.parse(model.text)
+              readonly property string key: model.key
               readonly property bool expanded: root.expandedReportKey === key
+              property bool detailsLoaded: false
               readonly property int commitCount: modelData.commits && typeof modelData.commits.length === "number"
                 ? modelData.commits.length : 0
               width: reportList.width
               height: reportContent.implicitHeight + Style.space(8)
               radius: 3
               color: key === root.selectedReportKey ? Qt.darker(root.accent, 2.8) : "transparent"
-              TapHandler {
-                onTapped: {
-                  keyHandler.forceActiveFocus()
-                  root.selectedReportKey = reportRow.key
-                  root.expandedReportKey = reportRow.expanded ? "" : reportRow.key
-                }
-              }
               Column {
                 id: reportContent
                 x: Style.space(4)
                 y: Style.space(4)
                 width: parent.width - Style.space(8)
                 spacing: Style.space(4)
-                Text {
+                Button {
+                  objectName: "reportToggle"
+                  width: Math.min(implicitWidth, parent.width)
+                  text: reportRow.expanded ? "▾ Collapse report" : "▸ Expand report"
+                  onClicked: {
+                    root.selectedReportKey = reportRow.key
+                    reportList.captureReading()
+                    root.expandedReportKey = reportRow.expanded ? "" : reportRow.key
+                  }
+                }
+                PanelDetail {
+                  objectName: "reportGoal"
                   width: parent.width
-                  text: (reportRow.expanded ? "▾ " : "▸ ") + (reportRow.modelData.goal || "Untitled task")
-                  textFormat: Text.PlainText
-                  color: root.foreground
-                  elide: Text.ElideRight
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
+                  metadata: "Goal"
+                  originalText: reportRow.modelData.goal || ""
                 }
                 Text {
                   width: parent.width
@@ -2815,40 +2815,18 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(10)
                 }
-                Text {
+                Loader {
+                  id: reportDetailsLoader
                   visible: reportRow.expanded
                   width: parent.width
-                  text: "goal: " + (reportRow.modelData.goal || "Untitled task")
-                    + "\ncommits:\n" + (root.reportCommits(reportRow.modelData.commits) || "No commits")
-                    + "\n" + root.reportLifecycleText(reportRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
-                }
-                Text {
-                  visible: reportRow.expanded && text !== ""
-                  width: parent.width
-                  text: root.usageBreakdown(reportRow.modelData.usage)
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
-                }
-                Text {
-                  visible: reportRow.expanded && text !== ""
-                  width: parent.width
-                  text: {
-                    const usage = root.usageBreakdown(reportRow.modelData.planner_usage)
-                    return usage ? "planner usage:\n" + usage : ""
+                  active: reportRow.expanded || reportRow.detailsLoaded
+                  onLoaded: reportRow.detailsLoaded = true
+                  sourceComponent: PanelFields {
+                    objectName: "reportDetails"
+                    width: reportDetailsLoader.width
+                    entries: PanelDetails.report(reportRow.modelData, root)
+                    onInspecting: reportList.captureReading()
                   }
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
                 }
               }
             }
@@ -2907,13 +2885,10 @@ Item {
                 id: catalogueSettings
                 width: parent.width
                 spacing: Style.space(6)
-                Text {
+                PanelDetail {
                   width: parent.width
-                  text: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Automatic routing defaults on: a legacy provider alone is a preference; a nonempty global implementer_model still pins provider/model. Disabling automatic routing constrains choices to the implementer provider. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
-                  wrapMode: Text.Wrap
-                  color: root.mutedForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
+                  originalText: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Automatic routing defaults on: a legacy provider alone is a preference; a nonempty global implementer_model still pins provider/model. Disabling automatic routing constrains choices to the implementer provider. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
+                  metadata: "Model policy help"
                 }
                 Rectangle {
                   width: parent.width
@@ -2946,17 +2921,10 @@ Item {
                   enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
                   onClicked: root.saveCatalogue()
                 }
-                Repeater {
-                  model: root.catalogueDetails ? root.catalogueDetails.options : []
-                  delegate: Text {
-                    required property var modelData
-                    width: parent.width
-                    text: root.catalogueOptionText(modelData)
-                    wrapMode: Text.Wrap
-                    color: modelData.eligible ? root.foreground : root.urgent
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
+                PanelFields {
+                  objectName: "catalogueOptions"
+                  width: parent.width
+                  entries: PanelDetails.options(root.catalogueDetails ? root.catalogueDetails.options : [], root.catalogueOptionText)
                 }
                 Row {
                   spacing: Style.space(8)
@@ -2975,31 +2943,17 @@ Item {
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(11)
                 }
-                Repeater {
-                  model: root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.records : []
-                  delegate: Text {
-                    required property var modelData
-                    width: parent.width
-                    text: root.catalogueMetadataText(modelData)
-                    wrapMode: Text.Wrap
-                    color: modelData.removed ? root.mutedForeground : root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
+                PanelFields {
+                  objectName: "catalogueMetadata"
+                  width: parent.width
+                  entries: PanelDetails.metadata(root.catalogueDetails && root.catalogueDetails.metadata
+                    ? root.catalogueDetails.metadata.records : [], root.catalogueStamp)
                 }
-                Repeater {
-                  model: root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.sources : []
-                  delegate: Text {
-                    required property var modelData
-                    width: parent.width
-                    text: root.catalogueMetadataSourceText(modelData)
-                    wrapMode: Text.Wrap
-                    color: modelData.error ? root.urgent : root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(10)
-                  }
+                PanelFields {
+                  objectName: "catalogueSources"
+                  width: parent.width
+                  entries: PanelDetails.sources(root.catalogueDetails && root.catalogueDetails.metadata
+                    ? root.catalogueDetails.metadata.sources : [], root.catalogueStamp)
                 }
                 Repeater {
                   model: root.catalogueDetails && root.catalogueDetails.metadata
@@ -3078,14 +3032,12 @@ Item {
               }
             }
 
-            Text {
+            PanelDetail {
               visible: root.diffError !== ""
               width: parent.width
-              text: root.diffError
-              color: root.urgent
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(10)
-              wrapMode: Text.WrapAnywhere
+              originalText: root.diffError
+              metadata: "Diff error"
+              error: true
             }
 
             ListView {
@@ -3243,12 +3195,23 @@ Item {
                 required property int index
                 readonly property bool selectable: chooserList.isSelectable(modelData)
                 width: chooserList.width
-                height: rowText.implicitHeight + Style.space(10)
+                height: (chooserError.visible ? chooserError.implicitHeight : rowText.implicitHeight) + Style.space(10)
                 radius: 4
                 color: selectable && (chooserRowArea.containsMouse || chooserList.currentIndex === index)
                   ? Qt.darker(root.accent, 2.8) : "transparent"
 
+                PanelDetail {
+                  id: chooserError
+                  visible: chooserRow.modelData.kind === "note"
+                  width: parent.width - Style.space(12)
+                  x: Style.space(6)
+                  y: Style.space(5)
+                  metadata: "Project discovery error"
+                  error: true
+                  originalText: visible ? chooserRow.modelData.label : ""
+                }
                 Row {
+                  visible: !chooserError.visible
                   anchors.verticalCenter: parent.verticalCenter
                   x: Style.space(6)
                   spacing: Style.space(8)

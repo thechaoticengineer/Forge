@@ -1,0 +1,336 @@
+pragma ComponentBehavior: Bound
+import QtQuick
+import QtQuick.Controls
+import QtTest
+import "components"
+import "components/PanelDetails.js" as PanelDetails
+Item {
+    id: root
+    width: 360
+    height: 700
+    property color foreground: "white"
+    property color mutedForeground: "#cccccc"
+    property color background: "#202020"
+    property color surface: "#202020"
+    property color urgent: "red"
+    property color accent: "#8888ff"
+    property string fontFamily: "monospace"
+    property string lastProject: "/fixture"
+    property int projectViewRevision: 1
+    property var plan: ({plan_id:"fixture"})
+    property var architecture: ({})
+    property var engineState: ({})
+    property var catalogue: ({})
+    property var catalogueDetails: ({})
+    property string localError: ""
+    property var chat: []
+    property bool chatExpanded: true
+    property var reports: []
+    property bool reportsVisible: mode === "reports"
+    property string selectedReportKey: ""
+    property string expandedReportKey: ""
+    property double agentNow: 1800000000
+    property var queue: []
+    property bool editingPlan: false
+    property bool engineOnline: true
+    property bool busy: false
+    property bool queueActive: false
+    property bool hasQueuedGoals: true
+    property int actions: 0
+    property string mode: "architecture"
+    function fs(n) { return n }
+    function act() { actions++ }
+    QtObject { id: style; function space(n) { return n } }
+    QtObject { id: clipboard; property string clipboardText: "" }
+    Item { id: keyHandler; focus: true }
+    // PANEL_HELPERS
+    Flickable {
+        id: panelScroll
+        anchors.fill: parent
+        contentHeight: pane.height
+        clip: true
+        Column {
+            id: pane
+            width: root.width
+            Column { visible: root.mode === "localError"; width: parent.width; // PANEL_LOCAL_ERROR
+            }
+            Column { visible: root.mode === "architecture"; width: parent.width; // PANEL_ARCHITECTURE
+            }
+            Column { visible: root.mode === "providers"; width: parent.width; // PANEL_PROVIDERS
+            }
+            Column { visible: root.mode === "options"; width: parent.width; // PANEL_OPTIONS
+            }
+            Column { visible: root.mode === "sources"; width: parent.width; // PANEL_SOURCES
+            }
+            Column { visible: root.mode === "metadata"; width: parent.width; // PANEL_METADATA
+            }
+            Column { visible: root.mode === "chat"; width: parent.width; // PANEL_CHAT
+            }
+            Column { visible: root.mode === "queue"; width: parent.width; // PANEL_QUEUE
+            }
+        }
+    }
+    Item { id: historyFilters; height: 0 }
+    // PANEL_REPORT
+    TestCase {
+        name: "ActualPanelDetails"
+        when: windowShown
+        readonly property var values: ["\n\t\r\n  first LF  \nlast  \t", "\r\n  first CRLF\r\nlast \t", "\r \rfirst CR\rlast  ",
+            "\n \t\r\n", "\n界🙂 é <b>literal</b> & text\nlast  ", "W".repeat(5000)]
+        function all(item, predicate) {
+            const found=[]
+            function walk(x) {
+                if (predicate(x)) found.push(x)
+                for (const child of x.children || []) walk(child)
+            }
+            walk(item);return found
+        }
+        function named(item, name) { return all(item,x=>x.objectName===name)[0] || null }
+        function details(item) { return all(item, x=>x.compactDetailFocusScope === true && x.visible) }
+        function group() {
+            const names={architecture:"architectureDetails",providers:"providerDetails",options:"catalogueOptions",
+                sources:"catalogueSources",metadata:"catalogueMetadata",chat:"chatDetails",reports:"reportDetails"}
+            return named(root,names[root.mode])
+        }
+        function click(item) {
+            verify(!!item,"control exists")
+            root.revealDetail(item);wait(20)
+            mouseClick(item,Math.min(20,item.width/2),Math.min(12,item.height/2));wait(20)
+        }
+        function init() {
+            root.localError="";root.mode="architecture";root.width=360;root.lastProject="/fixture";root.projectViewRevision++
+            panelScroll.contentY=0;root.expandedReportKey="";root.selectedReportKey="";root.actions=0
+            const v=values
+            root.architecture={revision:5,context_status:"needs_recovery",error:v[1],
+                recovery:{reason:v[2]},guidance:{1:{valid:true,text:v[0]},2:{valid:false,text:v[5]}},
+                unresolved_risks:v.map((text,i)=>({id:"r"+i,text:text})),
+                recent_decisions:[{id:"d1",status:"accepted",summary:v[4],rationale:v[0],supersedes:"d0",
+                    alternatives:[{description:v[1],tradeoffs:v[2]},{description:v[3],tradeoffs:v[5]}]}]}
+            root.engineState={persistence_error:v[0],architect_activity:{status:"blocked",error:v[5],reason:v[4]}}
+            root.catalogue={providers:v.map((text,i)=>({provider:"p"+i,status:"unavailable",model_count:2,
+                cached_stale:true,blocker:{message:text},error:{message:text},cache_error:text,description:text}))}
+            root.catalogueDetails={options:v.map((text,i)=>({provider:"p",model:"model"+i,tier:"strong",availability:"unverified",
+                effort:"high",policy_revision:5,eligible:false,error:text,description:text})),metadata:{
+                sources:v.map(text=>({url:text,error:text,failures:2,next_attempt_unix:100,checked_unix:50})),
+                records:v.map((text,i)=>({provider:"p",model:"m"+i,provenance:text,description:text,verified_unix:100,
+                    removed:true,conflicts:["c"],pricing:{label:text,input:1,output:2,currency:"USD",unit:"per million tokens",basis:"API",as_of:"2026"}}))}}
+            root.chat=v.map(text=>({role:"user",text:text})).concat([{role:"user",text:v[0]}])
+            root.queue=[{id:1,status:"queued",goal:v[5]},{id:2,status:"failed",goal:v[0]}]
+            root.reports=Array.from({length:4},(_,i)=>({unix:100+i,plan_id:"plan"+i,revision:5,project:"/fixture",goal:v[5],
+                duration_secs:30,commits:v.map((text,n)=>({sha:"sha"+n,message:text})),
+                architecture:{summary:v[0],recent_decisions:root.architecture.recent_decisions,unresolved_risks:root.architecture.unresolved_risks},
+                stage_outcomes:[{id:1,title:"Visible stage title",status:"committed",review_gate:{status:"error",roles:{architect:"pending",reviewer:"approved"}},
+                    model_agreement:{valid:true,effective:{provider:"codex",model:"configured",native_effort:"high"},availability:"unverified",planner_reason:v[0],architect_reason:v[1]},
+                    review_policy:{rationale:v[2]}}],usage:{codex:{input_tokens:1,output_tokens:2,total_tokens:3,calls:1,models:{configured:3}}}}))
+            wait(80)
+        }
+        function test_prose_matrix_data() {
+            const rows=[]
+            for (const mode of ["architecture","providers","options","sources","metadata","chat","reports"])
+                for (const width of [280,800]) rows.push({tag:mode+"-"+width,mode:mode,width:width})
+            return rows
+        }
+        function test_prose_matrix(data) {
+            root.width=data.width;root.mode=data.mode;wait(50)
+            if (data.mode==="reports") click(named(root,"reportToggle"))
+            const g=group(), ds=details(g)
+            verify(ds.length>=values.length,"every record is retained")
+            for (const source of values) {
+                const d=ds.find(x=>x.originalText===source)
+                verify(!!d,"original field exists: "+JSON.stringify(source.slice(0,40)))
+                const preview=named(d,"detailPreview"), toggle=named(d,"detailToggle")
+                compare(d.expanded,false)
+                compare(preview.maximumLineCount,1);compare(preview.wrapMode,Text.NoWrap);compare(preview.textFormat,Text.PlainText)
+                verify(preview.width>0,"preview has available width")
+                verify(toggle.x+toggle.width<=d.width+0.5,"expand button fits")
+                if (source===values[5]) verify(preview.truncated,"renderer actually elides long line")
+                click(toggle)
+                const editor=named(d,"detailFullText")
+                verify(!!editor);verify(editor.readOnly);verify(editor.selectByMouse)
+                editor.select(0,editor.length);verify(editor.selectedText.length>0)
+                click(named(d,"detailCopy"));compare(clipboard.clipboardText,source,"exact original including CR/CRLF")
+                const expandedReport=root.expandedReportKey
+                editor.forceActiveFocus();keyClick(Qt.Key_A,Qt.ControlModifier);keyClick(Qt.Key_C,Qt.ControlModifier)
+                verify(editor.selectedText.length>0)
+                keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
+                compare(root.expandedReportKey,expandedReport,"nested keys and clicks leave report expansion unchanged")
+                click(toggle)
+            }
+            const statuses=all(g,x=>x.objectName==="fieldStatus" && x.visible)
+            for (const status of statuses) {
+                compare(status.textFormat,Text.PlainText);compare(status.wrapMode,Text.Wrap)
+                verify(status.width<=data.width,"status stays within available width")
+                verify(status.height>=status.contentHeight,"status body remains visible")
+            }
+        }
+        function test_local_error_in_column_data() {
+            return [280,800].map(width=>({tag:String(width),width:width}))
+        }
+        function test_local_error_in_column(data) {
+            root.mode="localError";root.width=data.width
+            for (const source of values) {
+                root.localError=source;wait(30)
+                const field=named(root,"localErrorDetail"), d=details(field)[0]
+                verify(field.visible);compare(field.width,data.width);verify(field.height>0)
+                verify(d.visible);verify(d.width>0)
+                const preview=named(d,"detailPreview"), toggle=named(d,"detailToggle")
+                verify(preview.visible);verify(preview.width>0);verify(preview.height>0)
+                compare(d.metadata,"! Error");compare(d.foreground,root.urgent)
+                verify(!named(d,"detailMetadata").truncated,"error indicator is readable")
+                verify(toggle.width>40);verify(toggle.x+toggle.width<=data.width)
+                if(source===values[5]) verify(preview.truncated)
+                root.revealDetail(toggle);toggle.forceActiveFocus();keyClick(Qt.Key_Space);wait(20)
+                verify(d.expanded)
+                keyClick(Qt.Key_Tab);verify(named(d,"detailCopy").activeFocus)
+                keyClick(Qt.Key_Space);compare(clipboard.clipboardText,source)
+                const editor=named(d,"detailFullText");editor.select(0,editor.length)
+                verify(editor.selectedText.length>0)
+                click(named(d,"detailCopy"));compare(clipboard.clipboardText,source)
+                click(toggle)
+            }
+        }
+        function test_report_cap_responsiveness_data() {
+            return [280,800].map(width=>({tag:String(width),width:width}))
+        }
+        function test_report_cap_responsiveness(data) {
+            const template=root.reports[0]
+            root.mode="reports";root.width=data.width;root.reports=[];wait(30)
+            // The complete multiline report from the surface matrix, at the
+            // engine's 100-report cap. Measure synchronous work, excluding waits.
+            const reports=Array.from({length:100},(_,i)=>Object.assign({},template,{unix:100+i}))
+            const started=Date.now();root.reports=reports;const assignMs=Date.now()-started
+            wait(150)
+            compare(reportList.count,100)
+            compare(all(reportList,x=>x.objectName==="reportDetails").length,0,"collapsed details are never constructed")
+            const objects=all(reportList,()=>true).length
+            verify(objects<4000,"collapsed header objects stay bounded: "+objects)
+            root.selectedReportKey=root.reportKey(root.reports[50],50)
+            const navStart=Date.now()
+            for(let i=0;i<1000;i++) compare(root.selectedReportIndex(),50)
+            const navMs=Date.now()-navStart
+            verify(navMs<100,"1000 cached navigation lookups: "+navMs+"ms")
+            // Open an interior report, select text, scroll away and back, then
+            // prepend at the cap. Its loaded subtree and reading anchor survive.
+            root.expandedReportKey=root.selectedReportKey;wait(40)
+            const row=reportList.itemAtIndex(50)
+            compare(all(reportList,x=>x.objectName==="reportDetails").length,1)
+            const g=named(row,"reportDetails"), d=details(g).find(x=>x.metadata==="Architecture")
+            click(named(d,"detailToggle"))
+            const editor=named(d,"detailFullText");editor.select(3,15);const selection=editor.selectedText
+            reportList.captureReading();const anchor=reportList.readingKey,offset=reportList.readingOffset
+            reportList.positionViewAtEnd();wait(30)
+            reportList.restoreReadingPosition();wait(30)
+            compare(named(d,"detailFullText"),editor);compare(editor.selectedText,selection)
+            let maxPollMs=0
+            for(let i=0;i<5;i++) {
+                const next=[Object.assign({},template,{unix:300+i})].concat(JSON.parse(JSON.stringify(root.reports)).slice(0,99))
+                const pollStart=Date.now();root.reports=next;maxPollMs=Math.max(maxPollMs,Date.now()-pollStart)
+                wait(40)
+                compare(reportList.count,100);compare(named(d,"detailFullText"),editor);compare(editor.selectedText,selection)
+                compare(reportList.readingKey,anchor);compare(reportList.readingOffset,offset)
+                const anchorRow=all(reportList,x=>x.key===anchor && x.modelData!==undefined)[0]
+                verify(!!anchorRow,"anchor row survives capped polling")
+                verify(Math.abs(reportList.contentY-anchorRow.y-offset)<2,"cap polling preserves actual viewport anchor: "
+                    +JSON.stringify({y:reportList.contentY,rowY:anchorRow.y,offset:offset,anchor:anchor,selected:row.key}))
+                compare(all(reportList,x=>x.objectName==="reportDetails").length,1)
+            }
+            // Collapse the outer report without discarding inspected fields.
+            const key=root.expandedReportKey;root.expandedReportKey="";wait(20);root.expandedReportKey=key;wait(30)
+            compare(named(d,"detailFullText"),editor);compare(editor.selectedText,selection)
+            click(named(d,"detailCopy"));compare(clipboard.clipboardText,values[0])
+            verify(assignMs<300,"100-report assignment: "+assignMs+"ms")
+            verify(maxPollMs<200,"cap prepend polling: "+maxPollMs+"ms")
+            console.log("REPORT_CAP width="+data.width+" assignment_ms="+assignMs+" navigation_1000_ms="+navMs
+                +" max_prepend_ms="+maxPollMs+" collapsed_objects="+objects)
+        }
+        function test_keyboard_traversal_and_polling() {
+            root.mode="architecture";wait(30)
+            let d=details(group()).find(x=>x.metadata==="Risk r0")
+            const toggle=named(d,"detailToggle")
+            root.revealDetail(toggle);toggle.forceActiveFocus();keyClick(Qt.Key_Space);wait(30)
+            verify(d.expanded)
+            keyClick(Qt.Key_Tab);wait(20)
+            verify(named(d,"detailCopy").activeFocus,"Tab reaches copy control")
+            keyClick(Qt.Key_Space);compare(clipboard.clipboardText,d.originalText)
+            const editor=named(d,"detailFullText");editor.select(3,15);const selection=editor.selectedText
+            for(let i=0;i<8;i++) {
+                const cp=JSON.parse(JSON.stringify(root.architecture));cp.context_status=i%2 ? "needs_recovery" : "error"
+                cp.unresolved_risks.push({id:"new"+i,text:values[5]});root.architecture=cp;wait(10)
+                compare(named(d,"detailFullText"),editor);compare(editor.selectedText,selection)
+            }
+            root.width=280;wait(30);compare(editor.selectedText,selection)
+            const cp=JSON.parse(JSON.stringify(root.architecture));cp.unresolved_risks[0].text="changed\nnew body";root.architecture=cp;wait(20)
+            compare(editor.selectedText,selection);compare(d.originalText,values[0],"open snapshot stays readable")
+            click(named(d,"detailCopy"));compare(clipboard.clipboardText,values[0])
+            click(toggle);compare(d.originalText,"changed\nnew body")
+        }
+        function test_chat_and_reports_polling_anchors() {
+            root.mode="chat";wait(40)
+            const chatView=all(root,x=>x.followTail!==undefined)[0]
+            const d=details(group())[0];click(named(d,"detailToggle"))
+            const editor=named(d,"detailFullText");editor.select(3,15);const selection=editor.selectedText
+            chatView.contentY=0;chatView.readingY=0
+            for(let i=0;i<8;i++) {root.chat=root.chat.concat([{role:"assistant",text:values[5]}]);wait(20)}
+            verify(!chatView.followTail);compare(chatView.contentY,0);compare(editor.selectedText,selection)
+            root.chatExpanded=false;wait(20);root.chatExpanded=true;wait(20);compare(editor.selectedText,selection)
+            root.mode="reports";wait(40)
+            const view=all(root,x=>x.readingKey!==undefined)[0]
+            click(named(root,"reportToggle"))
+            const rd=details(group()).find(x=>x.metadata==="Architecture");click(named(rd,"detailToggle"))
+            const re=named(rd,"detailFullText");re.select(3,15);const rs=re.selectedText
+            view.captureReading();const anchor=view.readingKey,offset=view.readingOffset
+            for(let i=0;i<8;i++) {
+                root.reports=[{unix:200+i,goal:"new report",commits:[]}].concat(JSON.parse(JSON.stringify(root.reports)))
+                wait(40)
+                compare(named(rd,"detailFullText"),re);compare(re.selectedText,rs)
+                compare(view.readingKey,anchor);compare(view.readingOffset,offset)
+            }
+            const row=all(view,x=>x.key===anchor && x.modelData!==undefined)[0]
+            verify(!!row);verify(Math.abs(view.contentY-row.y-offset)<2,"report anchor remains at same viewport offset")
+            for (const width of [280,800]) {
+                root.width=width;wait(50)
+                compare(re.selectedText,rs)
+                verify(Math.abs(view.contentY-row.y-offset)<2,"report resize preserves reading anchor")
+            }
+            root.mode="chat";wait(30);root.mode="reports";wait(30)
+            compare(re.selectedText,rs,"report filter toggle preserves selected editor")
+            root.projectViewRevision++;wait(30)
+            compare(root.expandedReportKey!=="",true) // project handler owns this reset in the full panel
+            verify(details(group()).every(x=>!x.expanded),"nested selection is reset with project scope")
+        }
+        function test_mouse_selection_and_disappearing_error_snapshot() {
+            root.mode="reports";wait(30)
+            const goal=named(root,"reportGoal"), d=details(goal)[0]
+            click(named(d,"detailToggle"))
+            const editor=named(d,"detailFullText")
+            root.revealDetail(editor);wait(30)
+            mousePress(editor,10,12)
+            mouseMove(editor,90,12,30)
+            mouseRelease(editor,90,12)
+            verify(editor.selectedText.length>0,"real drag selects text")
+            compare(root.expandedReportKey,"","drag never toggles parent report")
+            click(named(d,"detailCopy"));compare(clipboard.clipboardText,values[5])
+            root.mode="architecture";wait(30)
+            const error=details(group()).find(x=>x.metadata.indexOf("Persistence error")>=0)
+            click(named(error,"detailToggle"))
+            const body=named(error,"detailFullText");body.select(3,15);const selected=body.selectedText
+            root.engineState={architect_activity:{status:"ready"}};wait(30)
+            compare(named(error,"detailFullText"),body);compare(body.selectedText,selected)
+            verify(error.metadata.indexOf("previously shown")>=0)
+            click(named(error,"detailCopy"));compare(clipboard.clipboardText,values[0])
+            click(named(error,"detailToggle"));wait(30)
+            verify(!details(group()).some(x=>x.metadata.indexOf("Persistence error")>=0))
+        }
+        function test_queue_controls_and_report_metadata() {
+            root.mode="queue";root.width=280;wait(30)
+            const start=all(root,x=>x.label==="Start queue")[0];verify(!!start);click(start);compare(root.actions,1)
+            const d=details(pane)[0];verify(named(d,"detailPreview").truncated)
+            click(named(d,"detailToggle"));click(named(d,"detailCopy"));compare(clipboard.clipboardText,values[5]);compare(root.actions,1)
+            root.mode="reports";wait(30)
+            const toggle=named(root,"reportToggle");verify(toggle.width<=280);click(toggle)
+            const statuses=all(group(),x=>x.objectName==="fieldStatus" && x.visible).map(x=>x.text).join("\n")
+            for(const word of ["Visible stage title","committed","Recorded aggregate: error","independent: approved","architect: pending","configured","unverified"])
+                verify(statuses.includes(word),word+" remains independent of prose")
+        }
+    }
+}
