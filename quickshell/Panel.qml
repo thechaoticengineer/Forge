@@ -2,6 +2,9 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+// qs.Ui exports its own Button, which shadows the Controls one and carries a
+// different API. Controls-specific buttons name it explicitly.
+import QtQuick.Controls as QQC
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -2322,7 +2325,7 @@ Item {
                 visible: !stageRow.editable
                 width: stageRow.width
                 spacing: 2
-                Button {
+                QQC.Button {
                   id: stageToggle
                   objectName: "stageToggle"
                   width: stageRow.width
@@ -2495,7 +2498,7 @@ Item {
                           originalText: modelData.text
                         }
                       }
-                      Button {
+                      QQC.Button {
                         id: stageRoutingToggle
                         objectName: "stageRoutingToggle"
                         width: stageRow.width
