@@ -4,6 +4,7 @@ import QtQuick.Controls
 import QtTest
 import "components"
 import "components/PanelDetails.js" as PanelDetails
+import "components/PlanReview.js" as PlanReview
 Item {
     id: root
     width: 360
@@ -39,7 +40,15 @@ Item {
     property int actions: 0
     property string mode: "architecture"
     function fs(n) { return n }
-    function act() { actions++ }
+    property var settingsPatch: null
+    property var historyPages: []
+    property var historyPaths: []
+    function act(path, body) { actions++; settingsPatch = body }
+    function api(method, path, body, done) {
+        historyPaths.push(path)
+        const page = historyPages.shift()
+        Qt.callLater(function() { done(page, page.httpStatus || 200) })
+    }
     QtObject { id: style; function space(n) { return n } }
     QtObject { id: clipboard; property string clipboardText: "" }
     Item { id: keyHandler; focus: true }
@@ -52,6 +61,10 @@ Item {
         Column {
             id: pane
             width: root.width
+            Column { visible: root.mode === "planReview"; width: parent.width; // PANEL_PLAN_REVIEW
+            }
+            Column { visible: root.mode === "cadence"; width: parent.width; // PANEL_CADENCE
+            }
             Column { visible: root.mode === "localError"; width: parent.width; // PANEL_LOCAL_ERROR
             }
             Column { visible: root.mode === "architecture"; width: parent.width; // PANEL_ARCHITECTURE
@@ -123,6 +136,81 @@ Item {
                     model_agreement:{valid:true,effective:{provider:"codex",model:"configured",native_effort:"high"},availability:"unverified",planner_reason:v[0],architect_reason:v[1]},
                     review_policy:{rationale:v[2]}}],usage:{codex:{input_tokens:1,output_tokens:2,total_tokens:3,calls:1,models:{configured:3}}}}))
             wait(80)
+        }
+        function test_cadence_keyboard() {
+            root.mode="cadence";root.engineOnline=true
+            root.engineState={settings:{review_cadence:{architect:"per_stage",reviewer:"per_plan"}}};wait(30)
+            const architect=named(root,"architectCadence"), reviewer=named(root,"reviewerCadence")
+            compare(architect.label,"architect review: per stage")
+            compare(reviewer.label,"reviewer review: per plan")
+            keyHandler.forceActiveFocus();keyClick(Qt.Key_Tab);wait(20)
+            verify(architect.activeFocus,"Tab reaches architect cadence")
+            keyClick(Qt.Key_Space);compare(root.actions,1)
+            compare(root.settingsPatch.review_cadence.architect,"per_plan")
+            compare(root.settingsPatch.review_cadence.reviewer,"per_plan")
+            keyClick(Qt.Key_Tab);verify(reviewer.activeFocus)
+            keyClick(Qt.Key_Return);compare(root.actions,2)
+            compare(root.settingsPatch.review_cadence.architect,"per_stage")
+            compare(root.settingsPatch.review_cadence.reviewer,"per_stage")
+            keyClick(Qt.Key_Enter);compare(root.actions,3)
+            keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
+            root.engineState=null;wait(20);verify(architect.label.indexOf("unavailable")>0)
+            root.engineOnline=false;wait(20);verify(!architect.activeFocusOnTab)
+            root.engineOnline=true
+        }
+        function test_plan_review_full_requests_data() {
+            return [280,800].map(width=>({tag:String(width),width:width}))
+        }
+        function test_plan_review_full_requests(data) {
+            root.mode="planReview";root.width=data.width
+            const identity={plan_id:"fixture",revision:1,scope:"plan",stage_id:null,attempt_id:"attempt",round:2,
+                snapshot:{head:"head",tree:"tree"},policy:{required_roles:["architect","reviewer"]}}
+            const originals=Array.from({length:12},(_,i)=>"request "+i+"\r\n  界🙂 <b>plain</b> & é\n"+"full text ".repeat(60)+"\nlast  \t")
+            const records=["architect","reviewer"].map(role=>({role:role,identity:Object.assign({},identity,{role:role}),issues:originals,notes:[]}))
+            root.historyPaths=[]
+            root.historyPages=records.map((record,i)=>({plan_id:"fixture",event_end:200,next_cursor:i===0?100:null,
+                items:[{plan_id:"fixture",id:"event"+i,payload:{kind:"plan_review",reviews:[record]}}]}))
+            root.historyPages.unshift({httpStatus:503,error:"History unavailable"})
+            root.plan={plan_id:"fixture",revision:1,plan_review:{attempt_id:"attempt",rounds:2,budget:1,status:"exhausted",fix_sha:"abc123",
+                gate:{status:"exhausted",identity:identity,roles:{architect:"changes_requested",reviewer:"changes_requested"},
+                    requests_truncated:true,requests:originals.slice(0,8).map(text=>({role:"architect",text:text.slice(0,240)}))}}}
+            wait(40)
+            const section=named(root,"planReviewSection"), detail=named(section,"planReviewRequests")
+            verify(section.visible);compare(root.historyPaths.length,0,"state polling does not load history")
+            const status=named(section,"fieldStatus").text
+            for (const value of ["exhausted","round 2 of 2","Architect: changes_requested","Independent: changes_requested","Fix commit: abc123"])
+                verify(status.indexOf(value)>=0,value)
+            const preview=originals.slice(0,8).map(text=>"[architect] "+text.slice(0,240)).join("\n\n")
+            function verifyPreview() {
+                compare(detail.textComplete,false);compare(detail.originalText,preview)
+                const line=named(detail,"detailPreview")
+                verify(line.visible && line.width>0 && line.height>0)
+                verify(line.text.indexOf("[architect] request 0")===0)
+                verify(line.text.indexOf("(empty text)")<0)
+                const label=all(section,x=>x.objectName==="fieldStatus" && x.text.indexOf("Shortened preview")===0)[0]
+                verify(!!label && label.visible);verify(label.wrapMode!==Text.NoWrap)
+                verify(!named(detail,"detailFullText"));verify(!named(detail,"detailCopy"))
+            }
+            verifyPreview()
+            click(named(detail,"detailToggle"));tryCompare(detail,"detailError","History unavailable")
+            verifyPreview();compare(root.historyPaths.length,1)
+            click(all(detail,x=>x.text==="Retry full text" && x.clicked!==undefined)[0])
+            tryCompare(detail,"textComplete",true)
+            compare(root.historyPaths.length,3)
+            compare(all(section,x=>x.objectName==="fieldStatus" && x.text.indexOf("Shortened preview")===0 && x.visible).length,0)
+            const expected=["architect","reviewer"].map(role=>originals.map(text=>"["+role+"] "+text).join("\n\n")).join("\n\n")
+            const editor=named(detail,"detailFullText")
+            verify(!!editor);compare(detail.originalText,expected)
+            compare(editor.text,expected.replace(/\r\n|\r/g,"\n"));compare(editor.textFormat,TextEdit.PlainText)
+            verify(editor.readOnly && editor.selectByMouse);verify(editor.wrapMode!==TextEdit.NoWrap)
+            editor.select(0,9);compare(editor.selectedText,expected.slice(0,9))
+            click(named(detail,"detailCopy"));compare(clipboard.clipboardText,expected)
+            const held=editor
+            root.plan=JSON.parse(JSON.stringify(root.plan));wait(30)
+            compare(named(detail,"detailFullText"),held);compare(held.selectedText,expected.slice(0,9))
+            editor.forceActiveFocus();keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
+            root.projectViewRevision++;wait(30)
+            compare(detail.expanded,false);compare(detail.textComplete,false)
         }
         function test_prose_matrix_data() {
             const rows=[]

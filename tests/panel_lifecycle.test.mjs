@@ -33,3 +33,32 @@ test('pending recovery and current gates take precedence over old approval in pa
   assert.ok(!text.includes('approved'));
   assert.match(ctx.lifecycleSummary({}),/inactive/);
 });
+
+const cadence = {};
+vm.runInNewContext(panel.slice(panel.indexOf('  function reviewCadenceLabel('),panel.indexOf('  function planReviewStatusText(')),cadence);
+test('cadence controls toggle only their role and post both normalized keys',()=>{
+  for(const current of [{architect:'per_stage',reviewer:'per_plan'}, {architect:'per_plan',reviewer:'per_stage'},
+    {architect:'unknown'}, undefined]) for(const role of ['architect','reviewer']) {
+    cadence.engineState={settings:{review_cadence:current}};
+    let sent;cadence.act=(path,body)=>{assert.equal(path,'/api/settings');sent=body};
+    cadence.toggleReviewCadence(role);
+    const expected={architect:current?.architect==='per_plan'?'per_plan':'per_stage',
+      reviewer:current?.reviewer==='per_plan'?'per_plan':'per_stage'};
+    expected[role]=expected[role]==='per_plan'?'per_stage':'per_plan';
+    assert.deepEqual(JSON.parse(JSON.stringify(sent)),{review_cadence:expected});
+    assert.deepEqual(cadence.engineState.settings.review_cadence,current,'does not mutate polled state');
+  }
+  for(const role of ['architect','reviewer']) {
+    assert.equal(cadence.reviewCadenceLabel(null,role),'… (unavailable)');
+    assert.equal(cadence.reviewCadenceLabel({settings:{}},role),'… (unavailable)');
+    assert.equal(cadence.reviewCadenceLabel({settings:{review_cadence:{[role]:'per_plan'}}},role),'per plan');
+    assert.equal(cadence.reviewCadenceLabel({settings:{review_cadence:{[role]:'per_stage'}}},role),'per stage');
+    assert.equal((panel.match(new RegExp('CadenceButton \\{ role: "'+role+'" \\}','g'))||[]).length,1);
+  }
+  const button=panel.slice(panel.indexOf('  component CadenceButton:'),panel.indexOf('  component PanelButton:'));
+  assert.match(button,/enabled: root.engineOnline/);
+  assert.match(button,/activeFocusOnTab: enabled/);
+  assert.match(button,/root.toggleReviewCadence\(role\)/);
+  for(const key of ['Key_Space','Key_Return','Key_Enter','Key_Tab','Key_Backtab','Key_Escape']) assert.ok(button.includes(key));
+  assert.match(button,/Key_Escape\) keyHandler.forceActiveFocus\(\)/);
+});

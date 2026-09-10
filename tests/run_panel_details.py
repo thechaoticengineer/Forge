@@ -50,8 +50,11 @@ helpers += between('  function architectUsageText(', '  function reportLifecycle
 helpers += between('  function catalogueProviderText(', '  function openCatalogue(')
 helpers += between('  function nonNegativeInt(', '  property var reviewViews:')
 helpers += between('  function reportTime(', '  function chooserRows(')
-helpers += between('  component PanelButton:', '\n}')
+helpers += between('  component CadenceButton:', '\n}')
+helpers += between('  readonly property var planReview:', '  property bool chooserOpen:')
 fragments = {
+    'PLAN_REVIEW': block('id: planReviewSection', 'Column'),
+    'CADENCE': 'CadenceButton { objectName: "architectCadence"; role: "architect" }\nCadenceButton { objectName: "reviewerCadence"; role: "reviewer" }',
     'LOCAL_ERROR': block('objectName: "localErrorDetail"', 'PanelDetail'),
     'ARCHITECTURE': block('objectName: "architectureDetails"', 'ArchitectureDetails'),
     'PROVIDERS': block('objectName: "providerDetails"', 'PanelFields'),
@@ -69,7 +72,7 @@ fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.cl
 with tempfile.TemporaryDirectory(prefix='forge-panel-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js'):
+    for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'PlanReview.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_panel.qml').write_text(fixture)
     runtime = path / 'runtime'

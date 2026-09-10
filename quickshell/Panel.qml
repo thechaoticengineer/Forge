@@ -11,6 +11,7 @@ import qs.Commons
 import qs.Ui
 import "DetailView.js" as DetailView
 import "ReviewView.js" as ReviewView
+import "PlanReview.js" as PlanReview
 import "PanelDetails.js" as PanelDetails
 
 Item {
@@ -133,6 +134,63 @@ Item {
   readonly property string projectName: engineState
     ? engineState.project.split("/").filter(function(p) { return p !== "" }).pop() || "?"
     : "?"
+
+  readonly property var planReview: plan && plan.plan_review ? plan.plan_review : null
+  readonly property string planReviewScope: PlanReview.scope(lastProject, projectViewRevision, plan)
+  property var planReviewView: null
+  property int planReviewVersion: 0
+  property bool planReviewExpanded: false
+  onPlanReviewScopeChanged: {
+    planReviewView = plan && plan.plan_review ? PlanReview.create(lastProject, plan) : null
+    planReviewExpanded = false
+    planReviewVersion++
+  }
+
+  function loadPlanReviewRequests() {
+    const view = planReviewView, scope = planReviewScope
+    if (!view) return
+    const started = PlanReview.begin(view)
+    planReviewVersion++
+    if (!started) return
+    api("GET", PlanReview.path(view), null, function(resp, status) {
+      if (root.planReviewScope !== scope || root.planReviewView !== view) return
+      const more = PlanReview.finish(view, resp, status)
+      root.planReviewVersion++
+      if (more) root.loadPlanReviewRequests()
+    }, true)
+  }
+
+  function reviewCadenceLabel(state, role) {
+    const cadence = state && state.settings ? state.settings.review_cadence : null
+    return !cadence || cadence[role] === undefined ? "… (unavailable)"
+      : cadence[role] === "per_plan" ? "per plan" : "per stage"
+  }
+
+  function toggleReviewCadence(role) {
+    const settings = engineState && engineState.settings ? engineState.settings : {}
+    const current = settings.review_cadence || {}
+    const cadence = {architect: current.architect === "per_plan" ? "per_plan" : "per_stage",
+      reviewer: current.reviewer === "per_plan" ? "per_plan" : "per_stage"}
+    cadence[role] = cadence[role] === "per_plan" ? "per_stage" : "per_plan"
+    act("/api/settings", {review_cadence: cadence})
+  }
+
+  function planReviewStatusText(review) {
+    if (!review) return ""
+    const gate = review.gate || {}, roles = gate.roles || {}
+    function outcome(role) {
+      const value = roles[role]
+      return value === "not_required" ? "review not required"
+        : value === "deferred" ? "deferred to the plan review" : value || "unavailable"
+    }
+    const round = typeof review.rounds === "number" ? review.rounds : "—"
+    const maximum = typeof review.budget === "number" ? review.budget + 1 : "—"
+    return "Plan review: " + (review.status || "unavailable")
+      + " · round " + round + " of " + maximum
+      + "\nCurrent gate: " + (gate.status || "unavailable")
+      + "\nArchitect: " + outcome("architect") + " · Independent: " + outcome("reviewer")
+      + (review.fix_sha ? "\nFix commit: " + review.fix_sha : "")
+  }
 
   property bool chooserOpen: false
   property var projectsData: null
@@ -1061,10 +1119,17 @@ Item {
     const gate = stage.review_gate || {}
     const policy = stage.review_policy || {}
     const roles = gate.roles || {}
+    function outcome(role) {
+      return roles[role] === "deferred" ? "deferred to the plan review"
+        : roles[role] === "not_required" ? "review not required" : roles[role] || "pending"
+    }
+    const status = gate.status === "deferred"
+      ? (stage.status === "committed" ? "deferred · committed under a deferred review policy"
+        : "deferred · awaiting commit under a deferred review policy") : gate.status || "pending"
     return "Review policy: " + (policy.scope || "pending")
-      + " · gate: " + (gate.status || "pending")
-      + "\nArchitect: " + (roles.architect === "not_required" ? "review not required" : (roles.architect || "pending"))
-      + " · Independent: " + (roles.reviewer || "pending")
+      + " · gate: " + status
+      + "\nArchitect: " + outcome("architect")
+      + " · Independent: " + outcome("reviewer")
   }
 
   function reviewStrings(values) {
@@ -1777,6 +1842,8 @@ Item {
               + (root.engineState ? root.engineState.settings.reviewer : "…")
             onClicked: root.cycleTool("reviewer")
           }
+          CadenceButton { role: "architect" }
+          CadenceButton { role: "reviewer" }
           PanelButton {
             label: "push at end: "
               + (root.engineState && root.engineState.settings.auto_push ? "yes" : "no")
@@ -2107,6 +2174,50 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.fs(12)
             wrapMode: Text.Wrap
+          }
+        }
+
+        Column {
+          id: planReviewSection
+          objectName: "planReviewSection"
+          visible: root.planReview !== null
+          width: parent.width
+          spacing: Style.space(6)
+          readonly property var view: {
+            const version = root.planReviewVersion
+            return Object.assign({}, root.planReviewView || {})
+          }
+          PanelFields {
+            width: parent.width
+            scope: root.planReviewScope
+            entries: [PanelDetails.status("plan-review", root.planReviewStatusText(root.planReview))]
+              .concat(planReviewSection.view.complete ? [] : [PanelDetails.status("plan-review-preview",
+                "Shortened preview · full change requests have not been loaded.")])
+          }
+          CompactDetail {
+            id: planReviewRequests
+            objectName: "planReviewRequests"
+            width: parent.width
+            metadata: "Plan review change requests"
+            originalText: planReviewSection.view.text || ""
+            textComplete: planReviewSection.view.complete === true
+            loading: planReviewSection.view.pending === true
+            detailError: planReviewSection.view.error || "Complete requests have not been loaded."
+            expanded: root.planReviewExpanded
+            foreground: root.foreground
+            mutedForeground: root.mutedForeground
+            background: root.surface
+            fontFamily: root.fontFamily
+            fontSize: root.fs(12)
+            onExpansionRequested: value => {
+              root.planReviewExpanded = value
+              if (value && !textComplete) root.loadPlanReviewRequests()
+            }
+            onLoadRequested: root.loadPlanReviewRequests()
+            onCopyRequested: original => Quickshell.clipboardText = original
+            onLeaveRequested: keyHandler.forceActiveFocus()
+            onFocusRevealed: control => root.revealDetail(control)
+            onInspecting: root.inspectDetail(planReviewRequests)
           }
         }
 
@@ -3815,6 +3926,24 @@ Item {
           }
         }
       }
+    }
+  }
+
+  component CadenceButton: PanelButton {
+    id: cadenceButton
+    required property string role
+    label: role + " review: " + root.reviewCadenceLabel(root.engineState, role)
+    enabled: root.engineOnline
+    activeFocusOnTab: enabled
+    border.color: activeFocus ? root.accent : Qt.darker(root.foreground, 3)
+    onClicked: root.toggleReviewCadence(role)
+    onActiveFocusChanged: if (activeFocus) root.revealDetail(cadenceButton)
+    Keys.onPressed: event => {
+      if (event.key === Qt.Key_Escape) keyHandler.forceActiveFocus()
+      else if (event.key === Qt.Key_Space || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+        if (enabled && !event.isAutoRepeat) clicked()
+      } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) return
+      event.accepted = true
     }
   }
 
