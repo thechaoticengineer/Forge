@@ -1008,6 +1008,17 @@ impl Ctx {
             };
             let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
             if let Some((kind,evidence)) = trigger {
+                // A scope escalation says this stage cannot be built as written.
+                // Re-running it against the same words only spends the remaining
+                // fix rounds, so the planner that owns the text decides instead.
+                if kind == "material_scope_change" {
+                    let (revised, message) = self.renegotiate_scope(plan, idx, &evidence)?;
+                    if revised { return Ok("renegotiated"); }
+                    plan["stages"][idx]["review_gate"] = json!({"status":"scope_blocked","reason":message,
+                        "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
+                    self.save_plan(plan)?;
+                    return Ok("scope_blocked");
+                }
                 if round < budget { self.reassess(plan, idx, &kind, evidence)?; continue; }
                 return Ok("exhausted");
             }

@@ -181,3 +181,38 @@ Do NOT fix anything yourself; do NOT modify implementation or runtime files. The
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
 To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+
+pub(crate) const SCOPE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+The implementer refused to build one stage of an approved plan, reporting that the stage
+as written cannot be built as specified. You own the stage text, so you decide what it says.
+
+GOAL (unchanged and authoritative):
+{goal}
+
+STAGE {sid} — {title}
+
+CURRENT INSTRUCTIONS:
+{instructions}
+
+CURRENT ACCEPTANCE:
+{acceptance}
+
+IMPLEMENTER ESCALATION:
+{escalation}
+
+Inspect whatever you need in the repository to judge the report. Do not write any file, do
+not implement anything, do not commit or push. Judge only whether the stage text is
+buildable, never whether the implementer tried hard enough.
+
+If the report is right, rewrite this stage's instructions and acceptance so the work is
+buildable and still delivers the goal. Change only what actually blocks it. A requirement
+the user asked for stays, even when it is hard; a requirement the planner invented that
+cannot be met goes. Acceptance describes behavior the user can observe, not internal names,
+private helpers or test fixture data.
+
+If the report is wrong and the stage can be built as written, say so instead and explain how.
+
+Return ONLY JSON in your final response, no fences and no output files, either:
+{"revised": {"instructions": "...", "acceptance": "..."}, "removed": "what you changed and why, one short paragraph"}
+or:
+{"refused": "why the stage is buildable as written, and how"}"#;

@@ -2,9 +2,11 @@
 
 /// Repair rounds allowed before a rejected candidate is abandoned.
 const REPAIR_ATTEMPTS: u32 = 2;
+/// Scope renegotiations allowed per stage before the block belongs to a human.
+const SCOPE_RENEGOTIATIONS: u64 = 1;
 use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
-use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT};
+use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
 use crate::candidate_draft::prepare_candidate_draft;
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{fill_template, json_payload, unix_timestamp};
@@ -214,5 +216,97 @@ impl Ctx {
         self.set_phase("plan_ready");
         self.log_event("plan", &format!("plan {action} with {n} stages"));
         Ok(())
+    }
+
+    /// A scope escalation reports that the stage as written cannot be built. The
+    /// planner owns the stage text, so hand the report back to it once instead of
+    /// spending the remaining fix rounds re-running the same impossible stage.
+    /// Returns whether the stage was revised, with the message either way.
+    pub(super) fn renegotiate_scope(&self, plan: &mut Value, idx: usize, outcome: &Value)
+        -> Result<(bool, String), String>
+    {
+        let sid = plan["stages"][idx]["id"].clone();
+        let request = &outcome["request"];
+        let reason = request["reason"].as_str().unwrap_or("").to_string();
+        let done = plan["stages"][idx]["scope_renegotiations"].as_u64().unwrap_or(0);
+        if done >= SCOPE_RENEGOTIATIONS {
+            return Ok((false, format!(
+                "the stage was already revised once and the implementer still calls it unbuildable: {reason}")));
+        }
+        self.set_step(sid.as_i64(), "renegotiating stage scope");
+        self.log_event("plan", &format!(
+            "stage {sid} reported unbuildable as written; asking the planner to revise it"));
+        let escalation = format!("reason: {reason}\nrequired: {}\nevidence:\n- {}",
+            request["required_capability"].as_str().unwrap_or(""),
+            outcome["evidence"].as_array().into_iter().flatten()
+                .filter_map(Value::as_str).collect::<Vec<_>>().join("\n- "));
+        let stage = plan["stages"][idx].clone();
+        let prompt = fill_template(SCOPE_PROMPT, &[
+            ("{goal}", plan["goal"].as_str().unwrap_or("")),
+            ("{sid}", &sid.to_string()),
+            ("{title}", stage["title"].as_str().unwrap_or("")),
+            ("{instructions}", stage["instructions"].as_str().unwrap_or("")),
+            ("{acceptance}", stage["acceptance"].as_str().unwrap_or("")),
+            ("{escalation}", &escalation),
+        ]);
+        let requirements = self.model_requirements("planner", None)?;
+        let (result, (tool, _, _)) = self.with_selected_model(&requirements, None, |(tool, model, effort)|
+            self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,prompt:&prompt }))?;
+        self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
+        // The mock planner answers through settings, the way it answers plan
+        // generation through the candidate file.
+        let answer: Value = if tool == "mock" {
+            self.app.settings.lock().unwrap()["mock_scope_output"].clone()
+        } else {
+            serde_json::from_str(json_payload(&result.output))
+                .map_err(|e| format!("invalid scope revision: {e}"))?
+        };
+        if let Some(refused) = answer["refused"].as_str().filter(|r| !r.trim().is_empty()) {
+            return Ok((false, format!("the planner holds the stage buildable as written: {refused}")));
+        }
+        let revised = &answer["revised"];
+        let (instructions, acceptance) = match (revised["instructions"].as_str(), revised["acceptance"].as_str()) {
+            (Some(i), Some(a)) if !i.trim().is_empty() => (i.to_owned(), a.to_owned()),
+            _ => return Err("planner returned no usable stage revision".into()),
+        };
+        if instructions == stage["instructions"].as_str().unwrap_or("")
+            && acceptance == stage["acceptance"].as_str().unwrap_or("") {
+            return Ok((false, "the planner returned the stage unchanged".into()));
+        }
+        let changed = answer["removed"].as_str().unwrap_or("").to_owned();
+        // Record the renegotiation before the edit so it survives reconciliation
+        // and stays visible next to the stage it narrowed.
+        let mut current = self.load_plan().ok_or("missing plan")?;
+        let target = current["stages"].as_array().ok_or("invalid stages")?.iter()
+            .position(|s| s["id"] == sid).ok_or("stage disappeared during renegotiation")?;
+        current["stages"][target]["scope_renegotiations"] = json!(done + 1);
+        if !current["stages"][target]["scope_history"].is_array() {
+            current["stages"][target]["scope_history"] = json!([]);
+        }
+        let entry = json!({"unix": unix_timestamp(), "revision": current["revision"],
+            "reason": reason, "changed": changed});
+        current["stages"][target]["scope_history"].as_array_mut().unwrap().push(entry);
+        self.save_plan(&current)?;
+        let current = self.load_plan().ok_or("missing plan")?;
+        let stages: Vec<Value> = current["stages"].as_array().unwrap().iter().map(|s| {
+            let mut edited = json!({"id": s["id"], "title": s["title"],
+                "instructions": s["instructions"], "acceptance": s["acceptance"],
+                "commit": s["commit"].as_str().unwrap_or("")});
+            if s["id"] == sid {
+                edited["instructions"] = json!(instructions);
+                edited["acceptance"] = json!(acceptance);
+            }
+            if let Some(depends) = s.get("depends_on") { edited["depends_on"] = depends.clone(); }
+            if !s["model_constraint"].is_null() { edited["model_constraint"] = s["model_constraint"].clone(); }
+            edited
+        }).collect();
+        let body = json!({"plan": {"goal": current["goal"], "stages": stages}});
+        let mut edited = crate::plan::edit_plan(&current, &body).map_err(str::to_string)?;
+        // The user approved this plan. Narrowing one stage to something buildable
+        // is not a new plan to approve, so the run keeps its approval.
+        edited["status"] = current["status"].clone();
+        *plan = self.architect_publish(edited, Some(&current), "stage scope renegotiation")?;
+        self.log_event("plan", &format!("stage {sid} revised by the planner: {changed}"));
+        Ok((true, changed))
     }
 }

@@ -186,12 +186,21 @@ impl Ctx {
                 return Ok(());
             }
             let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
-            let title = plan["stages"][idx]["title"].as_str().unwrap_or("").to_string();
-            self.initialize_stage_attempt(&mut plan, idx)?;
-            self.set_step(Some(sid), "implementing");
-            self.log_event("stage", &format!("stage {sid} started: {title}"));
+            // A renegotiated stage carries revised text and replenished rounds,
+            // so it starts over as a fresh attempt rather than ending the run.
+            let outcome = loop {
+                let title = plan["stages"][idx]["title"].as_str().unwrap_or("").to_string();
+                self.initialize_stage_attempt(&mut plan, idx)?;
+                self.set_step(Some(sid), "implementing");
+                self.log_event("stage", &format!("stage {sid} started: {title}"));
+                match self.run_one_stage(&mut plan, idx)? {
+                    "renegotiated" => plan = self.load_plan()
+                        .ok_or("missing plan after scope renegotiation")?,
+                    settled => break settled,
+                }
+            };
 
-            match self.run_one_stage(&mut plan, idx)? {
+            match outcome {
                 "stopped" => {
                     self.set_phase("plan_ready");
                     self.log_event("run", "stopped by user; progress is saved, run again to continue");
@@ -208,6 +217,15 @@ impl Ctx {
                     self.set_phase("blocked");
                     self.log_event("stage", &format!(
                         "stage {sid} blocked after {duration}: required review gate is not clean after max fix rounds — needs a human"));
+                    return Ok(());
+                }
+                "scope_blocked" => {
+                    let reason = plan["stages"][idx]["review_gate"]["reason"]
+                        .as_str().unwrap_or("the stage cannot be built as written").to_string();
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked")?);
+                    self.set_phase("blocked");
+                    self.log_event("stage", &format!(
+                        "stage {sid} blocked after {duration}: {reason} — needs a human"));
                     return Ok(());
                 }
                 _approved => {

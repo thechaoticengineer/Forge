@@ -643,3 +643,55 @@ fn stopped_architect_review_recovers_checkpoint_without_reselecting_or_resetting
     );
     assert_eq!(f.counts(), (1, 1));
 }
+
+#[test]
+fn a_scope_escalation_revises_the_stage_once_and_then_belongs_to_a_human() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    p["stages"][0]["rounds"] = json!(2);
+    f.ctx.save_plan(&p).unwrap();
+    let outcome = json!({"status":"escalation","evidence":["Qt normalises CRLF to LF on assignment"],
+        "request":{"kind":"scope","reason":"Acceptance demands byte equality Qt cannot provide",
+                   "required_capability":"Reconcile the acceptance criterion"}});
+    f.set("mock_scope_output", json!({"revised":{
+        "instructions":"Implement greeting","acceptance":"Greeting works on normalised text"},
+        "removed":"Dropped byte equality; Qt normalises newlines"}));
+    let (revised, message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
+    assert!(revised);
+    assert_eq!(message, "Dropped byte equality; Qt normalises newlines");
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["acceptance"], "Greeting works on normalised text");
+    // Reconciliation replenishes the rounds the unbuildable text consumed, and
+    // the run keeps the approval the user already gave this plan.
+    assert_eq!(saved["stages"][0]["rounds"], 0);
+    assert_eq!(saved["status"], "ready");
+    assert_eq!(saved["stages"][0]["scope_renegotiations"], 1);
+    assert_eq!(saved["stages"][0]["scope_history"][0]["reason"],
+        "Acceptance demands byte equality Qt cannot provide");
+    // A second escalation on the same stage stops instead of looping.
+    let mut again = saved;
+    let (revised, message) = f.ctx.renegotiate_scope(&mut again, 0, &outcome).unwrap();
+    assert!(!revised);
+    assert!(message.contains("already revised once"), "{message}");
+    assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["scope_renegotiations"], 1);
+}
+
+#[test]
+fn a_refused_or_unchanged_scope_revision_leaves_the_stage_exactly_as_written() {
+    let f = Fixture::new();
+    let outcome = json!({"status":"escalation","evidence":["cannot be done"],
+        "request":{"kind":"scope","reason":"too hard","required_capability":"more"}});
+    for (answer, expected) in [
+        (json!({"refused":"The acceptance is met by trimming the input first"}), "holds the stage buildable"),
+        (json!({"revised":{"instructions":"Implement greeting","acceptance":"Greeting works"}}), "unchanged"),
+    ] {
+        let mut p = f.attempt();
+        f.set("mock_scope_output", answer);
+        let (revised, message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
+        assert!(!revised);
+        assert!(message.contains(expected), "{message}");
+        let saved = f.ctx.load_plan().unwrap();
+        assert_eq!(saved["stages"][0]["acceptance"], "Greeting works");
+        assert!(saved["stages"][0]["scope_renegotiations"].is_null());
+    }
+}

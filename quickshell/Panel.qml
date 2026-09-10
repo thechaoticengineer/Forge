@@ -2318,8 +2318,10 @@ Item {
                     width: Math.min(implicitWidth, stageRow.width)
                     text: root.editingPlan && stageRow.modelData.status === "committed"
                       ? "committed — locked" : stageRow.modelData.status === "blocked"
-                      ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
-                         ? "blocked · review budget exhausted" : "blocked") : stageRow.modelData.status
+                      ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "scope_blocked"
+                         ? "blocked · stage cannot be built as written"
+                         : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
+                         ? "blocked · fix rounds exhausted" : "blocked") : stageRow.modelData.status
                       + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
                     color: stageRow.modelData.status === "committed" ? root.success
                       : stageRow.modelData.status === "in_progress" ? root.working
