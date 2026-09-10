@@ -9,7 +9,7 @@ repo = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="forge-compact-clipboard-") as directory:
     fixture = Path(directory)
     (fixture / "components").mkdir()
-    for name in ("CompactDetail.qml", "DetailText.js"):
+    for name in ("CompactDetail.qml", "StageProse.qml", "DetailText.js"):
         shutil.copyfile(repo / "quickshell" / name, fixture / "components" / name)
     shutil.copyfile(repo / "tests/qml/clipboard.qml", fixture / "shell.qml")
     environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software")
@@ -20,5 +20,5 @@ with tempfile.TemporaryDirectory(prefix="forge-compact-clipboard-") as directory
     )
     output = result.stdout + result.stderr
     print(output, end="")
-    if result.returncode or "EXACT_COPY_PASSED (5 originals)" not in output:
+    if result.returncode or "EXACT_COPY_PASSED (5 originals, CompactDetail and StageProse)" not in output:
         raise SystemExit(1)
