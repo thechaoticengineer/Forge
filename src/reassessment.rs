@@ -183,13 +183,25 @@ impl Ctx {
     ) -> Result<bool, String> {
         self.boundary_guard(plan, idx)?;
         self.reassessment_init(plan, idx);
+        self.operational_retry_for_scope(plan, Some(idx), error, role)
+    }
+
+    pub(crate) fn operational_retry_for_scope(
+        &self, plan: &mut Value, idx: Option<usize>, error: &str, role: &str,
+    ) -> Result<bool, String> {
+        let guard = |plan: &Value| match idx {
+            Some(idx) => self.boundary_guard(plan, idx),
+            None => self.plan_fixer_boundary(plan),
+        };
+        guard(plan)?;
         let kind = failure_kind(error);
-        let state = &mut plan["stages"][idx]["reassessment"];
+        let state = match idx {
+            Some(idx) => &mut plan["stages"][idx]["reassessment"],
+            None => &mut plan["plan_review"]["retries"],
+        };
         let n = state["operational_retries"].as_u64().unwrap_or(0);
         if kind != "transient"
-            || n >= state["limits"]["max_operational_retries"]
-                .as_u64()
-                .unwrap_or(2)
+            || n >= state["limits"]["max_operational_retries"].as_u64().unwrap_or(2)
         {
             return Ok(false);
         }
@@ -201,7 +213,7 @@ impl Ctx {
         #[cfg(test)]
         let delay = delay.min(5);
         for _ in 0..delay.div_ceil(25) {
-            self.boundary_guard(plan, idx)?;
+            guard(plan)?;
             std::thread::sleep(Duration::from_millis(25));
         }
         Ok(true)

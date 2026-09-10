@@ -335,11 +335,6 @@ impl Ctx {
             return Ok(());
         }
         if self.session.stop_requested.load(Ordering::SeqCst) {
-            if !self.deferred_plan_roles(&persisted)?.is_empty() {
-                plan["plan_review"]["status"] = json!("interrupted");
-                plan["plan_review"]["gate"]["status"] = json!("interrupted");
-                self.save_plan(plan)?;
-            }
             self.set_phase("plan_ready");
             return Ok(());
         }

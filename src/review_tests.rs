@@ -1286,6 +1286,9 @@ fn plan_review_captures_range_evidence_storage_sessions_and_gates_publication() 
         assert_eq!(r["budget"],0);
         assert_eq!(r["rounds"],1);
         assert_eq!(r["gate"]["status"],"approved");
+        assert!(r["fix_sha"].is_null());
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        assert_eq!(r["next_action"],"complete");
         assert_eq!(r["required_roles"],json!(["architect","reviewer"]));
         assert_eq!(r["acceptance"],"stage 1 (Implement feature): The requested change works.\nstage 2 (Integrate feature): Second feature works.\nstage 2 (Integrate feature): Both features integrate.");
         let calls = f.plan_calls();
@@ -1349,7 +1352,7 @@ fn plan_review_errors_stops_and_budget_never_publish_partial_approval() {
         assert_eq!(p["plan_review"]["rounds"],1,"{kind}: {p}");
         assert_eq!(p["plan_review"]["status"],if kind == "stop" {"interrupted"} else {"blocked"});
         assert_eq!(f.ctx.session.state.lock().unwrap().phase,if kind == "stop" {"plan_ready"} else {"blocked"});
-        assert_eq!(p["plan_review"]["gate"]["status"],if kind == "stop" {"interrupted"} else if kind == "reject" {"blocked"} else {"error"});
+        assert_eq!(p["plan_review"]["gate"]["status"],if kind == "stop" {"interrupted"} else if kind == "reject" {"exhausted"} else {"error"});
         assert!(!f.ctx.forge_path("reports.jsonl").exists());
         assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
         let calls = f.plan_calls().len();
@@ -1625,5 +1628,261 @@ fn plan_review_uses_earliest_deferred_base_but_all_stages_as_context() {
         let prompt = call["prompt"].as_str().unwrap();
         assert!(prompt.contains("contextual stages outside this range"));
         assert!(prompt.contains(&format!("CRITERIA TO EVIDENCE:\n{acceptance}\n")));
+    }
+}
+
+#[test]
+fn plan_review_fixes_are_reviewed_then_committed_once() {
+    for deleted in [false, true] {
+        let f = Fixture::new("Implement feature", 1);
+        f.two_deferred_stages();
+        f.setting("mock_edits", json!([{"first.rs":"first"},{"second.rs":"second"},{"first.rs":"fixed"}]));
+        f.setting("mock_verdicts", json!([reject("Fix feature behavior"),clean()]));
+        f.setting("mock_architect_verdicts", json!([reject("Fix integration"),clean()]));
+        f.setting("mock_usage", json!({"input":2,"output":3,"total":5}));
+        if deleted { f.setting("mock_fixer_actions",json!([{"remove":["second.rs"]}])); }
+        let p = f.run();
+        let r = &p["plan_review"];
+        assert_eq!(p["status"],"done","{p}");
+        assert_eq!(r["rounds"],2);
+        assert_eq!(r["budget"],1);
+        assert_eq!(r["next_action"],"complete");
+        assert_eq!(r["fix_sha"],f.ctx.git(&["rev-parse","--short","HEAD"]).unwrap());
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+        assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"fix(review): apply deferred plan review findings");
+        assert_eq!(f.ctx.git(&["rev-parse","HEAD^{tree}"]).unwrap(),r["gate"]["identity"]["snapshot"]["tree"]);
+        assert_eq!(f.ctx.git(&["rev-parse","HEAD^"]).unwrap(),r["head"]);
+        assert_eq!(f.plan_calls().len(),4);
+        assert_eq!(r["reviews"].as_array().unwrap().len(),4);
+        assert_ne!(r["reviews"][0]["identity"]["snapshot"],r["reviews"][2]["identity"]["snapshot"]);
+        assert_eq!(r["model_invocations"].as_array().unwrap().len(),1);
+        let call = &r["model_invocations"][0];
+        for key in ["turn_id","requested","effective","model_reported","verification_state","usage"] { assert!(!call[key].is_null(),"{key}"); }
+        assert_eq!(call["role"],"fixer");
+        assert_eq!(call["round"],2);
+        assert_eq!(call["verification_state"],"execution_verified");
+        assert_eq!(p["role_usage"]["fixer"]["mock"]["total_tokens"],5);
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let prompt = settings["mock_fixer_prompts"][0].as_str().unwrap();
+        for text in ["Improve the project","[architect] Fix integration","[reviewer] Fix feature behavior","no commit, amend, rebase, reset --hard, cherry-pick, revert or any ref update","8734","18734","ARCHITECT GUIDANCE","SAVED CONSTRAINTS"] { assert!(prompt.contains(text),"{text}"); }
+        for stage in r["subject"]["stages"].as_array().unwrap() {
+            for key in ["title","instructions","acceptance","sha"] { assert!(prompt.contains(&stage[key].to_string())); }
+        }
+        assert!(prompt.contains(&format!("{}..HEAD",r["base"].as_str().unwrap())));
+        drop(settings);
+        f.ctx.validate_plan_approval(&p).unwrap();
+        let mut resumed = f.plan();
+        assert!(f.ctx.run_plan_review(&mut resumed).unwrap());
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+        assert_eq!(f.plan_calls().len(),4);
+    }
+}
+
+#[test]
+fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
+    for budget in [0, 1, 2] {
+        let f = Fixture::new("Implement feature",budget);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!(vec![reject("Fix behavior");4]));
+        f.setting("auto_push",json!(true));
+        let remote = f.root.join(".git/test-remote");
+        f.ctx.git(&["init","--bare",remote.to_str().unwrap()]).unwrap();
+        f.ctx.git(&["remote","add","origin",remote.to_str().unwrap()]).unwrap();
+        let p = f.run();
+        assert_eq!(p["plan_review"]["rounds"],budget+1);
+        assert_eq!(p["plan_review"]["gate"]["status"],"exhausted");
+        assert_eq!(p["plan_review"]["status"],"blocked");
+        assert_eq!(p["plan_review"]["outstanding_requests"],json!(["[reviewer] Fix behavior"]));
+        assert_eq!(f.count("fixer"),budget as usize);
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        assert!(p["plan_review"]["fix_sha"].is_null());
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        assert!(f.ctx.git(&["ls-remote","origin"]).unwrap().is_empty());
+        // A new process/context with increased settings must retain the captured budget.
+        let mut settings = f.ctx.app.settings.lock().unwrap().clone();
+        settings["max_fix_rounds"] = json!(20);
+        let app = Arc::new(App::new(f.root.to_str().unwrap(),settings));
+        let ctx = app.context(f.root.to_str().unwrap());
+        ctx.run_worker();
+        let resumed = ctx.load_plan().unwrap();
+        assert_eq!(resumed["plan_review"],p["plan_review"]);
+        assert!(!ctx.forge_path("reports.jsonl").exists());
+        assert!(ctx.git(&["ls-remote","origin"]).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn plan_review_interrupted_fixer_consumes_reserved_cycle() {
+    for budget in [1,2] {
+        let f = Fixture::new("Implement feature",budget);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        f.setting("mock_fixer_actions",json!([{"stop":true}]));
+        let p = f.run();
+        assert_eq!(p["plan_review"]["status"],"interrupted");
+        assert_eq!(p["plan_review"]["next_action"],"fixing");
+        assert_eq!(p["plan_review"]["rounds"],2);
+        assert_eq!(p["plan_review"]["outstanding_requests"],json!(["[reviewer] Fix behavior"]));
+        assert_eq!(f.plan_calls().len(),2);
+        assert_eq!(f.count("fixer"),1);
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        f.ctx.session.stop_requested.store(false,Ordering::SeqCst);
+        f.setting("max_fix_rounds",json!(10));
+        let resumed = f.run();
+        assert_eq!(resumed["plan_review"]["rounds"],if budget == 1 {2} else {3});
+        assert_eq!(resumed["plan_review"]["budget"],budget);
+        assert_eq!(f.count("fixer"),if budget == 1 {1} else {2});
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),budget == 2);
+    }
+}
+
+#[test]
+fn plan_review_recovers_only_exact_fix_commit_after_update_ref_crash() {
+    for change in ["none","delete","message","content","subject","evidence"] {
+        let f = Fixture::new("Implement feature",1);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        if change == "delete" { f.setting("mock_fixer_actions",json!([{"remove":["second.rs"]}])); }
+        f.setting("test_plan_commit_crash",json!(true));
+        let p = f.run();
+        assert_eq!(p["plan_review"]["next_action"],"finalize");
+        assert_eq!(p["plan_review"]["gate"]["status"],"approved");
+        assert!(p["plan_review"]["fix_sha"].is_null());
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+        let head = f.ctx.git(&["rev-parse","HEAD"]).unwrap();
+        match change {
+            "message" => { f.ctx.git(&["commit","--amend","-m","wrong message"]).unwrap(); }
+            "content" => { fs::write(f.root.join("first.rs"),"external change").unwrap(); }
+            "subject" => { let mut changed = p.clone(); changed["stages"][0]["acceptance"] = json!("Different criteria"); f.ctx.save_plan(&changed).unwrap(); }
+            "evidence" => { let mut changed = p.clone(); changed["plan_review"]["reviews"][2]["criteria"] = json!([]); f.ctx.save_plan(&changed).unwrap(); }
+            _ => {}
+        }
+        f.setting("test_plan_commit_crash",json!(false));
+        let resumed = f.run();
+        let recovered = matches!(change,"none"|"delete");
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),recovered,"{change}: {resumed}");
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+        if recovered {
+            assert_eq!(f.ctx.git(&["rev-parse","HEAD"]).unwrap(),head);
+            assert!(resumed["plan_review"]["fix_sha"].is_string());
+            assert_eq!(resumed["plan_review"]["next_action"],"complete");
+        } else { assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked"); }
+        assert_eq!(f.plan_calls().len(),4);
+    }
+}
+
+#[test]
+fn plan_review_crash_boundaries_distinguish_unstarted_and_completed_fixers() {
+    for action in ["fix_pending","fixing","review_pending","reviewing","finalize"] {
+        let f = Fixture::new("Implement feature",1);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        f.setting("test_plan_crash_action",json!(action));
+        let p = f.run();
+        assert_eq!(p["plan_review"]["rounds"],2);
+        assert_eq!(p["plan_review"]["next_action"],action);
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        assert_eq!(f.count("fixer"),usize::from(!matches!(action,"fix_pending"|"fixing")));
+        f.setting("test_plan_crash_action",Value::Null);
+        let resumed = f.run();
+        let completes = matches!(action,"fix_pending"|"review_pending"|"finalize");
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),completes,"{action}: {resumed}");
+        assert_eq!(resumed["plan_review"]["rounds"],2);
+        assert_eq!(resumed["plan_review"]["attempt_id"],p["plan_review"]["attempt_id"]);
+        assert_eq!(f.count("fixer"),usize::from(action != "fixing"));
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if completes {"4"} else {"3"});
+    }
+}
+
+#[test]
+fn plan_review_fixer_head_changes_block_without_engine_commit_or_report() {
+    let f = Fixture::new("Implement feature",2);
+    f.two_deferred_stages();
+    f.setting("mock_verdicts",json!([reject("Fix behavior")]));
+    f.setting("mock_fixer_actions",json!([{"git":["commit","--allow-empty","-m","unauthorized fixer commit"]}]));
+    let p = f.run();
+    assert_eq!(p["plan_review"]["status"],"blocked");
+    assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("HEAD moved"));
+    assert_eq!(p["plan_review"]["rounds"],2);
+    assert!(p["plan_review"]["fix_sha"].is_null());
+    assert_eq!(f.plan_calls().len(),2);
+    assert!(!f.ctx.forge_path("reports.jsonl").exists());
+    let resumed = f.run();
+    assert_eq!(resumed["plan_review"]["rounds"],2);
+    assert_eq!(f.count("fixer"),1);
+    assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+}
+
+#[test]
+fn plan_review_fixer_uses_shared_capability_retry_fallback_and_provenance() {
+    for kind in ["transient","retry_exhausted","fallback","weak_pin","other_provider","substitution"] {
+        let f = Fixture::new("Implement feature",1);
+        let mut p = f.pending_plan_review();
+        for stage in p["stages"].as_array_mut().unwrap() {
+            stage["implementer_provider"] = json!("claude");
+            stage["model_invocations"] = json!([]);
+            stage["model_agreement"]["policy_inputs"]["minimum_tier"] = json!(3);
+        }
+        f.ctx.save_plan(&p).unwrap();
+        let stages = f.plan()["stages"].clone();
+        f.setting("implementer",json!(if kind == "other_provider" {"codex"} else {"claude"}));
+        f.setting("reviewer",json!("codex"));
+        f.setting("test_fake_providers",json!(true));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1","tier":"strong"},
+            {"provider":"claude","model":"claude-opus-4-6","tier":"strong"},
+            {"provider":"claude","model":"weak-model","tier":"basic"},
+            {"provider":"codex","model":"stage-model","tier":"strong"}]);
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        match kind {
+            "transient" => f.setting("mock_implementation_errors",json!(["429 rate limit",null])),
+            "retry_exhausted" => f.setting("mock_implementation_errors",json!(["429 rate limit","429 rate limit","429 rate limit",null])),
+            "fallback" => f.setting("mock_implementation_errors",json!(["claude exited with exit status: 1: You've reached your Fable limit.",null])),
+            "weak_pin" => f.setting("implementer_model",json!("weak-model")),
+            "substitution" => f.setting("mock_effective_models",json!(["unexpected-model"])),
+            _ => {}
+        }
+        let p = f.run();
+        let approved = matches!(kind,"transient"|"fallback");
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),approved,"{kind}: {}",p["plan_review"]["gate"]);
+        assert_eq!(p["stages"],stages,"fixer must not borrow stage bookkeeping");
+        let calls = p["plan_review"]["model_invocations"].as_array().unwrap();
+        assert_eq!(calls.len(),match kind {"weak_pin"|"other_provider" => 0,"retry_exhausted" => 3,"substitution" => 1,_ => 2},"{kind}");
+        assert!(calls.iter().all(|c| c["requested"]["provider"] == "claude"));
+        if kind == "transient" {
+            assert_eq!(calls[0]["failure_kind"],"transient");
+            assert_eq!(calls[0]["requested"],calls[1]["requested"]);
+            assert_eq!(p["plan_review"]["retries"]["operational_retries"],1);
+        }
+        if kind == "fallback" {
+            assert_ne!(calls[0]["requested"]["model"],calls[1]["requested"]["model"]);
+            assert_eq!(calls[1]["verification_state"],"execution_verified");
+        }
+        if kind == "substitution" { assert_eq!(calls[0]["verification_state"],"unexpected_substitution"); }
+        assert!(f.plan_calls().iter().filter(|c| c["role"] == "reviewer").all(|c| c["provider"] == "codex"));
+        assert_eq!(p["plan_review"]["rounds"],2);
+    }
+}
+
+#[test]
+fn plan_review_recovers_staging_crash_but_rejects_new_content_or_index() {
+    for change in ["none","content","index"] {
+        let f = Fixture::new("Implement feature",1);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        f.setting("test_plan_staging_crash",json!(true));
+        let p = f.run();
+        assert_eq!(p["plan_review"]["gate"]["status"],"approved");
+        assert_eq!(p["plan_review"]["commit_state"],"staging");
+        assert_eq!(f.ctx.git(&["write-tree"]).unwrap(),p["plan_review"]["gate"]["identity"]["snapshot"]["tree"]);
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        if change == "content" { fs::write(f.root.join("first.rs"),"external change").unwrap(); }
+        if change == "index" { f.ctx.git(&["rm","--cached","first.rs"]).unwrap(); }
+        f.setting("test_plan_staging_crash",json!(false));
+        let resumed = f.run();
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),change == "none","{change}: {}",resumed["plan_review"]["gate"]);
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if change == "none" {"4"} else {"3"});
+        assert_eq!(f.plan_calls().len(),4);
     }
 }

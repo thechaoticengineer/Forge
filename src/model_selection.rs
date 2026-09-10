@@ -28,6 +28,13 @@ fn tier_rank(tier: &Tier) -> u8 {
 }
 
 impl ModelRequirements {
+    pub(crate) fn requiring_at_least(mut self, minimum: Tier) -> Self {
+        if self.minimum_tier.as_ref().is_none_or(|tier| tier_rank(tier) < tier_rank(&minimum)) {
+            self.minimum_tier = Some(minimum);
+        }
+        self
+    }
+
     pub(crate) fn pinned(mut self) -> Self {
         self.fallback = false;
         self

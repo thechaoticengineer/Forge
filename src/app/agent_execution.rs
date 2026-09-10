@@ -227,6 +227,20 @@ impl Ctx {
         }
         self.mock_agent(role)?;
         #[cfg(test)]
+        if role == "fixer" {
+            let action = self.app.settings.lock().unwrap()["mock_fixer_actions"].as_array_mut()
+                .filter(|a| !a.is_empty()).map(|a| a.remove(0));
+            if let Some(action) = action {
+                for path in action["remove"].as_array().into_iter().flatten() {
+                    fs::remove_file(PathBuf::from(self.project()).join(path.as_str().unwrap())).map_err(|e| e.to_string())?;
+                }
+                if let Some(args) = action["git"].as_array() {
+                    self.git(&args.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())?;
+                }
+                if action["stop"] == true { self.session.stop_requested.store(true, Ordering::SeqCst); }
+            }
+        }
+        #[cfg(test)]
         if matches!(role, "implementer" | "fixer") {
             let mut settings = self.app.settings.lock().unwrap();
             if let Some(error) = settings["mock_implementation_errors"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)).and_then(|v| v.as_str().map(str::to_owned)) { return Err(error); }

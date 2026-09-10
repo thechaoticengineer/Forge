@@ -37,6 +37,11 @@ fn implementation(path: &str) -> bool {
 /// A raw layout identity and a normalized final tree are both necessary: git add
 /// changes the former legitimately, but must never change reviewed content.
 fn snapshot(root: &str) -> Result<Value, String> {
+    snapshot_against(root, "HEAD")
+}
+
+// Keep deleted paths from the reviewed parent in the content digest during finalization.
+fn snapshot_against(root: &str, subject_head: &str) -> Result<Value, String> {
     let head = String::from_utf8(git_bytes(root, &["rev-parse", "HEAD"])?)
         .map_err(|e| e.to_string())?
         .trim()
@@ -55,7 +60,7 @@ fn snapshot(root: &str) -> Result<Value, String> {
         .into_iter()
         .chain(paths(&git_bytes(
             root,
-            &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+            &["ls-tree", "-r", "--name-only", "-z", subject_head],
         )?)?)
         .filter(|p| implementation(p))
         .collect();
