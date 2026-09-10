@@ -1,11 +1,88 @@
 use crate::app::{App, FORGE_DIR, WorkerGuard};
-use crate::plan::default_settings;
+use crate::plan::{default_settings, review_cadence};
 use crate::test_support::{QueueTest, api_request, wait_for_worker};
 use serde_json::{Value, json};
 use std::fs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[test]
+fn review_cadence_defaults_and_accessor() {
+    let settings = default_settings();
+    assert_eq!(settings["review_cadence"], json!({"architect":"per_stage","reviewer":"per_stage"}));
+    for role in ["architect", "reviewer"] {
+        assert_eq!(review_cadence(&settings, role), "per_stage");
+        for value in [json!("per_plan"), json!("per_stage"), json!("unknown"), json!("PER_PLAN"), json!("per_plan "), Value::Null, json!(true), json!(1), json!([]), json!({})] {
+            let mut settings = settings.clone();
+            settings["review_cadence"][role] = value.clone();
+            assert_eq!(review_cadence(&settings, role), if value == "per_plan" { "per_plan" } else { "per_stage" });
+        }
+        for legacy in [json!({}), Value::Null, json!([]), json!(false), json!("per_plan"), json!({"review_cadence":null}), json!({"review_cadence":[]}), json!({"review_cadence":"per_plan"}), json!({"review_cadence":{}})] {
+            assert_eq!(review_cadence(&legacy, role), "per_stage");
+        }
+    }
+    assert_eq!(review_cadence(&settings, "unknown"), "per_stage");
+}
+
+#[test]
+fn review_cadence_settings_are_returned_in_state() {
+    let test = QueueTest::new(false);
+    let app = &test.app.app;
+    let (code, state) = api_request(app, "GET", "/api/state", json!({}));
+    assert_eq!(code, 200);
+    assert_eq!(state["settings"]["review_cadence"], default_settings()["review_cadence"]);
+    for architect in ["per_plan", "per_stage"] {
+        for reviewer in ["per_stage", "per_plan"] {
+            let cadence = json!({"architect":architect,"reviewer":reviewer});
+            assert_eq!(api_request(app, "POST", "/api/settings", json!({"review_cadence":cadence})).0, 200);
+            assert_eq!(app.settings.lock().unwrap()["review_cadence"], cadence);
+            let (code, state) = api_request(app, "GET", "/api/state", json!({}));
+            assert_eq!(code, 200);
+            assert_eq!(state["settings"]["review_cadence"], cadence);
+        }
+    }
+}
+
+#[test]
+fn invalid_review_cadence_settings_are_atomic() {
+    let test = QueueTest::new(false);
+    let mut app = App::new(test.app.project(), default_settings());
+    app.model_policy_path = Some(test.path.join("model-policy.json"));
+    let app = Arc::new(app);
+    let mut policy = json!(crate::catalogue::Policy::default());
+    policy["policy_revision"] = json!("2");
+    assert_eq!(api_request(&app, "POST", "/api/settings", json!({
+        "model_catalogue":policy,"review_cadence":{"architect":"per_plan","reviewer":"per_stage"}
+    })).0, 200);
+    let saved = app.settings.lock().unwrap().clone();
+    let policy_path = app.model_policy_path.as_ref().unwrap();
+    let saved_policy = fs::read(policy_path).unwrap();
+    policy["policy_revision"] = json!("3");
+    let mut invalid = vec![json!({}), json!({"architect":"per_plan"}), json!({"reviewer":"per_stage"}),
+        json!({"architect":"per_plan","reviewer":"per_stage","extra":"per_stage"}),
+        Value::Null, json!("per_plan"), json!([]), json!(true), json!(1)];
+    for role in ["architect", "reviewer"] {
+        for value in [json!("unknown"), json!("PER_PLAN"), json!("per_plan "), Value::Null, json!(true), json!(1), json!([]), json!({})] {
+            let mut cadence = saved["review_cadence"].clone();
+            cadence[role] = value;
+            invalid.push(cadence);
+        }
+    }
+    for cadence in invalid {
+        let (code, response) = api_request(&app, "POST", "/api/settings", json!({
+            "review_cadence":cadence,"auto_push":false,"model_catalogue":policy
+        }));
+        assert_eq!(code, 400, "{cadence}");
+        let error = response["error"].as_str().unwrap();
+        for text in ["invalid review_cadence", "exactly", "architect", "reviewer", "per_stage", "per_plan"] {
+            assert!(error.contains(text), "{error}");
+        }
+        assert_eq!(app.settings.lock().unwrap()["auto_push"], true);
+        assert_eq!(*app.settings.lock().unwrap(), saved);
+        assert_eq!(fs::read(policy_path).unwrap(), saved_policy);
+    }
+}
 
 #[test]
 fn session_aliases_and_selection_preserve_existing_work() {

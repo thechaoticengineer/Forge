@@ -341,6 +341,10 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     if limits.as_object().is_none_or(|o| o.len() != 4) || [("max_reassessments",0,8),("max_operational_retries",0,5),("repeat_threshold",2,10),("context_percent",50,95)].iter().any(|(k,min,max)| limits[*k].as_u64().is_none_or(|v| v < *min || v > *max)) {
         return (400,json!({"error":"invalid reassessment_limits: reassessments 0..8, retries 0..5, repeat threshold 2..10, context percent 50..95"}));
     }
+    let cadence = &candidate["review_cadence"];
+    if cadence.as_object().is_none_or(|o| o.len() != 2) || ["architect", "reviewer"].iter().any(|role| !matches!(cadence[*role].as_str(), Some("per_stage" | "per_plan"))) {
+        return (400,json!({"error":"invalid review_cadence: use exactly architect and reviewer, each set to \"per_stage\" or \"per_plan\""}));
+    }
     let policy = match crate::catalogue::Policy::from_settings(&candidate) {
         Ok(p) => p, Err(e) => return (400,json!({"error":e})),
     };

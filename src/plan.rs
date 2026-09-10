@@ -15,11 +15,21 @@ pub(crate) fn default_settings() -> Value {
         "planner_model": "",
         "implementer_model": "",
         "reviewer_model": "",
+        "review_cadence": {"architect":"per_stage","reviewer":"per_stage"},
         "max_fix_rounds": 3,
         "reassessment_limits": {"max_reassessments":3,"max_operational_retries":2,"repeat_threshold":2,"context_percent":85},
         "auto_push": true,
         "queue_auto_approve": false,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn review_cadence(settings: &Value, role: &str) -> &'static str {
+    if settings.get("review_cadence").and_then(|cadence| cadence.get(role)).and_then(Value::as_str) == Some("per_plan") {
+        "per_plan"
+    } else {
+        "per_stage"
+    }
 }
 
 /// Build a replacement only after validation, leaving the saved plan untouched on errors.

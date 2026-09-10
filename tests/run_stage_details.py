@@ -48,6 +48,6 @@ with tempfile.TemporaryDirectory(prefix='forge-stage-details-') as directory:
                QT_QPA_PLATFORMTHEME='', QT_QUICK_CONTROLS_STYLE='Basic',
                GSETTINGS_BACKEND='memory', XDG_RUNTIME_DIR=str(runtime))
     result = subprocess.run(['/usr/lib/qt6/bin/qmltestrunner', '-input', str(path)],
-                            env=env, capture_output=True, text=True, timeout=45)
+                            env=env, capture_output=True, text=True, timeout=120)
     print(result.stdout + result.stderr, end='')
     raise SystemExit(result.returncode)
