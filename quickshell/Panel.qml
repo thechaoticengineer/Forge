@@ -449,7 +449,7 @@ Item {
     // Ignore log/diff responses from an earlier visit, even after switching back.
     projectViewRevision++
     reviewViews = ({})
-    stageDetailExpanded = ({})
+    stageReviewBlocks = ({})
     stageSnapshot = null
     stageRoutingExpanded = false
     cancelPlanEdit()
@@ -829,7 +829,9 @@ Item {
 
   property var reviewViews: ({})
   property int reviewViewVersion: 0
-  property var stageDetailExpanded: ({})
+  property var stageReviewBlocks: ({})
+  readonly property string stageReviewBlockScope: stageDetailScope({id: null})
+  onStageReviewBlockScopeChanged: stageReviewBlocks = ({})
 
   function revealDetail(control) {
     // Reveal inside every enclosing scroller, from the inner viewport outward.
@@ -914,10 +916,11 @@ Item {
     })
     reviewViews = kept
   }
-  function loadStageReviews(stageId, cursor, end) {
+  function loadStageReviews(stageId, cursor, end, chain) {
     const stage = plan && plan.stages ? plan.stages.find(function(s) { return s.id === stageId }) : null
     if (!stage || !lastProject) return
     const scope = reviewScope(stage)
+    chain = chain || {detailScope: stageDetailScope(stage), automatic: false}
     const view = reviewViews[scope.key] || ReviewView.create(scope)
     reviewViews[scope.key] = view
     const request = ReviewView.begin(view, cursor, end)
@@ -928,29 +931,117 @@ Item {
       if (!current || root.reviewViews[scope.key] !== view) return
       const result = ReviewView.finish(view, request, root.reviewScope(current), resp, status)
       if (result === "stale") return
+      // Observe terminal outcomes before bindings or changed-triggered refresh
+      // can replace this verified view. Manual retries/older pages also latch:
+      // their failure must not restart automatic completion on the next poll.
+      if (chain.detailScope === root.stageDetailScope(current)) {
+        if (result === "failed" || result === "changed") root.setStageReviewBlock(current, view.error)
+        else if (result === "complete") root.setStageReviewBlock(current, "")
+      }
       root.reviewViewVersion++
-      if (result === "more") root.loadStageReviews(stageId, view.retry.cursor, view.retry.end)
+      if (result === "more") root.loadStageReviews(stageId, view.retry.cursor, view.retry.end, chain)
       if (result === "changed") root.refresh()
     }, true)
   }
 
-  component StageDetail: CompactDetail {
-    property string detailKey: ""
-    expanded: root.stageDetailExpanded[detailKey] === true
-    foreground: root.mutedForeground
-    mutedForeground: root.mutedForeground
-    background: root.background
-    fontFamily: root.fontFamily
-    fontSize: root.fs(11)
-    onExpansionRequested: value => {
-      const next = Object.assign({}, root.stageDetailExpanded)
-      next[detailKey] = value
-      root.stageDetailExpanded = next
-      if (value && !textComplete) loadRequested()
+  function setStageReviewBlock(stage, message) {
+    // Prune scopes retired by a project/visit/plan/revision change. Execution
+    // snapshots and checkpoints deliberately do not participate in this key.
+    const next = {}
+    const stages = plan && plan.stages ? plan.stages : []
+    stages.forEach(function(s) {
+      const key = root.stageDetailScope(s)
+      if (root.stageReviewBlocks[key]) next[key] = root.stageReviewBlocks[key]
+    })
+    const key = stageDetailScope(stage)
+    if (message) next[key] = message
+    else delete next[key]
+    stageReviewBlocks = next
+  }
+  function stageReviewIncompleteRange(view) {
+    const rows = view.rows.filter(function(row) { return row.complete === false })
+    return rows.length ? {cursor: rows[0].position, end: rows[rows.length - 1].position + 1} : null
+  }
+  function ensureStageReviewsLoaded(stage) {
+    // This is also called by deferred checks: resolve the current stage instead
+    // of trusting a captured publication or a delegate that has been destroyed.
+    const current = plan && plan.stages ? plan.stages.find(function(s) { return s.id === stage.id }) : null
+    if (!lastProject || !current || expandedStageId !== current.id || editingPlan) return
+    const view = reviewView(current)
+    const range = stageReviewIncompleteRange(view)
+    if (!range || view.pending || view.error !== "" || stageReviewBlocks[stageDetailScope(current)]) return
+    loadStageReviews(current.id, range.cursor, range.end,
+      {detailScope: stageDetailScope(current), automatic: true})
+  }
+  function retryStageReviews(stage) {
+    const current = plan && plan.stages ? plan.stages.find(function(s) { return s.id === stage.id }) : null
+    if (!current || !lastProject || expandedStageId !== current.id) return
+    const view = reviewView(current)
+    if (view.pending) return
+    // Keep older-page gaps recoverable even when every displayed row is full.
+    const range = view.retry || stageReviewIncompleteRange(view)
+      || (view.older > 0 ? {cursor: Math.max(0, view.older - 8), end: view.older} : null)
+    setStageReviewBlock(current, "")
+    if (range) loadStageReviews(current.id, range.cursor, range.end)
+  }
+  function stageReviewHasSelection(item) {
+    if (!item) return false
+    if (item.stageProseField === true && item.hasSelection) return true
+    return Array.from(item.children || []).some(function(child) { return root.stageReviewHasSelection(child) })
+  }
+  function stageReviewHasHeldPreview(presentation, view) {
+    if (stageReviewIncompleteRange(view)) return false
+    for (let i = 0; i < presentation.count; i++) {
+      if (!presentation.get(i).record.complete) return true
     }
-    onCopyRequested: original => Quickshell.clipboardText = original
-    onLeaveRequested: keyHandler.forceActiveFocus()
-    onFocusRevealed: control => panelScroll.reveal(control)
+    return false
+  }
+  function reconcileStageReviewPresentation(stage, presentation, repeater) {
+    // Presentation is separate from ReviewView's current verification authority.
+    // A selected original stays in its existing editor, with its source scope;
+    // it never makes a new scope's preview complete or suppresses verification.
+    const view = reviewView(stage), scope = view.scope.key, detailScope = stageDetailScope(stage)
+    if (presentation.count && presentation.get(0).detailScope !== detailScope) presentation.clear()
+    const desired = []
+    view.rows.forEach(function(row) {
+      const identity = ReviewView.identity(row.verdict)
+      let found = -1
+      for (let i = 0; i < presentation.count; i++) {
+        const entry = presentation.get(i)
+        if (desired.indexOf(entry.token) >= 0) continue
+        // A selected preview must not hide a newly available complete record.
+        if (!entry.record.complete && row.complete && stageReviewHasSelection(repeater.itemAt(i))) continue
+        if ((entry.sourceScope === scope && entry.record.position === row.position)
+          || (identity && identity === ReviewView.identity(entry.record.verdict))) { found = i; break }
+      }
+      if (found < 0) {
+        const token = JSON.stringify([scope, row.position, row.complete])
+        presentation.append({token: token, detailScope: detailScope, sourceScope: scope, record: row})
+        desired.push(token)
+      } else {
+        const entry = presentation.get(found)
+        desired.push(entry.token)
+        if (!stageReviewHasSelection(repeater.itemAt(found))
+          && (entry.sourceScope !== scope || (!entry.record.complete && row.complete))) {
+          presentation.setProperty(found, "record", row)
+          presentation.setProperty(found, "sourceScope", scope)
+        }
+      }
+    })
+    for (let i = presentation.count - 1; i >= 0; i--) {
+      if (desired.indexOf(presentation.get(i).token) < 0 && !stageReviewHasSelection(repeater.itemAt(i)))
+        presentation.remove(i)
+    }
+    // Reorder by current history without destroying existing delegates/editors.
+    // Unmatched selected originals remain at the end, explicitly source-labelled.
+    for (let i = 0; i < desired.length; i++) {
+      for (let j = i; j < presentation.count; j++) {
+        if (presentation.get(j).token === desired[i]) {
+          if (i !== j) presentation.move(j, i, 1)
+          break
+        }
+      }
+    }
   }
 
   component StageProseField: StageProse {
@@ -2309,7 +2400,9 @@ Item {
               readonly property string detailScope: root.stageDetailScope(modelData)
               readonly property var prose: root.stageSnapshot && root.stageSnapshot.key === detailScope
                 ? root.stageSnapshot : null
-              readonly property string reviewDetailScope: root.reviewScope(modelData).key
+              readonly property string reviewMessage: reviewView.error || root.stageReviewBlocks[detailScope] || ""
+              readonly property bool reviewRetryAvailable: reviewMessage !== "" && (!!reviewView.retry
+                || root.stageReviewIncompleteRange(reviewView) !== null || reviewView.older > 0)
               readonly property var lastReview: reviewHistory.length > 0
                 ? reviewHistory[reviewHistory.length - 1] : null
               readonly property var lastDecision: lastReview
@@ -2557,7 +2650,27 @@ Item {
                       originalText: stageRow.prose ? stageRow.prose.acceptance : ""
                     }
                     Column {
+                      id: stageReviews
                       objectName: "stageHistoricalReviews"
+                      readonly property var currentRows: stageRow.reviewHistory
+                      readonly property string currentScope: stageRow.reviewView.scope.key
+                      readonly property bool planEditing: root.editingPlan
+                      readonly property bool heldPreview: root.stageReviewHasHeldPreview(reviewPresentation, stageRow.reviewView)
+                      // A single queued update coalesces publications and runs
+                      // against current delegate state, outside binding evaluation.
+                      onCurrentRowsChanged: reviewUpdate.restart()
+                      onCurrentScopeChanged: reviewUpdate.restart()
+                      onPlanEditingChanged: reviewUpdate.restart()
+                      Timer {
+                        id: reviewUpdate
+                        interval: 0
+                        running: true
+                        onTriggered: {
+                          root.ensureStageReviewsLoaded(stageRow.modelData)
+                          root.reconcileStageReviewPresentation(stageRow.modelData, reviewPresentation, reviewRepeater)
+                        }
+                      }
+                      ListModel { id: reviewPresentation; dynamicRoles: true }
                       width: stageRow.width
                       spacing: 2
                       Text {
@@ -2572,11 +2685,24 @@ Item {
                         font.family: root.fontFamily
                         font.pixelSize: root.fs(11)
                       }
+                      Text {
+                        objectName: "stageReviewStatus"
+                        visible: text !== ""
+                        width: stageRow.width
+                        text: stageRow.reviewMessage || (stageRow.reviewView.pending ? "Loading complete reviews…"
+                          : root.stageReviewIncompleteRange(stageRow.reviewView) ? "Complete reviews have not been loaded."
+                          : stageReviews.heldPreview ? "Selected preview retained; complete reviews are shown separately." : "")
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        color: stageRow.reviewMessage ? root.urgent : root.mutedForeground
+                        font.family: root.fontFamily
+                        font.pixelSize: root.fs(11)
+                      }
                       Flow {
-                        visible: stageRow.expanded && (stageRow.reviewView.older > 0 || !!stageRow.reviewView.pending || !!stageRow.reviewView.error)
                         width: stageRow.width
                         spacing: Style.space(6)
                         Button {
+                          objectName: "stageReviewsOlder"
                           visible: stageRow.reviewView.older > 0
                           width: Math.min(implicitWidth, stageRow.width)
                           text: "Load older reviews (" + stageRow.reviewView.older + ")"
@@ -2584,37 +2710,23 @@ Item {
                           onClicked: root.loadStageReviews(stageRow.modelData.id,
                             Math.max(0, stageRow.reviewView.older - 8), stageRow.reviewView.older)
                         }
-                        Text {
-                          visible: !!stageRow.reviewView.pending
-                          width: stageRow.width
-                          text: "Loading complete reviews…"
-                          textFormat: Text.PlainText
-                          wrapMode: Text.Wrap
-                          color: stageRow.reviewView.error ? root.urgent : root.mutedForeground
-                          font.family: root.fontFamily
-                          font.pixelSize: root.fs(11)
-                        }
-                        PanelDetail {
-                          visible: originalText !== ""
-                          width: stageRow.width
-                          metadata: "Review load error"
-                          error: true
-                          originalText: stageRow.reviewView.error
-                        }
                         Button {
-                          visible: !!stageRow.reviewView.error && !!stageRow.reviewView.retry
+                          objectName: "stageReviewsRetry"
+                          visible: stageRow.reviewRetryAvailable
                           width: Math.min(implicitWidth, stageRow.width)
                           text: "Retry reviews"
                           enabled: !stageRow.reviewView.pending
-                          onClicked: root.loadStageReviews(stageRow.modelData.id,
-                            stageRow.reviewView.retry.cursor, stageRow.reviewView.retry.end)
+                          onClicked: root.retryStageReviews(stageRow.modelData)
                         }
                       }
                       Repeater {
-                        model: stageRow.reviewHistory
+                        id: reviewRepeater
+                        model: reviewPresentation
                         delegate: Column {
                           id: reviewRound
-                          required property var modelData
+                          required property var record
+                          required property string sourceScope
+                          readonly property var modelData: record
                           readonly property var verdict: modelData.verdict
                           readonly property var decision: root.reviewDecision(verdict)
                           visible: stageRow.expanded
@@ -2624,6 +2736,8 @@ Item {
                             width: stageRow.width
                             text: "Historical · " + (reviewRound.verdict.role || "reviewer") + " review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
                               + reviewRound.decision.label
+                              + (reviewRound.sourceScope !== stageReviews.currentScope
+                                ? " · selected text held from an earlier publication" : "")
                             textFormat: Text.PlainText
                             color: reviewRound.decision.optionalNotes ? root.working
                               : reviewRound.decision.clean
@@ -2642,29 +2756,23 @@ Item {
                             font.family: root.fontFamily
                             font.pixelSize: root.fs(11)
                           }
-                          StageDetail {
+                          StageProseField {
                             width: stageRow.width
-                            metadata: textComplete ? "Summary" : "Summary preview · feedback may be omitted"
-                            detailKey: stageRow.reviewDetailScope + "/review/" + reviewRound.modelData.key + "/summary"
+                            label: reviewRound.modelData.complete ? "Summary" : "Summary preview · feedback may be omitted"
                             originalText: reviewRound.verdict.summary || ""
-                            textComplete: reviewRound.modelData.complete
-                            loading: !!stageRow.reviewView.pending
-                            detailError: stageRow.reviewView.error
-                            onLoadRequested: root.loadStageReviews(stageRow.modelData.id,
-                              reviewRound.modelData.position, reviewRound.modelData.position + 1)
+                            onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
                           }
                           Repeater {
                             // Shortened feedback is never offered as complete. Each full
                             // request, legacy note and check gets its own copy source.
                             model: reviewRound.modelData.complete ? root.reviewFields(reviewRound.verdict) : []
-                            delegate: StageDetail {
+                            delegate: StageProseField {
                               required property var modelData
-                              required property int index
                               width: stageRow.width
-                              detailKey: stageRow.reviewDetailScope + "/review/" + reviewRound.modelData.key + "/field/" + index
-                              metadata: modelData.label
+                              label: modelData.label
                               foreground: modelData.kind === "issues" ? root.urgent : root.mutedForeground
                               originalText: modelData.text
+                              onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
                             }
                           }
                         }

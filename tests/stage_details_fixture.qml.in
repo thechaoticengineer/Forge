@@ -19,9 +19,6 @@ Item {
     property string fontFamily: "monospace"
     property string lastProject: "/fixture"
     property int projectViewRevision: 1
-    property var reviewViews: ({})
-    property int reviewViewVersion: 0
-    property var stageDetailExpanded: ({})
     property bool editingPlan: false
     property var editStages: []
     property bool editPending: false
@@ -42,12 +39,14 @@ Item {
     function usageSummary(u) { return "" }
     function refresh() { refreshes++ }
     function api(method, path, body, done, scoped) { calls.push({path:path,done:done,scoped:scoped}) }
-    function respond(index, status) {
-        const call = calls[index], cursor = Number(call.path.match(/cursor=(\d+)/)[1])
+    function respond(index, status, snapshot, pageSize) {
+        const call = calls[index]
+        if (!call) throw new Error("Missing request " + index + " of " + calls.length)
+        const cursor = Number(call.path.match(/cursor=(\d+)/)[1])
         const limit = Number(call.path.match(/limit=(\d+)/)[1])
-        const items = fullRecords.slice(cursor, cursor + limit)
+        const items = fullRecords.slice(cursor, cursor + (pageSize || limit))
         call.done(status === 200 ? {project:lastProject,plan_id:plan.plan_id,revision:plan.revision,
-            checkpoint:plan.architecture.checkpoint, snapshot:"snapshot-1",stage_id:1,count:fullRecords.length,
+            checkpoint:plan.architecture.checkpoint, snapshot:snapshot || plan.stages[0].review_snapshot,stage_id:1,count:fullRecords.length,
             items:items,next_cursor:cursor+items.length < fullRecords.length ? cursor+items.length : null}
             : {error:"Fixture offline"},status)
     }
@@ -92,10 +91,9 @@ Item {
         name: "ActualStageDetails"
         when: windowShown
         readonly property var stageRow: root.currentStageRow
-        function descendants(item, excludeReviews) {
-            if (excludeReviews && item.objectName === "stageHistoricalReviews") return []
+        function descendants(item) {
             let found = [item]
-            for (const child of item.children || []) found = found.concat(descendants(child, excludeReviews))
+            for (const child of item.children || []) found = found.concat(descendants(child))
             return found
         }
         function prose(label) { return descendants(stageRow).find(d => d.stageProseField && d.label === label) }
@@ -114,13 +112,14 @@ Item {
             }
         }
         function assertExpandedControls() {
-            // Revision 3 intermediate acceptance: retained historical-review
-            // presentation/actions are excluded ONLY from expanded assertions.
-            const owned = descendants(stageRow,true)
+            const owned = descendants(stageRow)
             const buttons = owned.filter(d => d instanceof Button)
-            compare(buttons.length,2)
-            compare(buttons[0].objectName,"stageToggle")
-            compare(buttons[1].objectName,"stageRoutingToggle")
+            compare(buttons.filter(d => d.objectName === "stageToggle").length,1)
+            compare(buttons.filter(d => d.objectName === "stageRoutingToggle").length,1)
+            verify(buttons.every(d => ["stageToggle","stageRoutingToggle","stageReviewsOlder","stageReviewsRetry"].includes(d.objectName)))
+            const historical = all("stageHistoricalReviews")[0]
+            verify(descendants(historical).filter(d => d instanceof Button).every(d =>
+                ["stageReviewsOlder","stageReviewsRetry"].includes(d.objectName)))
             verify(!owned.some(d => ["detailToggle","detailPreview","detailFullText","detailCopy"].includes(d.objectName)))
         }
         function all(name) {
@@ -132,16 +131,6 @@ Item {
             walk(stageRow)
             return found
         }
-        function details() {
-            const found=[]
-            function walk(item) {
-                if (item.compactDetailFocusScope === true) found.push(item)
-                for (const child of item.children || []) walk(child)
-            }
-            walk(stageRow)
-            return found
-        }
-        function field(label) { return details().find(d => d.metadata === label) }
         function control(item,name) {
             if (item.objectName === name) return item
             for (const child of item.children || []) {
@@ -157,16 +146,15 @@ Item {
             mouseClick(item,Math.min(item.width-1,20),Math.min(item.height-1,12))
             wait(20)
         }
-        function openDetail(detail) { click(control(detail,"detailToggle")); return control(detail,"detailFullText") }
         function init() {
             root.lastProject="/fixture"; root.projectViewRevision=1
-            root.calls=[]; root.reviewViews=({}); root.stageDetailExpanded=({}); root.reviewViewVersion++
+            root.calls=[]; root.reviewViews=({}); root.stageReviewBlocks=({}); root.refreshes=0; root.reviewViewVersion++
             root.expandedStageId=-1; root.editingPlan=false; root.editStages=[]; root.width=440
             root.selectedStageIndex=0; root.leakedKeys=0
             root.fullRecords=Array.from({length:10},function(_,i) {
-                return {round:1,role:i%2 ? "reviewer" : "architect",approved:false,
-                    summary:"\n same preview\r\n" + "界🙂".repeat(2500) + "\nsummary " + i + " END  \t",
-                    issues:["request " + i + "\n" + "x".repeat(5000) + " END  ","request two\r\nlast  "],
+                return {id:"review-"+i,round:1,role:i%2 ? "reviewer" : "architect",approved:false,
+                    summary:"\n same preview\r\n" + "界🙂".repeat(100) + "\nsummary " + i + " END  \t",
+                    issues:["request " + i + "\n" + "x".repeat(i === 2 ? 5000 : 600) + " END  ","request two\r\nlast  "],
                     notes:["note\nlast  "],checks:["check\r\nlast  "]}
             })
             root.plan={plan_id:"fixture",revision:5,architecture:{checkpoint:"checkpoint-1"},stages:[{
@@ -252,7 +240,7 @@ Item {
             verify(editor.width>0)
             click(all("stageToggle")[0]); assertCollapsed()
             compare(root.stageSnapshot,null); compare(root.stageRoutingExpanded,false)
-            compare(root.calls.length,0)
+            compare(root.calls.length,1)
         }
         function test_header_keyboard_activation_and_panel_shortcut() {
             const p=JSON.parse(JSON.stringify(root.plan))
@@ -274,56 +262,206 @@ Item {
                 keyClick(key);wait(20);compare(root.expandedStageId,-1)
             }
         }
+        function publish(snapshot, checkpoint) {
+            const p=JSON.parse(JSON.stringify(root.plan))
+            if (snapshot) p.stages[0].review_snapshot=snapshot
+            if (checkpoint) p.architecture.checkpoint=checkpoint
+            root.plan=p;root.syncReviewViews();wait(60)
+        }
+        function assertFailure(message) {
+            const lines=all("stageReviewStatus").filter(d=>d.visible)
+            compare(lines.length,1)
+            compare(lines[0].text,message)
+            compare(lines[0].color,root.urgent)
+            compare(lines[0].wrapMode,Text.Wrap)
+            verify(all("stageReviewsRetry")[0].visible)
+            verify(all("stageReviewsRetry")[0].enabled)
+            verify(!!prose("Summary preview · feedback may be omitted"))
+            assertExpandedControls()
+        }
         function test_loading_failure_retry_complete_copy_and_older_pages() {
+            compare(root.calls.length,0);assertCollapsed()
             root.expandedStageId=1; wait(60)
-            compare(root.calls.length,0)
-            const preview=details().find(d=>!d.textComplete)
-            openDetail(preview)
             compare(root.calls.length,1)
-            verify(preview.loading)
-            compare(control(preview,"detailFullText"),null)
-            compare(control(preview,"detailCopy"),null)
+            verify(root.calls[0].path.includes("cursor=2&limit=8"))
+            compare(all("stageReviewStatus")[0].text,"Loading complete reviews…")
             root.respond(0,500); wait(40)
-            verify(!preview.loading); compare(preview.detailError,"Fixture offline")
-            compare(control(preview,"detailCopy"),null)
-            preview.loadRequested(); root.respond(1,200); wait(80)
-            const loaded=details().find(d=>d.originalText===root.fullRecords[2].summary)
-            verify(!!loaded); verify(loaded.expanded)
-            const editor=control(loaded,"detailFullText")
-            verify(!!editor); editor.select(0,20); verify(editor.selectedText.length>0)
-            click(control(loaded,"detailCopy"))
-            compare(clipboard.clipboardText,root.fullRecords[2].summary)
-            editor.select(1,20)
-            const selection=editor.selectedText
-            root.syncReviewViews(); root.width=360; wait(30)
-            compare(control(loaded,"detailFullText"),editor)
-            compare(editor.selectedText,selection)
-            const request=field("Change request 1")
-            openDetail(request); click(control(request,"detailCopy"))
-            compare(clipboard.clipboardText,root.fullRecords[2].issues[0])
-            compare(root.expandedStageId,1)
-            root.loadStageReviews(1,0,2); root.respond(2,200); wait(80)
-            compare(stageRow.reviewHistory.length,10); compare(stageRow.reviewView.older,0)
+            assertFailure("Fixture offline")
+            publish("snapshot-2","checkpoint-2")
+            compare(stageRow.reviewView.error,"")
+            assertFailure("Fixture offline")
+            compare(root.calls.length,1)
+            click(all("stageToggle")[0]);assertCollapsed()
+            click(all("stageToggle")[0]);assertFailure("Fixture offline")
+            compare(root.calls.length,1)
+            click(all("stageReviewsRetry")[0]);compare(root.calls.length,2)
+            root.respond(1,200);wait(80)
+            const loaded=prose("Summary"),editor=control(loaded,"stageProseText")
+            compare(loaded.originalText,root.fullRecords[2].summary)
+            compare(editor.text,nativeText(loaded.originalText))
+            editor.forceActiveFocus();editor.select(1,15)
+            const start=editor.selectionStart,end=editor.selectionEnd,selection=editor.selectedText,exact=loaded.selectedText
+            keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
+            verify(exact.includes("\r\n"))
+            root.syncReviewViews();root.width=360;wait(30)
+            compare(control(loaded,"stageProseText"),editor)
+            compare(editor.selectionStart,start);compare(editor.selectionEnd,end);compare(editor.selectedText,selection)
+            // Production plan replacement and a checkpoint both change protocol
+            // ownership; the selected original remains in the very same editor.
+            for (const publication of ["heartbeat","checkpoint","appended"]) {
+                if (publication==="appended") {
+                    const p=JSON.parse(JSON.stringify(root.plan))
+                    const added=Object.assign({},root.fullRecords[0],{id:"new-review",summary:"new full summary"})
+                    root.fullRecords=root.fullRecords.concat([added])
+                    p.stages[0].review_count++
+                    p.stages[0].reviews=p.stages[0].reviews.slice(1).concat([{id:added.id,truncated:true,summary:"new preview"}])
+                    p.stages[0].review_snapshot="snapshot-3";root.plan=p
+                }
+                publish(null,publication==="checkpoint" ? "checkpoint-3" : null)
+                compare(control(loaded,"stageProseText"),editor)
+                compare(editor.selectionStart,start);compare(editor.selectionEnd,end)
+                compare(editor.selectedText,selection);compare(loaded.selectedText,exact)
+                verify(editor.activeFocus)
+                keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
+                if (stageRow.reviewView.pending) {
+                    verify(stageRow.reviewHistory.some(r=>!r.complete),"held text never imports completeness")
+                    root.respond(root.calls.length-1,200);wait(60)
+                    compare(control(loaded,"stageProseText"),editor)
+                    compare(editor.selectedText,selection)
+                }
+            }
+            const request=prose("Change request 1"),requestEditor=control(request,"stageProseText")
+            compare(request.originalText,root.fullRecords[3].issues[0])
+            requestEditor.forceActiveFocus();requestEditor.select(0,requestEditor.length)
+            keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,request.originalText)
+            editor.deselect();wait(30)
+            // Actual group action pages backwards, preserving a selected field
+            // even when older records are inserted before its delegate.
+            const requestSelection=requestEditor.selectedText
+            click(all("stageReviewsOlder")[0]);root.respond(root.calls.length-1,200);wait(80)
+            compare(stageRow.reviewHistory.length,11);compare(stageRow.reviewView.older,0)
+            compare(control(request,"stageProseText"),requestEditor)
+            compare(requestEditor.selectedText,requestSelection)
             compare(stageRow.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
-            root.syncReviewViews(); wait(30)
-            compare(stageRow.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
-            const obsolete=root.calls[2]
-            root.projectViewRevision++;root.reviewViews=({});root.lastProject="/another";wait(30)
+            assertExpandedControls()
+            const count=root.calls.length
+            click(all("stageToggle")[0]);assertCollapsed()
+            click(all("stageToggle")[0]);compare(root.calls.length,count,"complete records do not reload")
+            root.loadStageReviews(1,0,2);const obsolete=root.calls[root.calls.length-1]
+            root.projectViewRevision++;root.reviewViews=({});root.lastProject="/another";root.expandedStageId=-1;wait(30)
             obsolete.done({error:"stale"},500);wait(30)
             compare(stageRow.reviewView.error,"")
+            compare(Object.keys(root.stageReviewBlocks).length,0)
             verify(stageRow.reviewHistory.every(r=>!r.complete))
+        }
+        function test_changed_refresh_and_retry_failure_remain_blocked() {
+            root.expandedStageId=1;wait(40)
+            root.respond(0,200,"unverified-snapshot");wait(40)
+            compare(root.refreshes,1)
+            const message=stageRow.reviewMessage
+            verify(message.includes("cannot be verified"));assertFailure(message)
+            publish("snapshot-2","checkpoint-2")
+            assertFailure(message);compare(root.calls.length,1)
+            click(all("stageReviewsRetry")[0]);root.respond(1,500);wait(40)
+            publish("snapshot-3","checkpoint-3")
+            assertFailure("Fixture offline");compare(root.calls.length,2)
+            click(all("stageReviewsRetry")[0]);root.respond(2,200);wait(40)
+            verify(stageRow.reviewHistory.every(r=>r.complete))
+            compare(stageRow.reviewMessage,"")
+            // An older-page action can fail after successful automatic/retry
+            // loading too. New publications must not bypass that failure.
+            click(all("stageReviewsOlder")[0]);root.respond(3,500);wait(40)
+            verify(all("stageReviewsRetry")[0].visible,"older gaps have Retry with complete rows")
+            publish("snapshot-4","checkpoint-4")
+            assertFailure("Fixture offline");compare(root.calls.length,4)
+            click(all("stageReviewsRetry")[0]);root.respond(4,200);wait(40)
+            verify(stageRow.reviewHistory.every(r=>r.complete));compare(stageRow.reviewMessage,"")
+        }
+        function test_collapse_before_deferred_start_and_during_continuation() {
+            root.expandedStageId=1;root.expandedStageId=-1;wait(50)
+            compare(root.calls.length,0);assertCollapsed()
+            root.expandedStageId=1;wait(50);compare(root.calls.length,1)
+            root.expandedStageId=-1;wait(30);assertCollapsed()
+            root.respond(0,200,null,1);wait(30)
+            compare(root.calls.length,2,"already-started byte-limited chain continues while collapsed")
+            verify(root.calls[1].path.includes("cursor=3&limit=7"))
+            root.expandedStageId=1;wait(40);compare(root.calls.length,2,"reopen cannot compete with pending continuation")
+            root.respond(1,200);wait(50)
+            compare(root.calls.length,2)
+            root.expandedStageId=-1;wait(30);root.expandedStageId=1;wait(40)
+            compare(root.calls.length,2,"reopening full records starts nothing")
         }
         function test_complete_state_review_retains_selection_without_fetching() {
             const p=JSON.parse(JSON.stringify(root.plan))
-            p.stages[0].reviews=[{summary:"short first\nfull tail  ",approved:true,round:1}]
-            p.stages[0].review_count=1; p.stages[0].reviews_truncated=false;root.plan=p
+            p.stages[0].reviews=[{id:"complete",summary:"short first\r\nfull tail  ",approved:true,round:1}]
+            p.stages[0].review_count=1;p.stages[0].reviews_truncated=false;root.plan=p
             root.expandedStageId=1;wait(40)
-            const summary=field("Summary"), editor=openDetail(summary)
-            editor.select(2,16);const selection=editor.selectedText
-            root.syncReviewViews();root.syncReviewViews();wait(40)
-            compare(control(field("Summary"),"detailFullText"),editor)
-            compare(editor.selectedText,selection)
+            const summary=prose("Summary"),editor=control(summary,"stageProseText")
+            editor.forceActiveFocus();editor.select(2,16)
+            const selection=editor.selectedText,exact=summary.selectedText,start=editor.selectionStart,end=editor.selectionEnd
+            root.syncReviewViews();root.syncReviewViews();root.width=300;wait(40)
+            publish("snapshot-2","checkpoint-2")
+            compare(control(prose("Summary"),"stageProseText"),editor)
+            compare(editor.selectedText,selection);compare(editor.selectionStart,start);compare(editor.selectionEnd,end)
+            keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
             compare(root.calls.length,0)
+        }
+        function test_selected_preview_completion_and_unidentified_replacement() {
+            root.expandedStageId=1;wait(50)
+            const preview=prose("Summary preview · feedback may be omitted"),editor=control(preview,"stageProseText")
+            editor.forceActiveFocus();editor.select(1,15)
+            const start=editor.selectionStart,end=editor.selectionEnd,exact=preview.selectedText,original=preview.originalText
+            root.respond(0,200);wait(80)
+            compare(control(preview,"stageProseText"),editor)
+            compare(preview.originalText,original);compare(editor.selectionStart,start);compare(editor.selectionEnd,end)
+            compare(prose("Summary").originalText,root.fullRecords[2].summary)
+            verify(stageRow.reviewHistory.every(r=>r.complete))
+            verify(all("stageReviewStatus")[0].text.includes("Selected preview retained"))
+            keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
+            editor.deselect();wait(50)
+            compare(prose("Summary preview · feedback may be omitted"),undefined)
+            // With no durable id, a new publication's same position/role/round
+            // is a different row. Hold the selected source with provenance.
+            const p=JSON.parse(JSON.stringify(root.plan))
+            p.stages[0].reviews=[{summary:"old legacy\r\noriginal  ",round:1,role:"architect",approved:true}]
+            p.stages[0].review_count=1;p.stages[0].review_snapshot="legacy-1";root.plan=p;wait(60)
+            const old=prose("Summary"),oldEditor=control(old,"stageProseText")
+            oldEditor.forceActiveFocus();oldEditor.select(1,15)
+            const oldStart=oldEditor.selectionStart,oldEnd=oldEditor.selectionEnd,oldExact=old.selectedText
+            const replacement=JSON.parse(JSON.stringify(root.plan))
+            replacement.stages[0].reviews[0].summary="replacement with same position and role/round"
+            replacement.stages[0].review_snapshot="legacy-2";replacement.architecture.checkpoint="checkpoint-2"
+            root.plan=replacement;root.syncReviewViews();root.width=280;wait(60)
+            compare(control(old,"stageProseText"),oldEditor)
+            compare(old.originalText,"old legacy\r\noriginal  ")
+            compare(oldEditor.selectionStart,oldStart);compare(oldEditor.selectionEnd,oldEnd)
+            verify(descendants(stageRow).some(d=>d.stageProseField && d.originalText===replacement.stages[0].reviews[0].summary))
+            verify(descendants(stageRow).some(d=>d instanceof Text && d.text.includes("held from an earlier publication")))
+            keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,oldExact)
+            compare(root.calls.length,1,"complete legacy publications do not fetch")
+            oldEditor.deselect();wait(40)
+            verify(!descendants(stageRow).some(d=>d.stageProseField && d.originalText==="old legacy\r\noriginal  "))
+        }
+        function test_block_scope_retirement_and_plan_edit_gate() {
+            root.expandedStageId=1;wait(50);root.respond(0,500);wait(30)
+            const oldKey=stageRow.detailScope
+            verify(!!root.stageReviewBlocks[oldKey])
+            const p=JSON.parse(JSON.stringify(root.plan));p.revision++;root.plan=p;wait(50)
+            compare(root.stageReviewBlocks[oldKey],undefined)
+            compare(root.calls.length,2)
+            const old=root.calls[1]
+            root.editStages=p.stages;root.editingPlan=true;wait(30)
+            old.done({error:"edit-time failure"},500);wait(30)
+            p.revision++;p.stages[0].status="committed";root.plan=JSON.parse(JSON.stringify(p));root.editStages=root.plan.stages
+            wait(40);compare(root.calls.length,2,"no automatic completion in plan-edit mode, even committed cards")
+            // Plan editing gates automatic initiation only. Group actions on
+            // the committed read-only card keep their existing availability.
+            root.setStageReviewBlock(root.plan.stages[0],"Manual retry required");wait(30)
+            verify(all("stageReviewsRetry")[0].enabled)
+            click(all("stageReviewsRetry")[0]);compare(root.calls.length,3)
+            root.editingPlan=false;wait(40);compare(root.calls.length,3)
+            old.done({error:"stale failure"},500);wait(30)
+            compare(stageRow.reviewMessage,"")
         }
         function test_poll_replacement_preserves_editor_identity_and_native_selection() {
             click(all("stageToggle")[0])

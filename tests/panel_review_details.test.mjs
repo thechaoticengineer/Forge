@@ -111,10 +111,10 @@ test('errors keep preview incomplete, retry works, invalid pages never offer ful
 const panel = read('Panel.qml');
 function panelContext(st = stage([full('a')]), p = plan) {
   const ctx = {ReviewView:review,lastProject:'/a',projectViewRevision:1,plan:{...p,stages:[st]},
-    reviewViews:{},reviewViewVersion:0,calls:[],refreshes:0,refresh(){this.refreshes++}};
+    reviewViews:{},reviewViewVersion:0,stageReviewBlocks:{},expandedStageId:-1,editingPlan:false,calls:[],refreshes:0,refresh(){this.refreshes++}};
   ctx.root=ctx;
   ctx.api=(method,path,body,done,scoped)=>ctx.calls.push({method,path,done,scoped});
-  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  component StageDetail:')),ctx);
+  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  component StageProseField:')),ctx);
   return ctx;
 }
 test('stage prose identity survives publications while review identity remains snapshot scoped', () => {
@@ -136,9 +136,9 @@ test('stage prose identity survives publications while review identity remains s
   assert.notEqual(ctx.stageDetailScope({...st,id:4}),key);
   const card=panel.slice(panel.indexOf('id: stageRow'),panel.indexOf('id: stageEditor'));
   assert.match(card,/detailScope: root.stageDetailScope\(modelData\)/);
-  assert.match(card,/reviewDetailScope: root.reviewScope\(modelData\).key/);
+  assert.ok(!card.includes("reviewDetailScope"));
   assert.equal((card.match(/detailKey: stageRow.detailScope/g)||[]).length,0);
-  assert.equal((card.match(/detailKey: stageRow.reviewDetailScope/g)||[]).length,2);
+  assert.equal((card.match(/detailKey: stageRow.reviewDetailScope/g)||[]).length,0);
 });
 test('actual Panel handlers load lazily, cache completed text, restart changed snapshots and discard stale callbacks', () => {
   const ctx=panelContext(), st=ctx.plan.stages[0];
@@ -170,7 +170,10 @@ test('stage field wiring preserves each original, full prose, review previews, l
   assert.deepEqual(Array.from(fields,f=>f.text),[...v.issues,...v.notes,...v.checks]);
   const card=panel.slice(panel.indexOf('id: stageRow'),panel.indexOf('id: stageEditor'));
   assert.ok(!card.includes('maximumLineCount: 3'));
-  assert.match(card,/textComplete: reviewRound.modelData.complete/);
+  assert.match(card,/label: reviewRound.modelData.complete \? "Summary"/);
+  assert.ok(!card.includes("StageDetail"));
+  assert.ok(!card.includes("textComplete:"));
+  assert.ok(!card.includes("detailKey:"));
   assert.match(card,/model: reviewRound.modelData.complete \? root.reviewFields/);
   assert.match(card,/editable: root.editingPlan && modelData.status !== "committed"/);
   assert.equal((card.match(/objectName: "stageToggle"/g)||[]).length,1);
@@ -194,4 +197,97 @@ test('a byte-limited older page followed by failure keeps its unfilled gap reach
   assert.equal(review.finish(view,req,s,page(s,records.slice(4,12),4),200),'complete');
   assert.equal(view.older,4);
   assert.deepEqual(Array.from(view.rows,r=>r.position),Array.from({length:16},(_,i)=>i+4));
+});
+
+
+test('automatic completion gates current state and claims pending before notifications', () => {
+  const records=Array.from({length:10},(_,i)=>full('r'+i));
+  const ctx=panelContext(stage(records)),st=ctx.plan.stages[0];
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,0);
+  ctx.expandedStageId=3;ctx.editingPlan=true;
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,0);
+  ctx.editingPlan=false;ctx.lastProject='';
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,0);
+  ctx.lastProject='/a';
+  // A scheduling callback resolves the current publication, not old previews.
+  ctx.plan.stages=[{...st,reviews:[records[9]],review_count:10,review_snapshot:'complete-publication'}];
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,0);
+  ctx.plan.stages=[st];
+  let version=ctx.reviewViewVersion;
+  Object.defineProperty(ctx,'reviewViewVersion',{get(){return version},set(v){
+    version=v;ctx.ensureStageReviewsLoaded(st);
+  }});
+  ctx.ensureStageReviewsLoaded(st);ctx.ensureStageReviewsLoaded(st);
+  assert.equal(ctx.calls.length,1);assert.match(ctx.calls[0].path,/cursor=2&limit=8/);
+  ctx.expandedStageId=-1;
+  ctx.calls[0].done(page(scope(st),records.slice(2,3),2),200);
+  assert.equal(ctx.calls.length,2,'more is permitted after collapse');
+  assert.match(ctx.calls[1].path,/cursor=3&limit=7/);
+  ctx.expandedStageId=3;ctx.ensureStageReviewsLoaded(st);
+  assert.equal(ctx.calls.length,2,'pending continuation owns the remaining range');
+  ctx.calls[1].done(page(scope(st),records.slice(3),3),200);
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,2);
+});
+
+test('failures from every load origin survive publications and explicit Retry recovers current ranges', () => {
+  const records=Array.from({length:10},(_,i)=>full('r'+i));
+  const ctx=panelContext(stage(records));ctx.expandedStageId=3;
+  let st=ctx.plan.stages[0];const key=ctx.stageDetailScope(st);
+  const publish=()=>{
+    st={...st,review_snapshot:st.review_snapshot+'-next'};
+    ctx.plan={...ctx.plan,architecture:{checkpoint:ctx.plan.architecture.checkpoint+'-next'},stages:[st]};
+    ctx.syncReviewViews();ctx.ensureStageReviewsLoaded(st);
+  };
+  ctx.ensureStageReviewsLoaded(st);
+  ctx.calls[0].done(page(ctx.reviewScope(st),records.slice(2,3),2),200);
+  assert.equal(ctx.calls.length,2);
+  ctx.calls[1].done({error:'continuation offline'},500);
+  assert.equal(ctx.stageReviewBlocks[key],'continuation offline');
+  publish();publish();assert.equal(ctx.calls.length,2);
+  assert.equal(ctx.reviewView(st).error,'');assert.equal(ctx.reviewView(st).retry,null);
+  ctx.retryStageReviews(st);assert.equal(ctx.calls.length,3);
+  assert.match(ctx.calls[2].path,/cursor=2&limit=8/);
+  ctx.calls[2].done({error:'retry offline'},500);
+  publish();assert.equal(ctx.calls.length,3);assert.equal(ctx.stageReviewBlocks[key],'retry offline');
+  ctx.retryStageReviews(st);ctx.calls[3].done(page(ctx.reviewScope(st),records.slice(2),2),200);
+  assert.equal(ctx.stageReviewBlocks[key],undefined);
+  ctx.loadStageReviews(3,0,2);
+  ctx.calls[4].done(page(ctx.reviewScope(st),records.slice(0,1),0),200);
+  ctx.calls[5].done({error:'older gap offline'},500);
+  assert.equal(ctx.reviewView(st).older,2);
+  assert.equal(ctx.stageReviewBlocks[key],'older gap offline');
+  ctx.retryStageReviews(st);
+  assert.match(ctx.calls[6].path,/cursor=1&limit=1/,'Retry uses actual remaining older gap');
+  ctx.calls[6].done({error:'older retry offline'},500);
+  publish();assert.equal(ctx.calls.length,7);
+  ctx.retryStageReviews(st);ctx.calls[7].done(page(ctx.reviewScope(st),records.slice(2),2),200);
+  assert.equal(ctx.stageReviewBlocks[key],undefined);
+});
+
+test('changed observation precedes synchronous refresh and obsolete callbacks cannot alter a newer block', () => {
+  const ctx=panelContext();ctx.expandedStageId=3;
+  const st=ctx.plan.stages[0],key=ctx.stageDetailScope(st);
+  ctx.refresh=function(){
+    this.refreshes++;
+    this.plan={...this.plan,architecture:{checkpoint:'published'},stages:[{...st,review_snapshot:'published'}]};
+    this.syncReviewViews();this.ensureStageReviewsLoaded(st);
+  };
+  ctx.ensureStageReviewsLoaded(st);const obsolete=ctx.calls[0];
+  obsolete.done(page(ctx.reviewScope(st),[full('a')],0,{snapshot:'wrong'}),200);
+  assert.equal(ctx.refreshes,1);assert.equal(ctx.calls.length,1);
+  assert.equal(ctx.reviewView(ctx.plan.stages[0]).error,'');
+  assert.match(ctx.stageReviewBlocks[key],/cannot be verified/);
+  ctx.retryStageReviews(st);ctx.calls[1].done({error:'new failure'},500);
+  obsolete.done(page(scope(st),[full('a')],0),200);
+  obsolete.done({error:'obsolete failure'},500);
+  assert.equal(ctx.stageReviewBlocks[key],'new failure');
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,2);
+  const oldScope=ctx.stageDetailScope(st);
+  ctx.plan={...ctx.plan,revision:6};ctx.syncReviewViews();
+  ctx.ensureStageReviewsLoaded(st);assert.equal(ctx.calls.length,3,'a new stage scope is unblocked');
+  const newScope=ctx.stageDetailScope(st);
+  ctx.calls[2].done({error:'new revision failure'},500);
+  assert.equal(ctx.stageReviewBlocks[oldScope],undefined);
+  ctx.calls[1].done(page(scope(st),[full('a')],0),200);
+  assert.equal(ctx.stageReviewBlocks[newScope],'new revision failure');
 });
