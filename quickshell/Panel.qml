@@ -181,7 +181,11 @@ Item {
   }
 
   function stageModelDetails(stage, detail) {
-    const a = stage.model_agreement || {}, p = a.policy_inputs || {}
+    return detail ? stageModelRationale(stage).concat(stageModelDiagnostics(stage)) : stageModelReasons(stage)
+  }
+
+  function stageModelReasons(stage) {
+    const a = stage.model_agreement || {}
     const fields = []
     function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
     add("Planner", a.planner_reason)
@@ -190,23 +194,39 @@ Item {
     const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
     if (trigger) add("Trigger evidence", typeof trigger.evidence === "string" ? trigger.evidence
       : JSON.stringify(trigger.evidence || trigger.error || ""))
-    if (detail) {
-      history.slice(-4).forEach(function(h, i) {
-        add(h.kind + " · Planner " + (i + 1), h.planner_reason)
-        add(h.kind + " · Architect " + (i + 1), h.architect_reason)
-      })
-      add("Risk", ((a.validated_proposal || {}).risk || "pending") + " · complexity: " + ((a.validated_proposal || {}).complexity || "pending"))
-      add("Constraint", JSON.stringify(p.constraint || {}))
-      add("Cost", p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
-        ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
-        : "unknown / no comparable billing data used")
-      add("Routing price", p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing)
-        : "unavailable / no comparable rate used")
-      add("Agreement", (a.id || "pending") + " · policy: " + (p.policy || "pending"))
-      const calls = stage.model_invocations || []
-      if (calls.length) add("Latest invocation", JSON.stringify(calls[calls.length - 1]))
-    }
     return fields
+  }
+
+  function stageModelRoutingHistory(stage) {
+    const routing = stage.reassessment || {}, history = routing.history || []
+    const fields = []
+    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
+    history.slice(-4).forEach(function(h, i) {
+      add(h.kind + " · Planner " + (i + 1), h.planner_reason)
+      add(h.kind + " · Architect " + (i + 1), h.architect_reason)
+    })
+    return fields
+  }
+
+  function stageModelDiagnostics(stage) {
+    const a = stage.model_agreement || {}, p = a.policy_inputs || {}
+    const fields = []
+    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
+    add("Risk", ((a.validated_proposal || {}).risk || "pending") + " · complexity: " + ((a.validated_proposal || {}).complexity || "pending"))
+    add("Constraint", JSON.stringify(p.constraint || {}))
+    add("Cost", p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
+      ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
+      : "unknown / no comparable billing data used")
+    add("Routing price", p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing)
+      : "unavailable / no comparable rate used")
+    add("Agreement", (a.id || "pending") + " · policy: " + (p.policy || "pending"))
+    const calls = stage.model_invocations || []
+    if (calls.length) add("Latest invocation", JSON.stringify(calls[calls.length - 1]))
+    return fields
+  }
+
+  function stageModelRationale(stage) {
+    return stageModelReasons(stage).concat(stageModelRoutingHistory(stage))
   }
 
   function changeModelConstraint(index, key, value) {

@@ -224,8 +224,16 @@ Item {
             // engine's 100-report cap. Measure synchronous work, excluding waits.
             const reports=Array.from({length:100},(_,i)=>Object.assign({},template,{unix:100+i}))
             const started=Date.now();root.reports=reports;const assignMs=Date.now()-started
-            wait(150)
             compare(reportList.count,100)
+            // cacheBuffer delegates incubate asynchronously. Wait for the whole
+            // cap before measuring its objects or jumping to the end: Qt's
+            // positionViewAtEnd releases existing delegates if its target has
+            // not been created yet, even with a full-content cacheBuffer.
+            tryVerify(() => {
+                for (let i=0;i<reportList.count;i++)
+                    if (!reportList.itemAtIndex(i)) return false
+                return true
+            }, 5000, "all 100 report headers are cached before inspection")
             compare(all(reportList,x=>x.objectName==="reportDetails").length,0,"collapsed details are never constructed")
             const objects=all(reportList,()=>true).length
             verify(objects<4000,"collapsed header objects stay bounded: "+objects)

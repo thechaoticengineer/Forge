@@ -47,9 +47,12 @@ ShellRoot {
         return null
     }
     Timer {
+        id: nextCase
         interval: 100
         running: true
-        repeat: true
+        // QtTest key events process nested events. Schedule the next original
+        // only after this handler returns, including on slow text layouts.
+        repeat: false
         onTriggered: {
             if (fixture.next === fixture.values.length) {
                 console.log(fixture.passed && fixture.stageCopies === 4
@@ -63,6 +66,11 @@ ShellRoot {
             prose.originalText = detail.originalText
             const editor = fixture.find(prose, "stageProseText")
             editor.forceActiveFocus()
+            // Force nested event processing past the timer interval so a
+            // repeating timer would advance (or quit) during this copy case.
+            const caseIndex = fixture.next
+            keyboard.wait(120)
+            if (fixture.next !== caseIndex) fixture.passed = false
             keyboard.keyClick(Qt.Key_A, Qt.ControlModifier)
             if (prose.selectedText !== prose.originalText) fixture.passed = false
             // Empty prose has no selection and must not emit or alter the clipboard.
@@ -75,6 +83,7 @@ ShellRoot {
             } else if (fixture.stageCopies !== before + 1) {
                 fixture.passed = false
             }
+            nextCase.start()
         }
     }
 }
