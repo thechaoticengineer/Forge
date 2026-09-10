@@ -8,6 +8,188 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
+fn state_plan_review_is_bounded_and_never_loads_verdict_payloads() {
+    let test = QueueTest::new(false);
+    let store = test.app.architecture_store();
+    let long = "界🙂\u{0001}".repeat(2000);
+    let identity = json!({"plan_id":"plan", "scope":"plan", "stage_id":null,
+        "attempt_id":"attempt", "round":12, "policy":{"rationale":long}});
+    let reviews: Vec<_> = (0..12).map(|round| json!({"round":round,
+        "role":if round % 2 == 0 {"architect"} else {"reviewer"},
+        "identity":identity, "approved":false, "summary":long,
+        "criteria":[{"evidence":"complete evidence must not enter state"}],
+        "issues":[format!("full request {round}: {long}")]})).collect();
+    let plan = json!({"stages":[{"id":1,"reviews":[{"summary":"stage review"}]}],
+        "plan_review":{"version":1,"status":"blocked","base":"base-sha","head":"head-sha",
+            "attempt_id":"attempt","rounds":12,"budget":11,"fix_sha":"fix-sha",
+            "required_roles":["architect","reviewer"],"reviews":reviews,
+            "gate":{"status":"blocked","roles":{"architect":"blocked","reviewer":"blocked"},
+                "identity":identity,"requests":vec![json!({"role":"architect","text":long});20]},
+            "model_invocations":vec![json!({"role":"fixer","requested":{"model":long},"failure":long});20],
+            "subject":{"large":long},"acceptance":long,"retries":{"history":vec![long.clone();20]},
+            "outstanding_requests":vec![format!("[reviewer] {long}");20],"unknown":long}});
+    let mut plan = plan;
+    plan["plan_review"]["reviews"] = json!([]);
+    for verdict in &reviews {
+        plan["plan_review"]["reviews"].as_array_mut().unwrap().push(verdict.clone());
+        plan = store.publish(plan, crate::architecture::checkpoint_default(),
+            json!({"kind":"plan_review","reviews":[verdict]})).unwrap();
+    }
+    let raw = store.load_raw().unwrap().unwrap();
+    assert_eq!(raw["architecture"]["review_history"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["1"]);
+    assert!(raw["plan_review"]["reviews"]["$forge_reviews"].is_string());
+    assert_eq!(store.load().unwrap().unwrap()["plan_review"]["reviews"], json!(reviews));
+    let (code, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(code, 200);
+    let review = &state["plan"]["plan_review"];
+    for (key, expected) in [("status",json!("blocked")),("base",json!("base-sha")),
+        ("rounds",json!(12)),("budget",json!(11)),("fix_sha",json!("fix-sha")),
+        ("required_roles",json!(["architect","reviewer"]))] { assert_eq!(review[key],expected); }
+    assert_eq!(review["gate"]["roles"], json!({"architect":"blocked","reviewer":"blocked"}));
+    assert_eq!(review["gate"]["identity"]["attempt_id"], "attempt");
+    assert_eq!(review["gate"]["requests_truncated"], true);
+    assert_eq!(review["gate"]["identity_truncated"], true);
+    assert_eq!(review["gate"]["requests"][0]["role"],"architect");
+    assert!(review["gate"]["requests"][0]["text"].as_str().unwrap().chars().count() <= 240);
+    assert_eq!(review["review_count"],12);
+    assert_eq!(review["reviews_truncated"],true);
+    assert_eq!(review["reviews"].as_array().unwrap().len(),crate::review_history::PREVIEW_COUNT);
+    assert_eq!(review["reviews"][0]["round"],4);
+    assert!(review["reviews"].as_array().unwrap().iter().all(|r|
+        r["truncated"] == true && r.get("criteria").is_none() && r.get("identity").is_none() && r.to_string().len() <= 4096));
+    assert_eq!(review["model_invocation_count"],20);
+    assert_eq!(review["model_invocations_truncated"],true);
+    assert_eq!(review["model_invocations"].as_array().unwrap().len(),8);
+    for key in ["subject","acceptance","retries","unknown"] { assert!(review.get(key).is_none()); }
+    assert!(review.to_string().len() < 100 * 1024);
+    let mut twice = state["plan"].clone();
+    crate::review_history::bounded(&mut twice);
+    assert_eq!(twice,state["plan"]);
+    let mut cursor = 0;
+    let mut complete = Vec::new();
+    loop {
+        let (code, history) = api_request(&test.app.app,"GET",
+            &format!("/api/architecture/history?limit=100&cursor={cursor}"),json!({}));
+        assert_eq!(code,200,"{}",history["error"]);
+        let items = history["items"].as_array().unwrap();
+        assert!(items.len() <= 100);
+        let next = history["next_cursor"].as_u64().unwrap_or(history["event_end"].as_u64().unwrap());
+        assert!(next > cursor && next - cursor <= 256 * 1024);
+        assert!(items.iter().map(|v| v.to_string().len()).sum::<usize>() <= 4 * 1024 * 1024);
+        for event in items {
+            assert!(event["id"].is_string());
+            assert_eq!(event["payload"]["kind"],"plan_review");
+            complete.extend(event["payload"]["reviews"].as_array().unwrap().iter().cloned());
+        }
+        if history["next_cursor"].is_null() { break; }
+        cursor = next;
+    }
+    assert!(complete == reviews,"paged verdicts must preserve every full field and identity");
+
+    // Neither indexed verdicts nor even the latest event's full payload is read
+    // by polling. Keep file sizes and the committed newline intact.
+    let dir = test.app.forge_path("architecture").join(raw["plan_id"].as_str().unwrap());
+    let reference = &raw["architecture"]["plan_review_history"];
+    fs::write(dir.join("reviews").join(format!("{}.jsonl",reference["file"].as_str().unwrap())),
+        vec![b'x';reference["bytes"].as_u64().unwrap() as usize]).unwrap();
+    let mut event = vec![b'x';raw["architecture"]["event_end"].as_u64().unwrap() as usize];
+    *event.last_mut().unwrap() = b'\n';
+    fs::write(dir.join("events.jsonl"),event).unwrap();
+    assert!(store.load().is_err());
+    let (_, again) = api_request(&test.app.app,"GET","/api/state",json!({}));
+    assert_eq!(again["plan"],state["plan"]);
+    assert_eq!(again["architecture"],state["architecture"]);
+}
+
+#[test]
+fn state_omits_absent_plan_review_and_projects_small_verdicts() {
+    let test = QueueTest::new(false);
+    for optional in [None, Some(Value::Null)] {
+        let mut plan = json!({"stages":[]});
+        if let Some(value) = optional { plan["plan_review"] = value; }
+        test.app.save_plan(&plan).unwrap();
+        let (_, state) = api_request(&test.app.app,"GET","/api/state",json!({}));
+        assert!(state["plan"].get("plan_review").is_none());
+    }
+    let mut plan = test.app.load_plan().unwrap();
+    plan["plan_review"] = json!({"status":"pending","reviews":[]});
+    test.app.save_plan(&plan).unwrap();
+    let (_, state) = api_request(&test.app.app,"GET","/api/state",json!({}));
+    assert_eq!(state["plan"]["plan_review"]["review_count"],0);
+    assert_eq!(state["plan"]["plan_review"]["reviews_truncated"],false);
+    plan["plan_review"]["reviews"] = json!([{"role":"reviewer","summary":"small", "criteria":["private evidence"]}]);
+    test.app.save_plan(&plan).unwrap();
+    let (_, state) = api_request(&test.app.app,"GET","/api/state",json!({}));
+    assert_eq!(state["plan"]["plan_review"]["reviews"][0]["summary"],"small");
+    assert!(state["plan"]["plan_review"]["reviews"][0].get("criteria").is_none());
+    assert_eq!(state["plan"]["plan_review"]["reviews_truncated"],true);
+}
+
+#[test]
+fn plan_review_history_keeps_record_limit_and_cursor_identity() {
+    let test = QueueTest::new(false);
+    let store = test.app.architecture_store();
+    let mut plan = json!({"stages":[],"plan_review":{"reviews":[]}});
+    let mut expected = Vec::new();
+    for round in 1..=101 {
+        let role = if round % 2 == 0 { "architect" } else { "reviewer" };
+        let verdict = json!({"id":format!("review-{round}"),"role":role,"round":round,
+            "identity":{"stage_id":null,"scope":"plan","role":role,"attempt_id":"attempt","round":round},
+            "issues":[format!("full request {round}")],"criteria":[{"evidence":"full evidence"}]});
+        plan["plan_review"]["reviews"].as_array_mut().unwrap().push(verdict.clone());
+        expected.push(verdict.clone());
+        plan = store.publish(plan,crate::architecture::checkpoint_default(),
+            json!({"kind":"plan_review","reviews":[verdict]})).unwrap();
+    }
+    let (code, first) = api_request(&test.app.app,"GET","/api/architecture/history?limit=999",json!({}));
+    assert_eq!(code,200);
+    assert_eq!(first["items"].as_array().unwrap().len(),100);
+    let cursor = first["next_cursor"].as_u64().unwrap();
+    assert!(cursor <= 256 * 1024);
+    assert_eq!(api_request(&test.app.app,"GET",
+        &format!("/api/architecture/history?cursor={}",cursor - 1),json!({})).0,400);
+    let path = format!("/api/architecture/history?plan_id={}&cursor={cursor}&limit=999",plan["plan_id"].as_str().unwrap());
+    let (code, last) = api_request(&test.app.app,"GET",&path,json!({}));
+    assert_eq!(code,200);
+    assert_eq!(last["items"].as_array().unwrap().len(),1);
+    assert!(last["next_cursor"].is_null());
+    let all: Vec<_> = first["items"].as_array().unwrap().iter().chain(last["items"].as_array().unwrap())
+        .map(|event| event["payload"]["reviews"][0].clone()).collect();
+    assert_eq!(all,expected);
+    store.reset().unwrap();
+    assert_eq!(api_request(&test.app.app,"GET",&path,json!({})).1,last);
+}
+
+#[test]
+fn plan_review_publication_respects_page_and_expanded_record_budgets() {
+    let test = QueueTest::new(false);
+    let store = test.app.architecture_store();
+    let evidence = "complete evidence ".repeat(8000);
+    let verdict = json!({"role":"architect","identity":{"scope":"plan","stage_id":null,
+        "attempt_id":"attempt","round":1,"role":"architect"},
+        "criteria":vec![json!({"evidence":evidence});8],"issues":[evidence]});
+    let plan = store.publish(json!({"stages":[],"plan_review":{"reviews":[verdict.clone()]}}),
+        crate::architecture::checkpoint_default(),json!({"kind":"plan_review","reviews":[verdict.clone()]})).unwrap();
+    let (code, page) = api_request(&test.app.app,"GET","/api/architecture/history",json!({}));
+    assert_eq!(code,200);
+    assert!(page["event_end"].as_u64().unwrap() <= 256 * 1024);
+    assert!(page.to_string().len() > 256 * 1024);
+    assert!(page.to_string().len() < 4 * 1024 * 1024);
+    assert!(page["items"][0]["payload"]["reviews"][0] == verdict);
+    let before = fs::read(test.app.forge_path("plan.json")).unwrap();
+    for oversized in [json!({"summary":"x".repeat(300 * 1024)}),
+        json!({"criteria":vec![json!({"evidence":"x".repeat(100 * 1024)});42]})] {
+        let mut next = plan.clone();
+        next["plan_review"]["reviews"].as_array_mut().unwrap().push(oversized.clone());
+        let error = store.publish(next,store.checkpoint(&plan).unwrap(),
+            json!({"kind":"plan_review","reviews":[oversized]})).unwrap_err();
+        assert!(error.contains("limit"),"{error}");
+        assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(),before);
+        assert_eq!(store.load().unwrap().unwrap(),plan);
+    }
+}
+
+#[test]
 fn review_cadence_defaults_and_accessor() {
     let settings = default_settings();
     assert_eq!(settings["review_cadence"], json!({"architect":"per_stage","reviewer":"per_stage"}));

@@ -75,6 +75,86 @@ pub(crate) fn bounded(plan: &mut Value) {
             }
         }
     }
+    if let Some(review) = plan.get_mut("plan_review").filter(|r| r.is_object()) {
+        *review = bounded_plan_review(review);
+    } else if let Some(plan) = plan.as_object_mut() {
+        plan.remove("plan_review");
+    }
+}
+
+// Bound every auxiliary field, including arbitrary model metadata and identity
+// strings. The byte budget counts JSON escaping, keys and container punctuation.
+fn limited(value: &Value, budget: &mut usize, depth: usize) -> Value {
+    let result = match value {
+        Value::String(s) => json!(s.chars().take(240.min(budget.saturating_sub(2) / 6)).collect::<String>()),
+        Value::Array(values) if depth > 0 => {
+            *budget = budget.saturating_sub(2);
+            return Value::Array(values.iter().take(8).map_while(|v| {
+                if *budget < 5 { return None; }
+                *budget -= 1;
+                Some(limited(v, budget, depth - 1))
+            }).collect());
+        }
+        Value::Object(fields) if depth > 0 => {
+            *budget = budget.saturating_sub(2);
+            let mut result = serde_json::Map::new();
+            for (key, value) in fields.iter().take(32) {
+                let cost = serde_json::to_vec(key).unwrap().len() + 2;
+                if cost + 4 > *budget { break; }
+                *budget -= cost;
+                result.insert(key.clone(), limited(value, budget, depth - 1));
+            }
+            return Value::Object(result);
+        }
+        Value::Array(_) | Value::Object(_) => Value::Null,
+        _ => value.clone(),
+    };
+    let bytes = result.to_string().len();
+    if bytes > *budget { *budget = budget.saturating_sub(4); Value::Null }
+    else { *budget -= bytes; result }
+}
+
+fn bounded_field(value: &Value) -> Value {
+    limited(value, &mut 4096, 6)
+}
+
+fn bounded_plan_review(review: &Value) -> Value {
+    let mut result = json!({});
+    for key in ["version", "attempt_id", "status", "base", "head", "rounds", "budget",
+        "required_roles", "fix_sha", "next_action", "usage", "role_usage", "outstanding_requests"] {
+        if let Some(value) = review.get(key) {
+            result[key] = bounded_field(value);
+            if result[key] != *value || review[format!("{key}_truncated")] == true {
+                result[format!("{key}_truncated")] = json!(true);
+            }
+        }
+    }
+    if let Some(gate) = review.get("gate").filter(|g| g.is_object()) {
+        result["gate"] = json!({});
+        for key in ["status", "roles", "requests", "identity", "policy"] {
+            if let Some(value) = gate.get(key) {
+                result["gate"][key] = bounded_field(value);
+                if result["gate"][key] != *value || gate[format!("{key}_truncated")] == true {
+                    result["gate"][format!("{key}_truncated")] = json!(true);
+                }
+            }
+        }
+    }
+    for (key, count_key, flag) in [("reviews", "review_count", "reviews_truncated"),
+        ("model_invocations", "model_invocation_count", "model_invocations_truncated")] {
+        if let Some(records) = review[key].as_array() {
+            let total = (records.len() as u64).max(review[count_key].as_u64().unwrap_or(0));
+            let recent: Vec<_> = records.iter().skip(records.len().saturating_sub(PREVIEW_COUNT))
+                .map(|r| if key == "reviews" { plan_preview(r) } else { bounded_field(r) }).collect();
+            let truncated = review[flag] == true || total > recent.len() as u64
+                || records.iter().rev().zip(recent.iter().rev()).any(|(a,b)| a != b)
+                || recent.iter().any(|r| r["truncated"] == true);
+            result[key] = json!(recent);
+            result[count_key] = json!(total);
+            result[flag] = json!(truncated);
+        }
+    }
+    result
 }
 
 pub(crate) fn write(dir: &Path, records: &[Value]) -> Result<Value, String> {

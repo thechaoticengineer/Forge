@@ -57,6 +57,22 @@ pub(crate) fn completed_run_report(
             report[key] = usage.clone();
         }
     }
+    // One record per completed stage attempt, in plan order. Null cadence means
+    // it was not captured by the older engine; never substitute live settings.
+    let stages = plan["stages"].as_array().unwrap();
+    if stages.iter().any(|s| s["review_cadence"].is_object()) {
+        report["review_cadence"] = json!({"version":1, "stage_attempts":stages.iter().map(|s|
+            json!({"stage_id":s["id"], "attempt_id":s["attempt_id"],
+                "revision":s["attempt_revision"], "cadence":s["review_cadence"]})).collect::<Vec<_>>()});
+    }
+    if let Some(review) = plan.get("plan_review").filter(|r| r.is_object()) {
+        report["plan_review"] = json!({"status":review["gate"]["status"],
+            "rounds":review["rounds"], "roles":review["gate"]["roles"],
+            "base":review["base"], "fix_sha":review["fix_sha"]});
+        for key in ["usage", "role_usage"] {
+            if let Some(value) = review.get(key) { report["plan_review"][key] = value.clone(); }
+        }
+    }
     report
 }
 

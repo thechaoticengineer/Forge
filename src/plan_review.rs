@@ -440,6 +440,11 @@ impl Ctx {
                     s["model_agreement"]["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(3)).max().unwrap_or(3),
                 "retries":{"operational_retries":0,"history":[],"limits":self.app.settings.lock().unwrap()["reassessment_limits"]},
                 "acceptance":acceptance(&captured),"subject":captured});
+            for key in ["usage", "role_usage"] {
+                if let Some(value) = plan["plan_review"].get(key) {
+                    next["plan_review"][key] = value.clone();
+                }
+            }
             self.validate_plan_subject(&next)?;
             self.save_plan(&next)?;
             *plan = next;

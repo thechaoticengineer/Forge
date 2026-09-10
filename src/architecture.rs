@@ -20,6 +20,7 @@ const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 // agreements and risks. A smaller line budget rejects turns the validator
 // accepts, so the log line has to hold what a legal turn can produce.
 const EVENT_LIMIT: usize = 512 * 1024;
+const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 static IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Guidance and agreement records carry a `relevant_inputs` fingerprint that
@@ -327,6 +328,12 @@ impl Store {
     }
     // Polling and pagination never hydrate the full review arrays.
     pub(crate) fn load_raw(&self) -> Result<Option<Value>, String> {
+        self.load_raw_inner(false)
+    }
+    pub(crate) fn load_state(&self) -> Result<Option<Value>, String> {
+        self.load_raw_inner(true)
+    }
+    fn load_raw_inner(&self, polling: bool) -> Result<Option<Value>, String> {
         let path = self.root.join("plan.json");
         if !path.exists() {
             return Ok(None);
@@ -339,7 +346,7 @@ impl Store {
             return Err("invalid plan stages".into());
         }
         if plan.get("architecture").is_some() {
-            self.checkpoint(&plan)?;
+            self.checkpoint_inner(&plan, polling)?;
         } else if plan.get("plan_id").is_some() || plan.get("contract_version").is_some() {
             return Err("incomplete plan identity contract".into());
         }
@@ -449,11 +456,10 @@ impl Store {
         }
         if plan["plan_review"].is_object() {
             let reference = plan["architecture"]["plan_review_history"].clone();
-            plan["plan_review"]["reviews"] = reference["recent"].clone();
-            plan["plan_review"]["review_count"] = reference["count"].clone();
-            plan["plan_review"]["reviews_truncated"] = json!(true);
-            plan["plan_review"].as_object_mut().unwrap().remove("subject");
-            plan["plan_review"].as_object_mut().unwrap().remove("acceptance");
+            if reference.is_object() {
+                plan["plan_review"]["reviews"] = reference["recent"].clone();
+                plan["plan_review"]["review_count"] = reference["count"].clone();
+            }
         }
         crate::review_history::bounded(&mut plan);
         // References for removed stages stay on disk and remain accessible through pagination.
@@ -464,6 +470,9 @@ impl Store {
         plan
     }
     pub(crate) fn checkpoint(&self, plan: &Value) -> Result<Value, String> {
+        self.checkpoint_inner(plan, false)
+    }
+    fn checkpoint_inner(&self, plan: &Value, polling: bool) -> Result<Value, String> {
         let id = plan["plan_id"].as_str().ok_or("missing plan identity")?;
         let token = plan["architecture"]["checkpoint"]
             .as_str()
@@ -476,7 +485,7 @@ impl Store {
         let mut bundle = read_json(&dir.join("checkpoints").join(format!("{token}.json")))?;
         bundle["checkpoint"] = storage::unpack(bundle["checkpoint"].take(), CHECKPOINT_LIMIT, "architectural checkpoint")?;
         if bundle["version"] != VERSION
-            || (bundle["plan"] != *plan && self.hydrate(bundle["plan"].clone())? != *plan)
+            || (bundle["plan"] != *plan && (polling || self.hydrate(bundle["plan"].clone())? != *plan))
         {
             return Err("plan/checkpoint mismatch".into());
         }
@@ -494,6 +503,19 @@ impl Store {
             .ok_or("invalid event start")?;
         if end - start > EVENT_LIMIT as u64 {
             return Err("oversized event".into());
+        }
+        if polling {
+            // Publication verified the complete event before selecting this
+            // checkpoint. Polling checks its boundary, never its verdict payload.
+            if end == start { return Err("empty committed event".into()); }
+            let mut file = file;
+            file.seek(SeekFrom::Start(end - 1)).map_err(|e| e.to_string())?;
+            let mut boundary = [0];
+            file.read_exact(&mut boundary).map_err(|e| e.to_string())?;
+            if boundary != [b'\n'] { return Err("unterminated committed event".into()); }
+            self.validate_reviews(&bundle["plan"])?;
+            validate_checkpoint(&bundle["checkpoint"], plan)?;
+            return Ok(bundle["checkpoint"].clone());
         }
         let mut file = file;
         file.seek(SeekFrom::Start(start))
@@ -706,7 +728,13 @@ impl Store {
         };
         let event = json!({"version": VERSION, "id": identity(), "plan_id": id,
             "revision": revision, "unix": unix_timestamp(), "checkpoint": token, "payload": payload});
-        let stored_event = storage::pack(&event, EVENT_LIMIT - 1, "architecture event")?;
+        // Plan verdicts are retrieved only through history. Admit them only if
+        // their lossless stored form fits one existing page; expansion keeps its
+        // separate 4 MiB limit. Reject before publishing any event or reference.
+        let event_limit = if event["payload"]["kind"] == "plan_review" {
+            HISTORY_PAGE_BYTES
+        } else { EVENT_LIMIT };
+        let stored_event = storage::pack(&event, event_limit - 1, "architecture event")?;
         let mut bytes = serde_json::to_vec(&stored_event).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         if bytes.len() > EVENT_LIMIT {
@@ -837,6 +865,12 @@ impl Store {
         Ok(())
     }
     pub(crate) fn summary(&self, plan: Option<&Value>) -> Result<Value, String> {
+        self.summary_inner(plan, false)
+    }
+    pub(crate) fn state_summary(&self, plan: Option<&Value>) -> Result<Value, String> {
+        self.summary_inner(plan, true)
+    }
+    fn summary_inner(&self, plan: Option<&Value>, polling: bool) -> Result<Value, String> {
         let Some(plan) = plan else {
             return Ok(Value::Null);
         };
@@ -845,7 +879,7 @@ impl Store {
                 json!({"context_status": "legacy", "revision": null, "recent_decisions": []}),
             );
         }
-        let cp = self.checkpoint(plan)?;
+        let cp = self.checkpoint_inner(plan, polling)?;
         let pending_path = self.directory(plan["plan_id"].as_str().unwrap())?.join("architect-pending.json");
         let recovery_needed = match fs::read(&pending_path) {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map(|p| p["turn"] != cp["last_turn"]).unwrap_or(true),
@@ -985,7 +1019,7 @@ impl Store {
         }
         f.seek(SeekFrom::Start(cursor)).map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        f.take((end - cursor).min(256 * 1024))
+        f.take((end - cursor).min(HISTORY_PAGE_BYTES as u64))
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
         let mut items = Vec::new();

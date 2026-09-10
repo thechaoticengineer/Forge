@@ -8,6 +8,59 @@ use std::fs;
 use std::sync::Arc;
 
 #[test]
+fn completed_plan_review_report_preserves_captured_cadences_and_phase_usage() {
+    let test = QueueTest::new(false);
+    let first = json!({"architect":"per_plan","reviewer":"per_stage"});
+    let second = json!({"architect":"per_stage","reviewer":"per_plan"});
+    let plan = json!({"goal":"Mixed run","status":"done","stages":[
+        {"id":1,"attempt_id":"first","attempt_revision":1,"sha":"one","review_cadence":first},
+        {"id":2,"attempt_id":"second","attempt_revision":2,"sha":"two","review_cadence":second},
+        {"id":3,"sha":"legacy"}],
+        "usage":{"mock":{"total_tokens":100,"calls":4}},
+        "plan_review":{"status":"approved","rounds":2,"base":"base","fix_sha":"fix",
+            "gate":{"status":"approved","roles":{"architect":"approved","reviewer":"approved"}},
+            "reviews":[]}});
+    test.app.save_plan(&plan).unwrap();
+    let mut plan = test.app.load_plan().unwrap();
+    for role in ["architect","reviewer","fixer"] {
+        test.app.record_plan_usage(&mut plan,role,"mock",Some(crate::agent::AgentUsage {
+            input_tokens:2,output_tokens:3,total_tokens:5,model:"model".into(),
+        })).unwrap();
+    }
+    // Current settings have no authority over the captured completed attempts.
+    test.app.app.settings.lock().unwrap()["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
+    let report = completed_run_report(&plan,test.app.project(),3,10,20,Value::Null);
+    assert_eq!(report["review_cadence"],json!({"version":1,"stage_attempts":[
+        {"stage_id":1,"attempt_id":"first","revision":1,"cadence":first},
+        {"stage_id":2,"attempt_id":"second","revision":2,"cadence":second},
+        {"stage_id":3,"attempt_id":null,"revision":null,"cadence":null}]}));
+    assert_eq!(report["plan_review"],json!({"status":"approved","rounds":2,
+        "roles":{"architect":"approved","reviewer":"approved"},"base":"base","fix_sha":"fix",
+        "usage":plan["plan_review"]["usage"],"role_usage":plan["plan_review"]["role_usage"]}));
+    assert_eq!(report["usage"]["mock"]["total_tokens"],115);
+    assert_eq!(report["usage"]["mock"]["calls"],7);
+    assert_eq!(report["plan_review"]["usage"]["mock"]["total_tokens"],15);
+    assert_eq!(report["plan_review"]["usage"]["mock"]["calls"],3);
+    for role in ["architect","reviewer","fixer"] {
+        assert_eq!(report["plan_review"]["role_usage"][role]["mock"]["total_tokens"],5);
+    }
+    assert_eq!(report["stage_outcomes"],json!(plan["stages"].as_array().unwrap().iter()
+        .map(crate::reports::stage_outcome).collect::<Vec<_>>()));
+    assert_eq!(test.app.load_plan().unwrap()["plan_review"]["usage"],report["plan_review"]["usage"]);
+
+    let legacy = completed_run_report(&json!({"stages":[]}),test.app.project(),0,0,0,Value::Null);
+    assert!(legacy.get("review_cadence").is_none());
+    assert!(legacy.get("plan_review").is_none());
+    let null_review = completed_run_report(&json!({"stages":[],"plan_review":null}),test.app.project(),0,0,0,Value::Null);
+    assert_eq!(legacy,null_review);
+    fs::write(test.app.forge_path("reports.jsonl"),format!("{legacy}\n{report}\n")).unwrap();
+    let restarted = Arc::new(App::new(test.app.project(),default_settings()));
+    assert_eq!(restarted.context(test.app.project()).read_reports(),json!([legacy,report]));
+    let (_, state) = api_request(&restarted,"GET","/api/state",json!({}));
+    assert_eq!(state["reports"],json!([legacy,report]));
+}
+
+#[test]
 fn history_entries_include_timestamp_and_only_available_context() {
     let test = QueueTest::new(true);
     let before = unix_timestamp();

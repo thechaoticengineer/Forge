@@ -22,6 +22,8 @@ impl Ctx {
 
     pub(crate) fn record_plan_usage(&self, plan: &mut Value, role: &str, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
         if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+            accumulate_invocation_usage(&mut plan["plan_review"], "usage", tool, &usage);
+            accumulate_invocation_usage(&mut plan["plan_review"]["role_usage"], role, tool, &usage);
             accumulate_invocation_usage(plan, "usage", tool, &usage);
             accumulate_invocation_usage(&mut plan["role_usage"], role, tool, &usage);
             self.save_plan(plan)?;

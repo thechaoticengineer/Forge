@@ -1662,6 +1662,14 @@ fn plan_review_fixes_are_reviewed_then_committed_once() {
         assert_eq!(call["round"],2);
         assert_eq!(call["verification_state"],"execution_verified");
         assert_eq!(p["role_usage"]["fixer"]["mock"]["total_tokens"],5);
+        assert_eq!(r["usage"]["mock"]["total_tokens"],25);
+        assert_eq!(r["usage"]["mock"]["calls"],5);
+        let reports = f.ctx.read_reports();
+        assert_eq!(reports[0]["plan_review"]["usage"],r["usage"]);
+        assert_eq!(reports[0]["usage"],p["usage"]);
+        let stage_tokens: i64 = p["stages"].as_array().unwrap().iter()
+            .map(|s| s["usage"]["mock"]["total_tokens"].as_i64().unwrap_or(0)).sum();
+        assert_eq!(p["usage"]["mock"]["total_tokens"].as_i64().unwrap(),stage_tokens + 25);
         let settings = f.ctx.app.settings.lock().unwrap();
         let prompt = settings["mock_fixer_prompts"][0].as_str().unwrap();
         for text in ["Improve the project","[architect] Fix integration","[reviewer] Fix feature behavior","no commit, amend, rebase, reset --hard, cherry-pick, revert or any ref update","8734","18734","ARCHITECT GUIDANCE","SAVED CONSTRAINTS"] { assert!(prompt.contains(text),"{text}"); }
