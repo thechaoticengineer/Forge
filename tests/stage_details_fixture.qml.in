@@ -8,6 +8,7 @@ Item {
     id: root
     width: 440
     height: 700
+    property color accent: "cyan"
     property color foreground: "white"
     property color mutedForeground: "#cccccc"
     property color background: "#202020"
@@ -21,13 +22,20 @@ Item {
     property int reviewViewVersion: 0
     property var stageDetailExpanded: ({})
     property bool editingPlan: false
-    property int expandedStageId: -1
+    property var editStages: []
+    property bool editPending: false
+    property real agentNow: 100
+    property int selectedStageIndex: 0
+    property bool reportsVisible: false
+    property int leakedKeys: 0
+    Keys.onPressed: event => { leakedKeys++; event.accepted = true }
+    // PANEL_STAGE_STATE
     property bool busy: true
     property var engineState: ({current_stage:1,current_step:"reviewing"})
     property var plan: ({})
     property var calls: []
     property var fullRecords: []
-    property var currentStageRow: null
+    readonly property var currentStageRow: stageList.currentItem
     property int refreshes: 0
     function fs(n) { return n }
     function usageSummary(u) { return "" }
@@ -44,7 +52,13 @@ Item {
     }
     QtObject { id: style; function space(n) { return n } }
     QtObject { id: clipboard; property string clipboardText: "" }
-    Item { id: keyHandler }
+    Item {
+        id: keyHandler
+        Keys.onPressed: event => {
+            const stages = root.displayedStages
+            // PANEL_STAGE_SHORTCUT
+        }
+    }
     // PANEL_HELPERS
     Flickable {
         id: panelScroll
@@ -55,21 +69,21 @@ Item {
             const y = control.mapToItem(contentItem,0,0).y
             contentY = Math.max(0,Math.min(contentHeight-height,y-20))
         }
-        Repeater {
-          id: stageRows
-          model: root.plan.stages || []
-          onItemAdded: (index, item) => root.currentStageRow = item
-          onItemRemoved: (index, item) => { if (root.currentStageRow === item) root.currentStageRow = null }
-          delegate: Item {
+        ListView {
+          id: stageList
+          width: root.width
+          height: contentHeight
+          interactive: false
+          currentIndex: 0
+          // PANEL_STAGE_MODEL
+          delegate: Rectangle {
             id: stageRow
-            width: root.width
+            width: stageList.width
             height: stageContent.implicitHeight
-            required property var modelData
-            property bool expanded: root.expandedStageId === modelData.id
-            property bool editable: root.editingPlan && modelData.status !== "committed"
-            property real elapsedSecs: -1
+            // PANEL_STAGE_DELEGATE
             // PANEL_STAGE_PROPERTIES
             // PANEL_STAGE_CONTENT
+            Loader { id: stageEditor; active: stageRow.editable }
           }
         }
     }
@@ -77,6 +91,37 @@ Item {
         name: "ActualStageDetails"
         when: windowShown
         readonly property var stageRow: root.currentStageRow
+        function descendants(item, excludeReviews) {
+            if (excludeReviews && item.objectName === "stageHistoricalReviews") return []
+            let found = [item]
+            for (const child of item.children || []) found = found.concat(descendants(child, excludeReviews))
+            return found
+        }
+        function prose(label) { return descendants(stageRow).find(d => d.stageProseField && d.label === label) }
+        function nativeText(original) { return original.replace(/\r\n/g,"\n").replace(/\r/g,"\n") }
+        function assertCollapsed() {
+            for (const name of ["detailToggle","detailPreview","detailFullText","stageProseText","stageRoutingToggle"])
+                compare(all(name).length,0,name + " is not instantiated anywhere in the collapsed card")
+            const buttons = descendants(stageRow).filter(d => d instanceof Button)
+            compare(buttons.length,1)
+            compare(buttons[0].objectName,"stageToggle")
+            for (const item of descendants(stageRow)) {
+                if (item instanceof Text) {
+                    compare(item.textFormat,Text.PlainText)
+                    compare(item.wrapMode,Text.Wrap)
+                }
+            }
+        }
+        function assertExpandedControls() {
+            // Revision 3 intermediate acceptance: retained historical-review
+            // presentation/actions are excluded ONLY from expanded assertions.
+            const owned = descendants(stageRow,true)
+            const buttons = owned.filter(d => d instanceof Button)
+            compare(buttons.length,2)
+            compare(buttons[0].objectName,"stageToggle")
+            compare(buttons[1].objectName,"stageRoutingToggle")
+            verify(!owned.some(d => ["detailToggle","detailPreview","detailFullText","detailCopy"].includes(d.objectName)))
+        }
         function all(name) {
             const found=[]
             function walk(item) {
@@ -115,7 +160,8 @@ Item {
         function init() {
             root.lastProject="/fixture"; root.projectViewRevision=1
             root.calls=[]; root.reviewViews=({}); root.stageDetailExpanded=({}); root.reviewViewVersion++
-            root.expandedStageId=-1; root.editingPlan=false; root.width=440
+            root.expandedStageId=-1; root.editingPlan=false; root.editStages=[]; root.width=440
+            root.selectedStageIndex=0; root.leakedKeys=0
             root.fullRecords=Array.from({length:10},function(_,i) {
                 return {round:1,role:i%2 ? "reviewer" : "architect",approved:false,
                     summary:"\n same preview\r\n" + "界🙂".repeat(2500) + "\nsummary " + i + " END  \t",
@@ -130,6 +176,10 @@ Item {
                 review_gate:{status:"error",roles:{architect:"pending",reviewer:"approved"}},last_verdict_valid:false,
                 model_agreement:{valid:true,effective:{provider:"codex",model:"configured-model",native_effort:"high"},
                     availability:"unverified",planner_reason:"\nplanner first\nplanner tail  ",architect_reason:"\narchitect first\narchitect tail  "},
+                model_block:"blocked model\nfull status tail",
+                reassessment:{status:"pending",error:"routing error\r\nfull status tail",
+                    pending:{evidence:"\r\ntrigger evidence  "},
+                    history:[{kind:"retry",planner_reason:"\nold planner  ",architect_reason:"\rold architect\t"}]},
                 reviews:root.fullRecords.slice(-8).map(function(r) { return {round:r.round,role:r.role,approved:false,
                     truncated:true,summary:r.summary.slice(0,240),issues:[r.issues[0].slice(0,100)]} })
             }]}
@@ -138,31 +188,90 @@ Item {
         }
         function test_status_prose_and_nested_selection() {
             compare(root.calls.length,0)
-            for (const label of ["Commit","Instructions","Planner","Architect","Review policy rationale"]) {
-                const d=field(label)
+            verify(stageRow.reviewHistory.length > 0,"collapsed assertions include populated reviews")
+            assertCollapsed()
+            click(all("stageToggle")[0])
+            compare(root.expandedStageId,1)
+            assertExpandedControls()
+            const st=stageRow.modelData
+            const originals={Commit:st.commit,Instructions:st.instructions,"Acceptance criteria":st.acceptance,
+                "Review policy rationale":st.review_policy.rationale}
+            for (const f of root.stageModelRationale(st)) originals[f.label]=f.text
+            for (const label of Object.keys(originals)) {
+                const d=prose(label)
                 verify(!!d,label)
-                compare(d.expanded,false)
-                const p=control(d,"detailPreview")
-                compare(p.maximumLineCount,1); compare(p.elide,Text.ElideRight); compare(p.wrapMode,Text.NoWrap)
-                const editor=openDetail(d)
+                compare(d.originalText,originals[label],label+" preserves the original")
+                const editor=control(d,"stageProseText")
                 verify(!!editor); verify(editor.readOnly); verify(editor.selectByMouse)
-                editor.select(0,editor.length)
-                verify(editor.selectedText.length>0)
-                click(control(d,"detailCopy"))
-                compare(clipboard.clipboardText,d.originalText)
-                compare(root.expandedStageId,-1,"nested controls do not toggle the card")
+                compare(editor.text,nativeText(originals[label]))
+                compare(editor.wrapMode,TextEdit.Wrap)
                 editor.forceActiveFocus()
+                editor.select(0,editor.length)
+                keyClick(Qt.Key_C,Qt.ControlModifier)
+                compare(clipboard.clipboardText,originals[label])
+                editor.select(0,Math.min(4,editor.length))
+                const exact=d.selectedText
+                keyClick(Qt.Key_C,Qt.ControlModifier)
+                compare(clipboard.clipboardText,exact)
+                keyClick(Qt.Key_O); keyClick(Qt.Key_R); keyClick(Qt.Key_Space)
+                compare(root.expandedStageId,1)
+                compare(root.leakedKeys,0)
                 keyClick(Qt.Key_Escape)
-                verify(keyHandler.activeFocus,"Escape returns to the panel shortcut handler")
-                click(control(d,"detailToggle"))
+                verify(keyHandler.activeFocus)
             }
-            const status=root.stageModelStatus(stageRow.modelData)
-            verify(status.indexOf("configured-model")>=0); verify(status.indexOf("unverified")>=0)
-            verify(root.reviewGateText(stageRow.modelData).indexOf("Independent: approved")>=0)
-            verify(root.reviewGateText(stageRow.modelData).indexOf("Architect: pending")>=0)
-            verify(stageRow.activity.indexOf("reviewing")>=0)
+            const instructions=prose("Instructions"), editor=control(instructions,"stageProseText")
+            editor.forceActiveFocus(); editor.select(1,21)
+            compare(instructions.selectedText," instructions first\r\n")
+            keyClick(Qt.Key_C,Qt.ControlModifier)
+            compare(clipboard.clipboardText," instructions first\r\n")
+            verify(root.stageModelStatus(st).includes("configured-model"))
+            verify(root.reviewGateText(st).includes("Independent: approved"))
+            verify(stageRow.activity.includes("reviewing"))
+            verify(descendants(stageRow).some(d => d instanceof Text && d.text===root.stageModelErrors(st) && d.color===root.urgent))
+            compare(prose("Risk"),undefined)
+            click(all("stageRoutingToggle")[0])
+            for (const f of root.stageModelDiagnostics(st)) {
+                compare(prose(f.label).originalText,f.text)
+                compare(control(prose(f.label),"stageProseText").text,nativeText(f.text))
+            }
+            assertExpandedControls()
+            click(all("stageRoutingToggle")[0])
+            const routingToggle=all("stageRoutingToggle")[0]
+            for (const key of [Qt.Key_Return,Qt.Key_Enter,Qt.Key_Space]) {
+                routingToggle.forceActiveFocus(Qt.TabFocusReason)
+                keyClick(key);wait(20);compare(root.stageRoutingExpanded,true)
+                keyClick(key);wait(20);compare(root.stageRoutingExpanded,false)
+                compare(root.expandedStageId,1)
+            }
+            routingToggle.forceActiveFocus();keyClick(Qt.Key_O);keyClick(Qt.Key_R)
+            compare(root.stageRoutingExpanded,false);compare(root.leakedKeys,0)
+            compare(prose("Risk"),undefined)
+            verify(!!prose("Planner")); verify(!!prose("retry · Planner 1"))
             root.width=240; wait(40)
-            verify(control(field("Instructions"),"detailPreview").width>=0)
+            verify(editor.width>0)
+            click(all("stageToggle")[0]); assertCollapsed()
+            compare(root.stageSnapshot,null); compare(root.stageRoutingExpanded,false)
+            compare(root.calls.length,0)
+        }
+        function test_header_keyboard_activation_and_panel_shortcut() {
+            const p=JSON.parse(JSON.stringify(root.plan))
+            p.stages.push(Object.assign({},p.stages[0],{id:2,title:"Other stage"}))
+            root.plan=p;root.selectedStageIndex=1;wait(40)
+            const toggle=all("stageToggle")[0]
+            for (const key of [Qt.Key_Return,Qt.Key_Enter,Qt.Key_Space]) {
+                toggle.forceActiveFocus(Qt.TabFocusReason)
+                keyClick(key);wait(20)
+                compare(root.expandedStageId,1,"focused header activates once, not the selected other card")
+                keyClick(key);wait(20)
+                compare(root.expandedStageId,-1)
+            }
+            toggle.forceActiveFocus();keyClick(Qt.Key_O);keyClick(Qt.Key_R)
+            compare(root.expandedStageId,-1);compare(root.leakedKeys,0)
+            for (const key of [Qt.Key_Return,Qt.Key_Enter,Qt.Key_O,Qt.Key_Space]) {
+                keyHandler.forceActiveFocus();keyClick(key);wait(20)
+                compare(root.expandedStageId,2,"unchanged panel shortcut uses selected stage")
+                keyClick(key);wait(20);compare(root.expandedStageId,-1)
+            }
         }
         function test_loading_failure_retry_complete_copy_and_older_pages() {
             root.expandedStageId=1; wait(60)
@@ -215,66 +324,84 @@ Item {
             compare(editor.selectedText,selection)
             compare(root.calls.length,0)
         }
-        function test_publications_preserve_prose_expansion() {
-            root.expandedStageId=1; wait(40)
-            const labels=["Commit","Instructions","Acceptance criteria","Review policy rationale","Planner","Architect"]
-            const originals={}, keys={}
-            for (const label of labels) {
-                openDetail(field(label))
-                originals[label]=field(label).originalText
-                keys[label]=field(label).detailKey
+        function test_poll_replacement_preserves_editor_identity_and_native_selection() {
+            click(all("stageToggle")[0])
+            const row=stageRow, d=prose("Instructions"), editor=control(d,"stageProseText")
+            const commitEditor=control(prose("Commit"),"stageProseText"), oldCommit=prose("Commit").originalText
+            editor.forceActiveFocus();editor.select(1,21)
+            const start=editor.selectionStart,end=editor.selectionEnd,native=editor.selectedText,exact=d.selectedText
+            const original=d.originalText
+            const snapshot=root.stageSnapshot
+            const rationaleEditors=root.stageModelRationale(stageRow.modelData).map(f => ({
+                label:f.label,original:f.text,editor:control(prose(f.label),"stageProseText")}))
+            for (const publication of ["heartbeat","checkpoint","reviews"]) {
+                const p=JSON.parse(JSON.stringify(root.plan))
+                p.stages[0].instructions="\r\nNEW instructions "+publication+"  "
+                p.stages[0].commit="\nNEW commit "+publication+"\t"
+                p.stages[0].model_agreement.planner_reason="new planner "+publication
+                p.stages[0].status="blocked"
+                if (publication==="checkpoint") p.architecture.checkpoint="checkpoint-2"
+                if (publication==="reviews") {
+                    p.stages[0].reviews.push(p.stages[0].reviews.shift())
+                    p.stages[0].review_count++;p.stages[0].review_snapshot="snapshot-2"
+                }
+                root.plan=p;root.syncReviewViews();wait(60)
+                compare(stageRow,row,"production ListView retains the delegate")
+                compare(root.displayedStages,p.stages,"production displayedStages consumes replaced array")
+                compare(root.stageSnapshot,snapshot)
+                for (const held of rationaleEditors) {
+                    compare(prose(held.label).originalText,held.original)
+                    compare(control(prose(held.label),"stageProseText"),held.editor)
+                }
+                compare(prose("Instructions"),d)
+                compare(control(d,"stageProseText"),editor)
+                compare(control(prose("Commit"),"stageProseText"),commitEditor)
+                compare(d.originalText,original);compare(prose("Commit").originalText,oldCommit)
+                compare(editor.selectionStart,start);compare(editor.selectionEnd,end)
+                compare(editor.selectedText,native);compare(d.selectedText,exact)
+                verify(editor.activeFocus)
+                keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
+                compare(stageRow.modelData.status,"blocked")
+                verify(descendants(stageRow).some(t=>t instanceof Text && t.text==="blocked" && t.color===root.urgent))
             }
-            const preview=details().find(d=>!d.textComplete)
-            openDetail(preview)
-            const reviewKey=preview.detailKey
-            let p=JSON.parse(JSON.stringify(root.plan))
-            p.architecture.checkpoint="checkpoint-2"
-            root.plan=p;root.syncReviewViews();wait(60)
-            for (const label of labels) {
-                compare(field(label).detailKey,keys[label],label+" key survives checkpoint publication")
-                verify(field(label).expanded,label+" stays expanded after delegate recreation")
-            }
-            const changedPreview=details().find(d=>!d.textComplete)
-            verify(changedPreview.detailKey!==reviewKey,"reviews retain publication scope")
-            compare(changedPreview.expanded,false)
-            p=JSON.parse(JSON.stringify(root.plan))
-            p.stages[0].reviews.push(p.stages[0].reviews[0])
-            p.stages[0].reviews.shift()
-            p.stages[0].review_count++
-            p.stages[0].review_snapshot="snapshot-2"
-            root.plan=p;root.syncReviewViews();wait(60)
-            for (const label of labels) {
-                compare(field(label).detailKey,keys[label],label+" key survives appended review")
-                verify(field(label).expanded,label+" remains readable")
-                verify(!!control(field(label),"detailFullText"))
-                click(control(field(label),"detailCopy"))
-                compare(clipboard.clipboardText,originals[label])
-            }
+            click(all("stageRoutingToggle")[0])
+            click(all("stageToggle")[0]);assertCollapsed()
+            compare(root.stageSnapshot,null);compare(root.stageRoutingExpanded,false)
+            click(all("stageToggle")[0])
+            compare(prose("Instructions").originalText,root.plan.stages[0].instructions)
+            compare(prose("Commit").originalText,root.plan.stages[0].commit)
+            compare(prose("Planner").originalText,root.plan.stages[0].model_agreement.planner_reason)
         }
         function test_prose_expansion_scope_changes_data() {
             return ["project","visit","plan","revision","stage"].map(s=>({tag:s,scope:s}))
         }
         function test_prose_expansion_scope_changes(data) {
             root.expandedStageId=1;wait(40)
-            for (const label of ["Instructions","Acceptance criteria"]) openDetail(field(label))
+            const oldKey=root.stageSnapshot.key
             const p=JSON.parse(JSON.stringify(root.plan))
-            if (data.scope==="project") root.lastProject="/different"
-            if (data.scope==="visit") root.projectViewRevision++
+            p.stages[0].instructions="\r\nnew scoped instructions  "
             if (data.scope==="plan") p.plan_id="different-plan"
             if (data.scope==="revision") p.revision++
-            if (data.scope==="stage") { p.stages[0].id=2; root.expandedStageId=2 }
-            root.plan=p;root.syncReviewViews();wait(60)
-            for (const label of ["Instructions","Acceptance criteria"]) {
-                compare(field(label).expanded,false,label+" resets for "+data.scope)
-                compare(control(field(label),"detailFullText"),null)
-            }
+            if (data.scope==="stage") p.stages[0].id=2
+            root.plan=p
+            if (data.scope==="project") root.lastProject="/different"
+            if (data.scope==="visit") root.projectViewRevision++
+            if (data.scope==="stage") root.expandedStageId=2
+            root.syncReviewViews();wait(60)
+            verify(root.stageSnapshot.key!==oldKey)
+            compare(root.stageSnapshot.key,stageRow.detailScope)
+            compare(prose("Instructions").originalText,p.stages[0].instructions)
+            compare(control(prose("Instructions"),"stageProseText").text,nativeText(p.stages[0].instructions))
         }
         function test_committed_lock_preserves_read_only_details() {
-            const p=JSON.parse(JSON.stringify(root.plan));p.stages[0].status="committed";root.plan=p
-            root.editingPlan=true;wait(30)
+            const p=JSON.parse(JSON.stringify(root.plan));p.stages[0].status="committed";p.stages[0].sha="abc123";root.plan=p
+            root.editStages=p.stages;root.editingPlan=true;wait(30)
             compare(stageRow.editable,false)
-            verify(field("Instructions").visible)
-            const editor=openDetail(field("Instructions")); verify(editor.readOnly)
+            verify(descendants(stageRow).some(t => t instanceof Text && t.text === "committed — locked abc123"))
+            assertCollapsed()
+            click(all("stageToggle")[0])
+            verify(prose("Instructions").visible)
+            verify(control(prose("Instructions"),"stageProseText").readOnly)
         }
     }
 }

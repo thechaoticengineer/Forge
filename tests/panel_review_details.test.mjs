@@ -137,7 +137,7 @@ test('stage prose identity survives publications while review identity remains s
   const card=panel.slice(panel.indexOf('id: stageRow'),panel.indexOf('id: stageEditor'));
   assert.match(card,/detailScope: root.stageDetailScope\(modelData\)/);
   assert.match(card,/reviewDetailScope: root.reviewScope\(modelData\).key/);
-  assert.equal((card.match(/detailKey: stageRow.detailScope/g)||[]).length,5);
+  assert.equal((card.match(/detailKey: stageRow.detailScope/g)||[]).length,0);
   assert.equal((card.match(/detailKey: stageRow.reviewDetailScope/g)||[]).length,2);
 });
 test('actual Panel handlers load lazily, cache completed text, restart changed snapshots and discard stale callbacks', () => {
@@ -163,7 +163,7 @@ test('actual Panel handlers load lazily, cache completed text, restart changed s
   assert.equal(legacy.reviewView(st).rows[0].complete,false);
 });
 
-test('stage field wiring preserves each original, safe previews, locks, and header-only parent expansion', () => {
+test('stage field wiring preserves each original, full prose, review previews, locks, and header-only parent expansion', () => {
   const ctx={};
   vm.runInNewContext(panel.slice(panel.indexOf('  function reviewGateText('),panel.indexOf('  function reviewRoundLabel(')),ctx);
   const v=full('a'), fields=ctx.reviewFields(v);
@@ -173,8 +173,12 @@ test('stage field wiring preserves each original, safe previews, locks, and head
   assert.match(card,/textComplete: reviewRound.modelData.complete/);
   assert.match(card,/model: reviewRound.modelData.complete \? root.reviewFields/);
   assert.match(card,/editable: root.editingPlan && modelData.status !== "committed"/);
-  assert.match(card,/Flow \{\s+TapHandler/);
-  for (const name of ['commit','instructions','acceptance']) assert.match(card,new RegExp('originalText: stageRow.modelData.'+name));
+  assert.equal((card.match(/objectName: "stageToggle"/g)||[]).length,1);
+  assert.equal((card.match(/objectName: "stageRoutingToggle"/g)||[]).length,1);
+  assert.ok(!card.includes('TapHandler'));
+  assert.match(card,/StageProseField \{/);
+  assert.match(card,/active: stageRow.expanded && !stageRow.editable && stageRow.prose !== null/);
+  for (const name of ['commit','instructions','acceptance']) assert.match(card,new RegExp('originalText: stageRow.prose \\? stageRow.prose.'+name));
 });
 
 test('a byte-limited older page followed by failure keeps its unfilled gap reachable', () => {

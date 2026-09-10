@@ -22,16 +22,24 @@ helpers += between('  component StageDetail:', '  function reviewGateText(')
 helpers += between('  function reviewGateText(', '  function reportTime(')
 helpers += between('  function nonNegativeInt(', '  function formatTokens(')
 content = between('              Column {\n                id: stageContent', '              Loader {\n                id: stageEditor')
+state = between('  property int expandedStageId:', '  property int selectedStageIndex:')
+state += between('  readonly property var displayedStages:', '  readonly property bool editValid:')
+delegate = between('              readonly property var modelData: root.displayedStages[index]', '              readonly property var reviewView:')
+model = between('            model: root.displayedStages.length', '            delegate: Rectangle {')
+shortcut = between('              } else if (event.key === Qt.Key_Return', '                event.accepted = true\n              }\n            }')
+shortcut = shortcut.replace('              } else if', '              if', 1) + '                event.accepted = true\n              }\n'
 properties = between('              readonly property var reviewView:', '              width: stageList.width')
 fixture = (repo / 'tests/stage_details_fixture.qml.in').read_text()
 fixture = fixture.replace('import QtTest', 'import QtTest\nimport "components/PanelDetails.js" as PanelDetails')
 fixture = fixture.replace('// PANEL_HELPERS', helpers).replace('// PANEL_STAGE_CONTENT', content)
 fixture = fixture.replace('// PANEL_STAGE_PROPERTIES', properties)
+fixture = fixture.replace('// PANEL_STAGE_STATE', state).replace('// PANEL_STAGE_DELEGATE', delegate)
+fixture = fixture.replace('// PANEL_STAGE_MODEL', model).replace('// PANEL_STAGE_SHORTCUT', shortcut)
 fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.clipboardText', 'clipboard.clipboardText')
 with tempfile.TemporaryDirectory(prefix='forge-stage-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js'):
+    for name in ('StageProse.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_stage.qml').write_text(fixture)
     runtime = path / 'runtime'

@@ -42,7 +42,7 @@ test('routing status shows bounded retry counts, trigger evidence and both decis
   for (const expected of ['blocked','reassessments 2/3','operational retries 1/2','repeated_reasoning_failure','same failing test','Stronger capability needed','Preserve the invariant','No adequate eligible model']) assert.ok(text.includes(expected));
 });
 
-test('stage status remains visible while both exact rationale sources are independently expandable', () => {
+test('stage status stays live while full rationale and optional diagnostics use the snapshot', () => {
   const multiline = structuredClone(stage);
   multiline.model_agreement.planner_reason = '\n  planner first\r\nplanner tail  ';
   multiline.model_agreement.architect_reason = '\rarchitect first\narchitect tail\t';
@@ -54,8 +54,10 @@ test('stage status remains visible while both exact rationale sources are indepe
   assert.equal(fields.find(f => f.label === 'Architect').text, multiline.model_agreement.architect_reason);
   multiline.model_block = 'blocked\nfull error';
   assert.equal(ctx.stageModelErrors(multiline), multiline.model_block);
-  assert.match(qml, /model: root.stageModelDetails\(stageRow.modelData, stageRow.expanded\)/);
-  assert.match(qml, /PanelDetails.field\("routing", "Routing error", \(stageRow.modelData.reassessment \|\| \{\}\).error, true\)/);
+  assert.match(qml, /rationale: stageModelRationale\(stage\), diagnostics: stageModelDiagnostics\(stage\)/);
+  assert.match(qml, /model: stageRow.prose \? stageRow.prose.rationale : \[\]/);
+  assert.match(qml, /model: root.stageRoutingExpanded && stageRow.prose \? stageRow.prose.diagnostics : \[\]/);
+  assert.match(qml, /text: root.stageModelErrors\(stageRow.modelData\)\s+textFormat: Text.PlainText\s+color: root.urgent\s+wrapMode: Text.Wrap/);
 });
 
 test('pending model agreements still expose routing outcomes and execution identity', () => {
