@@ -275,7 +275,9 @@ impl Ctx {
         }
         let changed = answer["removed"].as_str().unwrap_or("").to_owned();
         // Record the renegotiation before the edit so it survives reconciliation
-        // and stays visible next to the stage it narrowed.
+        // and stays visible next to the stage it narrowed. It also goes into the
+        // caller's plan, so a later failure saving that copy cannot drop the
+        // count and hand the stage an unlimited supply of renegotiations.
         let mut current = self.load_plan().ok_or("missing plan")?;
         let target = current["stages"].as_array().ok_or("invalid stages")?.iter()
             .position(|s| s["id"] == sid).ok_or("stage disappeared during renegotiation")?;
@@ -287,6 +289,8 @@ impl Ctx {
             "reason": reason, "changed": changed});
         current["stages"][target]["scope_history"].as_array_mut().unwrap().push(entry);
         self.save_plan(&current)?;
+        plan["stages"][idx]["scope_renegotiations"] = json!(done + 1);
+        plan["stages"][idx]["scope_history"] = current["stages"][target]["scope_history"].clone();
         let current = self.load_plan().ok_or("missing plan")?;
         let stages: Vec<Value> = current["stages"].as_array().unwrap().iter().map(|s| {
             let mut edited = json!({"id": s["id"], "title": s["title"],

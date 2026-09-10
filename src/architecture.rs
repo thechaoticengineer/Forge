@@ -15,7 +15,11 @@ pub(crate) const VERSION: u64 = 1;
 // existing decoded-record memory budget for disk storage too; the 64 KiB
 // event/page budget is not a valid bound for an entire plan checkpoint.
 const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
-const EVENT_LIMIT: usize = 64 * 1024;
+// One turn may carry up to 16 decisions, each validated at 1 KiB of summary,
+// 4 KiB of rationale and 8 alternatives of 1 KiB each — roughly 336 KiB before
+// agreements and risks. A smaller line budget rejects turns the validator
+// accepts, so the log line has to hold what a legal turn can produce.
+const EVENT_LIMIT: usize = 512 * 1024;
 static IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Guidance and agreement records carry a `relevant_inputs` fingerprint that
@@ -1051,6 +1055,29 @@ mod tests {
         json!({"goal": "goal", "custom": {"preserved": true}, "usage": {"codex": {"total_tokens": 77}},
             "stages": [{"id": 1, "title": "one", "instructions": "work", "acceptance": "test", "commit": "feat: one"}]})
     }
+    /// The validator accepts 16 decisions of 1 KiB summary, 4 KiB rationale and
+    /// 8 alternatives of 1 KiB each. Storage has to accept the same turn.
+    #[test]
+    fn a_maximal_legal_architect_turn_fits_in_one_event() {
+        let temp = Temp::new();
+        let store = temp.store();
+        let published = publish(&store);
+        let decisions: Vec<Value> = (0..16).map(|i| json!({
+            "id": format!("decision-{i}"), "stage_id": 1, "status": "accepted",
+            "summary": "s".repeat(1000), "rationale": "r".repeat(4000),
+            "alternatives": (0..8).map(|_| json!({
+                "description": "d".repeat(1000), "tradeoffs": "t".repeat(1000)})).collect::<Vec<_>>(),
+        })).collect();
+        let cp = store.checkpoint(&published).unwrap();
+        let published = store.publish(published, cp,
+            json!({"kind":"architect_turn","turn":"t","decisions":decisions})).unwrap();
+        let page = store.history(published["plan_id"].as_str(), 0, 100).unwrap();
+        let stored = page["items"].as_array().unwrap().iter()
+            .find(|e| e["payload"]["kind"] == "architect_turn").expect("turn event");
+        assert_eq!(stored["payload"]["decisions"].as_array().unwrap().len(), 16);
+        assert_eq!(stored["payload"]["decisions"][15]["rationale"], "r".repeat(4000));
+    }
+
     fn publish(store: &Store) -> Value {
         store
             .publish(plan(), checkpoint_default(), json!({"kind": "created"}))
