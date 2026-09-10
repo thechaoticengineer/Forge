@@ -495,8 +495,18 @@ decision cannot be mistaken for approval of work under review. An older clean
 decision is muted during current activity. Budget exhaustion displays
 `blocked · review budget exhausted` alongside the last decision.
 
-Expand a stage to see recent review previews with recorded round, decision, summary,
-change requests, notes, checks under `verified:`, and timestamp (UTC).
+Expand a stage to read complete, wrapping, selectable review text: summaries,
+change requests, notes and checks under `verified:`, with recorded round, decision
+and timestamp (UTC). Ctrl+C copies the exact selection. Opening automatically
+loads completion for shortened records; until verified, their summaries remain
+explicitly labelled previews and selectable. A loading failure or unverifiable
+history appears as one group status line with **Retry reviews**. Automatic loading
+stays suppressed through polling, execution publications and collapse/re-expand
+until Retry or the applicable project, visit, plan, revision or stage scope reset.
+Collapsed cards initiate no automatic load, but an already-started chain may
+finish its pages after collapse. Complete records do not reload on reopening.
+**Load older reviews** pages eight at a time; Retry and older-page loading are
+group actions, with no per-review Expand, Load or Copy controls.
 Earlier requests remain visible after final approval. Expanded history uses
 the same decisions, colors, and request counts as the chip: historical
 notes-only approvals display amber `approved with optional notes`, with their
@@ -511,20 +521,48 @@ active round.
 
 ### Compact details
 
-Read-only panel details show the first non-empty line, with an ellipsis when it
-exceeds the available width. Each message or field stays separate, including
-Plan Q&A, architecture guidance, decisions, risks, reports and model descriptions.
+Chat (including Plan Q&A), live output, history, reports, providers, catalogue
+and queue keep compact per-field expansion: the first non-empty line appears
+with an ellipsis when it exceeds the available width. Each message or field stays
+separate. The architecture card is unchanged, including its grouped disclosures
+and compact guidance, decision and risk fields.
 **Expand** opens selectable plain text; **Copy full text** copies the original,
 including blank lines and whitespace. Use Tab and Space/Enter for the controls;
 Escape returns to panel shortcuts. Empty text has an explicit empty preview.
-Stage/report expansion and their individual text expansions remain separate.
+Report expansion and its individual text expansions remain separate.
 Statuses, errors, quota warnings, metadata and actions stay visible. Goal/plan/
 model-policy editors, structured diffs and keyboard help keep their existing uses.
+
+Read-only plan stage cards have exactly one disclosure toggle in the header;
+Enter / o / Space on the selected stage expands or collapses the same whole card.
+Collapsed cards show only the header and short wrapping status lines: stage
+status and sha, current activity, review policy and gate, the latest historical
+review line, elapsed time, model identity/effort, availability verification, tier
+provenance, and routing or block errors. There are no preview lines, per-field
+Expand controls or editors. Expanded cards show Commit, all model-agreement
+rationale (including routing-history rationale), review-policy rationale,
+Instructions, Acceptance criteria and historical reviews as complete, wrapping,
+selectable plain text, with no per-field controls. Ctrl+C copies the exact
+selected original text, including whitespace and CR/CRLF line endings. The single
+permitted extra toggle, **Model agreement and routing details**, reveals only
+risk, constraint, cost qualification, routing price, agreement id and latest
+invocation; rationale remains visible whenever the card is expanded. Committed
+stages remain read-only during plan editing.
+
+An expanded card holds stage prose at the snapshot taken when it opened, so
+polling cannot rebind an open editor or destroy a selection; status lines keep
+updating. Newer prose appears on collapse/re-expand or a project, project visit,
+plan, revision or stage scope change. Review presentation separately retains
+selected originals, labelled when held from an earlier publication, without
+making them verified in the current review scope. A selected preview stays
+labelled while its completed record appears separately; releasing the selection
+allows reconciliation. Collapse/re-expand or a stage scope reset clears held
+review presentation.
 
 Inspecting chat or output suspends following new messages. Polling preserves
 unchanged selections and open text; changed fields refresh on collapse. An open
 field removed from the current snapshot stays labelled **previously shown** until
-collapsed. Large review previews load complete text before offering full copying.
+collapsed.
 Legacy unstructured logs remain accessible as a single full-text entry: old
 message boundaries and text discarded before this upgrade cannot be reconstructed.
 See [panel detail implementation and isolated runtime checks](docs/panel-details.md).
@@ -582,7 +620,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `Escape` | Leave a text field, close the top overlay, or cancel plan editing |
 | `j` / `k` | Select next / previous stage |
 | `gg` / `G` | Select first / last stage |
-| `Enter` / `o` / `Space` | Expand or collapse selected stage; focus its title when editing |
+| `Enter` / `o` / `Space` | Expand or collapse the whole selected stage card; focus its title when editing |
 | `Tab` | Toggle Live / History |
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
@@ -1071,9 +1109,12 @@ substitution. Every handoff includes the saved architecture summary, decisions,
 guidance, constraints, completed interfaces, outstanding findings and worktree/
 diff context, and directs a replacement agent to inspect and preserve partial work.
 
-Collapsed stage cards show the model/effort, availability verification, tier
-provenance and both rationales before approval and during execution. Expand a
-stage for classification, constraints, cost qualification and invocation details.
+Collapsed stage cards show model identity/effort, availability verification and
+tier provenance as status lines before approval and during execution. Expanding
+the card shows all model-agreement rationale, including both selection reasons
+and retained routing-history rationale. Its single extra **Model agreement and
+routing details** toggle reveals risk classification, constraints, cost
+qualification, routing price, agreement id and latest invocation only.
 Planning/revision failure retains the previous published plan and context as one
 atomic unit. Read-only plan Q&A never selects models or publishes architectural
 changes.

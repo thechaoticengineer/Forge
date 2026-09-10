@@ -82,8 +82,8 @@ QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
 python3 tests/run_compact_clipboard.py
 ```
 
-The clipboard fixture exits and prints `EXACT_COPY_PASSED (5 originals)` on
-success. It changes only the isolated offscreen clipboard. The QtTest fixture
+The clipboard fixture exits and prints
+`EXACT_COPY_PASSED (5 originals, CompactDetail and StageProse)` on success. It changes only the isolated offscreen clipboard. The QtTest fixture
 exercises actual mouse/keyboard controls, elision, exact copy signal data,
 selection retention across reconciled polls/filtering/resizing/appends, reading
 anchors, tail behavior, long-line responsiveness, a 400-row history, width-based
@@ -101,81 +101,138 @@ full-panel live polling validation.
 
 ## Stage details and complete reviews
 
-Stage cards reuse `CompactDetail` separately for commit text, instructions,
-acceptance, review-policy rationale, both model-selection rationales and model
-explanations. Current aggregate gate, separate architect/independent outcomes,
-activity, model identity/availability, routing failures and historical labels
-remain independent, wrapping status text. Clicking the stage header or using the
-existing stage shortcut reveals acceptance and review history; each prose field
-has its own expansion. Only the header owns the stage pointer handler, so text
-selection and nested controls do not collapse the card. Committed editors stay
-locked, including while editing the rest of a plan.
+A read-only plan stage card has exactly one disclosure toggle in its header,
+which expands or collapses the whole card. The selected stage's Enter / o / Space
+shortcut does the same thing; at most one stage is expanded. A collapsed card
+contains only that header and short, wrapping plain-text status lines: stage
+status and sha, current activity, review policy and gate (including architect and
+independent outcomes), the latest historical review line, elapsed time, model
+identity and effort, availability verification, tier provenance, and routing or
+block errors. There are no preview lines, per-field Expand controls or editors.
+Committed stages keep this read-only card even while the rest of a plan is edited;
+the existing editability rule is unchanged.
 
-Prose expansion uses project, project visit, plan identity, revision, stage and
-field identity. Checkpoint publications and appended reviews therefore preserve
-open commit, instructions, acceptance, policy and model details even when stage
-delegates are recreated. Review rows retain their separate snapshot scope so an
-open review cannot transfer to a different publication.
+An expanded card shows Commit, all model-agreement rationale (planner, architect,
+trigger evidence and retained routing-history rationales), review-policy rationale,
+Instructions, Acceptance criteria and historical reviews as complete, wrapping,
+selectable plain text through `StageProse.qml`. There are no per-field disclosure,
+load or copy controls. Ctrl+C copies exactly the selected substring of the
+original, including whitespace and original CR/CRLF line endings; Ctrl+A selects
+all. Qt normalizes line endings in the displayed editor, but the selection maps
+back to the original for copying. Escape returns to panel shortcuts; Tab and
+Backtab traverse focus, while other keys stay contained in the field. Pointer
+focus does not scroll away from a drag selection. The panel viewport scrolls the full prose; ordinary text wraps by word
+and unbroken lines longer than 1000 characters wrap anywhere.
 
-`ReviewView.js` owns lazy review retrieval through the existing
-`/api/architecture/reviews` endpoint. Requests include explicit `project`,
-`stage_id`, available `plan_id` and `checkpoint`, `cursor`, and `limit`. Revision
-is a client scope/response guard, not an endpoint query parameter. Loading a
-shortened review seeks to its absolute position; older reviews load eight at a
-time, following `next_cursor` if the byte budget ends a page early. A failed
-continuation does not advance the contiguous older-page boundary past a gap.
+The single permitted extra disclosure toggle, **Model agreement and routing
+details**, reveals only diagnostics: risk, constraint, cost qualification,
+routing price, agreement id and latest invocation. All rationale prose is visible
+whenever the card is expanded, regardless of this toggle.
 
-The additive response fields `project`, `revision`, and `snapshot` identify the
-returned publication. The read-only state projection adds `review_snapshot` to
-each stage. Indexed histories use their immutable file identifier. Legacy
-histories use SHA-256 over all complete records (including unknown fields); an
-empty history has the marker `empty`. Both readers use the existing SHA-256
-utility. Cached legacy state retains its original marker without hashing the
-shortened projection again. No records are rewritten by reads. The existing
-8-record / 4096-serialized-byte preview bounds and whole-record page budgets
-remain unchanged. Last-verdict-only legacy histories are also readable through
-the endpoint.
+Opening a card automatically requests completion of shortened review previews
+when needed, outside plan-edit mode. Already complete records do not reload, and
+collapsed cards initiate no automatic load. An already-started request chain may
+finish its continuation pages after collapse; collapse does not cancel requests.
+Until complete verified records arrive, shortened summaries remain selectable
+and explicitly labelled **Summary preview · feedback may be omitted**. Complete
+records show the full summary and every change request, legacy note and verified
+check, alongside the round, role, decision and UTC timestamp. A shortened record
+is never presented as complete.
 
-Cache and request ownership include project visit, plan, revision, stage,
-checkpoint and history marker. Durable record identities are checked when
-available; otherwise the recent preview at index `i` maps to
-`review_count - preview_count + i` only after the endpoint verifies the same
-snapshot. Summary strings and shared round numbers never establish identity.
-With no checkpoint, a changed full-history marker rejects the response and
-refreshes state; assembly restarts in the new scope. An old server without either
-a checkpoint or a snapshot marker cannot authorize positional mapping. The panel
-reports that it cannot verify the history rather than attaching full text to an
-unverified preview. Stale success and failure callbacks cannot modify the view.
+The review group keeps its **Historical reviews · showing N of M** line and one
+wrapping loading/failure status line, red on failure. A failed load or history
+that cannot be verified exposes a group-level **Retry reviews** action. Automatic
+loading stays suppressed through polling, checkpoint/snapshot publications and
+collapse/re-expand until Retry or an applicable project, visit, plan, revision or
+stage scope reset. Retry uses the failed range when available, otherwise the
+current incomplete range or older-page gap; successful completion clears the
+failure state. Failures from Retry and older-page actions also suppress automatic
+loading. **Load older reviews (N)** pages backwards eight records at a time.
+These are group actions, not disclosure toggles or per-review load buttons.
 
-A shortened preview explicitly says it is a preview. Expansion displays loading,
-failure and retry controls, with no editor or full-copy action until a complete,
-verified record arrives. Each full summary, individual request, legacy note and
-check then has a separate selectable editor and an exact original copy source.
-Current gates remain independent of historical review approvals.
+The card-level snapshot-hold captures stage prose when the card opens. Commit,
+instructions, acceptance, policy rationale, model rationale and diagnostics stay
+bound to that snapshot while expanded, so polling cannot rebind an open editor
+or destroy a selection. Status lines keep updating. Newer prose appears on
+collapse/re-expand or when the project, project visit, plan, revision or stage
+scope changes. Stage delegates retain their identity across ordinary plan-array
+replacement.
 
-Additional verification:
+Historical review presentation is retained separately from current review
+verification. Selected review editors survive polling, `syncReviewViews()`,
+checkpoint publications, resizing and older-row insertion. Selected text from a
+previous publication is labelled as held from that publication; it cannot make
+the current scope's preview complete or bypass verification. If a selected
+preview finishes loading, the complete record appears separately while the
+selected preview keeps its label and original. Releasing the selection permits
+reconciliation; collapse/re-expand or a stage-detail scope reset clears the held
+presentation. Current review gates remain independent of historical approvals.
+
+`ReviewView.js` owns retrieval through `/api/architecture/reviews`. Requests carry
+`project`, `stage_id`, available `plan_id` and `checkpoint`, `cursor` and `limit`;
+revision is a client scope/response guard, not a query parameter. Loading seeks
+to absolute record positions and follows `next_cursor` when the byte budget ends
+a page early. A failed continuation cannot advance the contiguous older-page
+boundary past a gap. The 8-record / 4096-serialized-byte preview bounds and
+whole-record page budgets are unchanged, including last-verdict legacy fallback.
+
+Request/cache ownership includes project visit, plan, revision, stage, checkpoint
+and history marker. Response `project`, `revision` and `snapshot` identify the
+publication; stage state exposes `review_snapshot`. Indexed histories use their
+immutable file identifier, while legacy histories use SHA-256 over all complete
+records, including unknown fields, or `empty` for no history. Cached legacy state
+keeps its original marker without hashing shortened projections; reads rewrite
+no records. Durable record identities are checked when available; otherwise
+preview positions map only after verification of the same snapshot. Summary text
+and shared round numbers do not establish identity. A changed marker rejects the
+response and refreshes state; durable stage-scoped suppression prevents that
+refresh from silently restarting automatic loading. Without a checkpoint or
+snapshot marker, the panel reports unverifiable history. Stale success and
+failure callbacks cannot mutate the current view.
+
+Chat, live output, history, reports, providers, catalogue and queue keep the
+compact per-field expansion described in the earlier sections. The architecture
+card is unchanged, including its grouped disclosures and compact fields.
+
+Verification rerun for this documentation stage:
 
 ```sh
-node --test tests/panel_review_details.test.mjs tests/panel_review.test.mjs \
-  tests/panel_routing.test.mjs tests/panel_lifecycle.test.mjs
+node --test tests/*.test.mjs
 python3 tests/run_stage_details.py
+python3 tests/run_panel_details.py
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+  /usr/lib/qt6/bin/qmltestrunner -input tests/qml
+python3 tests/run_compact_clipboard.py
 ```
 
-The stage fixture extracts the current Panel stage-content subtree, compact
-wrapper and request/status helpers, substituting only theme, clipboard and
-viewport services. It executes actual delegates and controls offscreen: narrow
-widths, independent expansion, selection/copy, lazy loading, failure/retry,
-complete long reviews and individual requests, older pagination, stale callbacks,
-and committed read-only presentation. Stage delegates are recreated on plan
-replacement; regression checks preserve expanded prose across checkpoint-only
-publication and appended reviews, and reset it for project, visit, plan, revision
-or stage changes. Clipboard signal data is asserted there;
-`run_compact_clipboard.py` separately verifies the actual Quickshell clipboard.
-This is isolated stage-subtree evidence, not a running Omarchy-shell interaction
-or validation of the remaining stage-4 panel surfaces. Rust endpoint tests pin
-same-revision publications, reconstruct large complete histories, detect hidden
-legacy changes with identical previews, preserve cached markers, and confirm
-that reads leave saved records unchanged.
+All five commands exited successfully: Node reported 57 passed, the stage fixture
+17 passed, the panel fixture 27 passed, and the offscreen QML suite 32 passed
+(including `tests/qml/tst_stage_prose.qml`), with zero failures or skips. The
+isolated Quickshell clipboard run printed
+`EXACT_COPY_PASSED (5 originals, CompactDetail and StageProse)`, confirming exact
+round trips through both components. It also emitted the offscreen platform's
+window-mask warning; the clipboard check still completed successfully.
+
+The stage fixture extracts the production card subtree, `StageProseField`,
+request/status helpers, stage model and keyboard shortcut, substituting only
+host services such as theme, clipboard and viewport. It proves the populated
+collapsed subtree has only its header toggle and wrapping status text, with no
+previews or editors; expanded prose and diagnostics obey the disclosure limits;
+and header/keyboard activation, exact-selection copying and committed read-only
+presentation work. It checks editor identity and native selection retention
+through polling, checkpoint/appended-review publications, syncing and resizing,
+with live statuses, held-preview/source labels and scope resets. Loading checks
+cover automatic completion on opening, no initiation while collapsed, allowed
+in-flight continuation after collapse, no reload of complete records, durable
+failure suppression, unverifiable responses, Retry recovery, older pagination
+to the oldest record and stale callbacks. Node protocol tests additionally cover
+byte-limited pages and contiguous older-page gaps. The component suite includes
+the new stage-prose test for original CR/CRLF selection mapping, keyboard
+containment, mouse selection, empty input and long-line wrapping.
+
+These are isolated component and stage/panel-subtree checks, not full-panel live
+polling validation. No live Omarchy shell or Forge engine was started or stopped.
+The clipboard check uses a separate offscreen Quickshell process.
 
 ## Remaining panel details
 
@@ -241,17 +298,19 @@ polling and outer collapse/re-expansion. A Node regression separately counts
 exactly one serialization per report per update and none during navigation.
 Warnings from the extracted subtrees fail the runner.
 
-The re-review run passed all 24 panel runtime checks on Qt 6.11.2 (offscreen,
-software rendering). At 280/800 pixels respectively, assigning the 100 reports
-took 16/15 ms, 1,000 cached navigation lookups took 2/2 ms, and the slowest of five
-prepend polls took 23/22 ms. Each collapsed list had 2,203 visual objects and zero
-report detail trees. These are fixture measurements, not live-shell benchmarks.
+The documentation-stage rerun passed all 27 panel runtime checks on Qt 6.11.2
+(offscreen, software rendering). At 280/800 pixels respectively, assigning the
+100 reports took 18/15 ms, 1,000 cached navigation lookups took 3/2 ms, and the
+slowest of five prepend polls took 25/23 ms. Each collapsed list had 2,103 visual
+objects and zero report detail trees. These are fixture measurements, not
+live-shell benchmarks.
 
 The existing `tests/qml` runtime suite separately validates live/history component
 behavior (including 400 loaded rows, filtering, reading anchors and Unicode
 elision). `run_compact_clipboard.py` separately verifies exact Quickshell clipboard
-round trips for five originals in an offscreen process; the subtree fixtures
-assert clipboard signal data, not the desktop clipboard. `run_stage_details.py`
+round trips for five originals through both `CompactDetail` and `StageProse`
+in an offscreen process; the subtree fixtures assert clipboard signal data, not
+the desktop clipboard. `run_stage_details.py`
 continues to test the stage/review subtree, lazy loading and stale responses.
 These are applicable isolated runtime checks, not JavaScript/parsing substitutes.
 No live Omarchy shell was restarted or installed into, and no Forge engine was
