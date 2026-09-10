@@ -29,6 +29,10 @@ fn preview(record: &Value) -> Value {
     if record.to_string().len() <= 4096 {
         return record.clone();
     }
+    plan_preview(record)
+}
+
+fn plan_preview(record: &Value) -> Value {
     let strings = |key: &str| {
         record[key]
             .as_array()
@@ -74,6 +78,14 @@ pub(crate) fn bounded(plan: &mut Value) {
 }
 
 pub(crate) fn write(dir: &Path, records: &[Value]) -> Result<Value, String> {
+    write_with_preview(dir, records, preview)
+}
+
+pub(crate) fn write_plan(dir: &Path, records: &[Value]) -> Result<Value, String> {
+    write_with_preview(dir, records, plan_preview)
+}
+
+fn write_with_preview(dir: &Path, records: &[Value], preview: fn(&Value) -> Value) -> Result<Value, String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let id = crate::architecture::identity();
     let mut data = OpenOptions::new()

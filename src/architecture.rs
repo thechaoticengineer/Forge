@@ -351,9 +351,12 @@ impl Store {
             .join("reviews"))
     }
     fn hydrate(&self, mut plan: Value) -> Result<Value, String> {
-        let Some(refs) = plan["architecture"].get("review_history").cloned() else {
-            return Ok(plan);
-        };
+        let refs = plan["architecture"]["review_history"].clone();
+        if plan["plan_review"]["reviews"]["$forge_reviews"].is_string() {
+            plan["plan_review"]["reviews"] = crate::review_history::all(
+                &self.review_dir(&plan)?, &plan["architecture"]["plan_review_history"])?;
+        }
+        if refs.is_null() { return Ok(plan); }
         let dir = self.review_dir(&plan)?;
         for stage in plan["stages"].as_array_mut().ok_or("invalid stages")? {
             if stage["reviews"].is_object() && stage["reviews"].get("$forge_reviews").is_some() {
@@ -364,6 +367,14 @@ impl Store {
         Ok(plan)
     }
     fn validate_reviews(&self, plan: &Value) -> Result<(), String> {
+        if let Some(reference) = plan["architecture"].get("plan_review_history") {
+            crate::review_history::validate(&self.review_dir(plan)?, reference)?;
+            if plan["plan_review"]["reviews"]["$forge_reviews"] != reference["file"] {
+                return Err("plan review/reference mismatch".into());
+            }
+        } else if plan["plan_review"]["reviews"]["$forge_reviews"].is_string() {
+            return Err("missing plan review reference".into());
+        }
         if let Some(refs) = plan["architecture"].get("review_history") {
             let dir = self.review_dir(plan)?;
             for (id, reference) in refs.as_object().ok_or("invalid review manifest")? {
@@ -436,10 +447,19 @@ impl Store {
                 }
             }
         }
+        if plan["plan_review"].is_object() {
+            let reference = plan["architecture"]["plan_review_history"].clone();
+            plan["plan_review"]["reviews"] = reference["recent"].clone();
+            plan["plan_review"]["review_count"] = reference["count"].clone();
+            plan["plan_review"]["reviews_truncated"] = json!(true);
+            plan["plan_review"].as_object_mut().unwrap().remove("subject");
+            plan["plan_review"].as_object_mut().unwrap().remove("acceptance");
+        }
         crate::review_history::bounded(&mut plan);
         // References for removed stages stay on disk and remain accessible through pagination.
         if let Some(architecture) = plan.get_mut("architecture").and_then(Value::as_object_mut) {
             architecture.remove("review_history");
+            architecture.remove("plan_review_history");
         }
         plan
     }
@@ -752,6 +772,15 @@ impl Store {
         }
         if !references.is_empty() {
             plan["architecture"]["review_history"] = json!(references);
+        }
+        if let Some(records) = plan["plan_review"]["reviews"].as_array() {
+            let previous = old.as_ref().filter(|_| same);
+            let reference = if previous.is_some_and(|p| p["plan_review"]["reviews"] == json!(records)
+                && p["architecture"]["plan_review_history"].is_object()) {
+                previous.unwrap()["architecture"]["plan_review_history"].clone()
+            } else { crate::review_history::write_plan(&review_dir, records)? };
+            plan["plan_review"]["reviews"] = json!({"$forge_reviews":reference["file"]});
+            plan["architecture"]["plan_review_history"] = reference;
         }
         sync_dir(&dir)?;
         if stop == "reviews" {
@@ -1337,6 +1366,41 @@ mod tests {
         assert_eq!(page["items"][0]["payload"], payload);
         assert!(page["next_cursor"].is_null());
         assert_eq!(page["event_end"], second["architecture"]["event_end"]);
+    }
+
+    #[test]
+    fn plan_review_events_and_references_publish_atomically_with_bounded_previews() {
+        for point in ["events", "reviews", "checkpoint", "publication_error", "publication"] {
+            let temp = Temp::new();
+            let store = temp.store();
+            let old = publish(&store);
+            let cp = store.checkpoint(&old).unwrap();
+            let verdict = json!({"scope":"plan","stage_id":null,"role":"reviewer","approved":true,
+                "identity":{"scope":"plan"},"criteria":[{"evidence":"full evidence"}],"summary":"small verdict"});
+            let mut next = old.clone();
+            next["plan_review"] = json!({"version":1,"reviews":[verdict.clone()]});
+            let event = json!({"kind":"plan_review","reviews":[verdict.clone()]});
+            assert!(store.publish_at(next.clone(),cp.clone(),event.clone(),point).is_err());
+            let current = store.load().unwrap().unwrap();
+            if point != "publication" {
+                assert_eq!(current,old);
+                store.publish(next,cp,event.clone()).unwrap();
+            }
+            let raw = store.load_raw().unwrap().unwrap();
+            assert!(raw["plan_review"]["reviews"]["$forge_reviews"].is_string());
+            assert_eq!(store.load().unwrap().unwrap()["plan_review"]["reviews"],json!([verdict]));
+            assert_eq!(store.history(None,0,10).unwrap()["items"].as_array().unwrap().last().unwrap()["payload"],event);
+            let state = store.state_plan(raw.clone());
+            assert!(state["plan_review"]["reviews"][0]["criteria"].is_null());
+            assert!(state["plan_review"]["reviews"][0]["identity"].is_null());
+            assert_eq!(state["plan_review"]["review_count"],1);
+            // Polling reads the projection even if full data is not JSON-readable.
+            let reference = &raw["architecture"]["plan_review_history"];
+            let path = store.review_dir(&raw).unwrap().join(format!("{}.jsonl",reference["file"].as_str().unwrap()));
+            fs::write(path,vec![b'x';reference["bytes"].as_u64().unwrap() as usize]).unwrap();
+            assert!(store.load().is_err());
+            assert_eq!(store.state_plan(store.load_raw().unwrap().unwrap()),state);
+        }
     }
 
     #[test]

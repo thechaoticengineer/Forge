@@ -53,7 +53,7 @@ impl Fixture {
     fn count(&self, role: &str) -> usize {
         self.ctx.app.settings.lock().unwrap()[format!("mock_{role}_prompts")]
             .as_array()
-            .map_or(0, Vec::len)
+            .map_or(0, |prompts| prompts.iter().filter(|p| !p.as_str().unwrap_or("").contains("\"scope\":\"plan\"")).count())
     }
     fn docs(&self) {
         self.setting(
@@ -1133,10 +1133,11 @@ fn deferred_commit_keeps_snapshot_checks_and_exact_commit_recovery() {
 }
 
 #[test]
-fn deferred_obligations_block_completion_reports_and_push_even_after_restart() {
+fn rejected_deferred_obligations_block_completion_reports_and_push_even_after_restart() {
     for reviewer in ["per_stage", "per_plan"] {
         let f = Fixture::new("Implement feature", 0);
         f.setting("review_cadence", json!({"architect":"per_plan","reviewer":reviewer}));
+        f.setting("mock_architect_verdicts", json!([reject("Resolve the cross-stage defect")]));
         f.setting("auto_push", json!(true));
         let remote = f.root.join(".git/test-remote");
         f.ctx.git(&["init", "--bare", remote.to_str().unwrap()]).unwrap();
@@ -1236,5 +1237,393 @@ fn legacy_policy_without_partition_still_requires_evidenced_role_approvals() {
         f.ctx.save_plan(&p).unwrap();
         let result = f.ctx.commit_reviewed(&p, 0, "feat: stage");
         assert_eq!(result.is_err(), invalid, "{result:?}");
+    }
+}
+
+impl Fixture {
+    fn two_deferred_stages(&self) -> String {
+        let mut p = self.plan();
+        let mut second = p["stages"][0].clone();
+        second["id"] = json!(2);
+        second["title"] = json!("Integrate feature");
+        second["instructions"] = json!("Integrate the second feature with the first.");
+        second["acceptance"] = json!("Second feature works.\n\n Both features integrate. ");
+        second["commit"] = json!("feat: second stage");
+        p["stages"].as_array_mut().unwrap().push(second);
+        self.ctx.save_plan(&p).unwrap();
+        self.setting("review_cadence", json!({"architect":"per_plan","reviewer":"per_plan"}));
+        self.setting("mock_edits", json!([{"first.rs":"fn first() {}\n"},{"second.rs":"fn second() {}\n"}]));
+        self.ctx.git(&["rev-parse","HEAD"]).unwrap()
+    }
+    fn plan_calls(&self) -> Vec<Value> {
+        self.ctx.app.settings.lock().unwrap()["test_review_sessions"].as_array().into_iter().flatten()
+            .filter(|r| r["prompt"].as_str().unwrap().contains("\"scope\":\"plan\"" )).cloned().collect()
+    }
+}
+
+#[test]
+fn plan_review_captures_range_evidence_storage_sessions_and_gates_publication() {
+    for push in [false,true] {
+        let f = Fixture::new("Implement feature",0);
+        let base = f.two_deferred_stages();
+        f.setting("auto_push",json!(push));
+        f.setting("mock_usage",json!({"input":2,"output":3,"total":5}));
+        let remote = f.root.join(".git/test-remote");
+        f.ctx.git(&["init","--bare",remote.to_str().unwrap()]).unwrap();
+        f.ctx.git(&["remote","add","origin",remote.to_str().unwrap()]).unwrap();
+        let p = f.run();
+        assert_eq!(p["status"],"done","{p}");
+        assert_eq!(f.ctx.session.state.lock().unwrap().phase,"done");
+        for stage in p["stages"].as_array().unwrap() {
+            assert_eq!(stage["status"],"committed");
+            assert_eq!(stage["review_gate"]["status"],"deferred");
+            assert_eq!(stage["reviews"],json!([]));
+        }
+        let r = &p["plan_review"];
+        assert_eq!(r["base"],base);
+        assert!(r["attempt_id"].is_string());
+        assert_eq!(r["head"],f.ctx.git(&["rev-parse","HEAD"]).unwrap());
+        assert_eq!(r["budget"],0);
+        assert_eq!(r["rounds"],1);
+        assert_eq!(r["gate"]["status"],"approved");
+        assert_eq!(r["required_roles"],json!(["architect","reviewer"]));
+        assert_eq!(r["acceptance"],"stage 1 (Implement feature): The requested change works.\nstage 2 (Integrate feature): Second feature works.\nstage 2 (Integrate feature): Both features integrate.");
+        let calls = f.plan_calls();
+        assert_eq!(calls.len(),2);
+        assert_eq!(calls[0]["role"],"reviewer");
+        assert!(calls[0]["session"].is_null());
+        assert_eq!(calls[1]["role"],"architect");
+        assert!(calls[1]["session"].is_string());
+        for (i,call) in calls.iter().enumerate() {
+            let prompt = call["prompt"].as_str().unwrap();
+            assert!(prompt.contains(&format!("git log --stat {base}..HEAD")));
+            assert!(prompt.contains(&format!("git diff {base}..HEAD")));
+            for stage in r["subject"]["stages"].as_array().unwrap() {
+                for key in ["title","instructions","commit","sha"] { assert!(prompt.contains(stage[key].as_str().unwrap())); }
+            }
+            for rule in ["/tmp", "Do not change source", "Return ONLY JSON", "8734", "18734", "CRITERIA TO EVIDENCE"] { assert!(prompt.contains(rule)); }
+            let verdict = &r["reviews"][i];
+            assert_eq!(verdict["identity"]["scope"],"plan");
+            assert!(verdict["identity"]["stage_id"].is_null());
+            assert_eq!(verdict["identity"]["round"],1);
+            assert_eq!(verdict["criteria"].as_array().unwrap().len(),3);
+            normalize(&verdict.to_string(),&verdict["identity"],r["acceptance"].as_str().unwrap()).unwrap();
+        }
+        let raw = f.ctx.architecture_store().load_raw().unwrap().unwrap();
+        assert!(raw["plan_review"]["reviews"]["$forge_reviews"].is_string());
+        assert!(raw["architecture"]["review_history"].as_object().unwrap().keys().all(|k| k == "1" || k == "2"));
+        let state = f.ctx.architecture_store().state_plan(raw);
+        assert_eq!(state["plan_review"]["review_count"],2);
+        for preview in state["plan_review"]["reviews"].as_array().unwrap() {
+            for key in ["identity","acceptance_evidence","criteria","project_checks"] { assert!(preview[key].is_null()); }
+        }
+        let log = fs::read_to_string(f.ctx.forge_path("architecture").join(p["plan_id"].as_str().unwrap()).join("events.jsonl")).unwrap();
+        let events: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).filter(|e: &Value| e["payload"]["kind"] == "plan_review").collect();
+        assert_eq!(events.len(),2);
+        for (i,event) in events.iter().enumerate() { assert_eq!(event["payload"]["reviews"][0],r["reviews"][i]); }
+        assert_eq!(p["role_usage"]["reviewer"]["mock"]["total_tokens"],5);
+        assert!(p["usage"]["mock"]["total_tokens"].as_i64().unwrap() >= 10);
+        assert_eq!(fs::read_to_string(f.ctx.forge_path("reports.jsonl")).unwrap().lines().count(),1);
+        assert_eq!(!f.ctx.git(&["ls-remote","origin"]).unwrap().is_empty(),push);
+        f.ctx.validate_plan_approval(&p).unwrap();
+        let before = calls.len();
+        let mut resumed = f.plan();
+        assert!(f.ctx.run_plan_review(&mut resumed).unwrap());
+        assert_eq!(f.plan_calls().len(),before);
+    }
+}
+
+#[test]
+fn plan_review_errors_stops_and_budget_never_publish_partial_approval() {
+    for kind in ["reject","evidence","stop","mutation","error"] {
+        let f = Fixture::new("Implement feature",0);
+        f.two_deferred_stages();
+        match kind {
+            "reject" => f.setting("mock_architect_verdicts",json!([reject("Fix cross-stage integration")])),
+            "evidence" => f.setting("mock_verdicts",json!([{"approved":true,"issues":[],"criteria":[]}])),
+            "stop" => f.setting("mock_architect_actions",json!([{"stop":true}])),
+            "mutation" => f.setting("mock_architect_actions",json!([{"write":{"first.rs":"changed during review"}}])),
+            _ => f.setting("mock_architect_actions",json!([{"error":"review provider unavailable"}])),
+        }
+        let p = f.run();
+        assert_eq!(p["plan_review"]["rounds"],1,"{kind}: {p}");
+        assert_eq!(p["plan_review"]["status"],if kind == "stop" {"interrupted"} else {"blocked"});
+        assert_eq!(f.ctx.session.state.lock().unwrap().phase,if kind == "stop" {"plan_ready"} else {"blocked"});
+        assert_eq!(p["plan_review"]["gate"]["status"],if kind == "stop" {"interrupted"} else if kind == "reject" {"blocked"} else {"error"});
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        let calls = f.plan_calls().len();
+        f.ctx.session.stop_requested.store(false,Ordering::SeqCst);
+        f.setting("max_fix_rounds",json!(10));
+        let resumed = f.run();
+        assert_eq!(resumed["plan_review"]["rounds"],1);
+        assert_eq!(resumed["plan_review"]["budget"],0);
+        assert_eq!(f.plan_calls().len(),calls);
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+    }
+}
+
+#[test]
+fn plan_review_approved_revision_starts_new_attempt_and_preserves_evidence() {
+    use crate::test_support::api_request;
+
+    for rejected in [false,true] {
+        for add_stage in [false,true] {
+            let f = Fixture::new("Implement feature",0);
+            let base = f.two_deferred_stages();
+            if rejected {
+                f.setting("mock_architect_verdicts",json!([reject("Fix cross-stage integration")]));
+            }
+            let previous = f.run();
+            let old = &previous["plan_review"];
+            assert_eq!(old["status"],if rejected {"blocked"} else {"approved"});
+            assert_eq!(old["rounds"],1);
+            assert_eq!(old["budget"],0);
+            let old_reviews = old["reviews"].as_array().unwrap();
+            assert_eq!(old_reviews.len(),2);
+
+            let mut incoming = previous.clone();
+            incoming["goal"] = json!("Improve the project and verify integration");
+            if add_stage {
+                incoming["stages"].as_array_mut().unwrap().push(json!({"id":3,
+                    "title":"Complete integration","instructions":"Integrate the completed features.",
+                    "acceptance":"All three features integrate.\n Existing behavior works.",
+                    "commit":"feat: complete integration"}));
+                f.setting("mock_edits",json!([{"third.rs":"fn third() {}\n"}]));
+            }
+            let response = api_request(&f.ctx.app,"POST","/api/plan/edit",json!({"plan":incoming}));
+            assert_eq!(response.0,200,"{response:?}");
+            let draft = f.plan();
+            assert_eq!(draft["status"],"draft");
+            assert_eq!(draft["revision"].as_u64().unwrap(),previous["revision"].as_u64().unwrap()+1);
+            let mut pending = old.clone();
+            pending["pending_revision"] = draft["revision"].clone();
+            assert_eq!(draft["plan_review"],pending);
+            assert!(f.ctx.validate_plan_approval(&draft).is_err());
+            assert_eq!(api_request(&f.ctx.app,"POST","/api/run",json!({})).0,400);
+            f.setting("max_fix_rounds",json!(2));
+            let response = api_request(&f.ctx.app,"POST","/api/approve",json!({}));
+            assert_eq!(response.0,200,"{response:?}");
+            assert_eq!(f.plan()["status"],"approved");
+
+            let completed = f.run();
+            assert_eq!(completed["status"],"done","rejected={rejected}, add_stage={add_stage}: {completed}");
+            assert_eq!(f.ctx.session.state.lock().unwrap().phase,"done");
+            let new = &completed["plan_review"];
+            assert_ne!(new["attempt_id"],old["attempt_id"]);
+            assert_eq!(new["status"],"approved");
+            assert_eq!(new["rounds"],1);
+            assert_eq!(new["budget"],2);
+            assert!(new["pending_revision"].is_null());
+            assert_eq!(new["base"],base);
+            assert_eq!(new["head"],f.ctx.git(&["rev-parse","HEAD"]).unwrap());
+            assert_eq!(new["head"] != old["head"],add_stage);
+            assert_eq!(new["subject"]["revision"],completed["revision"]);
+            assert_eq!(new["subject"]["goal"],incoming["goal"]);
+            assert_eq!(new["subject"]["stages"].as_array().unwrap().len(),if add_stage {3} else {2});
+            assert_eq!(new["required_roles"],json!(["architect","reviewer"]));
+            let records = new["reviews"].as_array().unwrap();
+            assert_eq!(&records[..2],old_reviews);
+            assert_eq!(records.len(),4);
+            for record in &records[2..] {
+                assert_eq!(record["attempt_id"],new["attempt_id"]);
+                assert_eq!(record["identity"]["revision"],completed["revision"]);
+                assert_eq!(record["criteria"].as_array().unwrap().len(),if add_stage {5} else {3});
+                assert_eq!(record["acceptance_evidence"]["acceptance"],new["acceptance"]);
+            }
+            assert_eq!(f.plan_calls().len(),4);
+            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if add_stage {"4"} else {"3"});
+            for i in 0..2 {
+                assert_eq!(completed["stages"][i]["sha"],previous["stages"][i]["sha"]);
+                assert_eq!(completed["stages"][i]["model_invocations"],previous["stages"][i]["model_invocations"]);
+            }
+            assert_eq!(fs::read_to_string(f.ctx.forge_path("reports.jsonl")).unwrap().lines().count(),if rejected {1} else {2});
+            f.ctx.validate_plan_approval(&completed).unwrap();
+            let raw = f.ctx.architecture_store().load_raw().unwrap().unwrap();
+            assert_eq!(raw["architecture"]["plan_review_history"]["count"],4);
+            let log = fs::read_to_string(f.ctx.forge_path("architecture").join(completed["plan_id"].as_str().unwrap()).join("events.jsonl")).unwrap();
+            let verdicts: Vec<Value> = log.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|e| e["payload"]["kind"] == "plan_review")
+                .map(|e| e["payload"]["reviews"][0].clone()).collect();
+            assert_eq!(&verdicts,records);
+        }
+    }
+}
+
+#[test]
+fn plan_review_no_obligations_skips_even_with_unrelated_plan_review_state() {
+    let f = Fixture::new("Implement feature",0);
+    let mut p = f.plan();
+    p["plan_review"] = json!({"version":1,"status":"blocked","reviews":[]});
+    f.ctx.save_plan(&p).unwrap();
+    let p = f.run();
+    assert_eq!(p["status"],"done");
+    assert_eq!(p["plan_review"]["status"],"blocked");
+    assert!(f.plan_calls().is_empty());
+    assert_eq!(f.count("architect"),1);
+    assert_eq!(f.count("reviewer"),1);
+}
+
+#[test]
+fn plan_review_architect_only_marks_independent_reviewer_not_required() {
+    let f = Fixture::new("Implement feature",0);
+    f.setting("review_cadence",json!({"architect":"per_plan","reviewer":"per_stage"}));
+    let p = f.run();
+    assert_eq!(p["plan_review"]["gate"]["roles"],json!({"architect":"approved","reviewer":"not_required"}));
+    assert_eq!(f.plan_calls().len(),1);
+}
+
+impl Fixture {
+    fn pending_plan_review(&self) -> Value {
+        self.two_deferred_stages();
+        self.setting("reviewer",json!("unavailable"));
+        let mut p = self.run();
+        assert!(p["stages"].as_array().unwrap().iter().all(|s| s["status"] == "committed"));
+        p.as_object_mut().unwrap().remove("plan_review");
+        self.ctx.save_plan(&p).unwrap();
+        self.setting("reviewer",json!("mock"));
+        self.plan()
+    }
+}
+
+#[test]
+fn plan_review_provider_exclusion_covers_all_stages_prior_fixers_and_fallback() {
+    for kind in ["single","mixed","fixer","unknown","fallback","exhausted"] {
+        let f = Fixture::new("Implement feature",0);
+        let mut p = f.pending_plan_review();
+        for stage in p["stages"].as_array_mut().unwrap() {
+            stage["implementer_provider"] = json!("codex");
+            stage["model_invocations"] = json!([]);
+        }
+        if kind == "mixed" { p["stages"][1]["implementer_provider"] = json!("claude"); }
+        if kind == "fixer" { p["stages"][0]["model_invocations"] = json!([{"role":"fixer","requested":{"provider":"claude"},"status":"failed"}]); }
+        if kind == "unknown" { p["stages"][1]["implementer_provider"] = Value::Null; }
+        f.ctx.save_plan(&p).unwrap();
+        f.setting("test_fake_providers",json!(true));
+        f.setting("reviewer",json!("claude"));
+        f.setting("test_review_sessions",json!([]));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+            {"provider":"claude","model":"claude-fable-5-1[1m]","tier":"strong"},
+            {"provider":"claude","model":"opus[1m]","tier":"strong"},
+            {"provider":"codex","model":"stage-model","tier":"strong"}]);
+        let refusal = |family: &str| json!({"error":format!("claude exited with exit status: 1: You've reached your {family} limit.")});
+        if kind == "fallback" { f.setting("mock_reviewer_actions",json!([refusal("Fable")])); }
+        if kind == "exhausted" { f.setting("mock_reviewer_actions",json!([refusal("Fable"),refusal("Opus")])); }
+        let p = f.run();
+        let approved = matches!(kind,"single"|"fallback");
+        assert_eq!(p["plan_review"]["status"],if approved {"approved"} else {"blocked"},"{kind}: {p}");
+        let calls = f.plan_calls();
+        let reviewers: Vec<_> = calls.iter().filter(|c| c["role"] == "reviewer").collect();
+        assert!(reviewers.iter().all(|c| c["provider"] == "claude" && c["session"].is_null()));
+        assert_eq!(reviewers.len(),if matches!(kind,"fallback"|"exhausted") {2} else {usize::from(approved)});
+        if matches!(kind,"mixed"|"fixer") { assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("provider no stage implementer used")); }
+        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),approved);
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+    }
+}
+
+#[test]
+fn plan_review_requires_recoverable_base_and_frozen_subject_on_resume() {
+    for kind in ["fallback","missing","nonancestor","inputs","head","scope","evidence"] {
+        let f = Fixture::new("Implement feature",1);
+        let mut p = f.pending_plan_review();
+        let expected = p["stages"][0]["attempt_head"].clone();
+        if matches!(kind,"fallback"|"missing") { p["stages"][0].as_object_mut().unwrap().remove("attempt_head"); }
+        if kind == "missing" { p["stages"][0].as_object_mut().unwrap().remove("sha"); }
+        if kind == "nonancestor" {
+            let tree = f.ctx.git(&["rev-parse","HEAD^{tree}"]).unwrap();
+            let orphan = f.ctx.git(&["commit-tree",&tree,"-m","unrelated history"]).unwrap();
+            p["stages"][0]["attempt_head"] = json!(orphan);
+        }
+        f.ctx.save_plan(&p).unwrap();
+        let p = f.run();
+        if matches!(kind,"missing"|"nonancestor") {
+            assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked");
+            assert!(f.plan_calls().is_empty());
+            assert!(!f.ctx.forge_path("reports.jsonl").exists());
+            continue;
+        }
+        assert_eq!(p["plan_review"]["base"],expected);
+        assert_eq!(p["plan_review"]["status"],"approved","{p}");
+        let mut changed = p.clone();
+        match kind {
+            "inputs" => changed["stages"][0]["acceptance"] = json!("Changed criterion"),
+            "head" => { f.ctx.git(&["commit","--allow-empty","-qm","external change"]).unwrap(); },
+            "scope" => changed["plan_review"]["reviews"][0]["identity"]["scope"] = json!("stage"),
+            "evidence" => changed["plan_review"]["reviews"][0]["criteria"] = json!([]),
+            _ => continue,
+        }
+        assert!(f.ctx.validate_plan_approval(&changed).is_err(),"accepted {kind}");
+        f.ctx.save_plan(&changed).unwrap();
+        let calls = f.plan_calls().len();
+        let resumed = f.run();
+        assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked");
+        assert_eq!(resumed["plan_review"]["status"],"blocked");
+        assert_eq!(f.plan_calls().len(),calls);
+        assert_eq!(fs::read_to_string(f.ctx.forge_path("reports.jsonl")).unwrap().lines().count(),1);
+    }
+}
+
+#[test]
+fn plan_review_stop_resumes_a_new_round_with_persistent_architect_recovery() {
+    let f = Fixture::new("Implement feature",1);
+    f.two_deferred_stages();
+    f.setting("mock_architect_actions",json!([{"stop":true}]));
+    let p = f.run();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert_eq!(p["plan_review"]["reviews"].as_array().unwrap().len(),1);
+    f.ctx.session.stop_requested.store(false,Ordering::SeqCst);
+    let resumed = f.run();
+    assert_eq!(resumed["status"],"done","{resumed}");
+    assert_eq!(resumed["plan_review"]["attempt_id"],p["plan_review"]["attempt_id"]);
+    assert_eq!(resumed["plan_review"]["rounds"],2);
+    assert_eq!(resumed["plan_review"]["reviews"].as_array().unwrap().len(),3);
+    let cp2 = f.ctx.architecture_store().checkpoint(&resumed).unwrap();
+    assert_ne!(cp2["session"]["reference"],cp["session"]["reference"]);
+    for call in f.ctx.app.settings.lock().unwrap()["mock_architect_requests"].as_array().unwrap() {
+        assert!(!call["prompt"].as_str().unwrap().contains("acceptance_evidence"));
+    }
+    assert_eq!(f.plan_calls().len(),4);
+}
+
+#[test]
+fn plan_review_head_drift_does_not_replenish_interrupted_attempt() {
+    let f = Fixture::new("Implement feature",1);
+    f.two_deferred_stages();
+    f.setting("mock_architect_actions",json!([{"stop":true}]));
+    let interrupted = f.run();
+    assert_eq!(interrupted["plan_review"]["status"],"interrupted");
+    f.ctx.session.stop_requested.store(false,Ordering::SeqCst);
+    f.ctx.git(&["commit","--allow-empty","-qm","unexpected HEAD movement"]).unwrap();
+    f.setting("max_fix_rounds",json!(10));
+    let blocked = f.run();
+    assert_eq!(blocked["plan_review"]["status"],"blocked");
+    assert_eq!(blocked["plan_review"]["gate"]["status"],"error");
+    assert!(blocked["plan_review"]["gate"]["error"].as_str().unwrap().contains("edit and approve a new plan revision"));
+    for key in ["attempt_id","head","subject","rounds","budget","reviews"] {
+        assert_eq!(blocked["plan_review"][key],interrupted["plan_review"][key],"{key}");
+    }
+    assert_eq!(f.plan_calls().len(),2);
+    assert!(!f.ctx.forge_path("reports.jsonl").exists());
+}
+
+#[test]
+fn plan_review_uses_earliest_deferred_base_but_all_stages_as_context() {
+    let f = Fixture::new("Implement feature",0);
+    let mut p = f.pending_plan_review();
+    p["stages"][0]["review_policy"]["deferred_roles"] = json!([]);
+    p["stages"][0]["review_policy"]["stage_required_roles"] = json!(["architect","reviewer"]);
+    let expected = p["stages"][1]["attempt_head"].clone();
+    f.ctx.save_plan(&p).unwrap();
+    let p = f.run();
+    assert_eq!(p["status"],"done");
+    assert_eq!(p["plan_review"]["base"],expected);
+    assert_eq!(p["plan_review"]["subject"]["stages"].as_array().unwrap().len(),2);
+    let acceptance = p["plan_review"]["acceptance"].as_str().unwrap();
+    assert!(acceptance.starts_with("stage 1 (Implement feature):"));
+    for call in f.plan_calls() {
+        let prompt = call["prompt"].as_str().unwrap();
+        assert!(prompt.contains("contextual stages outside this range"));
+        assert!(prompt.contains(&format!("CRITERIA TO EVIDENCE:\n{acceptance}\n")));
     }
 }

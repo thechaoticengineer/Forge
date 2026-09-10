@@ -428,7 +428,7 @@ impl Ctx {
             // Keep the complete design/acceptance plan, without copying unbounded
             // review transcripts and token accounting into every provider turn.
             let mut context_plan = candidate.clone();
-            for key in ["architecture", "usage", "planner_usage", "role_usage"] {
+            for key in ["architecture", "usage", "planner_usage", "role_usage", "plan_review"] {
                 context_plan.as_object_mut().unwrap().remove(key);
             }
             for stage in context_plan["stages"].as_array_mut().unwrap() {

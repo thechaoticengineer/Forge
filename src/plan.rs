@@ -119,6 +119,9 @@ pub(crate) fn edit_plan(plan: &Value, body: &Value) -> Result<Value, &'static st
     reconcile(plan, &mut edited)?;
     if let Some(revision) = plan["revision"].as_u64() {
         edited["revision"] = json!(revision.checked_add(1).ok_or("revision limit reached")?);
+        if edited["plan_review"].is_object() {
+            edited["plan_review"]["pending_revision"] = edited["revision"].clone();
+        }
     }
     Ok(edited)
 }

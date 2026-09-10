@@ -1,7 +1,7 @@
 //! Engine-owned scope policy and snapshot-bound, immutable review gates.
 use super::Ctx;
 use crate::agent::{AgentRequest, AgentResult, AgentUsage};
-use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
+use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT, PLAN_REVIEW_PROMPT};
 use crate::util::{digest, unix_timestamp};
 use serde_json::{Value, json};
 use std::fs;
@@ -510,12 +510,13 @@ fn stage_required_roles(policy: &Value) -> Option<&Vec<Value>> {
 
 fn aggregate(identity: &Value, records: &[Value]) -> Value {
     let required = stage_required_roles(&identity["policy"]).unwrap();
-    let mut roles = json!({"architect":"not_required","reviewer":"pending"});
+    let mut roles = json!({"architect":"not_required","reviewer":if identity["scope"] == "plan" {"not_required"} else {"pending"}});
     let mut requests = vec![];
     for role in required {
         let name = role.as_str().unwrap();
         let record = records.iter().find(|r| {
             r["identity"]["role"] == *role
+                && (identity["scope"] != "plan" || r["identity"]["scope"] == "plan")
                 && r["identity"]["snapshot"] == identity["snapshot"]
                 && r["identity"]["policy"] == identity["policy"]
                 && r["identity"]["plan_id"] == identity["plan_id"]
@@ -544,6 +545,9 @@ fn aggregate(identity: &Value, records: &[Value]) -> Value {
     json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if required.is_empty() {"deferred"} else if approved {"approved"} else {"blocked"},"requests":requests})
 }
 
+#[derive(Clone, Copy)]
+enum ReviewScope { Stage(usize), Plan }
+
 #[cfg(test)]
 use crate::model_selection::claude_model_limit;
 
@@ -552,7 +556,7 @@ impl Ctx {
         let mut current = (provider.to_string(), model.to_string());
         let mut visited = vec![current.clone()];
         loop {
-            match self.invoke_review(plan,idx,base,role,&current.0,&current.1) {
+            match self.invoke_review(plan,ReviewScope::Stage(idx),base,role,&current.0,&current.1) {
                 Ok(v) => {
                     plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
                     self.save_plan(plan)?;
@@ -585,6 +589,10 @@ impl Ctx {
     }
 
     fn architect_review_with_selection(&self, plan: &mut Value, idx: usize, base: &Value) -> Result<Value,String> {
+        self.architect_review_for_scope(plan, ReviewScope::Stage(idx), base)
+    }
+
+    fn architect_review_for_scope(&self, plan: &mut Value, scope: ReviewScope, base: &Value) -> Result<Value, String> {
         let requirements = self.model_requirements("architect",None)?;
         let (verdict,_) = self.with_selected_model(&requirements,None, |choice| {
             *plan = self.load_plan().ok_or("missing current review plan")?;
@@ -599,14 +607,14 @@ impl Ctx {
                 *plan = self.architect_publish_selected(plan.clone(),Some(plan),
                     "review model recovery",Some(choice.clone()))?;
             }
-            self.invoke_review(plan,idx,base,"architect",&choice.0,&choice.1)
+            self.invoke_review(plan,scope,base,"architect",&choice.0,&choice.1)
         })?;
         Ok(verdict)
     }
     fn invoke_review(
         &self,
         plan: &mut Value,
-        idx: usize,
+        scope: ReviewScope,
         base: &Value,
         role: &str,
         provider: &str,
@@ -617,11 +625,28 @@ impl Ctx {
         identity["role"] = json!(role);
         *plan = self.load_plan().ok_or("missing current review plan")?;
         let mut cp = self.architecture_store().checkpoint(plan)?;
-        let mut context_stage = plan["stages"][idx].clone();
-        // Only preceding findings, never the other role's current endorsement.
-        context_stage["last_verdict"] = context_stage["previous_requests"].clone();
-        context_stage["last_verdict_valid"] = json!(true);
-        let mut prompt = self.stage_prompt(REVIEW_PROMPT, plan, &context_stage)?;
+        let (mut prompt, acceptance, guidance, step) = match scope {
+            ReviewScope::Stage(idx) => {
+                let mut context_stage = plan["stages"][idx].clone();
+                // Only preceding findings, never the other role's current endorsement.
+                context_stage["last_verdict"] = context_stage["previous_requests"].clone();
+                context_stage["last_verdict_valid"] = json!(true);
+                if plan["stages"][idx]["attempt_id"] != base["attempt_id"] {
+                    return Err("plan identity changed before review".into());
+                }
+                (self.stage_prompt(REVIEW_PROMPT, plan, &context_stage)?,
+                    context_stage["acceptance"].as_str().unwrap_or("").to_string(),
+                    cp["guidance"][context_stage["id"].to_string()].clone(), context_stage["id"].as_i64())
+            }
+            ReviewScope::Plan => {
+                self.validate_plan_subject(plan)?;
+                if plan["plan_review"]["attempt_id"] != base["attempt_id"] {
+                    return Err("plan review attempt changed".into());
+                }
+                if role == "reviewer" { self.validate_plan_reviewer(plan, provider)?; }
+                (self.plan_review_prompt(plan), plan["plan_review"]["acceptance"].as_str().unwrap_or("").to_string(), cp["guidance"].clone(), None)
+            }
+        };
         if role == "architect" {
             prompt = prompt.replacen(
                 "You are an independent reviewer in a fresh session.",
@@ -631,21 +656,21 @@ impl Ctx {
         }
         if plan["plan_id"] != base["plan_id"]
             || plan["revision"] != base["revision"]
-            || plan["stages"][idx]["attempt_id"] != base["attempt_id"]
         {
             return Err("plan identity changed before review".into());
         }
-        prompt.push_str(&format!(
-            "\nCRITERIA TO EVIDENCE: {}\n",
-            json!(criteria(
-                plan["stages"][idx]["acceptance"].as_str().unwrap_or("")
-            ))
-        ));
-        prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], cp["guidance"][plan["stages"][idx]["id"].to_string()], plan["plan_id"].as_str().unwrap()));
+        match scope {
+            ReviewScope::Stage(_) => prompt.push_str(&format!(
+                "\nCRITERIA TO EVIDENCE: {}\n", json!(criteria(&acceptance)))),
+            ReviewScope::Plan => prompt.push_str(&format!(
+                "\nCRITERIA TO EVIDENCE:\n{acceptance}\n")),
+        }
+        prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], guidance, plan["plan_id"].as_str().unwrap()));
         crate::architecture::atomic_json(&self.forge_path("review-identity.json"), &identity)?;
         prompt.push_str("\nThe engine also wrote the exact identity to .forge/review-identity.json (read-only during this review). Assemble your final verdict in private /tmp using a script: load that file with json.load, assign the resulting object to verdict['identity'], and serialize the verdict with json.dumps. Return that exact serialized JSON. Do not manually transcribe hashes or reconstruct the identity. The engine still validates the complete identity and rejects any mismatch.\n");
         if role == "architect" {
-            let requests: Vec<_> = plan["stages"][idx]["reviews"]
+            let records = match scope { ReviewScope::Stage(idx) => &plan["stages"][idx]["reviews"], ReviewScope::Plan => &plan["plan_review"]["reviews"] };
+            let requests: Vec<_> = records
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -661,7 +686,7 @@ impl Ctx {
             prompt.push_str("\nYou are the persistent architect reviewing recorded design, cross-stage interfaces and regressions. Your verdict has independent authority. For conflicting requests, record architectural clarification in architecture_context_gap without dismissing either role's unresolved findings.\n");
         }
         self.set_step(
-            plan["stages"][idx]["id"].as_i64(),
+            step,
             &format!("reviewing ({role})"),
         );
         for name in ["verdict.json", "architect-verdict.json"] {
@@ -694,7 +719,7 @@ impl Ctx {
             settings["test_review_sessions"].as_array_mut().unwrap().push(json!({"role":role,"provider":provider,"model":model,"session":if role == "architect" {session.clone()} else {None},"prompt":prompt}));
         }
         let result = if mock {
-            self.mock_review(&identity, &prompt, &plan["stages"][idx])
+            self.mock_review(&identity, &prompt, &json!({"acceptance":acceptance}))
         } else {
             let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
             let facts = self.model_facts(&policy,crate::catalogue::Provider::parse(provider).ok_or("invalid review provider")?,model,None);
@@ -722,6 +747,13 @@ impl Ctx {
         if snapshot(self.project())? != base["snapshot"] {
             return Err("implementation or HEAD changed during review".into());
         }
+        if matches!(scope, ReviewScope::Plan) {
+            let current = self.load_plan().ok_or("missing plan after review")?;
+            self.validate_plan_subject(&current)?;
+            if current["plan_review"] != plan["plan_review"] || current["revision"] != base["revision"] {
+                return Err("plan review changed during invocation".into());
+            }
+        }
         if !mock {
             let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
             let selected = self.model_facts(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model, None);
@@ -734,7 +766,7 @@ impl Ctx {
         let mut verdict = normalize(
             &result.output,
             &identity,
-            plan["stages"][idx]["acceptance"].as_str().unwrap_or(""),
+            &acceptance,
         )?;
         verdict["version"] = json!(1);
         verdict["id"] = json!(crate::architecture::identity());
@@ -762,19 +794,21 @@ impl Ctx {
         {
             return Err("architect review session identity mismatch".into());
         }
-        let stage = &mut plan["stages"][idx];
-        stage["context_valid"] = json!(true);
-        stage
-            .as_object_mut()
-            .unwrap()
-            .entry("reviews")
-            .or_insert(json!([]))
-            .as_array_mut()
-            .unwrap()
-            .push(verdict.clone());
-        if role == "reviewer" {
-            stage["last_verdict"] = verdict.clone();
-            stage["last_verdict_valid"] = json!(true);
+        match scope {
+            ReviewScope::Stage(idx) => {
+                let stage = &mut plan["stages"][idx];
+                stage["context_valid"] = json!(true);
+                stage.as_object_mut().unwrap().entry("reviews").or_insert(json!([]))
+                    .as_array_mut().unwrap().push(verdict.clone());
+                if role == "reviewer" {
+                    stage["last_verdict"] = verdict.clone();
+                    stage["last_verdict_valid"] = json!(true);
+                }
+            }
+            ReviewScope::Plan => {
+                verdict["scope"] = json!("plan");
+                plan["plan_review"]["reviews"].as_array_mut().ok_or("invalid plan review records")?.push(verdict.clone());
+            }
         }
         if role == "architect" {
             let reference = result
@@ -787,16 +821,32 @@ impl Ctx {
             }
             cp["last_turn"] = json!(turn);
             cp["session"]["checkpoint_reference"] = json!(turn);
+        }
+        if role == "architect" || matches!(scope, ReviewScope::Plan) {
             let _lock = self.session.persistence_lock.lock().unwrap();
-            *plan = self.architecture_store().publish(
+            let store = self.architecture_store();
+            let publication = store.publish(
                 plan.clone(),
                 cp,
-                json!({"kind":"architect_review","reviews":[verdict.clone()],"turn":turn}),
-            )?;
+                json!({"kind":if matches!(scope, ReviewScope::Plan) {"plan_review"} else {"architect_review"},"reviews":[verdict.clone()],"turn":turn}),
+            );
+            match publication {
+                Ok(published) => *plan = published,
+                Err(error) => {
+                    if matches!(scope, ReviewScope::Plan) {
+                        // Never save an unpublished role verdict via a later error checkpoint.
+                        *plan = store.load()?.ok_or("missing plan after failed verdict publication")?;
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             self.save_plan(plan)?;
         }
-        self.record_stage_usage(plan, idx, role, provider, result.usage)?;
+        match scope {
+            ReviewScope::Stage(idx) => self.record_stage_usage(plan, idx, role, provider, result.usage)?,
+            ReviewScope::Plan => self.record_plan_usage(plan, role, provider, result.usage)?,
+        }
         Ok(verdict)
     }
 
@@ -1325,3 +1375,6 @@ impl Ctx {
 #[cfg(test)]
 #[path = "review_tests.rs"]
 mod tests;
+
+#[path = "plan_review.rs"]
+mod plan_review;

@@ -20,6 +20,15 @@ impl Ctx {
         Ok(())
     }
 
+    pub(crate) fn record_plan_usage(&self, plan: &mut Value, role: &str, tool: &str, usage: Option<AgentUsage>) -> Result<(), String> {
+        if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
+            accumulate_invocation_usage(plan, "usage", tool, &usage);
+            accumulate_invocation_usage(&mut plan["role_usage"], role, tool, &usage);
+            self.save_plan(plan)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn finish_stage(&self, plan: &mut Value, idx: usize, status: &str) -> Result<i64, String> {
         let stage = &mut plan["stages"][idx];
         let finished = unix_timestamp();
@@ -250,6 +259,15 @@ impl Ctx {
             }
         }
 
+        match self.run_plan_review(&mut plan) {
+            Ok(true) => {},
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                self.set_phase("blocked");
+                self.log_event("plan_review", &format!("plan review could not be saved: {error}; repair storage and retry; commits remain local"));
+                return Ok(());
+            }
+        }
         self.publish_completed_run(&mut plan, count)
     }
 
@@ -303,11 +321,26 @@ impl Ctx {
     /// Publish completion durably; report errors propagate so queue goals remain recoverable.
     fn publish_completed_run(&self, plan: &mut Value, count: usize) -> Result<(), String> {
         let persisted = self.load_plan().ok_or("missing plan before completion")?;
-        if persisted["stages"].as_array().ok_or("invalid stages")?.iter().any(|stage| {
-            stage["review_policy"]["deferred_roles"].as_array().is_some_and(|roles| !roles.is_empty())
-        }) {
+        if let Err(error) = self.validate_plan_approval(&persisted) {
             self.set_phase("blocked");
-            self.log_event("run", "local stage commits retained; deferred reviews require the plan review phase before completion or push");
+            self.log_event("plan_review", &format!("completion blocked: {error}; commits remain local"));
+            *plan = persisted;
+            if plan["plan_review"].is_object() {
+                plan["plan_review"]["status"] = json!("blocked");
+                plan["plan_review"]["gate"] = json!({"status":"error","error":error});
+                if let Err(error) = self.save_plan(plan) {
+                    self.log_event("plan_review", &format!("could not save invalidated plan gate: {error}; repair storage and retry"));
+                }
+            }
+            return Ok(());
+        }
+        if self.session.stop_requested.load(Ordering::SeqCst) {
+            if !self.deferred_plan_roles(&persisted)?.is_empty() {
+                plan["plan_review"]["status"] = json!("interrupted");
+                plan["plan_review"]["gate"]["status"] = json!("interrupted");
+                self.save_plan(plan)?;
+            }
+            self.set_phase("plan_ready");
             return Ok(());
         }
         plan["status"] = json!("done");
