@@ -496,8 +496,20 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
     }
     Ok(v)
 }
+fn partition_policy(mut policy: Value, stage: &Value) -> Value {
+    let (required, deferred): (Vec<_>, Vec<_>) = policy["required_roles"].as_array().unwrap()
+        .iter().cloned().partition(|role| crate::plan::review_cadence(stage, role.as_str().unwrap()) == "per_stage");
+    policy["stage_required_roles"] = json!(required);
+    policy["deferred_roles"] = json!(deferred);
+    policy
+}
+
+fn stage_required_roles(policy: &Value) -> Option<&Vec<Value>> {
+    policy.get("stage_required_roles").unwrap_or(&policy["required_roles"]).as_array()
+}
+
 fn aggregate(identity: &Value, records: &[Value]) -> Value {
-    let required = identity["policy"]["required_roles"].as_array().unwrap();
+    let required = stage_required_roles(&identity["policy"]).unwrap();
     let mut roles = json!({"architect":"not_required","reviewer":"pending"});
     let mut requests = vec![];
     for role in required {
@@ -523,10 +535,13 @@ fn aggregate(identity: &Value, records: &[Value]) -> Value {
             }
         }
     }
+    for role in identity["policy"]["deferred_roles"].as_array().into_iter().flatten() {
+        roles[role.as_str().unwrap()] = json!("deferred");
+    }
     let approved = required
         .iter()
         .all(|r| roles[r.as_str().unwrap()] == "approved");
-    json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if approved {"approved"} else {"blocked"},"requests":requests})
+    json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if required.is_empty() {"deferred"} else if approved {"approved"} else {"blocked"},"requests":requests})
 }
 
 #[cfg(test)]
@@ -924,6 +939,12 @@ impl Ctx {
                     "no_current_verdict"
                 };
             plan["stages"][idx]["review_gate"] = json!({"status":"exhausted","roles":{"architect":architect,"reviewer":"no_current_verdict"}});
+            for role in ["architect", "reviewer"] {
+                if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan"
+                    && (role == "reviewer" || architect != "not_required") {
+                    plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
+                }
+            }
             self.save_plan(plan)?;
             return Ok("exhausted");
         }
@@ -932,12 +953,20 @@ impl Ctx {
                 return Ok("stopped");
             }
             let mut assignment = self.assignment_boundary(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
-            let (mut reviewer, mut reviewer_model) = self.reviewer_config(assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?)
-                .map_err(|e| format!("model routing blocked: {e}"))?;
+            let reviewer_runs = crate::plan::review_cadence(&plan["stages"][idx], "reviewer") == "per_stage";
+            let mut reviewer_config = if reviewer_runs {
+                Some(self.reviewer_config(assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?)
+                    .map_err(|e| format!("model routing blocked: {e}"))?)
+            } else { None };
             // Reserve the round before any invocation; errors/restarts cannot replenish it.
             plan["stages"][idx]["rounds"] = json!(round + 1);
             plan["stages"][idx]["review_gate"] =
                 json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
+            for role in ["architect", "reviewer"] {
+                if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan" {
+                    plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
+                }
+            }
             plan["stages"][idx]["last_verdict_valid"] = json!(false);
             self.save_plan(plan)?;
             let template = if round == 0 {
@@ -1002,7 +1031,9 @@ impl Ctx {
                         if self.operational_retry(plan, idx, &error,role)? { continue; }
                         self.reassess(plan, idx, "provider_operational_failure", json!({"failure_kind":super::reassessment::failure_kind(&error),"error":crate::util::last_chars(&error,2000),"provider":implementer}))?;
                         assignment = self.assignment_boundary(plan, idx)?;
-                        (reviewer, reviewer_model) = self.reviewer_config(assignment["effective"]["provider"].as_str().unwrap())?;
+                        if reviewer_runs {
+                            reviewer_config = Some(self.reviewer_config(assignment["effective"]["provider"].as_str().unwrap())?);
+                        }
                     }
                 }
             };
@@ -1044,8 +1075,12 @@ impl Ctx {
                 self.save_plan(plan)?;
                 self.reassess(plan,idx,"material_scope_change",json!({"engine_scope":policy,"planned_task":"documentation"}))?;
             }
+            policy = partition_policy(policy, &plan["stages"][idx]);
             let mut base = json!({"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":sid,"attempt_id":plan["stages"][idx]["attempt_id"],"round":round+1,"policy":policy,"snapshot":snap});
             let mut records = vec![];
+            if !plan["stages"][idx]["reviews"].is_array() {
+                plan["stages"][idx]["reviews"] = json!([]);
+            }
             loop {
                 plan["stages"][idx]["review_policy"] = policy.clone();
                 if policy["scope"] != "ordinary_documentation" {
@@ -1055,24 +1090,24 @@ impl Ctx {
                 self.save_plan(plan)?;
                 // Independent goes first: a scope promotion can bind both required
                 // verdicts to the promoted policy before any fixer is allowed.
-                let v =
-                    self.review_with_retry(plan, idx, &base, "reviewer", &reviewer, &reviewer_model)?;
-                let promote = v["requires_dual"] == true
-                    || v["architecture_context_gap"]
-                        .as_str()
-                        .is_some_and(|s| !s.trim().is_empty());
-                records.push(v);
-                plan["stages"][idx]["review_gate"] = aggregate(&base, &records);
-                self.save_plan(plan)?;
+                let promote = if let Some((reviewer, reviewer_model)) = &reviewer_config {
+                    let v = self.review_with_retry(plan, idx, &base, "reviewer", reviewer, reviewer_model)?;
+                    let promote = v["requires_dual"] == true
+                        || v["architecture_context_gap"].as_str().is_some_and(|s| !s.trim().is_empty());
+                    records.push(v);
+                    plan["stages"][idx]["review_gate"] = aggregate(&base, &records);
+                    self.save_plan(plan)?;
+                    promote
+                } else { false };
                 if policy["scope"] == "ordinary_documentation" && promote {
                     let findings = records.last().map(Ctx::review_requests).unwrap_or_default();
                     plan["stages"][idx]["previous_requests"] = json!({"approved":false,"summary":"Scope promotion; verify prior requests under dual policy", "issues":findings,"notes":[],"checks":[]});
-                    policy = dual("Independent reviewer identified architectural impact");
+                    policy = partition_policy(dual("Independent reviewer identified architectural impact"), &plan["stages"][idx]);
                     base["policy"] = policy.clone();
                     plan["stages"][idx]["dual_promoted"] = json!(true);
                     continue;
                 }
-                if policy["scope"] != "ordinary_documentation" {
+                if stage_required_roles(&policy).unwrap().contains(&json!("architect")) {
                     records.push(self.architect_review_with_selection(plan, idx, &base)?);
                 }
                 break;
@@ -1102,6 +1137,9 @@ impl Ctx {
             );
             if gate["status"] == "approved" {
                 return Ok("approved");
+            }
+            if gate["status"] == "deferred" {
+                return Ok("deferred");
             }
             // Record clarification without erasing either role's requests.
             let gaps: Vec<_> = records
@@ -1135,10 +1173,12 @@ impl Ctx {
     fn validate_commit_approval(&self, plan: &Value, idx: usize) -> Result<(), String> {
         let stage = &plan["stages"][idx];
         let gate = &stage["review_gate"];
-        if gate["status"] != "approved"
+        if !matches!(gate["status"].as_str(), Some("approved" | "deferred"))
             || gate["identity"]["plan_id"] != plan["plan_id"]
             || gate["identity"]["revision"] != plan["revision"]
+            || gate["identity"]["stage_id"] != stage["id"]
             || gate["identity"]["attempt_id"] != stage["attempt_id"]
+            || (!stage["attempt_revision"].is_null() && stage["attempt_revision"] != plan["revision"])
             || gate["identity"]["round"] != stage["rounds"]
         {
             return Err("no current aggregate review approval".into());
@@ -1147,21 +1187,42 @@ impl Ctx {
         if persisted["plan_id"] != plan["plan_id"]
             || persisted["revision"] != plan["revision"]
             || persisted["stages"][idx]["review_gate"] != *gate
+            || ["attempt_id", "attempt_revision", "rounds", "review_cadence", "review_policy", "reviews"]
+                .iter().any(|field| persisted["stages"][idx][*field] != stage[*field])
             || crate::plan::stage_inputs(&persisted, idx) != crate::plan::stage_inputs(plan, idx)
         {
             return Err("plan changed after review".into());
+        }
+        let policy = &gate["policy"];
+        let required = match policy["scope"].as_str() {
+            Some("ordinary_documentation") => json!(["reviewer"]),
+            Some("code_or_contract") => json!(["architect", "reviewer"]),
+            _ => return Err("invalid gate scope".into()),
+        };
+        if policy["version"] != 1 || policy["required_roles"] != required
+            || *policy != gate["identity"]["policy"] || *policy != stage["review_policy"] {
+            return Err("inconsistent gate policy".into());
+        }
+        let expected = partition_policy(policy.clone(), stage);
+        // Legacy gates have no scheduling metadata and retain every classified role.
+        let legacy = policy.get("stage_required_roles").is_none() && policy.get("deferred_roles").is_none();
+        if (legacy && expected["deferred_roles"] != json!([]))
+            || (!legacy && *policy != expected) {
+            return Err("gate policy does not match attempt review cadence".into());
+        }
+        let required = stage_required_roles(policy).ok_or("invalid gate roles")?;
+        if gate["status"] == "deferred"
+            && (!required.is_empty() || policy["deferred_roles"].as_array().is_none_or(Vec::is_empty)) {
+            return Err("deferred gate requires outstanding deferred roles and no stage-required roles".into());
         }
         let current = aggregate(
             &gate["identity"],
             stage["reviews"].as_array().ok_or("missing reviews")?,
         );
-        if current["status"] != "approved" {
+        if current != *gate {
             return Err("missing current role approvals".into());
         }
-        for role in gate["policy"]["required_roles"]
-            .as_array()
-            .ok_or("invalid gate roles")?
-        {
+        for role in required {
             let mut identity = gate["identity"].clone();
             identity["role"] = role.clone();
             let record = stage["reviews"]
@@ -1190,7 +1251,7 @@ impl Ctx {
         let Some(idx) = plan["stages"].as_array().ok_or("invalid stages")?.iter()
             .position(|stage| stage["status"] != "committed") else { return Ok(Vec::new()); };
         let stage = &plan["stages"][idx];
-        if stage["review_gate"]["status"] != "approved" { return Ok(Vec::new()); }
+        if !matches!(stage["review_gate"]["status"].as_str(), Some("approved" | "deferred")) { return Ok(Vec::new()); }
         let expected = &stage["review_gate"]["identity"]["snapshot"];
         let actual = snapshot(self.project())?;
         if actual["head"] == expected["head"] { return Ok(Vec::new()); }

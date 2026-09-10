@@ -888,3 +888,353 @@ fn cli_limit_fallback_preserves_explicit_choices_and_capability_floor() {
     f.setting("automatic_routing",json!(false));
     assert!(f.ctx.reviewer_quota_fallback(&plan,0,&current,error,&visited).unwrap().is_none());
 }
+
+#[test]
+fn deferred_architect_commits_with_only_independent_verdicts_including_promotion() {
+    for promote in [false, true] {
+        let f = Fixture::new(if promote { "Fix prose spelling" } else { "Implement feature" }, 0);
+        f.setting("review_cadence", json!({"architect":"per_plan","reviewer":"per_stage"}));
+        if promote {
+            f.docs();
+            f.setting("mock_verdicts", json!([{"approved":true,"issues":[],"requires_dual":true,"scope_reason":"Architectural impact"},clean()]));
+        }
+        let p = f.run();
+        let stage = &p["stages"][0];
+        assert_eq!(stage["status"], "committed", "{p}");
+        assert_eq!(stage["review_policy"]["required_roles"], json!(["architect","reviewer"]));
+        assert_eq!(stage["review_policy"]["stage_required_roles"], json!(["reviewer"]));
+        assert_eq!(stage["review_policy"]["deferred_roles"], json!(["architect"]));
+        assert_eq!(stage["review_gate"]["status"], "approved");
+        assert_eq!(stage["review_gate"]["roles"], json!({"architect":"deferred","reviewer":"approved"}));
+        assert_eq!(stage["review_gate"]["identity"]["policy"], stage["review_policy"]);
+        assert_eq!(f.count("reviewer"), if promote { 2 } else { 1 });
+        assert_eq!(f.count("architect"), 0);
+        assert_eq!(f.count("fixer"), 0);
+        assert!(stage["reviews"].as_array().unwrap().iter().all(|r| r["role"] == "reviewer"));
+        assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    }
+}
+
+#[test]
+fn deferred_reviewer_needs_no_reviewer_configuration_and_all_deferred_skips_fixes() {
+    for architect in ["per_stage", "per_plan"] {
+        for budget in [0, 2] {
+            let f = Fixture::new("Implement feature", budget);
+            f.setting("review_cadence", json!({"architect":architect,"reviewer":"per_plan"}));
+            f.setting("reviewer", json!("unavailable"));
+            assert!(f.ctx.reviewer_config("mock").is_err());
+            let p = f.run();
+            let stage = &p["stages"][0];
+            assert_eq!(stage["status"], "committed", "{p}");
+            // Round zero is durably reserved as rounds/identity.round == 1.
+            assert_eq!(stage["rounds"], 1);
+            assert_eq!(stage["review_gate"]["identity"]["round"], 1);
+            assert_eq!(stage["review_gate"]["roles"]["reviewer"], "deferred");
+            let fully_deferred = architect == "per_plan";
+            assert_eq!(stage["review_gate"]["status"], if fully_deferred { "deferred" } else { "approved" });
+            assert_eq!(stage["review_gate"]["roles"]["architect"], if fully_deferred { "deferred" } else { "approved" });
+            assert_eq!(f.count("reviewer"), 0);
+            assert_eq!(f.count("architect"), usize::from(!fully_deferred));
+            assert_eq!(f.count("fixer"), 0);
+            assert_eq!(stage["reviews"].as_array().unwrap().len(), usize::from(!fully_deferred));
+            assert_eq!(f.ctx.git(&["rev-parse", "HEAD^{tree}"]).unwrap(), stage["review_gate"]["identity"]["snapshot"]["tree"]);
+            assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+        }
+    }
+}
+
+#[test]
+fn deferred_reviewer_constraints_allow_codex_assignment_reassessment_and_local_commit() {
+    for pinned in [false, true] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("implementer", json!("codex"));
+        f.setting("reviewer", json!("codex"));
+        f.setting("automatic_routing", json!(pinned));
+        f.setting("reviewer_model", json!(if pinned { "stage-model" } else { "" }));
+        f.setting("test_fake_providers", json!(true));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+            {"provider":"codex","model":"stage-model","tier":"strong"},
+            {"provider":"claude","model":"other-model","tier":"strong"}
+        ]);
+        let proposal = json!({"risk":"standard","complexity":"standard","task":"functionality",
+            "provider":"codex","model":"stage-model","native_effort":"provider_default",
+            "rationale":"Configured strong capability is adequate for this feature."});
+        f.setting("mock_routing_planner_outputs", json!([{"proposals":[{"stage_id":1,"proposal":proposal}]}]));
+        let cadence = json!({"architect":"per_plan","reviewer":"per_plan"});
+        f.setting("review_cadence", cadence.clone());
+        let initial = f.plan();
+        let mut p = f.ctx.architect_publish(initial.clone(), Some(&initial), "test").unwrap();
+        assert_eq!(p["stages"][0]["model_proposal"], proposal);
+        assert_eq!(p["stages"][0]["model_agreement"]["reviewer"]["status"], "deferred");
+        p["stages"][0]["attempt_id"] = json!(crate::architecture::identity());
+        p["stages"][0]["attempt_revision"] = p["revision"].clone();
+        p["stages"][0]["review_cadence"] = cadence.clone();
+        for legacy in [false, true] {
+            let mut required = p.clone();
+            if legacy {
+                required["stages"][0].as_object_mut().unwrap().remove("review_cadence");
+            } else {
+                required["stages"][0]["review_cadence"]["reviewer"] = json!("per_stage");
+            }
+            f.ctx.save_plan(&required).unwrap();
+            let error = f.ctx.validated_assignment(&required, 0).unwrap_err();
+            assert!(error.contains("cross-provider-review conflict"), "{error}");
+            assert!(f.ctx.reviewer_config("codex").is_err());
+        }
+        f.ctx.save_plan(&p).unwrap();
+        // Settings and explicit reviewer changes cannot invalidate a captured deferral.
+        f.setting("review_cadence", crate::plan::default_settings()["review_cadence"].clone());
+        f.setting("reviewer", json!("unavailable"));
+        assert!(f.ctx.reviewer_config("codex").is_err());
+        assert!(f.ctx.validated_assignment(&p, 0).is_ok());
+        assert!(f.ctx.restored_assignment(&p, 0).is_ok());
+        assert!(f.ctx.has_operational_alternative(&p, 0).unwrap());
+        f.setting("mock_routing_planner_outputs", json!([{"proposals":[{"stage_id":1,"proposal":proposal}]}]));
+        f.ctx.reassess(&mut p, 0, "material_assignment_change", json!({"test":"revalidate captured cadence"})).unwrap();
+        assert_eq!(p["stages"][0]["model_proposal"], proposal);
+        let p = f.run();
+        let stage = &p["stages"][0];
+        assert_eq!(stage["status"], "committed", "{p}");
+        assert_eq!(stage["implementer_provider"], "codex");
+        assert_eq!(stage["review_cadence"], cadence);
+        assert_eq!(stage["review_gate"]["status"], "deferred");
+        assert_eq!(stage["reviews"], json!([]));
+        assert_eq!(stage["rounds"], 1);
+        assert_eq!(f.count("reviewer"), 0);
+        assert_eq!(f.count("architect"), 0);
+        assert_eq!(f.count("fixer"), 0);
+        assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    }
+}
+
+#[test]
+fn attempt_cadence_survives_settings_changes_and_legacy_absence_requires_stage_reviews() {
+    for legacy in [false, true] {
+        for architect in ["per_stage", "per_plan"] {
+            let f = Fixture::new("Implement feature", 1);
+            let cadence = json!({"architect":architect,"reviewer":"per_stage"});
+            f.setting("review_cadence", cadence.clone());
+            f.setting("mock_reviewer_actions", json!([{"stop":true}]));
+            let first = f.run();
+            assert_eq!(first["stages"][0]["review_cadence"], cadence);
+            if legacy {
+                let mut p = first.clone();
+                p["stages"][0].as_object_mut().unwrap().remove("review_cadence");
+                f.ctx.save_plan(&p).unwrap();
+            }
+            f.setting("review_cadence", json!({"architect":if architect == "per_stage" {"per_plan"} else {"per_stage"},"reviewer":"per_plan"}));
+            let p = f.run();
+            let stage = &p["stages"][0];
+            assert_eq!(stage["status"], "committed", "{p}");
+            assert_eq!(stage["attempt_id"], first["stages"][0]["attempt_id"]);
+            assert_eq!(stage["review_cadence"], if legacy {Value::Null} else {cadence});
+            assert_eq!(f.count("reviewer"), 2);
+            assert_eq!(f.count("architect"), usize::from(legacy || architect == "per_stage"));
+            assert_eq!(stage["review_gate"]["roles"]["architect"], if legacy || architect == "per_stage" {"approved"} else {"deferred"});
+        }
+    }
+}
+
+#[test]
+fn exhausted_attempt_retains_deferred_role_outcomes() {
+    for deferred in ["architect", "reviewer"] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("review_cadence", json!({"architect":if deferred == "architect" {"per_plan"} else {"per_stage"},"reviewer":if deferred == "reviewer" {"per_plan"} else {"per_stage"}}));
+        f.setting(if deferred == "architect" {"mock_verdicts"} else {"mock_architect_verdicts"}, json!([reject("Fix the change")]));
+        f.run();
+        let p = f.run();
+        assert_eq!(p["stages"][0]["review_gate"]["status"], "exhausted");
+        assert_eq!(p["stages"][0]["review_gate"]["roles"][deferred], "deferred");
+        assert_eq!(f.count(deferred), 0);
+        f.assert_no_commit();
+    }
+}
+
+impl Fixture {
+    fn deferred_gate(&self) -> Value {
+        let p = self.plan();
+        let mut p = self.ctx.architect_publish(p.clone(), Some(&p), "test").unwrap();
+        p["stages"][0]["attempt_id"] = json!(crate::architecture::identity());
+        p["stages"][0]["attempt_revision"] = p["revision"].clone();
+        p["stages"][0]["review_budget"] = json!(0);
+        p["stages"][0]["review_cadence"] = json!({"architect":"per_plan","reviewer":"per_plan"});
+        self.ctx.save_plan(&p).unwrap();
+        assert_eq!(self.ctx.run_review_stage(&mut p, 0).unwrap(), "deferred");
+        p
+    }
+}
+
+#[test]
+fn deferred_commit_rejects_forged_partitions_identity_outcomes_and_attempt_cadence() {
+    for case in ["empty", "overlap", "missing", "unknown", "scope", "stage", "attempt", "round", "cadence", "persisted_cadence", "approved", "roles", "policy"] {
+        let f = Fixture::new("Implement feature", 0);
+        let mut p = f.deferred_gate();
+        let stage = &mut p["stages"][0];
+        let mut policy = stage["review_policy"].clone();
+        match case {
+            "empty" => policy["deferred_roles"] = json!([]),
+            "overlap" => policy["stage_required_roles"] = json!(["architect"]),
+            "missing" => { policy.as_object_mut().unwrap().remove("stage_required_roles"); },
+            "unknown" => policy["deferred_roles"] = json!(["architect","unknown"]),
+            "scope" => policy["required_roles"] = json!(["reviewer"]),
+            "stage" => stage["review_gate"]["identity"]["stage_id"] = json!(2),
+            "attempt" => stage["review_gate"]["identity"]["attempt_id"] = json!("other"),
+            "round" => stage["review_gate"]["identity"]["round"] = json!(2),
+            "cadence" | "persisted_cadence" => stage["review_cadence"]["architect"] = json!("per_stage"),
+            "approved" => stage["review_gate"]["status"] = json!("approved"),
+            "roles" => stage["review_gate"]["roles"]["architect"] = json!("approved"),
+            "policy" => stage["review_policy"]["rationale"] = json!("tampered"),
+            _ => unreachable!(),
+        }
+        if ["empty", "overlap", "missing", "unknown", "scope"].contains(&case) {
+            stage["review_policy"] = policy.clone();
+            stage["review_gate"]["policy"] = policy.clone();
+            stage["review_gate"]["identity"]["policy"] = policy;
+        }
+        f.ctx.save_plan(&p).unwrap();
+        if case == "persisted_cadence" {
+            p["stages"][0]["review_cadence"]["architect"] = json!("per_plan");
+        }
+        assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err(), "accepted {case}");
+        f.assert_no_commit();
+    }
+}
+
+#[test]
+fn deferred_commit_keeps_snapshot_checks_and_exact_commit_recovery() {
+    for case in ["recover", "dirty", "wrong_message", "invalid_policy", "before_commit"] {
+        let f = Fixture::new("Implement feature", 0);
+        let mut p = f.deferred_gate();
+        if case == "before_commit" {
+            fs::write(f.root.join("README.md"), "Unreviewed content").unwrap();
+            assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err());
+            f.assert_no_commit();
+            continue;
+        }
+        let sha = f.ctx.commit_reviewed(&p, 0, if case == "wrong_message" {"other"} else {"feat: stage"}).unwrap().unwrap();
+        if case == "dirty" { fs::write(f.root.join("README.md"), "Unreviewed content").unwrap(); }
+        if case == "invalid_policy" {
+            p["stages"][0]["review_cadence"]["architect"] = json!("per_stage");
+            f.ctx.save_plan(&p).unwrap();
+        }
+        let result = f.ctx.recover_committed_stages();
+        if case == "recover" {
+            assert_eq!(result.unwrap(), vec![1]);
+            let saved = f.plan();
+            assert_eq!(saved["stages"][0]["sha"], sha);
+            assert_eq!(saved["stages"][0]["review_gate"], p["stages"][0]["review_gate"]);
+            assert_eq!(saved["stages"][0]["reviews"], json!([]));
+            assert!(f.ctx.recover_committed_stages().unwrap().is_empty());
+        } else {
+            assert!(result.is_err(), "accepted {case}");
+            assert_ne!(f.plan()["stages"][0]["status"], "committed");
+        }
+    }
+}
+
+#[test]
+fn deferred_obligations_block_completion_reports_and_push_even_after_restart() {
+    for reviewer in ["per_stage", "per_plan"] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("review_cadence", json!({"architect":"per_plan","reviewer":reviewer}));
+        f.setting("auto_push", json!(true));
+        let remote = f.root.join(".git/test-remote");
+        f.ctx.git(&["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        f.ctx.git(&["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        let mut approved = f.plan();
+        approved["status"] = json!("approved");
+        f.ctx.save_plan(&approved).unwrap();
+        let (code, response) = crate::test_support::api_request(&f.ctx.app, "POST", "/api/run", json!({}));
+        assert_eq!(code, 200, "{response}");
+        crate::test_support::wait_for_worker(&f.ctx);
+        let p = f.plan();
+        assert_eq!(p["status"], "approved");
+        assert_eq!(p["stages"][0]["status"], "committed", "{p}");
+        assert_eq!(f.ctx.session.state.lock().unwrap().phase, "blocked");
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        assert!(f.ctx.git(&["ls-remote", "origin"]).unwrap().is_empty());
+        let settings = {
+            let mut settings = f.ctx.app.settings.lock().unwrap().clone();
+            settings["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
+            settings
+        };
+        let app = Arc::new(App::new(f.root.to_str().unwrap(), settings));
+        let ctx = app.context(f.root.to_str().unwrap());
+        let (code, response) = crate::test_support::api_request(&ctx.app, "POST", "/api/run", json!({}));
+        assert_eq!(code, 200, "{response}");
+        crate::test_support::wait_for_worker(&ctx);
+        let resumed = ctx.load_plan().unwrap();
+        assert_eq!(resumed["status"], "approved");
+        assert_eq!(ctx.session.state.lock().unwrap().phase, "blocked");
+        assert_eq!(resumed["stages"][0]["sha"], p["stages"][0]["sha"]);
+        assert!(!ctx.forge_path("reports.jsonl").exists());
+        assert!(ctx.git(&["ls-remote", "origin"]).unwrap().is_empty());
+        assert_eq!(ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    }
+}
+
+#[test]
+fn a_new_attempt_captures_new_cadence_while_preserving_the_model_proposal() {
+    let f = Fixture::new("Implement feature", 1);
+    f.setting("mock_reviewer_actions", json!([{"stop":true}]));
+    let first = f.run();
+    let mut revised = first.clone();
+    revised["revision"] = json!(first["revision"].as_u64().unwrap() + 1);
+    f.ctx.save_plan(&revised).unwrap();
+    let cadence = json!({"architect":"per_plan","reviewer":"per_plan"});
+    f.setting("review_cadence", cadence.clone());
+    let p = f.run();
+    let stage = &p["stages"][0];
+    assert_eq!(stage["status"], "committed", "{p}");
+    assert_ne!(stage["attempt_id"], first["stages"][0]["attempt_id"]);
+    assert_eq!(stage["review_cadence"], cadence);
+    assert_eq!(stage["model_proposal"], first["stages"][0]["model_proposal"]);
+    assert_eq!(stage["review_gate"]["status"], "deferred");
+    assert_eq!(stage["rounds"], 1);
+    assert_eq!(f.count("reviewer"), 1);
+    assert_eq!(f.count("architect"), 0);
+    assert_eq!(f.count("fixer"), 0);
+}
+
+#[test]
+fn documentation_with_deferred_reviewer_has_no_stage_required_roles() {
+    let f = Fixture::new("Fix prose spelling", 0);
+    f.docs();
+    f.setting("review_cadence", json!({"architect":"per_stage","reviewer":"per_plan"}));
+    let p = f.run();
+    let stage = &p["stages"][0];
+    assert_eq!(stage["status"], "committed", "{p}");
+    assert_eq!(stage["review_policy"]["required_roles"], json!(["reviewer"]));
+    assert_eq!(stage["review_policy"]["stage_required_roles"], json!([]));
+    assert_eq!(stage["review_policy"]["deferred_roles"], json!(["reviewer"]));
+    assert_eq!(stage["review_gate"]["status"], "deferred");
+    assert_eq!(stage["review_gate"]["roles"], json!({"architect":"not_required","reviewer":"deferred"}));
+    assert_eq!(stage["reviews"], json!([]));
+    assert_eq!(f.count("reviewer"), 0);
+    assert_eq!(f.count("architect"), 0);
+}
+
+#[test]
+fn legacy_policy_without_partition_still_requires_evidenced_role_approvals() {
+    for invalid in [false, true] {
+        let f = Fixture::new("Implement feature", 0);
+        let mut p = f.reviewed();
+        let stage = &mut p["stages"][0];
+        let mut policy = stage["review_policy"].clone();
+        policy.as_object_mut().unwrap().remove("stage_required_roles");
+        policy.as_object_mut().unwrap().remove("deferred_roles");
+        stage["review_policy"] = policy.clone();
+        let mut base = stage["review_gate"]["identity"].clone();
+        base["policy"] = policy.clone();
+        let records = stage["reviews"].as_array_mut().unwrap();
+        for record in records.iter_mut() {
+            record["policy"] = policy.clone();
+            record["identity"]["policy"] = policy.clone();
+        }
+        if invalid { records[0]["criteria"] = json!([]); }
+        stage["review_gate"] = aggregate(&base, records);
+        f.ctx.save_plan(&p).unwrap();
+        let result = f.ctx.commit_reviewed(&p, 0, "feat: stage");
+        assert_eq!(result.is_err(), invalid, "{result:?}");
+    }
+}

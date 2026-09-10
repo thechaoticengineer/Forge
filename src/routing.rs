@@ -199,7 +199,7 @@ fn material_inputs(v: &Value, settings: &Value) -> Value {
     if let Some(obj) = v.as_object_mut() { for k in ["pricing", "relative_cost_preference", "billing_basis", "tier_provenance"] { obj.remove(k); } }
     // Automatic review resolves the opposite provider at execution. The legacy
     // global selector is unused and may change back to its default on restart.
-    if automatic_reviewer(settings) {
+    if automatic_reviewer(settings) || crate::plan::review_cadence(settings, "reviewer") == "per_plan" {
         if let Some(obj) = v.as_object_mut() { obj.remove("reviewer"); }
     }
     v
@@ -251,7 +251,8 @@ fn policy_inputs(
             }
         ));
     }
-    if p.provider != "mock" && settings["reviewer"] != if p.provider == "codex" { "claude" } else { "codex" }
+    let reviewer_deferred = crate::plan::review_cadence(settings, "reviewer") == "per_plan";
+    if !reviewer_deferred && p.provider != "mock" && settings["reviewer"] != if p.provider == "codex" { "claude" } else { "codex" }
         && (settings["automatic_routing"] == false || settings["reviewer_model"].as_str().is_some_and(|s| !s.is_empty())) {
         return Err("cross-provider-review conflict: explicit reviewer constraint prevents switch".into());
     }
@@ -285,7 +286,7 @@ fn policy_inputs(
         && !pending.is_object() && stage["routing_validity_only"] != true
         && options.iter().filter(adequate).any(|o| {
             matches_constraint(o, &c)
-                && (o["provider"] == "mock"
+                && (reviewer_deferred || o["provider"] == "mock"
                     || settings["reviewer"]
                         == if o["provider"] == "codex" {
                             "claude"
@@ -327,6 +328,14 @@ fn selection_plan(plan: &Value) -> Value {
 }
 
 impl Ctx {
+    fn stage_routing_settings(&self, plan: &Value, idx: usize) -> Value {
+        let mut settings = self.app.settings.lock().unwrap().clone();
+        settings["review_cadence"] = json!({
+            "architect": crate::plan::stage_review_cadence(&settings, plan, idx, "architect"),
+            "reviewer": crate::plan::stage_review_cadence(&settings, plan, idx, "reviewer"),
+        });
+        settings
+    }
     fn routing_handoff(&self, plan: &Value) -> Result<String, String> {
         let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
             .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
@@ -338,12 +347,14 @@ impl Ctx {
     pub(crate) fn has_operational_alternative(&self, plan: &Value, idx: usize) -> Result<bool,String> {
         let stage = &plan["stages"][idx];
         let old: Proposal = serde_json::from_value(stage["model_agreement"]["validated_proposal"].clone()).map_err(|e| e.to_string())?;
-        let settings = self.app.settings.lock().unwrap().clone();
+        let settings = self.stage_routing_settings(plan, idx);
         let options = self.routing_candidates()?;
         for o in &options {
             let mut p = old.clone();
             p.provider = o["provider"].as_str().unwrap_or("").into(); p.model = o["model"].as_str().unwrap_or("").into(); p.native_effort = o["effort"].as_str().unwrap_or("").into();
-            if policy_inputs(&settings,stage,&p,&options).is_ok() && self.reviewer_config(&p.provider).is_ok() { return Ok(true); }
+            if policy_inputs(&settings,stage,&p,&options).is_ok()
+                && (crate::plan::review_cadence(&settings, "reviewer") == "per_plan"
+                    || self.reviewer_config(&p.provider).is_ok()) { return Ok(true); }
         }
         Ok(false)
     }
@@ -360,7 +371,6 @@ impl Ctx {
         ))
     }
     pub(crate) fn routing_required(&self, plan: &Value, cp: &Value) -> Result<Vec<i64>, String> {
-        let settings = self.app.settings.lock().unwrap().clone();
         let options = self.routing_options()?;
         let mut ids = vec![];
         for (idx, stage) in plan["stages"]
@@ -372,6 +382,7 @@ impl Ctx {
             if stage["status"] == "committed" {
                 continue;
             }
+            let settings = self.stage_routing_settings(plan, idx);
             let a = &cp["agreements"][stage["id"].to_string()];
             let same_inputs = a["relevant_inputs"] == crate::plan::stage_inputs(plan, idx);
             let mut validity_stage = stage.clone();
@@ -634,7 +645,6 @@ impl Ctx {
                 all.extend(replacements.iter().cloned());
                 continue;
             }
-            let settings = self.app.settings.lock().unwrap().clone();
             let options = self.routing_candidates()?;
             for id in ids {
                 let idx = plan["stages"]
@@ -644,10 +654,16 @@ impl Ctx {
                     .position(|s| s["id"] == *id)
                     .unwrap();
                 let stage = &plan["stages"][idx];
+                let settings = self.stage_routing_settings(plan, idx);
                 let p: Proposal = serde_json::from_value(stage["model_proposal"].clone())
                     .map_err(|e| e.to_string())?;
                 let inputs = policy_inputs(&settings, stage, &p, &options)?;
-                let reviewer = self.reviewer_config(&p.provider)?;
+                let reviewer = if crate::plan::review_cadence(&settings, "reviewer") == "per_plan" {
+                    json!({"status":"deferred"})
+                } else {
+                    let (provider, model) = self.reviewer_config(&p.provider)?;
+                    json!({"provider":provider,"model":model})
+                };
                 let option = options
                     .iter()
                     .find(|o| {
@@ -664,7 +680,7 @@ impl Ctx {
                 let record = json!({"version":1,"id":agreement_id,"kind":"agreement","agreement_id":agreement_id,"valid":true,"agreed":true,
                     "proposal_ids":[last["planner_proposal_id"],last["architect_evaluation_id"]],"dialogue":turns,"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":id,
                     "architectural_constraints":cp["constraints"],"relevant_inputs":crate::plan::stage_inputs(plan, idx),"input_fingerprint":crate::metadata::fingerprint(json!({"stage":crate::plan::stage_inputs(plan,idx),"policy":inputs}).to_string().as_bytes()),"policy_inputs":inputs,
-                    "reviewer":{"provider":reviewer.0,"model":reviewer.1},"effective":{"provider":p.provider,"model":option["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort},
+                    "reviewer":reviewer,"effective":{"provider":p.provider,"model":option["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort},
                     "validated_proposal":p,"planner_reason":p.rationale,"architect_reason":e.rationale,"planner_bootstrap":stage["model_proposer"],
                     "architect_bootstrap":cp["routing_evaluator"],
                     "provenance":{"capability_policy_version":POLICY,"catalogue_revision":option["policy_revision"].as_str().unwrap_or("configured"),"official_sources":option["official_source"].as_str().into_iter().collect::<Vec<_>>(),"checked_unix":crate::util::unix_timestamp()},

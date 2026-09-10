@@ -23,13 +23,20 @@ pub(crate) fn default_settings() -> Value {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn review_cadence(settings: &Value, role: &str) -> &'static str {
     if settings.get("review_cadence").and_then(|cadence| cadence.get(role)).and_then(Value::as_str) == Some("per_plan") {
         "per_plan"
     } else {
         "per_stage"
     }
+}
+
+/// Routing precedes attempt initialization; existing attempts keep their saved cadence.
+pub(crate) fn stage_review_cadence(settings: &Value, plan: &Value, idx: usize, role: &str) -> &'static str {
+    let stage = &plan["stages"][idx];
+    let existing = stage["attempt_id"].is_string()
+        && (stage["attempt_revision"].is_null() || stage["attempt_revision"] == plan["revision"]);
+    review_cadence(if existing { stage } else { settings }, role)
 }
 
 /// Build a replacement only after validation, leaving the saved plan untouched on errors.

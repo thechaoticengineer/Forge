@@ -71,7 +71,9 @@ impl Ctx {
             let restored = (pending["kind"] == "material_assignment_change")
                 .then(|| self.restored_assignment(plan, idx)).transpose()?;
             if let Some(agreement) = restored.filter(|a| *a == pending["old_agreement"]) {
-                self.reviewer_config(agreement["effective"]["provider"].as_str().ok_or("missing agreed provider")?)?;
+                if crate::plan::review_cadence(&plan["stages"][idx], "reviewer") == "per_stage" {
+                    self.reviewer_config(agreement["effective"]["provider"].as_str().ok_or("missing agreed provider")?)?;
+                }
                 let state = &mut plan["stages"][idx]["reassessment"];
                 state["history"].as_array_mut().unwrap().push(json!({
                     "kind":"material_assignment_restored", "reservation":pending,

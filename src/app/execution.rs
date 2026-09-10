@@ -228,7 +228,8 @@ impl Ctx {
                         "stage {sid} blocked after {duration}: {reason} — needs a human"));
                     return Ok(());
                 }
-                _approved => {
+                // Both approved and fully deferred gates may authorize a local commit.
+                _settled => {
                     let msg = plan["stages"][idx]["commit"].as_str().unwrap_or("forge: stage").to_string();
                     let sha = match self.commit_reviewed(&plan, idx, &msg) {
                         Ok(sha) => sha,
@@ -280,7 +281,12 @@ impl Ctx {
             stage.insert("attempt_id".into(), json!(crate::architecture::identity()));
             stage.insert("attempt_revision".into(), plan_revision);
             stage.insert("rounds".into(), json!(0));
-            stage.insert("review_budget".into(), json!(self.app.settings.lock().unwrap()["max_fix_rounds"].as_i64().unwrap_or(3).max(0)));
+            let settings = self.app.settings.lock().unwrap();
+            stage.insert("review_budget".into(), json!(settings["max_fix_rounds"].as_i64().unwrap_or(3).max(0)));
+            stage.insert("review_cadence".into(), json!({
+                "architect": crate::plan::review_cadence(&settings, "architect"),
+                "reviewer": crate::plan::review_cadence(&settings, "reviewer"),
+            }));
             stage.insert("dual_promoted".into(), json!(false));
             stage.remove("attempt_head");
             stage.remove("reassessment");
@@ -296,6 +302,14 @@ impl Ctx {
 
     /// Publish completion durably; report errors propagate so queue goals remain recoverable.
     fn publish_completed_run(&self, plan: &mut Value, count: usize) -> Result<(), String> {
+        let persisted = self.load_plan().ok_or("missing plan before completion")?;
+        if persisted["stages"].as_array().ok_or("invalid stages")?.iter().any(|stage| {
+            stage["review_policy"]["deferred_roles"].as_array().is_some_and(|roles| !roles.is_empty())
+        }) {
+            self.set_phase("blocked");
+            self.log_event("run", "local stage commits retained; deferred reviews require the plan review phase before completion or push");
+            return Ok(());
+        }
         plan["status"] = json!("done");
         self.save_plan(plan)?;
         if self.app.settings.lock().unwrap()["auto_push"].as_bool() == Some(true) {
