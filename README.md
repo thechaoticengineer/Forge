@@ -16,18 +16,44 @@ Rust engine + Quickshell (Omarchy) panel.
 4. Forge runs each stage automatically:
    - the **implementer** implements the stage,
    - the engine classifies the full implementation snapshot,
-   - a fresh, adversarial **independent reviewer** verifies the stage and its scope,
-   - the persistent **architect** also reviews code and architectural contracts,
-   - requested edits return to the implementer, followed by all required reviews again,
-   - the engine commits only a current, clean aggregate gate and the exact reviewed tree.
-5. After the last stage, Forge pushes to `origin` when `auto_push` is enabled.
+   - a fresh, adversarial **independent reviewer** verifies the stage and its scope
+     when scheduled per stage,
+   - the persistent **architect** also reviews code and architectural contracts
+     when scheduled per stage,
+   - requested edits return to the implementer, followed by the stage-required reviews again,
+   - the engine commits the exact gated tree locally under an approved or deferred gate.
+5. After the last stage, Forge runs any deferred reviews over the plan's commit
+   range and fixes their findings. Only after that gate is clean and any approved
+   fixes are committed does it attempt a push to `origin` when `auto_push` is
+   enabled and append the completed-run report. Plans without deferred roles
+   skip this phase. Push failures are logged; report-storage failures are returned
+   for recovery.
 
 ### Scope and review authority
 
-Scope policy version 1 belongs to the engine. Ordinary documentation needs one
-fresh independent review; **architect review is not required**. The engine
+Scope policy version 1 belongs to the engine. Ordinary documentation requires
+the fresh independent reviewer; **architect review is not required**. The engine
 records the committed outcome in the architectural checkpoint so subsequent
 stages retain context without an architect approval or summary turn.
+
+`review_cadence` sets when each required role reviews:
+`{"architect":"per_stage","reviewer":"per_stage"}` is the default and preserves
+per-stage behavior. Either role can independently use `per_plan` instead. The
+engine's scope policy still decides which roles are required at all; cadence
+only schedules those required reviews. Each fresh stage attempt durably captures
+both normalized cadence values alongside its review budget. Changing settings
+mid-run does not alter an in-flight attempt's gate, including on resume. Missing
+legacy or unknown cadence values behave as `per_stage`.
+
+The recorded policy keeps `required_roles` and partitions it into
+`stage_required_roles` and `deferred_roles`. A required role with `per_plan`
+cadence receives no stage review invocation; its stage gate outcome is `deferred`,
+never an approval or `not_required`. If every required role is deferred, the
+stage commits locally after implementation with a `deferred` gate and no stage
+review or fix call. With mixed cadence, the stage-required roles must approve
+before that local commit; the other roles remain deferred. These recorded
+obligations survive settings changes and must be discharged by plan review.
+Deferring architect review does not disable architectural guidance or routing.
 
 The documentation exception requires both prose-oriented stage intent and the
 actual full diff: staged changes, unstaged changes and untracked implementation
@@ -42,18 +68,22 @@ non-executable `.md`, `.txt` and `.rst` files only; unknown/new/deleted files,
 mode changes, executable syntax, code fences and contractual/normative language
 in intent or full diff context require both roles. Its checks are conservative
 lexical signals, not proof of semantic equivalence. The independent reviewer
-must inspect actual behavior and confirm scope. It promotes suspected
-architectural impact with `requires_dual`, explaining why in `scope_reason`.
-Promotion records a new policy and requires new verdicts bound to that policy;
-previous verdicts remain historical. Scope is checked after each fix and before
-commit. Once dual review is required, it remains required for the attempt.
+must inspect actual behavior and confirm scope when invoked. During stage review,
+it promotes suspected architectural impact with `requires_dual`, explaining why
+in `scope_reason`.
+Promotion records a new policy and requires new stage-required verdicts bound to
+that policy, retaining any architect deferral; previous verdicts remain historical.
+Stage scope is checked after each fix and before commit. Once dual review is
+required, it remains required for the attempt.
 
-Both roles inspect the same HEAD, index and working content before a fixer
-runs. Reviews are sequential because the engine has one active-agent/log state.
+Roles reviewing in the same round inspect the same HEAD, index and working
+content before a fixer runs. Reviews are sequential because the engine has one
+active-agent/log state.
 The architect checks recorded decisions, cross-stage interfaces and regressions.
 The independent reviewer receives agreed constraints and preceding actionable
 requests, never the architect's current approval as an endorsement. The engine
-resolves its provider as the other provider relative to the actual implementer.
+resolves a stage reviewer's provider as the other provider relative to the actual
+implementer.
 The configured reviewer must match that provider; known unavailable models or
 incompatible effort/permission capabilities block execution. Configured explicit
 unverified fallbacks remain visibly unverified until execution verifies them.
@@ -65,6 +95,34 @@ or `[reviewer]` provenance. A reported `architecture_context_gap` requests a
 persistent architectural clarification and records its guidance/decisions;
 it does not erase either role's unresolved requests. Fixes must satisfy both
 roles wherever dual review applies. Clean first-round results need no fixer.
+
+After all stages commit, plan review runs the union of their recorded deferred
+roles. It freezes the goal, revision, ordered inputs and commit references of
+all completed stages, implementation provider provenance, required roles, base,
+anchored HEAD, attempt identity and budget. The base is the `attempt_head` of
+the earliest stage with deferred obligations, falling back to that stage commit's
+parent, and must be an ancestor of HEAD. Reviewers inspect
+`git log --stat <base>..HEAD` and `git diff <base>..HEAD` together with staged,
+unstaged and untracked changes. All completed stages supply acceptance and
+integration context, including earlier stages outside that range. The combined
+acceptance text preserves plan order and prefixes each non-empty criterion line
+with `stage <id> (<title>): `; every item needs its own evidence. The frozen
+subject is revalidated after reloads and before finalization; moved HEAD or
+changed inputs block continuation under the old subject.
+
+Plan review uses the same exact identity, snapshot, evidence normalization,
+read-only sandbox and independent project-check rules described below. Its
+identity has `stage_id: null` and `scope: "plan"`; each role's validated verdict
+is published as a `plan_review` event in the architecture event log. The architect
+uses its persistent session. The independent plan reviewer must use a provider
+no stage implementer used, including recorded implementation/fixer invocation
+provenance and plan fixes; retries and fallback cannot waive this exclusion.
+Unknown or unverified implementation provenance blocks independent plan review.
+If no eligible independent provider remains, the run blocks and commits stay local, with guidance
+to use reviewer cadence per stage for a revised plan or pin the implementer
+provider. These choices can prevent conflicts in future work; changing current
+settings or approving a revision cannot erase committed stages' existing
+deferrals or provider history.
 
 ### Verdict protocol and verification
 
@@ -124,17 +182,45 @@ reviews. This setting applies only to review roles.
 ### Budgets, commits and history
 
 `max_fix_rounds` (default `3`) means extra fix/review rounds after the initial
-round: at most four implementation/fix rounds by default, each with all required
-roles. A scope promotion can require a fresh independent verdict in the same
-round under the new policy. Rounds are reserved durably before calls. Stops,
-errors, partial paired-review failure and process restarts consume the reserved
+round: at most four implementation/fix rounds by default, each with its
+stage-required roles. A scope promotion can require a fresh independent verdict
+in the same round under the new policy. Rounds are reserved durably before calls.
+Stops, errors, partial paired-review failure and process restarts consume the reserved
 round and never reset the saved budget or reuse approval. Exhaustion blocks the
 stage. An approved plan revision starts a new attempt; changing a setting or
 pressing Run again does not replenish the current attempt.
 
-Commit validation checks current required verdicts, identity, policy and the
-unchanged snapshot. After staging, the actual index tree must equal the reviewed
-normalized tree, with unchanged worktree content and HEAD. The engine creates
+Plan review captures its own `max_fix_rounds` budget when the phase starts:
+one initial review plus at most that many corrective fix/review cycles, so `0`
+allows one review and no fixer, and the default `3` allows at most four review
+rounds and three corrective cycles. Each round is durably reserved before any
+invocation. Saved action boundaries distinguish work not yet launched from an
+interrupted invocation: an in-flight fixer or review is not replayed under its
+old round identity. Stops, errors and restarts retain consumed rounds, and may
+leave fewer corrective cycles available; neither Run nor a settings change
+replenishes the attempt. Exhaustion blocks with an `exhausted` gate. Editing and
+approving a new plan revision starts a fresh plan-review attempt while retaining
+historical verdicts and implementation provenance. This does not discharge the
+recorded deferred obligations.
+
+Plan fixes receive the goal, frozen stage text, commit range, role-tagged
+requests and architectural guidance/constraints. The fixer edits only the
+working tree, without committing or rewriting history. Its model uses the shared
+resolver, capability requirements, invocation accounting, operational retries
+and quota fallback. Every corrective tree is reviewed again by all required
+plan roles. Only a clean evidenced plan gate can authorize a single
+`fix(review): apply deferred plan review findings` commit of the approved tree;
+if that tree already equals HEAD's tree, there is no extra commit. Rejected or
+exhausted review leaves fixes uncommitted and prevents push and run-report
+publication. Stops retain work and return to `plan_ready`; other phase failures
+block. Successful finalization is saved and validated before `auto_push` or the
+completed-run report. Recovery after a fix ref update requires the exact approved
+tree/content, parent and deterministic message, so it cannot create a duplicate
+fix commit or approve new work.
+
+Stage commit validation checks current stage-required verdicts, identity, policy
+and the unchanged snapshot. After staging, the actual index tree must equal the
+reviewed normalized tree, with unchanged worktree content and HEAD. The engine creates
 that exact tree's commit with `git commit-tree` and advances HEAD with an expected
 old-value `git update-ref`; concurrent HEAD changes are rejected. This path does
 not run commit hooks, so required project checks must be evidenced during review.
@@ -142,12 +228,20 @@ Successful commits add an engine checkpoint outcome without modifying reviewed
 files. The final content check happens immediately before the ref update;
 external tools should not edit a repository during an active stage.
 
+Deferred stage gates retain the same identity, persisted-plan, policy partition,
+snapshot and tree checks, with evidence required for each stage-required role;
+a `deferred` aggregate is valid only with no stage-required roles and non-empty
+deferred obligations. Plan fix commits use the same staged-tree equality,
+`commit-tree` and compare-and-swap `update-ref` protocol, revalidating the frozen
+subject and every required verdict before committing.
+
 Immutable role records accumulate in `reviews`; `last_verdict` remains the
 latest independent verdict for compatibility. `review_policy` and the distinct
 `review_gate` expose current policy/reason, each role's outcome, aggregate status
 and actionable requests. An architect outcome of `not_required` explicitly means
 **architect review not required**, never approval. Historical approval is shown
-separately from current pending, blocked, error, interrupted or invalidated gates.
+separately from current pending, deferred, blocked, error, interrupted or
+invalidated gates.
 Legacy note-only approvals keep their historical rendering; incoming notes never
 permit a current clean gate. Full feedback remains in paginated review history.
 
@@ -319,6 +413,19 @@ an unchanged legacy file scans it once and caches only a bounded state view;
 state reads do not migrate it. Its next mutation writes indexed review files
 without changing any historical record. Existing inline snapshots remain readable.
 
+When the phase exists, `GET /api/state` exposes `plan.plan_review` as a bounded
+projection with status, attempt ID, base and anchored HEAD, `rounds`, captured
+`budget`, `required_roles`, optional `fix_sha`, usage and the gate's status, per-role
+outcomes, role-tagged requests and identity. It includes at most eight recent
+review previews with `review_count` and `reviews_truncated`; individual previews
+are explicitly shortened even for small verdicts. Auxiliary fields and strings
+are bounded too, with flags such as `requests_truncated` and
+`identity_truncated` on the gate. Polling uses stored projections without reading
+or returning full plan verdicts. Complete records have a separate
+`architecture.plan_review_history` reference for execution hydration and remain
+available through the architecture event log; the per-stage `review_history`
+manifest is unchanged. A plan without this phase omits `plan_review`.
+
 `GET /api/architecture/reviews?stage_id=1&cursor=0&limit=20` returns complete review
 records with a record-number `next_cursor` and total `count`. Pages contain at
 most 100 records and normally at most 256 KiB; a single larger legacy record is
@@ -337,7 +444,10 @@ stored event capped at 64 KiB. Add
 architecture log. History pages include the stable `plan_id` and current
 `checkpoint`; event payloads retain decisions (including supersessions), model
 agreements and invalidations. Review pages retain each role's full verdict and
-identity. For example, after a queued goal has completed and been replaced:
+identity. Plan-scope verdicts and their full identities are in history events
+whose `payload.kind` is `plan_review`, within the same event/page size bounds;
+they do not use a synthetic stage ID or the stage reviews endpoint. For example,
+after a queued goal has completed and been replaced:
 
 ```text
 GET /api/architecture/history?plan_id=<completed-plan-id>&cursor=0&limit=20
@@ -386,7 +496,7 @@ has no model, Forge uses the reported effective model or configured model.
 Usage is accumulated in `.forge/plan.json`:
 
 - Each stage's `usage` includes implementation, review, and fix
-  calls; the plan's top-level `usage` holds stage and architect totals.
+  calls; the plan's top-level `usage` holds stage, architect and plan-review/fix totals.
 - Top-level `planner_usage` records planning usage separately; it is not
   included in `usage`. `role_usage` additionally separates planner, architect,
   implementer, fixer and reviewer totals.
@@ -424,9 +534,25 @@ replaced. Each line has:
   restart or plan replacement. `/api/state.role_usage` uses durable plan totals;
   `session_role_usage` contains transient session counters.
 
+When at least one stage captured cadence, the report adds
+`review_cadence: {"version":1,"stage_attempts":[...]}`. Each entry, in plan order,
+has `stage_id`, `attempt_id`, `revision` (the attempt revision) and `cadence`
+(the recorded architect/reviewer pair). This preserves mixed cadences across
+completed stage attempts. An older stage with no capture has `cadence: null`;
+live settings are never substituted, and wholly legacy plans omit the field.
+If plan review exists, `plan_review` records final gate `status`, `rounds` used,
+per-role `roles`, `base`, `fix_sha` (null when no fix commit was needed), and its
+`usage` and `role_usage` contribution when present. That contribution is already
+included in plan totals. The existing `commits` and `stage_outcomes` remain stage
+lists; the extra fix commit is identified by `plan_review.fix_sha`. Reports
+without plan review omit that object, and older reports remain readable.
+
 Report appends are synced before a queue goal is marked complete. A storage
-failure is reported and keeps that queue goal for recovery; its commits remain
-local. Full decisions and superseded agreements remain addressable through
+failure is reported and keeps that queue goal for recovery; commits are retained
+locally, but a preceding enabled push may already have succeeded. Deferred review
+must pass and its approved tree be durably finalized before either push or report
+publication; a failed push is logged and does not prevent the report.
+Full decisions and superseded agreements remain addressable through
 architecture history using the report's plan ID. Reports summarize token usage;
 they do not estimate CLI spend or convert API list rates into subscription costs.
 The append log is not an exactly-once completion ledger: explicitly rerunning a
@@ -480,6 +606,14 @@ PATH, logged in. Review execution also requires `bwrap` and `sha256sum`.
 The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/architect/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
+
+The settings row has **architect review: per stage | per plan** and
+**reviewer review: per stage | per plan** controls. Each reflects the current
+setting, shows an unavailable placeholder before settings arrive, and toggles
+only its role while posting both cadence keys. They are disabled offline;
+Tab, Space and Enter operate them, and Escape returns to panel shortcuts.
+The new value applies to fresh attempts, not an already captured stage gate.
+
 Each stage shows its **review policy**, **architect and independent outcomes**,
 and **current aggregate gate**. Each reviewed stage also has a **historical review** chip showing its own
 round and decision: a clean `approved`, amber `approved with optional notes`
@@ -494,6 +628,21 @@ suffix. Current activity appears separately in bold, for example
 decision cannot be mistaken for approval of work under review. An older clean
 decision is muted during current activity. Budget exhaustion displays
 `blocked · review budget exhausted` alongside the last decision.
+
+A deferred role displays **deferred to the plan review**. A fully deferred gate
+distinguishes **awaiting commit under a deferred review policy** from
+**committed under a deferred review policy**, without presenting either as an
+approval. Plan review appears separately beside the architecture area, outside
+the stage cards, with phase status, current gate, round `n of budget + 1`,
+architect/independent outcomes and any fix commit SHA. Its role-tagged requests
+expand to complete, wrapping, selectable plain text with **Copy full text**.
+If state shortened the requests, opening the detail retrieves bounded pages of
+architecture history and matches the exact plan, attempt, round, policy,
+snapshot and role identities. Until retrieval succeeds, including after a load
+failure, the shortened preview remains labelled and full selection/copy stays
+unavailable; the detail offers retry. This uses disclosure-driven retrieval
+without increasing polling or page caps. Stage cards retain their single header
+disclosure and existing keyboard behavior.
 
 Expand a stage to read complete, wrapping, selectable review text: summaries,
 change requests, notes and checks under `verified:`, with recorded round, decision
@@ -1050,9 +1199,11 @@ The plan editor exposes exact constraint fields. HTTP clients may include, for
 example, `"model_constraint":{"provider":"codex","model":"your-exact-id"}`
 on a pending stage in `POST /api/plan/edit`. Constraints survive AI revision;
 agent output cannot manufacture user overrides or committed records. Invalid
-IDs, efforts, inadequate tiers and cross-provider reviewer conflicts are reported
-before approval rather than silently overriding settings. The independent
-reviewer must use the other provider relative to the selected implementer.
+IDs, efforts and inadequate tiers are reported before approval rather than
+silently overriding settings. Cross-provider reviewer conflicts are checked there
+when the reviewer is scheduled per stage; that reviewer must use the other
+provider relative to the selected implementer. Deferred reviewer independence
+is checked over the frozen plan subject when plan review runs.
 
 The planner proposes risk, complexity, task, provider/model, native effort and a
 stage-specific rationale in its existing standard/refactor/revision output.
@@ -1221,7 +1372,20 @@ routing defaults on, stage overrides take precedence over global model pins, and
 adequacy/review requirements always apply. Only `model_catalogue` policy is saved
 to the user configuration file; other engine settings are process settings.
 `auto_push` defaults to `true` (disable it for local-only runs), and
-`queue_auto_approve` defaults to `false`. This stage does not change Git behavior.
+`queue_auto_approve` defaults to `false`.
+
+`POST /api/settings` accepts `review_cadence`, for example
+`{"review_cadence":{"architect":"per_plan","reviewer":"per_stage"}}`.
+When supplied, it must be an object containing exactly both `architect` and
+`reviewer`, each the string `per_stage` or `per_plan`; it replaces the pair,
+not one nested key. Missing or extra keys, non-objects and invalid values return
+HTTP 400 with an `invalid review_cadence` error, leaving all settings unchanged
+even if the same request included other updates. Omitting `review_cadence`
+retains its current value. Accepted values are process settings returned as
+`settings.review_cadence` by `GET /api/state`; both default to `per_stage` on
+engine startup.
+Saved attempt cadence and deferred obligations survive independently of those
+current settings.
 
 Discovery runs at startup and every 360 minutes; metadata is first considered
 after discovery and every 1440 minutes, with a 168-hour TTL. The scheduler ticks
@@ -1266,6 +1430,13 @@ and reports the resulting unresolved widget types, plus an existing `enabled`
 property shadow warning. Live shell rendering is not validated because that would
 require loading changes into the running Omarchy instance.
 
+HTTP worker fixtures have a five-second deadline. On a loaded machine or in a
+review sandbox, use `cargo test --offline -- --test-threads=2` to reduce test
+contention. A focused mock-architect test in a fresh PID namespace can also hit
+the existing short-ID slicing panic in `src/architect.rs`: the formatter slices
+the variable-length ID before padding it. Use the complete suite for sandbox
+validation; a passing suite does not repair that focused-fixture limitation.
+
 The deterministic lifecycle fixture joins startup discovery, unknown pricing,
 configured unverified execution, conditional periodic official refresh, joint
 draft agreement, approval reuse, cheap documentation/functionality, interrupted
@@ -1280,10 +1451,12 @@ Do not use the live port 8734 for a smoke instance; use `FORGE_PORT=18734` and a
 isolated project/configuration. Validation needs no installation, instance restart,
 push, or paid generation.
 
-If Git commits an approved stage but checkpoint publication fails, the next Run
-can recover completion without another implementation or review. Recovery requires
-all saved current approvals, a clean index/worktree, the exact reviewed tree, a
-single parent matching the reviewed HEAD, and the intended commit message. Other
-HEAD changes or unreviewed edits are rejected. For offline recovery only, stop the
+If Git commits a stage under an approved or deferred gate but checkpoint publication
+fails, the next Run can recover that stage's commit without another implementation
+or stage review. Deferred obligations still require plan review before run completion.
+Recovery requires a valid saved gate and its stage-required approvals, a clean
+index/worktree, the exact gated tree, a single parent matching the reviewed HEAD,
+and the intended commit message. Other HEAD changes or unreviewed edits are
+rejected. For offline recovery only, stop the
 engine service first, then run `forge-engine /path/to/project --recover-committed`;
 this command restores matching completion state without running subsequent stages.
