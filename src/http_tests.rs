@@ -209,7 +209,8 @@ fn review_cadence_defaults_and_accessor() {
 
 #[test]
 fn review_cadence_settings_are_returned_in_state() {
-    let test = QueueTest::new(false);
+    let fixture = QueueTest::new(false);
+    let test = QueueTest::with_engine(false, Some(Arc::new(App::new(fixture.app.project(), default_settings()))));
     let app = &test.app.app;
     let (code, state) = api_request(app, "GET", "/api/state", json!({}));
     assert_eq!(code, 200);

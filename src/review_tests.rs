@@ -11,12 +11,16 @@ impl Fixture {
         Self::with_ignored_runtime(intent, budget, false)
     }
     fn with_ignored_runtime(intent: &str, budget: u64, ignored: bool) -> Self {
+        let mut settings = crate::plan::default_settings();
+        settings["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
+        Self::with_settings(intent, budget, ignored, settings)
+    }
+    fn with_settings(intent: &str, budget: u64, ignored: bool, mut settings: Value) -> Self {
         let root = std::env::temp_dir().join(format!(
             "forge-gate-test-{}",
             crate::architecture::identity()
         ));
         fs::create_dir_all(&root).unwrap();
-        let mut settings = crate::plan::default_settings();
         for role in ["planner", "architect", "implementer", "reviewer"] {
             settings[role] = json!("mock");
         }
@@ -983,7 +987,7 @@ fn deferred_reviewer_constraints_allow_codex_assignment_reassessment_and_local_c
         }
         f.ctx.save_plan(&p).unwrap();
         // Settings and explicit reviewer changes cannot invalidate a captured deferral.
-        f.setting("review_cadence", crate::plan::default_settings()["review_cadence"].clone());
+        f.setting("review_cadence", json!({"architect":"per_stage","reviewer":"per_stage"}));
         f.setting("reviewer", json!("unavailable"));
         assert!(f.ctx.reviewer_config("codex").is_err());
         assert!(f.ctx.validated_assignment(&p, 0).is_ok());

@@ -12,6 +12,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("forge-architect-test-{}", identity()));
         fs::create_dir_all(&root).unwrap();
         let mut settings = crate::plan::default_settings();
+        settings["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
         settings["planner"] = json!("mock");
         settings["implementer"] = json!("mock");
         settings["reviewer"] = json!("mock");

@@ -14,6 +14,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("forge-routing-test-{}", identity()));
         fs::create_dir_all(&root).unwrap();
         let mut s = crate::plan::default_settings();
+        s["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
         s["planner"] = json!("mock");
         s["architect"] = json!("mock");
         s["reviewer"] = json!("claude");

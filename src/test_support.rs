@@ -38,6 +38,7 @@ impl QueueTest {
         ));
         fs::create_dir(&path).unwrap();
         let mut settings = default_settings();
+        settings["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
         settings["planner"] = json!("mock");
         settings["implementer"] = json!("mock");
         settings["reviewer"] = json!("mock");
