@@ -55,7 +55,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let project_endpoint = matches!(path, "/api/state" | "/api/architecture/history" | "/api/architecture/reviews" | "/api/agent_log" | "/api/agent_records" | "/api/diff"
-        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/goal/enhance" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
         Ok(None)
@@ -112,6 +112,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Post, "/api/plan") => api_plan(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan/revise") => api_plan_revise(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan/chat") => api_plan_chat(&ctx, &body),
+        (tiny_http::Method::Post, "/api/goal/enhance") => api_goal_enhance(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan/edit") => api_plan_edit(&ctx, &body),
         (tiny_http::Method::Post, "/api/approve") => api_approve(&ctx),
         (tiny_http::Method::Post, "/api/run") => api_run(&ctx),
@@ -135,6 +136,7 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
             "current_step": s.current_step,
             "run_started_unix": s.run_started_unix,
             "model_selection": s.model_selection,
+            "goal_enhancement": s.goal_enhancement,
             "architect_activity":s.architect_activity,
             "role_usage":s.role_usage,
             "agent": {
@@ -567,6 +569,33 @@ fn api_plan_chat(ctx: &Ctx, body: &Value) -> (u32, Value) {
     let ctx2 = ctx.clone();
     std::thread::spawn(move || ctx2.chat_worker(&plan, &question));
     (200, json!({"ok": true}))
+}
+
+fn api_goal_enhance(ctx: &Ctx, body: &Value) -> (u32, Value) {
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+    let goal = body["goal"].as_str().unwrap_or("").trim().to_string();
+    if goal.is_empty() {
+        return (400, json!({"error": "goal required"}));
+    }
+    if goal.chars().count() > 20000 {
+        return (400, json!({"error": "goal too long"}));
+    }
+    if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+        return (409, json!({"error": "busy"}));
+    }
+    ctx.session.stop_requested.store(false, Ordering::SeqCst);
+    let request_id = {
+        let mut s = ctx.session.state.lock().unwrap();
+        s.goal_enhancement_serial += 1;
+        let request_id = s.goal_enhancement_serial;
+        s.goal_enhancement = json!({"status":"running","request_id":request_id,"original":goal,"unix":unix_timestamp()});
+        request_id
+    };
+    let short: String = goal.chars().take(300).collect();
+    ctx.log_event("plan", &format!("enhancing goal description: {short}"));
+    let ctx2 = ctx.clone();
+    std::thread::spawn(move || ctx2.enhance_goal_worker(&goal, request_id));
+    (200, json!({"ok": true, "request_id": request_id}))
 }
 
 fn api_plan_edit(ctx: &Ctx, body: &Value) -> (u32, Value) {

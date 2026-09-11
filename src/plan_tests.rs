@@ -291,6 +291,187 @@ fn plan_chat_bad_output_logs_error_without_appending_or_changing_plan() {
 }
 
 #[test]
+fn goal_enhance_validates_before_admission_and_preserves_rejected_state() {
+    let test = QueueTest::new(false);
+    let previous = json!({"status":"ready","request_id":7,"original":"old","goal":"clearer","unix":1});
+    {
+        let mut state = test.app.session.state.lock().unwrap();
+        state.goal_enhancement_serial = 7;
+        state.goal_enhancement = previous.clone();
+    }
+    for busy in [false, true] {
+        for queued in [false, true] {
+            test.app.session.busy.store(busy, Ordering::SeqCst);
+            test.app.session.queue_active.store(queued, Ordering::SeqCst);
+            test.app.session.stop_requested.store(true, Ordering::SeqCst);
+            let mut cases = vec![(json!({}), "goal required")];
+            for goal in [Value::Null, json!(42), json!(""), json!(" \t\n\u{2003}")] {
+                cases.push((json!({"goal":goal}), "goal required"));
+            }
+            cases.push((json!({"goal":"界".repeat(20001)}), "goal too long"));
+            if busy || queued { cases.push((json!({"goal":"rough goal"}), "busy")); }
+            for (body, error) in cases {
+                assert_eq!(api_request(&test.app.app, "POST", "/api/goal/enhance", body),
+                    (if error == "busy" { 409 } else { 400 }, json!({"error":error})));
+                assert_eq!(test.app.session.busy.load(Ordering::SeqCst), busy);
+                assert_eq!(test.app.session.queue_active.load(Ordering::SeqCst), queued);
+                assert!(test.app.session.stop_requested.load(Ordering::SeqCst));
+                let state = test.app.session.state.lock().unwrap();
+                assert_eq!(state.goal_enhancement_serial, 7);
+                assert_eq!(state.goal_enhancement, previous);
+            }
+        }
+    }
+    assert!(test.app.app.settings.lock().unwrap()["mock_agent_requests"].is_null());
+    assert_eq!(test.app.read_history(), json!([]));
+    assert!(!test.app.forge_path("enhanced-goal.json").exists());
+    assert!(!test.app.forge_path("plan.json").exists());
+    assert!(!test.app.forge_path("chat.jsonl").exists());
+}
+
+#[test]
+fn goal_enhance_without_plan_publishes_running_then_ready_and_increases_ids() {
+    let test = QueueTest::new(false);
+    let (status, initial) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(initial.get("goal_enhancement"), Some(&Value::Null));
+    let goals = ["rough goal 界🙂".to_string(), "界🙂".repeat(10000)];
+    for (index, goal) in goals.iter().enumerate() {
+        let request_id = index as i64 + 1;
+        test.app.session.stop_requested.store(true, Ordering::SeqCst);
+        // Hold model settings so the worker cannot finish before inspecting admission.
+        let settings = test.app.app.settings.lock().unwrap();
+        assert_eq!(api_request(&test.app.app, "POST", "/api/goal/enhance",
+            json!({"goal":format!(" \t{goal}\n\u{2003}")})),
+            (200, json!({"ok":true,"request_id":request_id})));
+        {
+            let state = test.app.session.state.lock().unwrap();
+            assert_eq!(state.goal_enhancement_serial, request_id);
+            assert_eq!(state.goal_enhancement["status"], "running");
+            assert_eq!(state.goal_enhancement["request_id"], request_id);
+            assert_eq!(state.goal_enhancement["original"], *goal);
+            assert!(state.goal_enhancement["unix"].as_i64().unwrap() > 0);
+            assert!(state.goal_enhancement.get("goal").is_none());
+            assert!(state.goal_enhancement.get("error").is_none());
+            assert_eq!(state.phase, initial["phase"].as_str().unwrap());
+        }
+        assert!(test.app.session.busy.load(Ordering::SeqCst));
+        assert!(!test.app.session.stop_requested.load(Ordering::SeqCst));
+        assert_eq!(api_request(&test.app.app, "POST", "/api/goal/enhance",
+            json!({"goal":"overlapping request"})), (409, json!({"error":"busy"})));
+        assert_eq!(test.app.session.state.lock().unwrap().goal_enhancement_serial, request_id);
+        drop(settings);
+        wait_for_worker(&test.app);
+        let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(status, 200);
+        assert_eq!(state["goal_enhancement"]["status"], "ready");
+        assert_eq!(state["goal_enhancement"]["request_id"], request_id);
+        assert_eq!(state["goal_enhancement"]["original"], *goal);
+        assert_eq!(state["goal_enhancement"]["goal"], "mock enhanced goal");
+        assert!(state["goal_enhancement"]["unix"].as_i64().unwrap() > 0);
+        assert_eq!(state["busy"], false);
+        assert_eq!(state["phase"], initial["phase"]);
+        assert_eq!(state["goal"], initial["goal"]);
+        assert_eq!(state["current_step"], "");
+        assert!(!test.app.forge_path("plan.json").exists());
+        assert!(!test.app.forge_path("chat.jsonl").exists());
+        let settings = test.app.app.settings.lock().unwrap();
+        let requests = settings["mock_agent_requests"].as_array().unwrap();
+        assert_eq!(requests.len(), index + 1);
+        assert!(requests.iter().all(|request| request["role"] == "enhance"));
+        let text = format!("enhancing goal description: {}", goal.chars().take(300).collect::<String>());
+        assert_eq!(test.app.read_history().as_array().unwrap().iter().filter(|event|
+            event["kind"] == "plan" && event["text"] == text).count(), 1);
+    }
+}
+
+#[test]
+fn goal_enhance_state_reports_failure_and_preserves_plan_chat_and_phase() {
+    for output in [json!({"goal":" \tclearer goal\n"}), json!({"goal":42})] {
+        let test = QueueTest::new(false);
+        let plan = b"{\"goal\":\"Existing goal\",\"stages\":[]}\n";
+        let chat = b"{\"role\":\"user\",\"text\":\"keep this\"}\n";
+        fs::write(test.app.forge_path("plan.json"), plan).unwrap();
+        fs::write(test.app.forge_path("chat.jsonl"), chat).unwrap();
+        test.app.set_phase("blocked");
+        test.app.app.settings.lock().unwrap()["mock_enhance_output"] = output.clone();
+        assert_eq!(api_request(&test.app.app, "POST", "/api/goal/enhance",
+            json!({"goal":"rough goal"})), (200, json!({"ok":true,"request_id":1})));
+        wait_for_worker(&test.app);
+        let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+        assert_eq!(status, 200);
+        let result = &state["goal_enhancement"];
+        assert_eq!(result["request_id"], 1);
+        assert_eq!(result["original"], "rough goal");
+        assert!(result["unix"].as_i64().unwrap() > 0);
+        if output["goal"].is_string() {
+            assert_eq!(result["status"], "ready");
+            assert_eq!(result["goal"], "clearer goal");
+        } else {
+            assert_eq!(result["status"], "failed");
+            let error = result["error"].as_str().unwrap();
+            assert!(!error.is_empty());
+            assert!(state["history"].as_array().unwrap().iter().any(|event|
+                event["kind"] == "error" && event["text"] == format!("goal enhancement failed: {error}")));
+        }
+        assert_eq!(state["busy"], false);
+        assert_eq!(state["phase"], "blocked");
+        assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), plan);
+        assert_eq!(fs::read(test.app.forge_path("chat.jsonl")).unwrap(), chat);
+    }
+}
+
+#[test]
+fn goal_enhance_targets_project_and_leaves_other_session_alone() {
+    let first = QueueTest::new(false);
+    let engine = &first.app.app;
+    let second = QueueTest::with_engine(false, Some(Arc::clone(engine)));
+    let previous = json!({"status":"ready","request_id":7,"original":"old","goal":"clearer","unix":1});
+    {
+        let mut state = first.app.session.state.lock().unwrap();
+        state.goal_enhancement_serial = 7;
+        state.goal_enhancement = previous.clone();
+        state.phase = "running".into();
+        state.goal = "first goal".into();
+        state.current_step = "other work".into();
+    }
+    first.app.acquire_busy().unwrap();
+    let _worker = WorkerGuard(&first.app.session);
+    first.app.session.stop_requested.store(true, Ordering::SeqCst);
+    second.app.set_phase("blocked");
+    assert_eq!(api_request(engine, "POST", "/api/goal/enhance",
+        json!({"project":second.app.project(),"goal":"second rough goal"})),
+        (200, json!({"ok":true,"request_id":1})));
+    wait_for_worker(&second.app);
+    let (status, state) = api_request(engine, "GET",
+        &format!("/api/state?project={}", second.app.project()), json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["goal_enhancement"]["status"], "ready");
+    assert_eq!(state["goal_enhancement"]["request_id"], 1);
+    assert_eq!(state["goal_enhancement"]["original"], "second rough goal");
+    assert_eq!(state["goal_enhancement"]["goal"], "mock enhanced goal");
+    assert_eq!(state["busy"], false);
+    assert_eq!(state["phase"], "blocked");
+    let (status, state) = api_request(engine, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["goal_enhancement"], previous);
+    assert_eq!(state["busy"], true);
+    assert_eq!(state["phase"], "running");
+    assert_eq!(state["goal"], "first goal");
+    assert_eq!(state["current_step"], "other work");
+    assert_eq!(first.app.session.state.lock().unwrap().goal_enhancement_serial, 7);
+    assert!(first.app.session.stop_requested.load(Ordering::SeqCst));
+    assert_eq!(*engine.active_project.lock().unwrap(), first.app.project());
+    assert_eq!(first.app.read_history(), json!([]));
+    assert!(!first.app.forge_path("enhanced-goal.json").exists());
+    for ctx in [&first.app, &second.app] {
+        assert!(!ctx.forge_path("plan.json").exists());
+        assert!(!ctx.forge_path("chat.jsonl").exists());
+    }
+    assert_eq!(engine.settings.lock().unwrap()["mock_agent_requests"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn plan_enhance_stores_trimmed_goal_and_preserves_plan_transcript_and_phase() {
     let test = QueueTest::new(false);
     let goal = " \tbuild a thing with {goal} and {answer_path} 界🙂\n";
