@@ -654,9 +654,12 @@ fn a_scope_escalation_revises_the_stage_once_and_then_belongs_to_a_human() {
     let outcome = json!({"status":"escalation","evidence":["Qt normalises CRLF to LF on assignment"],
         "request":{"kind":"scope","reason":"Acceptance demands byte equality Qt cannot provide",
                    "required_capability":"Reconcile the acceptance criterion"}});
-    f.set("mock_scope_output", json!({"revised":{
+    let revision = json!({"revised":{
         "instructions":"Implement greeting","acceptance":"Greeting works on normalised text"},
-        "removed":"Dropped byte equality; Qt normalises newlines"}));
+        "removed":"Dropped byte equality; Qt normalises newlines"});
+    f.set("mock_scope_output", json!(format!(
+        "I inspected settings[\"reviewer\"]. The escalation is correct.\n\n{revision}"
+    )));
     let (revised, message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
     assert!(revised);
     assert_eq!(message, "Dropped byte equality; Qt normalises newlines");

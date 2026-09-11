@@ -93,14 +93,30 @@ pub(crate) fn digest(bytes: &[u8]) -> Result<String, String> {
 /// is not discarded over its wrapper. Falls back to the trimmed output so a
 /// genuinely malformed response still produces a diagnosable parse error.
 pub(crate) fn json_payload(output: &str) -> &str {
+    json_payload_where(output, |_| true)
+}
+
+/// Ignore incidental JSON in prose until an object with a response key appears.
+/// Field validation remains the caller's responsibility, including malformed
+/// responses that contain a recognized key.
+pub(crate) fn json_payload_with_keys<'a>(output: &'a str, keys: &[&str]) -> &'a str {
+    json_payload_where(output, |candidate| {
+        serde_json::from_str::<serde_json::Value>(candidate)
+            .is_ok_and(|value| keys.iter().any(|key| value.get(*key).is_some()))
+    })
+}
+
+fn json_payload_where(output: &str, accepts: impl Fn(&str) -> bool) -> &str {
     let output = output.trim();
     if parses(output) {
         return output;
     }
     let bytes = output.as_bytes();
     let mut attempts = 0;
-    for start in 0..bytes.len() {
+    let mut start = 0;
+    while start < bytes.len() {
         if bytes[start] != b'{' && bytes[start] != b'[' {
+            start += 1;
             continue;
         }
         attempts += 1;
@@ -110,8 +126,16 @@ pub(crate) fn json_payload(output: &str) -> &str {
         if let Some(end) = balanced_end(bytes, start)
             && parses(&output[start..end])
         {
-            return &output[start..end];
+            let candidate = &output[start..end];
+            if accepts(candidate) {
+                return candidate;
+            }
+            // Do not reinterpret fields inside an unrelated JSON value as a
+            // separate response from the planner.
+            start = end;
+            continue;
         }
+        start += 1;
     }
     output
 }
@@ -151,7 +175,31 @@ fn balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::json_payload;
+    use super::{json_payload, json_payload_with_keys};
+
+    #[test]
+    fn scope_response_skips_json_in_the_planners_explanation() {
+        let revision = r#"{"revised":{"instructions":"Test deferred routing","acceptance":"Assignments are reused"},"removed":"Dropped prompt serialization requirement"}"#;
+        let output = format!(
+            "routing_prompt serializes settings[\"reviewer\"] unconditionally. \
+             The old settings are {{\"reviewer\":\"claude\"}}.\n\n{revision}"
+        );
+        assert_eq!(json_payload_with_keys(&output, &["revised", "refused"]), revision);
+        let refusal = r#"{"refused":"The stage can use the existing public API"}"#;
+        let output = format!("Inspected settings[\"reviewer\"].\n```json\n{refusal}\n```");
+        assert_eq!(json_payload_with_keys(&output, &["revised", "refused"]), refusal);
+    }
+
+    #[test]
+    fn scope_response_preserves_invalid_fields_for_validation() {
+        let invalid = r#"{"revised":{"instructions":null}}"#;
+        let output = format!("Inspected settings[\"reviewer\"].\n{invalid}");
+        assert_eq!(json_payload_with_keys(&output, &["revised", "refused"]), invalid);
+        let unrelated = r#"{"example":{"refused":"This is nested data"}}"#;
+        let output = format!("Example: {unrelated}");
+        assert_eq!(json_payload_with_keys(&output, &["revised", "refused"]), output);
+        assert_eq!(json_payload_with_keys(unrelated, &["revised", "refused"]), unrelated);
+    }
 
     #[test]
     fn plain_json_and_whitespace_are_returned_unchanged() {
@@ -181,4 +229,3 @@ mod tests {
         assert_eq!(json_payload("{\"unclosed\": 1"), "{\"unclosed\": 1");
     }
 }
-

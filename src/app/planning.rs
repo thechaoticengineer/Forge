@@ -9,7 +9,7 @@ use crate::agent::AgentRequest;
 use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
 use crate::candidate_draft::prepare_candidate_draft;
 use crate::usage::accumulate_invocation_usage;
-use crate::util::{fill_template, json_payload, unix_timestamp};
+use crate::util::{fill_template, json_payload, json_payload_with_keys, unix_timestamp};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
@@ -255,12 +255,14 @@ impl Ctx {
         self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
         // The mock planner answers through settings, the way it answers plan
         // generation through the candidate file.
-        let answer: Value = if tool == "mock" {
-            self.app.settings.lock().unwrap()["mock_scope_output"].clone()
+        let text = if tool == "mock" {
+            let answer = self.app.settings.lock().unwrap()["mock_scope_output"].clone();
+            answer.as_str().map(str::to_owned).unwrap_or_else(|| answer.to_string())
         } else {
-            serde_json::from_str(json_payload(&result.output))
-                .map_err(|e| format!("invalid scope revision: {e}"))?
+            result.output
         };
+        let answer: Value = serde_json::from_str(json_payload_with_keys(&text, &["revised", "refused"]))
+            .map_err(|e| format!("invalid scope revision: {e}"))?;
         if let Some(refused) = answer["refused"].as_str().filter(|r| !r.trim().is_empty()) {
             return Ok((false, format!("the planner holds the stage buildable as written: {refused}")));
         }
