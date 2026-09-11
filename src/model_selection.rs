@@ -27,6 +27,22 @@ fn tier_rank(tier: &Tier) -> u8 {
     }
 }
 
+fn tier_name(tier: &Tier) -> &'static str {
+    match tier {
+        Tier::Basic => "basic",
+        Tier::Standard => "standard",
+        Tier::Strong => "strong",
+    }
+}
+
+fn pin_error(role: &str, provider: &str, model: &str, cause: &str) -> String {
+    if model.is_empty() {
+        cause.into()
+    } else {
+        format!("pinned {role} model {provider}/{model}: {cause}")
+    }
+}
+
 impl ModelRequirements {
     pub(crate) fn requiring_at_least(mut self, minimum: Tier) -> Self {
         if self.minimum_tier.as_ref().is_none_or(|tier| tier_rank(tier) < tier_rank(&minimum)) {
@@ -98,7 +114,11 @@ impl Ctx {
         implementer: Option<&str>,
     ) -> Result<ModelRequirements, String> {
         let settings = self.app.settings.lock().unwrap();
-        let configured_role = if matches!(role, "chat" | "enhance") { "planner" } else { role };
+        let configured_role = if matches!(role, "chat" | "enhance") {
+            "planner"
+        } else {
+            role
+        };
         let automatic = settings["automatic_routing"] != false;
         let model = settings[format!("{configured_role}_model")]
             .as_str()
@@ -110,12 +130,24 @@ impl Ctx {
                 Some("codex") => "claude",
                 Some("claude") => "codex",
                 Some("mock") if configured == "mock" => "mock",
-                _ => return Err("cannot resolve independent reviewer provider".into()),
+                _ => {
+                    return Err(pin_error(
+                        role,
+                        configured,
+                        &model,
+                        "cannot resolve independent reviewer provider",
+                    ));
+                }
             };
             if configured != other && (!automatic || !model.is_empty()) {
-                return Err(format!(
-                    "independent reviewer must be configured as {other}, the other provider relative to {}",
-                    implementer.unwrap()
+                return Err(pin_error(
+                    role,
+                    configured,
+                    &model,
+                    &format!(
+                        "independent reviewer must be configured as {other}, the other provider relative to {}",
+                        implementer.unwrap()
+                    ),
                 ));
             }
             other
@@ -125,7 +157,11 @@ impl Ctx {
             configured
         };
         let mut requirements = ModelRequirements::for_class(role, provider, Tier::Strong);
-        if role == "reviewer" && !model.is_empty() {
+        if !matches!(
+            role,
+            "planner" | "architect" | "chat" | "enhance" | "reviewer"
+        ) || (role == "reviewer" && !model.is_empty())
+        {
             requirements.minimum_tier = None;
         }
         requirements.fallback = automatic && model.is_empty();
@@ -198,10 +234,21 @@ impl Ctx {
                 "provider_default".into(),
             ));
         }
-        let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
-        let provider = Provider::parse(&requirements.provider).ok_or("invalid model provider")?;
-        let mut candidates: Vec<_> = if requirements.model.is_empty() {
-            policy
+        let pinned = !requirements.model.is_empty();
+        let error = |cause: &str| {
+            pin_error(
+                &requirements.role,
+                &requirements.provider,
+                &requirements.model,
+                cause,
+            )
+        };
+        let policy = Policy::from_settings(&self.app.settings.lock().unwrap())
+            .map_err(|cause| error(&cause))?;
+        let provider = Provider::parse(&requirements.provider)
+            .ok_or_else(|| error("invalid model provider"))?;
+        let candidates: Vec<_> = if !pinned {
+            let mut entries: Vec<_> = policy
                 .entries
                 .iter()
                 .filter(|e| {
@@ -211,40 +258,56 @@ impl Ctx {
                             .as_ref()
                             .is_none_or(|minimum| tier_rank(&e.tier) >= tier_rank(minimum))
                 })
-                .map(|e| e.model.clone())
-                .collect()
+                .collect();
+            entries.sort_by_key(|e| tier_rank(&e.tier));
+            // Missing preferences establish no cost order for the entire tier.
+            for tier in entries.chunk_by_mut(|a, b| a.tier == b.tier) {
+                if tier.iter().all(|e| e.relative_cost_preference.is_some()) {
+                    tier.sort_by_key(|e| e.relative_cost_preference);
+                }
+            }
+            entries.into_iter().map(|e| e.model.clone()).collect()
         } else {
             vec![requirements.model.clone()]
         };
-        if requirements.model.is_empty() {
-            candidates.sort_by_key(|model| {
-                policy
-                    .entries
-                    .iter()
-                    .find(|e| e.provider == provider && &e.model == model)
-                    .map(|e| tier_rank(&e.tier))
-                    .unwrap_or(0)
-            });
-        }
         let mut blockers = Vec::new();
         for model in candidates {
             if excluded
                 .iter()
                 .any(|(p, m)| p == provider.name() && m == &model)
             {
+                if pinned {
+                    return Err(error("model was already attempted"));
+                }
                 continue;
             }
-            if requirements.minimum_tier.as_ref().is_some_and(|minimum| {
-                !policy.entries.iter().any(|e| {
-                    e.provider == provider
-                        && e.model == model
-                        && tier_rank(&e.tier) >= tier_rank(minimum)
-                })
-            }) {
-                continue;
+            if let Some(minimum) = &requirements.minimum_tier {
+                let configured = policy
+                    .entries
+                    .iter()
+                    .find(|e| e.provider == provider && e.model == model);
+                if configured.is_none_or(|e| tier_rank(&e.tier) < tier_rank(minimum)) {
+                    if pinned {
+                        return Err(error(&format!(
+                            "configured tier {}; this work requires at least {} - change the registry tier or the pin",
+                            configured
+                                .map(|e| tier_name(&e.tier))
+                                .unwrap_or("unclassified"),
+                            tier_name(minimum),
+                        )));
+                    }
+                    continue;
+                }
             }
             let facts = self.model_facts(&policy, provider, &model, None);
             if facts["eligible"] != true {
+                if pinned {
+                    return Err(error(
+                        facts["error"]
+                            .as_str()
+                            .unwrap_or("catalogue reports model ineligible"),
+                    ));
+                }
                 continue;
             }
             if let Some(reason) = self.model_quota_reason(
@@ -253,8 +316,8 @@ impl Ctx {
                 facts["resolved_id"].as_str().unwrap_or(&model),
                 false,
             ) {
-                if !requirements.fallback {
-                    return Err(reason);
+                if pinned || !requirements.fallback {
+                    return Err(error(&reason));
                 }
                 blockers.push(reason);
                 continue;
