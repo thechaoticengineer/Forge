@@ -15,7 +15,7 @@ pub(crate) fn default_settings() -> Value {
         "planner_model": "",
         "implementer_model": "",
         "reviewer_model": "",
-        "review_cadence": {"architect":"per_stage","reviewer":"per_stage"},
+        "review_cadence": {"architect":"per_plan","reviewer":"per_plan"},
         "max_fix_rounds": 3,
         "reassessment_limits": {"max_reassessments":3,"max_operational_retries":2,"repeat_threshold":2,"context_percent":85},
         "auto_push": true,

@@ -192,9 +192,9 @@ fn plan_review_publication_respects_page_and_expanded_record_budgets() {
 #[test]
 fn review_cadence_defaults_and_accessor() {
     let settings = default_settings();
-    assert_eq!(settings["review_cadence"], json!({"architect":"per_stage","reviewer":"per_stage"}));
+    assert_eq!(settings["review_cadence"], json!({"architect":"per_plan","reviewer":"per_plan"}));
     for role in ["architect", "reviewer"] {
-        assert_eq!(review_cadence(&settings, role), "per_stage");
+        assert_eq!(review_cadence(&settings, role), "per_plan");
         for value in [json!("per_plan"), json!("per_stage"), json!("unknown"), json!("PER_PLAN"), json!("per_plan "), Value::Null, json!(true), json!(1), json!([]), json!({})] {
             let mut settings = settings.clone();
             settings["review_cadence"][role] = value.clone();
