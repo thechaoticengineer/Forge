@@ -810,3 +810,202 @@ fn invalid_routing_json_and_then_invalid_schema_share_one_correction_budget() {
     assert_eq!(f.counts(), (4, 0));
     assert_eq!(p, before);
 }
+
+#[test]
+fn plan_fixer_uses_maximum_agreed_stage_floor_and_preserves_adequate_pins() {
+    for (risks, pin, saved_floor, expected) in [
+        (vec!["simple"], "", None, "budget-test"),
+        (vec!["standard"], "", None, "standard-test"),
+        (vec!["critical"], "", None, "strong-test"),
+        (vec!["simple", "critical"], "", None, "strong-test"),
+        (vec!["simple"], "standard-test", None, "standard-test"),
+        (vec!["standard"], "standard-test", None, "standard-test"),
+        (vec!["critical"], "budget-test", None, ""),
+        (vec!["simple"], "", Some(0), "budget-test"),
+        (vec!["simple"], "", Some(4), ""),
+    ] {
+        let f = Fixture::with_standard_model();
+        f.set("test_fake_providers", json!(true));
+        f.set(
+            "review_cadence",
+            json!({"architect":"per_plan","reviewer":"per_plan"}),
+        );
+        f.set("test_plan_crash_action", json!("fix_pending"));
+        f.set(
+            "mock_verdicts",
+            json!([{"approved":false,"issues":["Correct greeting"]},{"approved":true,"issues":[]}]),
+        );
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][3]["effort"] =
+            json!("high");
+        let mut candidate = plan();
+        candidate["stages"] = json!(
+            risks
+                .iter()
+                .enumerate()
+                .map(|(i, risk)| {
+                    let mut s = stage(i as i64 + 1);
+                    let model = match *risk {
+                        "simple" => "budget-test",
+                        "standard" => "standard-test",
+                        _ => "strong-test",
+                    };
+                    s["model_proposal"] = proposal(model, risk, "functionality");
+                    s
+                })
+                .collect::<Vec<_>>()
+        );
+        f.set(
+            "mock_routing_planner_outputs",
+            json!([{"proposals":candidate["stages"].as_array().unwrap().iter().map(|s|
+            json!({"stage_id":s["id"],"proposal":s["model_proposal"]})).collect::<Vec<_>>()}]),
+        );
+        f.ctx.publish_plan(&candidate, true).unwrap();
+        f.ctx.run_worker();
+        let mut p = f.ctx.load_plan().unwrap();
+        assert!(
+            p["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["status"] == "committed"),
+            "{p}"
+        );
+        assert_eq!(p["plan_review"]["next_action"], "fix_pending", "{p}");
+        let floor = match risks
+            .iter()
+            .max_by_key(|risk| match **risk {
+                "simple" => 1,
+                "standard" => 2,
+                _ => 3,
+            })
+            .unwrap()
+        {
+            &"simple" => 1,
+            &"standard" => 2,
+            _ => 3,
+        };
+        assert_eq!(p["plan_review"]["minimum_tier"], floor);
+        if let Some(saved) = saved_floor {
+            p["plan_review"]["minimum_tier"] = json!(saved);
+            f.ctx.save_plan(&p).unwrap();
+        }
+        f.set("implementer_model", json!(pin));
+        f.set("test_plan_crash_action", Value::Null);
+        let result = f.ctx.run_plan_review(&mut p).unwrap();
+        let calls = p["plan_review"]["model_invocations"].as_array().unwrap();
+        let requests = f.ctx.app.settings.lock().unwrap()["mock_agent_requests"].clone();
+        let launches: Vec<_> = requests
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["role"] == "fixer")
+            .collect();
+        assert_eq!(launches.len(), calls.len());
+        if expected.is_empty() {
+            assert!(!result);
+            assert!(calls.is_empty(), "{p}");
+            let error = p["plan_review"]["gate"]["error"].as_str().unwrap();
+            if pin.is_empty() {
+                assert!(
+                    error.contains("unknown agreed plan capability requirement"),
+                    "{error}"
+                );
+            } else {
+                for detail in [
+                    "pinned implementer model codex/budget-test",
+                    "configured tier basic",
+                    "requires at least strong",
+                ] {
+                    assert!(error.contains(detail), "{error}");
+                }
+            }
+        } else {
+            assert!(result, "{p}");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]["requested"],
+                json!({"provider":"codex","model":expected,
+                "native_effort":if expected == "standard-test" { "high" } else { "provider_default" }})
+            );
+            assert_eq!(calls[0]["effective"], calls[0]["requested"]);
+            assert_eq!(calls[0]["verification_state"], "execution_verified");
+        }
+    }
+}
+
+#[test]
+fn global_pin_routing_effort_gap_is_visible_while_stage_effort_constraint_is_exact() {
+    // MSA1-R-EFFORT: characterize the separate routing path for scoped reconciliation.
+    for constrained in [false, true] {
+        let f = Fixture::new();
+        f.set("implementer_model", json!("strong-test"));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
+            json!("high");
+        let mut p = plan();
+        if constrained {
+            p["stages"][0]["model_constraint"] =
+                json!({"provider":"codex","model":"strong-test","native_effort":"high"});
+        }
+        f.select(proposal("strong-test", "standard", "functionality"));
+        let published = f.publish(p);
+        if constrained {
+            assert!(published.unwrap_err().contains("constraint"));
+        } else {
+            let p = published.unwrap();
+            assert_eq!(
+                p["stages"][0]["model_agreement"]["effective"]["native_effort"],
+                "provider_default"
+            );
+            let requirements = f.ctx.model_requirements("implementer", None).unwrap();
+            assert_eq!(f.ctx.select_model(&requirements, &[]).unwrap().2, "high");
+            assert_eq!(
+                f.ctx.validated_assignment(&p, 0).unwrap()["effective"]["native_effort"],
+                "provider_default"
+            );
+        }
+    }
+}
+
+#[test]
+fn stage_implementer_and_fixer_launch_exact_effective_identity_and_effort() {
+    let f = Fixture::new();
+    f.set("test_fake_providers", json!(true));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] = json!("high");
+    f.set(
+        "mock_verdicts",
+        json!([{"approved":false,"issues":["Correct greeting"]},{"approved":true,"issues":[]}]),
+    );
+    let mut p = plan();
+    let effective = json!({"provider":"codex","model":"strong-test","native_effort":"high"});
+    p["stages"][0]["model_constraint"] = effective.clone();
+    let mut selected = proposal("strong-test", "standard", "functionality");
+    selected["native_effort"] = json!("high");
+    f.select(selected.clone());
+    p["stages"][0]["model_proposal"] = selected;
+    f.ctx.publish_plan(&p, true).unwrap();
+    f.ctx.run_worker();
+    let done = f.ctx.load_plan().unwrap();
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["stages"][0]["model_agreement"]["effective"], effective);
+    let calls = done["stages"][0]["model_invocations"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    for (call, role) in calls.iter().zip(["implementer", "fixer"]) {
+        assert_eq!(call["role"], role);
+        assert_eq!(call["requested"], effective);
+        assert_eq!(call["effective"], effective);
+        assert_eq!(call["unexpected_substitution"], false);
+    }
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let requests: Vec<_> = settings["mock_agent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| matches!(r["role"].as_str(), Some("implementer" | "fixer")))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request["provider"], effective["provider"]);
+        assert_eq!(request["model"], effective["model"]);
+        assert_eq!(request["effort"], effective["native_effort"]);
+    }
+}

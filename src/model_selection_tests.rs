@@ -455,3 +455,46 @@ fn quota_blocked_pin_is_terminal_even_when_fallback_is_enabled() {
         );
     }
 }
+
+#[test]
+fn independent_stage_review_keeps_strong_floor_and_other_provider_during_quota_fallback() {
+    let f = QueueTest::new(false);
+    let ctx = configured(&f);
+    ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({
+                "provider":"claude","model":"cheap-review","tier":"basic"
+            }),
+        );
+    assert_eq!(
+        ctx.reviewer_config("codex").unwrap(),
+        ("claude".into(), "claude-fable-5-1[1m]".into())
+    );
+    let requirements = ctx.model_requirements("reviewer", Some("codex")).unwrap();
+    assert_eq!(requirements.minimum_tier, Some(Tier::Strong));
+    let mut calls = vec![];
+    let (_, selected) = ctx
+        .with_selected_model(&requirements, None, |choice| {
+            calls.push(choice.clone());
+            if calls.len() == 1 {
+                Err(LIMIT.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|c| c.0 == "claude"));
+    assert_eq!(selected.1, "opus[1m]");
+    let policy = Policy::from_settings(&ctx.app.settings.lock().unwrap()).unwrap();
+    let facts = ctx.model_facts(&policy, Provider::Claude, &selected.1, Some(&selected.2));
+    assert_eq!(facts["eligible"], true);
+    assert_eq!(facts["tier"], "strong");
+    assert_eq!(
+        ctx.reviewer_config("claude").unwrap(),
+        ("codex".into(), "large".into())
+    );
+}
