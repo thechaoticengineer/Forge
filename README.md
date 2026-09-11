@@ -127,6 +127,35 @@ implementer provider. These choices can prevent conflicts in future work;
 changing current settings or approving a revision cannot erase committed stages'
 existing deferrals or provider history.
 
+### Shared response correction
+
+Every structured agent response uses one engine correction policy: validate the
+response, return the concrete validation error and rejected response to its author,
+and allow at most **three corrections after the initial response**. Changing error
+kinds does not reset the budget. Parsing and response-field validation share that
+budget. A valid response needs no extra call; exhausting the budget retains the
+previous published state and reports the last validation error.
+
+This applies to initial plans and revisions, plan Q&A, goal enhancement, scope
+answers, routing proposals and evaluations, architectural guidance, stage and plan
+review verdicts, and structured implementer/fixer stage outcomes. Planner proposal
+schemas are checked before calling the architect, including nested unknown fields.
+Corrections keep the selected provider/model and operation context. Architectural
+corrections retain the exact session; independent reviews remain fresh and inspect
+the same snapshot. Correcting an implementer's report uses a read-only invocation
+and does not repeat implementation. Successful operations account for every measured
+response invocation, including corrections.
+
+The shared policy lives in `src/response.rs`. New response operations must supply
+one complete, side-effect-free validator and a correction invocation to this policy;
+publication and other effects run only after validation succeeds. A valid rejection
+or scope clarification retains its meaning and follows the existing review/fix or
+scope workflow. Provider failures, cancellation, changed repository/model/session
+identities and storage failures are not response corrections. Their existing failure
+and recovery paths remain responsible; the engine does not replay writes, commits or
+pushes to repair JSON. Review fix budgets, scope renegotiation limits and routing
+reassessment budgets are separate and are never reset by response correction.
+
 ### Verdict protocol and verification
 
 Reviewers return JSON in their final response; the engine alone publishes
@@ -1369,7 +1398,7 @@ within the current attempt's remaining budget. This does not change acceptance o
 approve the implementation. The handoff survives restart; another scope escalation
 under the same requirements blocks without repeating the planner dialogue.
 Malformed routing proposal fields are returned to the planner with the validation
-error for up to two corrections. The full proposal batch must validate before any
+error for up to three corrections. The full proposal batch must validate before any
 stage receives a replacement proposal; unknown fields are never silently ignored.
 
 A stop preserves the worktree, unresolved requests and last committed architect
