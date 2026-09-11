@@ -129,7 +129,17 @@ fn constraint(settings: &Value, stage: &Value) -> Value {
         .as_str()
         .is_some_and(|s| !s.is_empty())
     {
-        return json!({"provider":settings["implementer"],"model":settings["implementer_model"]});
+        let mut pin = json!({"provider":settings["implementer"],"model":settings["implementer_model"]});
+        // Only explicitly configured effort narrows the joint proposal. Catalogue
+        // validation still owns eligibility; a stage constraint replaces this pin.
+        if let Ok(policy) = crate::catalogue::Policy::from_settings(settings)
+            && let Some(effort) = policy.entries.iter()
+                .find(|entry| entry.provider.name() == pin["provider"] && entry.model == pin["model"])
+                .and_then(|entry| entry.effort.as_deref())
+        {
+            pin["native_effort"] = json!(effort);
+        }
+        return pin;
     }
     if settings["automatic_routing"] == false {
         return json!({"provider":settings["implementer"]});
@@ -287,7 +297,10 @@ fn policy_inputs(
         return Err(format!("model unavailable: {}", selected["error"]));
     }
     if !matches_constraint(selected, &c) {
-        return Err("model conflicts with explicit stage/global constraint; edit the constraint or proposal".into());
+        return Err(format!(
+            "model conflicts with explicit stage/global constraint {c}: proposed {}/{} with native_effort {}; edit the constraint or proposal",
+            p.provider, p.model, p.native_effort
+        ));
     }
     let pending = &stage["reassessment"]["pending"];
     let old = &pending["old_agreement"];

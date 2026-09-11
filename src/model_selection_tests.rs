@@ -498,3 +498,32 @@ fn independent_stage_review_keeps_strong_floor_and_other_provider_during_quota_f
         ("codex".into(), "large".into())
     );
 }
+
+#[test]
+fn role_effort_defaults_and_explicit_pins_survive_policy_normalization() {
+    let f = QueueTest::new(false);
+    let ctx = configured(&f);
+    for effort in [None, Some("provider_default"), Some("high")] {
+        {
+            let mut settings = ctx.app.settings.lock().unwrap();
+            settings["implementer_model"] = json!("large");
+            let entry = settings["model_catalogue"]["entries"][3].as_object_mut().unwrap();
+            entry.remove("effort");
+            if let Some(effort) = effort {
+                entry.insert("effort".into(), json!(effort));
+            }
+        }
+        for normalized in [false, true] {
+            if normalized {
+                let mut settings = ctx.app.settings.lock().unwrap();
+                settings["model_catalogue"] = json!(Policy::from_settings(&settings).unwrap());
+            }
+            let requirements = ctx.model_requirements("implementer", None).unwrap()
+                .requiring_at_least(Tier::Strong);
+            assert_eq!(ctx.select_model(&requirements, &[]).unwrap(),
+                ("codex".into(), "large".into(), effort.unwrap_or("provider_default").into()));
+            let options = ctx.routing_options().unwrap();
+            assert_eq!(options.iter().filter(|o| o["model"] == "large" && o["effort"] == "provider_default").count(), 1);
+        }
+    }
+}

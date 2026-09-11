@@ -934,78 +934,287 @@ fn plan_fixer_uses_maximum_agreed_stage_floor_and_preserves_adequate_pins() {
 }
 
 #[test]
-fn global_pin_routing_effort_gap_is_visible_while_stage_effort_constraint_is_exact() {
-    // MSA1-R-EFFORT: characterize the separate routing path for scoped reconciliation.
-    for constrained in [false, true] {
+fn global_pin_preserves_configured_effort_through_publication_and_revalidation() {
+    for effort in ["high", "provider_default"] {
         let f = Fixture::new();
         f.set("implementer_model", json!("strong-test"));
         f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
-            json!("high");
-        let mut p = plan();
-        if constrained {
-            p["stages"][0]["model_constraint"] =
-                json!({"provider":"codex","model":"strong-test","native_effort":"high"});
+            json!(effort);
+        let effective = json!({"provider":"codex","model":"strong-test","native_effort":effort});
+        assert_eq!(f.ctx.proposal_inputs(&plan(), 0)["constraint"], effective);
+        let mut choice = proposal("strong-test", "standard", "functionality");
+        if effort == "high" {
+            f.select(choice.clone());
+            let error = f.publish(plan()).unwrap_err();
+            for detail in [
+                "constraint",
+                "codex",
+                "strong-test",
+                "native_effort",
+                "high",
+                "provider_default",
+            ] {
+                assert!(error.contains(detail), "{error}");
+            }
+            assert!(f.ctx.load_plan().is_none());
         }
-        f.select(proposal("strong-test", "standard", "functionality"));
-        let published = f.publish(p);
-        if constrained {
-            assert!(published.unwrap_err().contains("constraint"));
-        } else {
-            let p = published.unwrap();
-            assert_eq!(
-                p["stages"][0]["model_agreement"]["effective"]["native_effort"],
+        choice["native_effort"] = json!(effort);
+        f.select(choice);
+        let published = f.publish(plan()).unwrap();
+        let agreement = &published["stages"][0]["model_agreement"];
+        assert_eq!(agreement["policy_inputs"]["constraint"], effective);
+        assert_eq!(agreement["effective"], effective);
+        let cp = f.ctx.architecture_store().checkpoint(&published).unwrap();
+        let counts = f.counts();
+        assert!(f.ctx.routing_required(&published, &cp).unwrap().is_empty());
+        assert_eq!(
+            f.ctx.validated_assignment(&published, 0).unwrap(),
+            *agreement
+        );
+        assert_eq!(f.counts(), counts);
+
+        // A registry effort edit invalidates the saved assignment before launch.
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
+            json!(if effort == "high" {
                 "provider_default"
-            );
-            let requirements = f.ctx.model_requirements("implementer", None).unwrap();
-            assert_eq!(f.ctx.select_model(&requirements, &[]).unwrap().2, "high");
-            assert_eq!(
-                f.ctx.validated_assignment(&p, 0).unwrap()["effective"]["native_effort"],
-                "provider_default"
-            );
+            } else {
+                "high"
+            });
+        assert_eq!(f.ctx.routing_required(&published, &cp).unwrap(), vec![1]);
+        assert!(f.ctx.validated_assignment(&published, 0).is_err());
+        assert_eq!(f.counts(), counts);
+    }
+}
+
+#[test]
+fn global_pin_effort_is_provider_specific_and_omitted_effort_remains_unconstrained() {
+    let f = Fixture::new();
+    f.set("implementer_model", json!("strong-test"));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            0,
+            json!({
+                "provider":"claude","model":"strong-test","tier":"strong","effort":"high"
+            }),
+        );
+    f.select(proposal("strong-test", "standard", "functionality"));
+    let published = f.publish(plan()).unwrap();
+    let constraint = &published["stages"][0]["model_agreement"]["policy_inputs"]["constraint"];
+    assert_eq!(
+        *constraint,
+        json!({"provider":"codex","model":"strong-test"})
+    );
+    assert_eq!(
+        f.ctx.validated_assignment(&published, 0).unwrap()["effective"]["native_effort"],
+        "provider_default"
+    );
+}
+
+// Exercise the same typed normalization and disk persistence used by settings
+// writes and startup, without touching the installed application policy.
+fn policy_representations(f: &Fixture) -> Vec<Value> {
+    let raw = f.ctx.app.settings.lock().unwrap()["model_catalogue"].clone();
+    let policy = crate::catalogue::Policy::from_settings(&json!({"model_catalogue":raw})).unwrap();
+    let normalized = json!(policy);
+    let path = f.root.join("model-policy.json");
+    crate::catalogue::save_policy(&path, &policy).unwrap();
+    let reloaded = crate::catalogue::load_policy(&path).unwrap().unwrap();
+    assert_eq!(reloaded, policy);
+    vec![raw, normalized, json!(reloaded)]
+}
+
+#[test]
+fn global_pin_agreement_survives_policy_normalization_and_save_reload() {
+    for effort in [None, Some("provider_default"), Some("high")] {
+        let f = Fixture::new();
+        f.set("implementer_model", json!("strong-test"));
+        if let Some(effort) = effort {
+            f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] = json!(effort);
+        }
+        // Discovered support permits a non-default proposal even when registry
+        // effort is omitted. This is the restart-invalidated agreement regression.
+        let mut options = f.ctx.routing_options().unwrap();
+        let mut high = options[0].clone();
+        high["effort"] = json!("high");
+        options.push(high);
+        f.set("mock_routing_options", json!(options));
+        let mut choice = proposal("strong-test", "standard", "functionality");
+        choice["native_effort"] = json!(effort.unwrap_or("high"));
+        f.select(choice);
+        let published = f.publish(plan()).unwrap();
+        let agreement = &published["stages"][0]["model_agreement"];
+        let cp = f.ctx.architecture_store().checkpoint(&published).unwrap();
+        let counts = f.counts();
+        let expected = f.ctx.proposal_inputs(&published, 0)["constraint"].clone();
+        assert_eq!(expected.get("native_effort"), effort.map(|e| json!(e)).as_ref());
+        for policy in policy_representations(&f) {
+            assert_eq!(policy["entries"][0].get("effort"), effort.map(|e| json!(e)).as_ref());
+            f.set("model_catalogue", policy);
+            assert_eq!(f.ctx.proposal_inputs(&published, 0)["constraint"], expected);
+            assert!(f.ctx.routing_required(&published, &cp).unwrap().is_empty());
+            assert_eq!(f.ctx.validated_assignment(&published, 0).unwrap(), *agreement);
+            assert_eq!(f.counts(), counts);
         }
     }
 }
 
 #[test]
-fn stage_implementer_and_fixer_launch_exact_effective_identity_and_effort() {
-    let f = Fixture::new();
-    f.set("test_fake_providers", json!(true));
-    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] = json!("high");
-    f.set(
-        "mock_verdicts",
-        json!([{"approved":false,"issues":["Correct greeting"]},{"approved":true,"issues":[]}]),
-    );
-    let mut p = plan();
-    let effective = json!({"provider":"codex","model":"strong-test","native_effort":"high"});
-    p["stages"][0]["model_constraint"] = effective.clone();
-    let mut selected = proposal("strong-test", "standard", "functionality");
-    selected["native_effort"] = json!("high");
-    f.select(selected.clone());
-    p["stages"][0]["model_proposal"] = selected;
-    f.ctx.publish_plan(&p, true).unwrap();
-    f.ctx.run_worker();
-    let done = f.ctx.load_plan().unwrap();
-    assert_eq!(done["status"], "done", "{done}");
-    assert_eq!(done["stages"][0]["model_agreement"]["effective"], effective);
-    let calls = done["stages"][0]["model_invocations"].as_array().unwrap();
-    assert_eq!(calls.len(), 2);
-    for (call, role) in calls.iter().zip(["implementer", "fixer"]) {
-        assert_eq!(call["role"], role);
-        assert_eq!(call["requested"], effective);
-        assert_eq!(call["effective"], effective);
-        assert_eq!(call["unexpected_substitution"], false);
+fn global_pin_reassessment_preserves_omitted_and_explicit_effort_semantics() {
+    for effort in [None, Some("low"), Some("provider_default")] {
+        for representation in 0..3 {
+            let f = Fixture::new();
+            f.set("implementer_model", json!("strong-test"));
+            if let Some(effort) = effort {
+                f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] = json!(effort);
+            }
+            let mut options = f.ctx.routing_options().unwrap();
+            for effort in ["low", "high"] {
+                let mut option = options[0].clone();
+                option["effort"] = json!(effort);
+                options.push(option);
+            }
+            f.set("mock_routing_options", json!(options));
+            let mut choice = proposal("strong-test", "standard", "functionality");
+            choice["native_effort"] = json!(effort.unwrap_or("low"));
+            f.select(choice.clone());
+            let mut published = f.publish(plan()).unwrap();
+            let original = published["stages"][0]["model_agreement"].clone();
+            f.set("model_catalogue", policy_representations(&f)[representation].clone());
+            choice["native_effort"] = json!("high");
+            published["stages"][0]["reassessment"] = json!({
+                "visited":[original["effective"]],
+                "pending":{"kind":"implementer_escalation","old_agreement":original}
+            });
+            let settings = f.ctx.app.settings.lock().unwrap().clone();
+            let options = f.ctx.routing_options().unwrap();
+            let choice: Proposal = serde_json::from_value(choice).unwrap();
+            let result = policy_inputs(&settings, &published["stages"][0], &choice, &options);
+            if let Some(effort) = effort {
+                let error = result.unwrap_err();
+                for detail in ["constraint", "strong-test", effort, "high"] {
+                    assert!(error.contains(detail), "{error}");
+                }
+            } else {
+                let inputs = result.unwrap();
+                assert_eq!(inputs["effort"], "high");
+                assert_eq!(inputs["constraint"], original["policy_inputs"]["constraint"]);
+                assert_eq!(inputs["minimum_tier"], original["policy_inputs"]["minimum_tier"]);
+                // A model pin still forbids switching models during escalation.
+                let mut switched = choice.clone();
+                switched.model = "budget-test".into();
+                switched.native_effort = "provider_default".into();
+                assert!(policy_inputs(&settings, &published["stages"][0], &switched, &options)
+                    .unwrap_err().contains("constraint"));
+            }
+        }
     }
-    let settings = f.ctx.app.settings.lock().unwrap();
-    let requests: Vec<_> = settings["mock_agent_requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| matches!(r["role"].as_str(), Some("implementer" | "fixer")))
-        .collect();
-    assert_eq!(requests.len(), 2);
-    for request in requests {
-        assert_eq!(request["provider"], effective["provider"]);
-        assert_eq!(request["model"], effective["model"]);
-        assert_eq!(request["effort"], effective["native_effort"]);
+}
+
+#[test]
+fn stage_constraints_replace_global_pin_including_registry_effort() {
+    for constraint in [
+        json!({"provider":"codex"}),
+        json!({"model":"budget-test"}),
+        json!({"native_effort":"provider_default"}),
+        json!({"provider":"codex","model":"budget-test","native_effort":"provider_default"}),
+    ] {
+        let f = Fixture::new();
+        f.set("implementer_model", json!("strong-test"));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
+            json!("high");
+        let mut candidate = plan();
+        candidate["stages"][0]["model_constraint"] = constraint.clone();
+        f.select(proposal("budget-test", "simple", "functionality"));
+        let published = f.publish(candidate).unwrap();
+        let agreement = f.ctx.validated_assignment(&published, 0).unwrap();
+        assert_eq!(agreement["policy_inputs"]["constraint"], constraint);
+        assert_eq!(
+            agreement["effective"],
+            json!({"provider":"codex","model":"budget-test","native_effort":"provider_default"})
+        );
+    }
+}
+
+#[test]
+fn global_pin_cannot_replace_ineligible_effort_with_provider_default() {
+    let f = Fixture::new();
+    f.set("implementer_model", json!("strong-test"));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
+        json!("unsupported");
+    let mut choice = proposal("strong-test", "standard", "functionality");
+    choice["native_effort"] = json!("unsupported");
+    f.select(choice);
+    let error = f.publish(plan()).unwrap_err();
+    assert!(
+        error.contains("unsupported or unknown native effort"),
+        "{error}"
+    );
+    f.select(proposal("strong-test", "standard", "functionality"));
+    let error = f.publish(plan()).unwrap_err();
+    for detail in [
+        "constraint",
+        "strong-test",
+        "unsupported",
+        "provider_default",
+    ] {
+        assert!(error.contains(detail), "{error}");
+    }
+    assert!(f.ctx.load_plan().is_none());
+}
+
+#[test]
+fn stage_implementer_and_fixer_launch_exact_effective_identity_and_effort() {
+    for stage_override in [false, true] {
+        let f = Fixture::new();
+        f.set("test_fake_providers", json!(true));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
+            json!("high");
+        f.set(
+            "mock_verdicts",
+            json!([{"approved":false,"issues":["Correct greeting"]},{"approved":true,"issues":[]}]),
+        );
+        let mut p = plan();
+        f.set("implementer_model", json!("strong-test"));
+        let effort = if stage_override {
+            "provider_default"
+        } else {
+            "high"
+        };
+        let effective = json!({"provider":"codex","model":"strong-test","native_effort":effort});
+        if stage_override {
+            p["stages"][0]["model_constraint"] = json!({"native_effort":effort});
+        }
+        let mut selected = proposal("strong-test", "standard", "functionality");
+        selected["native_effort"] = json!(effort);
+        f.select(selected.clone());
+        p["stages"][0]["model_proposal"] = selected;
+        f.ctx.publish_plan(&p, true).unwrap();
+        f.ctx.run_worker();
+        let done = f.ctx.load_plan().unwrap();
+        assert_eq!(done["status"], "done", "{done}");
+        assert_eq!(done["stages"][0]["model_agreement"]["effective"], effective);
+        let calls = done["stages"][0]["model_invocations"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (call, role) in calls.iter().zip(["implementer", "fixer"]) {
+            assert_eq!(call["role"], role);
+            assert_eq!(call["requested"], effective);
+            assert_eq!(call["effective"], effective);
+            assert_eq!(call["unexpected_substitution"], false);
+        }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let requests: Vec<_> = settings["mock_agent_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r["role"].as_str(), Some("implementer" | "fixer")))
+            .collect();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request["provider"], effective["provider"]);
+            assert_eq!(request["model"], effective["model"]);
+            assert_eq!(request["effort"], effective["native_effort"]);
+        }
     }
 }

@@ -1263,7 +1263,9 @@ unresolved risks and usage per role, including legacy plans without context.
 
 `automatic_routing` defaults to `true`, including when older settings omit the
 key. A legacy `implementer` provider alone is a preference, not a pinned model.
-A nonempty legacy `implementer_model` remains a global provider/model constraint.
+A nonempty legacy `implementer_model` remains a global provider/model constraint,
+including native effort when explicitly configured on its registry entry; saving
+and reloading policy preserves whether effort was omitted.
 Set `automatic_routing: false` to constrain unpinned stages to the configured
 implementer provider while still requiring a validated joint assignment.
 Planner and architect bootstrap settings remain separate. With automatic routing,
@@ -1285,17 +1287,26 @@ Selection precedence is explicit:
    fields must be honoured verbatim or refused, without waiving capability,
    task suitability, catalogue eligibility, quota or independent review.
 2. Otherwise a nonempty `implementer_model` pins that model and its `implementer`
-   provider. A current limitation is that this global stage-routing constraint
-   does not pin the registry's native effort: the joint proposal supplies effort.
-   To pin stage effort, supply
-   `native_effort` in a stage constraint, including provider/model if those must
-   also remain fixed. With no pinned model, disabling automatic routing pins the
-   provider.
+   provider, plus native `effort` when explicitly configured on that provider/model's
+   registry entry (including an explicit `provider_default`). A conflicting
+   proposal is refused with the required constraint and proposed identity/effort;
+   agreement revalidation enforces the same constraint before stage implementation
+   or fixes. Omitted registry effort stays omitted through normalization, saving
+   and reload: the joint proposal supplies it, and supported effort-only
+   reassessment remains possible. An explicit effort pin can block escalation.
+   A stage constraint still replaces this whole global constraint. With no pinned
+   model, disabling automatic routing pins the provider.
 3. Within the effective constraint, the validated joint assignment determines
    all remaining fields. Stage implementer and fixer invocations use its effective
    provider, model and native effort verbatim; unexpected provider substitution
    blocks with saved work retained. Existing provider settings otherwise serve
    as preferences/defaults.
+
+Older saved policies may already contain serializer-inserted `"effort":"provider_default"`
+values. Their original intent cannot be recovered: stored effort strings remain
+explicit pins. Remove the `effort` field from an entry (and increment
+`policy_revision`) to leave its global stage effort unconstrained. Explicitly
+authored `provider_default` is never silently discarded.
 
 The plan editor exposes exact constraint fields. HTTP clients may include, for
 example, `"model_constraint":{"provider":"codex","model":"your-exact-id"}`

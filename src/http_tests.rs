@@ -583,3 +583,30 @@ fn agent_records_api_recovers_startup_without_hiding_incomplete_history() {
     assert_eq!(source["count"], 1);
     assert_eq!(fs::read_to_string(root.join(id).join("readable.log")).unwrap(), "old\nexact old\r\n  text\t\n");
 }
+
+#[test]
+fn settings_persistence_preserves_omitted_and_explicit_default_effort() {
+    let f = QueueTest::new(false);
+    let mut app = App::new(f.app.project(), default_settings());
+    let path = f.path.join("model-policy.json");
+    app.model_policy_path = Some(path.clone());
+    let app = Arc::new(app);
+    for (index, effort) in [None, Some("provider_default"), Some("high")].into_iter().enumerate() {
+        let mut policy = json!(crate::catalogue::Policy::default());
+        policy["policy_revision"] = json!(format!("effort-{index}"));
+        policy["entries"] = json!([{"provider":"codex","model":"exact-id","tier":"strong"}]);
+        if let Some(effort) = effort {
+            policy["entries"][0]["effort"] = json!(effort);
+        }
+        let (code, response) = api_request(&app, "POST", "/api/settings", json!({
+            "implementer":"codex","implementer_model":"exact-id","model_catalogue":policy
+        }));
+        assert_eq!(code, 200, "{response}");
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let reloaded = json!(crate::catalogue::load_policy(&path).unwrap().unwrap());
+        let live = app.settings.lock().unwrap()["model_catalogue"].clone();
+        for representation in [live, saved, reloaded] {
+            assert_eq!(representation["entries"][0].get("effort"), effort.map(|e| json!(e)).as_ref());
+        }
+    }
+}

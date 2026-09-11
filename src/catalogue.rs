@@ -54,11 +54,23 @@ pub(crate) struct Entry {
     pub limits: BTreeMap<String, u64>,
     #[serde(default)]
     pub relative_cost_preference: Option<u32>,
-    #[serde(default = "default_effort")]
-    pub effort: String,
+    // Omission leaves joint-routing effort unconstrained; even an explicit
+    // provider_default is a pin. Preserve that distinction through persistence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "explicit_effort"
+    )]
+    pub effort: Option<String>,
 }
-fn default_effort() -> String {
-    "provider_default".into()
+fn explicit_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    // A present effort must remain a string, not null.
+    String::deserialize(d).map(Some)
+}
+impl Entry {
+    pub fn execution_effort(&self) -> &str {
+        self.effort.as_deref().unwrap_or("provider_default")
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -147,7 +159,7 @@ impl Policy {
         let mut keys = BTreeSet::new();
         for e in &p.entries {
             if !identifier(&e.model)
-                || !identifier(&e.effort)
+                || !identifier(e.execution_effort())
                 || !keys.insert((e.provider, &e.model))
             {
                 return Err("invalid or duplicate provider/model, or invalid effort".into());
@@ -948,7 +960,7 @@ impl Catalogue {
                         .filter(|s| s.scope == scope(e.provider, policy)),
                     e.provider,
                     &e.model,
-                    &e.effort,
+                    e.execution_effort(),
                     Some(e),
                     &policy.policy_revision,
                     false,
@@ -965,7 +977,7 @@ impl Catalogue {
             .iter()
             .find(|e| e.provider == provider && e.model == model);
         let effort = entry
-            .map(|e| e.effort.as_str())
+            .map(Entry::execution_effort)
             .unwrap_or("provider_default");
         selection(
             state
@@ -1180,7 +1192,7 @@ fn selection(
             error = Some("native effort was rejected during execution; use provider_default");
         } else if !m.and_then(|m| m.supported_efforts.as_ref()).is_some_and(|list| list.iter().any(|e| e == effort))
             && !(m.and_then(|m| m.supported_efforts.as_ref()).is_none()
-                && entry.is_some_and(|e| e.effort == effort)
+                && entry.is_some_and(|e| e.execution_effort() == effort)
                 && match provider {
                     Provider::Codex => ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort),
                     Provider::Claude => ["low", "medium", "high", "xhigh", "max"].contains(&effort),

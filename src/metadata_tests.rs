@@ -634,7 +634,7 @@ fn catalogue_snapshot_covers_discovered_and_configured_only_models() {
         suitability: vec![],
         limits: BTreeMap::new(),
         relative_cost_preference: None,
-        effort: "provider_default".into(),
+        effort: Some("provider_default".into()),
     });
     policy.entries.push(Entry {
         provider: Provider::Claude,
@@ -643,7 +643,7 @@ fn catalogue_snapshot_covers_discovered_and_configured_only_models() {
         suitability: vec![],
         limits: BTreeMap::new(),
         relative_cost_preference: None,
-        effort: "provider_default".into(),
+        effort: Some("provider_default".into()),
     });
     let c = Catalogue::new(
         Arc::new(Fixed(models)),

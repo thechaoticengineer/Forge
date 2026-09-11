@@ -467,7 +467,7 @@ impl Ctx {
                 .flat_map(|m| m["supported_efforts"].as_array().into_iter().flatten())
                 .filter_map(Value::as_str);
             for effort in std::iter::once("provider_default").chain(efforts) {
-                if effort != entry.effort {
+                if effort != entry.execution_effort() {
                     options.push(self.app.catalogue.select(
                         &policy,
                         entry.provider,

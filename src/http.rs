@@ -360,8 +360,8 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     // Validate effort overrides against known provider evidence before accepting policy.
     if candidate["model_catalogue"] != settings["model_catalogue"] {
         for e in &policy.entries {
-            if e.effort != "provider_default" {
-                let option = app.catalogue.select(&policy, e.provider, &e.model, &e.effort);
+            if e.execution_effort() != "provider_default" {
+                let option = app.catalogue.select(&policy, e.provider, &e.model, e.execution_effort());
                 if option["eligible"] != true { return (400,json!({"error":option["error"]})); }
             }
         }

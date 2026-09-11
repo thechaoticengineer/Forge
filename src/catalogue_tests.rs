@@ -39,7 +39,7 @@ fn policy() -> Policy {
         suitability: vec!["contracts".into()],
         limits: BTreeMap::new(),
         relative_cost_preference: Some(2),
-        effort: default_effort(),
+        effort: Some("provider_default".into()),
     });
     p
 }
@@ -554,6 +554,7 @@ fn settings_validation_bounds_types_and_provenance() {
         ("tier", json!("best")),
         ("model", json!("--inject")),
         ("effort", json!("high\n-c evil")),
+        ("effort", Value::Null),
         ("pricing", json!(2)),
         ("relative_cost_preference", json!(-1)),
         ("provenance", json!("official")),
