@@ -1107,12 +1107,18 @@ unavailable usage information.
 All roles use the shared resolver in `src/model_selection.rs`: planner, chat,
 architect (including review), independent reviewer, and fixed stage execution.
 Roles supply constraints; the resolver owns catalogue facts, quota availability,
-and replacement decisions. Chat uses the planner configuration. Stage routing
-uses the same candidate pool, with its stage risk/task requirements layered on top.
+and replacement decisions. Chat and enhance use the planner configuration. Stage
+routing uses the same candidate pool, with its stage risk/task requirements layered
+on top.
 
 With automatic routing and an empty role model setting, selection skips known
-exhausted models. Registry order supplies preference within a capability class:
-configure Fable followed by Opus to use Opus when the Fable pool is depleted.
+exhausted models. The shared resolver selects the weakest adequate eligible tier.
+Within a tier, it orders candidates by lowest `relative_cost_preference` only
+when every candidate in that tier has a configured preference; ties retain
+registry order. If any candidate lacks a preference, the entire tier retains
+registry order: a missing preference is never assumed cheap or expensive.
+For example, without cost preferences, configure Fable followed by Opus in the
+same tier to use Opus when the Fable pool is depleted.
 If the pre-launch probe discovers exhaustion after selection, or the CLI explicitly
 reports the selected family's quota limit, the same resolver chooses another
 eligible model without revisiting one already attempted. This also works when
@@ -1124,9 +1130,24 @@ operational retries rather than immediately triggering reassessment.
 The existing capability classes are `basic`, `standard`, and `strong`. A class is
 a minimum: a stronger model can serve a lower class. A provider with one basic and
 one strong model can therefore cover all three classes. Native effort remains a
-separate provider setting. Planner, architect, chat, and automatic independent
-review require strong models. Adding models changes the registry; adding a new
+separate provider setting. Planner, architect, chat, enhance, and unpinned
+independent review keep a fixed `strong` floor as deliberate policy for planning,
+guidance and review, independent of automatic stage routing. Implementation and
+stage fixes instead use the floor the planner and architect agreed for the stage,
+subject to the engine's risk, complexity and task minimums described below. The
+plan-wide fix turn uses the strongest floor agreed by any stage in that plan
+(defaulting to `strong` if a saved floor is missing), through the shared resolver
+and implementer settings. Adding models changes the registry; adding a new
 provider still requires its CLI adapter and catalogue discovery support.
+
+In shared role resolution, an explicit role model is used with its configured
+provider and registry native `effort`, or refused with the specific reason; it is
+never silently replaced by a stronger or different model. Pin errors name the
+provider/model and report the configured tier and required floor (`unclassified`
+if absent), catalogue ineligibility such as an unknown ID or unsupported/rejected
+native effort, quota
+reason, or that the model was already attempted. Stage constraints fix their
+supplied fields under the joint assignment rules below.
 
 Actual choices are logged and retained in provenance. Fresh roles start fresh
 sessions; an architect model change reconstructs its context from the checkpoint
@@ -1156,9 +1177,11 @@ node --test bridges/claude-models/discovery.test.mjs tests/panel_catalogue.test.
 The planner and architect have separate provider/model settings: `planner` /
 `planner_model` (default provider `claude`) and `architect` / `architect_model`
 (default provider `codex`). Each selects an eligible `strong` entry from the
-configured model registry. An explicit model must match a strong registry entry;
-an empty model selects the first eligible strong entry for that provider. This
-uses configured tiers even when official comparative metadata is absent. An
+configured model registry. For these two roles, an explicit model must match a
+strong registry entry; an empty model selects an eligible strong entry for that
+provider using the shared cost/order rules above. Chat and enhance specifically
+use the planner settings and keep the same strong floor.
+This uses configured tiers even when official comparative metadata is absent. An
 explicit registry model may remain `configured_unverified` under the existing
 fallback policy. Known unavailable models are blocked. An empty registry requires
 configuration before planning; Forge never silently substitutes an unclassified
@@ -1245,29 +1268,45 @@ Set `automatic_routing: false` to constrain unpinned stages to the configured
 implementer provider while still requiring a validated joint assignment.
 Planner and architect bootstrap settings remain separate. With automatic routing,
 an unpinned reviewer follows the other provider and uses an eligible strong registry
-entry. A nonempty `reviewer_model` pins its configured reviewer provider/model;
-disabling automatic routing also preserves the configured reviewer provider. Like other role settings,
+entry. A nonempty `reviewer_model` pins its configured reviewer provider/model
+and uses its registry effort. This explicit reviewer pin is exempt from the
+automatic reviewer's strong floor, but must remain catalogue-eligible, available
+under quota, and independent of the implementer. Disabling automatic routing also
+preserves the configured reviewer provider. Like other role settings,
 these switches are engine settings; the model registry has its separate persisted
 policy file.
 
 Selection precedence is explicit:
 
 1. A stage's user-authored `model_constraint` narrows choices first. It accepts
-   `provider`, `model`, and/or `native_effort`. `null` clears it. This overrides
-   the global implementation constraint, but cannot waive capability or review.
+   `provider`, `model`, and/or `native_effort`. `null` clears it. A partial
+   constraint fixes only its supplied fields and replaces the whole global
+   implementation constraint; it need not specify a complete identity. Supplied
+   fields must be honoured verbatim or refused, without waiving capability,
+   task suitability, catalogue eligibility, quota or independent review.
 2. Otherwise a nonempty `implementer_model` pins that model and its `implementer`
-   provider. With no pinned model, disabling automatic routing pins the provider.
-3. Otherwise the validated agreed assignment determines provider, model and
-   native effort. Existing provider settings serve as preferences/defaults.
+   provider. A current limitation is that this global stage-routing constraint
+   does not pin the registry's native effort: the joint proposal supplies effort.
+   To pin stage effort, supply
+   `native_effort` in a stage constraint, including provider/model if those must
+   also remain fixed. With no pinned model, disabling automatic routing pins the
+   provider.
+3. Within the effective constraint, the validated joint assignment determines
+   all remaining fields. Stage implementer and fixer invocations use its effective
+   provider, model and native effort verbatim; unexpected provider substitution
+   blocks with saved work retained. Existing provider settings otherwise serve
+   as preferences/defaults.
 
 The plan editor exposes exact constraint fields. HTTP clients may include, for
 example, `"model_constraint":{"provider":"codex","model":"your-exact-id"}`
 on a pending stage in `POST /api/plan/edit`. Constraints survive AI revision;
 agent output cannot manufacture user overrides or committed records. Invalid
-IDs, efforts and inadequate tiers are reported before approval rather than
-silently overriding settings. Cross-provider reviewer conflicts are checked there
-when the reviewer is scheduled per stage; that reviewer must use the other
-provider relative to the selected implementer. Deferred reviewer independence
+IDs, unsupported native efforts, catalogue ineligibility, quota blocks and
+inadequate tiers are reported with the validation reason rather than silently
+overriding settings. Tier failures state the required floor and selected model's
+configured tier (`unclassified` if absent). Cross-provider reviewer conflicts are
+checked there when the reviewer is scheduled per stage; that reviewer must use
+the other provider relative to the selected implementer. Deferred reviewer independence
 is checked over the frozen plan subject when plan review runs.
 
 The planner proposes risk, complexity, task, provider/model, native effort and a
@@ -1280,20 +1319,34 @@ exchange for only the disputed stages, then blocks with the architect's reasons
 and correction instructions. A planner proposal alone never supplies architect
 approval. Malformed output or a policy violation also blocks publication.
 
-The engine's minimum policy is `stage-routing-1`. Critical or complex stages,
-including concurrency, persistence and security implementation, require the
-strongest suitable eligible tier, `strong`. A conservative implementation-text
-check also protects sensitive persistence/security/concurrency work from both
-participants underclassifying it. Explanatory prose about existing behavior is
-exempt from that text heuristic when explicitly classified as documentation;
-contracts, normative requirements and implementation work are not. Standard work requires `standard` or `strong`;
-simple work permits `basic` or higher. Unclassified models cannot meet these
+The engine's minimum policy is `stage-routing-1`. Critical risk, complex
+complexity, or a concurrency, persistence or security task requires `strong`.
+A conservative implementation-text check also protects sensitive
+persistence/security/concurrency work from both participants underclassifying it.
+Explanatory prose about existing behavior is exempt from that text heuristic
+when explicitly classified as documentation;
+contracts, normative requirements and implementation work are not. Documentation
+mentioning sensitive work together with implementation or requirement terms can
+therefore still require `strong`. When no strong-floor rule applies, risk and
+complexity both classified simple permit `basic` or higher; otherwise standard
+work requires `standard` or `strong`. Scope floors and reassessment safeguards
+can raise, but never lower, that minimum. Unclassified models cannot meet these
 requirements. Tiers express configured adequacy, never quality inferred from
 price, provider, name or list order. The planner and architect must still verify
 that the selected option is suitable for the specific work.
 
-Simple functionality and documentation prefer a cheaper adequate option when
-both options have explicitly configured `relative_cost_preference` values, or
+Joint stage routing validates the agreed proposal rather than applying the shared
+resolver's weakest-tier ordering: standard functionality can still accept an
+adequate strong proposal. Simple stages (a `basic` floor) and all documentation
+stages, including standard or strong-floor documentation, must take a cheaper
+adequate eligible option when the comparison establishes one. Alternatives must
+satisfy the effective constraint and preserve cross-provider review; for per-stage
+review, the comparison requires the configured reviewer to be the other provider.
+This check applies to new selection, not pending reassessment or validity-only
+checks of existing agreements, and does not bypass reassessment safeguards.
+
+A cheaper option is established when both options have explicitly configured
+`relative_cost_preference` values and the alternative has a lower value, or
 when published prices have comparable currency, unit and billing basis and one
 option is no more expensive for both input and output (and cheaper for at least
 one). Configured preferences take precedence over published prices. Set
