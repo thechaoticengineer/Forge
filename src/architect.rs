@@ -66,8 +66,6 @@ struct Turn {
     model_evaluations: Value,
 }
 fn contract_version() -> u64 { crate::architecture::VERSION }
-/// Corrections allowed before a rejected architect turn is abandoned.
-pub(crate) const REPAIR_ATTEMPTS: u32 = 2;
 fn text_ok(s: &str, max: usize) -> bool {
     !s.trim().is_empty() && s.len() <= max
 }
@@ -534,47 +532,39 @@ impl Ctx {
                 .session
                 .as_deref()
                 .filter(|s| crate::agent::session_id(s))
-                .ok_or("architect omitted exact session identity")?;
+                .ok_or("architect omitted exact session identity")?.to_owned();
             if session.as_deref().is_some_and(|id| id != reference) {
                 return Err("architect session identity changed unexpectedly".into());
             }
             if recovery_reason.is_some() && cp["session"]["reference"] == reference {
                 return Err("recovery did not create a replacement session identity".into());
             }
-            // A rejected turn is usually one field, not bad architecture. Hand the
-            // rejection back inside the same session, where the agent still has
-            // its context, rather than discarding the whole turn.
-            let mut turn_output = output.output.clone();
-            let mut repairs = 0;
-            let (mut next, records) = loop {
-                let error = match apply_turn(&candidate, &cp, &turn_output, &decisions, &required) {
-                    Ok(applied) => break applied,
-                    Err(error) => error,
-                };
-                if repairs == REPAIR_ATTEMPTS { return Err(error); }
-                repairs += 1;
-                self.log_event("architect", &format!(
-                    "turn rejected: {error} — asking for a correction ({repairs}/{REPAIR_ATTEMPTS})"));
-                let prompt = format!("Your last turn was rejected by the engine: {error}\n\nReturn the \
-                    corrected complete JSON for the same turn, in the same shape, with no prose and no \
-                    markdown fences. Change only what the rejection requires and keep every other field \
-                    exactly as you produced it.");
-                let repaired = if provider == "mock" {
-                    self.mock_architect(&candidate, &cp, &required, &routing_ids, &prompt, Some(reference))
-                } else {
-                    self.run_agent(&AgentRequest { role:"architect", provider:&provider, model:&model,
-                        effort:&effort, session:Some(reference), prompt:&prompt })
-                };
-                match repaired {
-                    Ok(repaired) => turn_output = repaired.output,
-                    // The rejection, not the failed correction, is what has to be reported.
-                    Err(failure) => {
-                        self.log_event("error", &format!("architect correction failed: {failure}"));
-                        return Err(error);
-                    },
-                }
-            };
-            let evaluation_output: Value = serde_json::from_str(&turn_output).map_err(|e| e.to_string())?;
+            let mut turn_usage: Vec<_> = output.usage.iter().cloned().collect();
+            let expected_model = output.effective_model.clone();
+            let (output, (mut next, records)) = self.repair_response("architect", output,
+                |response| {
+                    let applied = apply_turn(&candidate, &cp, &response.output, &decisions, &required)?;
+                    let parsed: Value = serde_json::from_str(&response.output).map_err(|e| e.to_string())?;
+                    crate::routing::validate_evaluations(&parsed["model_evaluations"], &routing_ids)?;
+                    Ok(applied)
+                },
+                |response, error| {
+                    let correction = crate::response::correction_prompt(&prompt, &response.output, error);
+                    let repaired = if provider == "mock" {
+                        self.mock_architect(&candidate, &cp, &required, &routing_ids, &correction, Some(&reference))?
+                    } else {
+                        self.run_agent(&AgentRequest { role:"architect", provider:&provider, model:&model,
+                            effort:&effort, session:Some(&reference), prompt:&correction })?
+                    };
+                    if repaired.session.as_deref() != Some(reference.as_str())
+                        || !repaired.completed || (provider != "mock" && (!repaired.model_reported
+                            || !crate::agent::same_model(&provider, &expected_model, &repaired.effective_model))) {
+                        return Err("architect correction changed session/model or did not complete".into());
+                    }
+                    if let Some(usage) = &repaired.usage { turn_usage.push(usage.clone()); }
+                    Ok(repaired)
+                })?;
+            let evaluation_output: Value = serde_json::from_str(&output.output).map_err(|e| e.to_string())?;
             next["routing_evaluator"] = json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
             self.agree_routing(&mut candidate, &mut next, &routing_ids, &evaluation_output["model_evaluations"])?;
             next["session"] = json!({"provider":provider,"reference":reference,"checkpoint_reference":turn,"resume_policy":"exact_if_committed"});
@@ -584,7 +574,7 @@ impl Ctx {
             next["effective_model"] =
                 json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
             next["recovery"] = json!({"reason":recovery_reason,"previous_session":cp["session"],"replacement_session":reference});
-            if let Some(usage) = &output.usage {
+            for usage in &turn_usage {
                 accumulate_invocation_usage(&mut next, "role_usage", "architect", usage);
                 accumulate_invocation_usage(&mut candidate, "usage", &provider, usage);
                 accumulate_invocation_usage(&mut candidate["role_usage"], "architect", &provider, usage);
@@ -594,7 +584,7 @@ impl Ctx {
                 return Err("plan changed during architect turn".into());
             }
             let published = store.publish(candidate, next.clone(), json!({"kind":"architect_turn","turn":turn,"reason":reason,
-                "model_agreements":next["agreements"],"decisions":records,"resolved_risks":serde_json::from_str::<Value>(&turn_output).unwrap()["resolved_risks"],
+                "model_agreements":next["agreements"],"decisions":records,"resolved_risks":evaluation_output["resolved_risks"],
                 "recovery_reason":recovery_reason,"previous_session":cp["session"],"session":reference}))?;
             self.session.state.lock().unwrap().architect_activity =
                 json!({"status":"ready","reason":recovery_reason,"session":reference});

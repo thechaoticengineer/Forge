@@ -51,7 +51,7 @@ impl Ctx {
         }
         let mock_execution = tool == "mock";
         #[cfg(test)]
-        let mock_execution = mock_execution || (matches!(role,"implementer"|"fixer") && {
+        let mock_execution = mock_execution || (matches!(role,"implementer"|"fixer"|"response_correction") && {
             let settings = self.app.settings.lock().unwrap();
             settings["test_fake_providers"] == true && settings["test_real_implementation_cli"] != true
         });
@@ -274,7 +274,7 @@ impl Ctx {
         #[allow(unused_mut)]
         let mut output = String::new();
         #[cfg(test)]
-        if matches!(role, "implementer" | "fixer") {
+        if matches!(role, "implementer" | "fixer" | "response_correction") {
             output = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0).to_string()).unwrap_or_default();
         }
         Ok(AgentResult { output, usage, effective_model, model_reported:true, completed: true, ..AgentResult::default() })
@@ -419,7 +419,12 @@ impl Ctx {
             }
             "chat" => {
                 #[cfg(test)]
-                if let Some(output) = self.app.settings.lock().unwrap().get("mock_chat_output") {
+                if let Some(output) = self.app.settings.lock().unwrap().get_mut("mock_chat_output") {
+                    let output = match output.as_array_mut() {
+                        Some(queue) if queue.len() > 1 => queue.remove(0),
+                        Some(queue) if !queue.is_empty() => queue[0].clone(),
+                        _ => output.clone(),
+                    };
                     // Null simulates an agent exiting without writing an answer.
                     if !output.is_null() {
                         fs::write(self.forge_path("answer.json"),
@@ -433,7 +438,12 @@ impl Ctx {
             }
             "enhance" => {
                 #[cfg(test)]
-                if let Some(output) = self.app.settings.lock().unwrap().get("mock_enhance_output") {
+                if let Some(output) = self.app.settings.lock().unwrap().get_mut("mock_enhance_output") {
+                    let output = match output.as_array_mut() {
+                        Some(queue) if queue.len() > 1 => queue.remove(0),
+                        Some(queue) if !queue.is_empty() => queue[0].clone(),
+                        _ => output.clone(),
+                    };
                     // Null simulates an agent exiting without writing an answer.
                     if !output.is_null() {
                         fs::write(self.forge_path("enhanced-goal.json"),
@@ -445,6 +455,7 @@ impl Ctx {
                 fs::write(self.forge_path("enhanced-goal.json"), json!({"goal": "mock enhanced goal"}).to_string())
                     .map_err(|e| e.to_string())?;
             }
+            "response_correction" => {},
             "implementer" | "fixer" => {
                 #[cfg(test)]
                 if let Some(edits) = self.app.settings.lock().unwrap()["mock_edits"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0)) {

@@ -718,61 +718,78 @@ impl Ctx {
         }
         let mock = provider == "mock";
         #[cfg(test)] let mock = mock || self.app.settings.lock().unwrap()["test_fake_providers"] == true;
-        #[cfg(test)] {
-            let mut settings = self.app.settings.lock().unwrap();
-            if !settings["test_review_sessions"].is_array() { settings["test_review_sessions"] = json!([]); }
-            settings["test_review_sessions"].as_array_mut().unwrap().push(json!({"role":role,"provider":provider,"model":model,"session":if role == "architect" {session.clone()} else {None},"prompt":prompt}));
-        }
-        let result = if mock {
-            self.mock_review(&identity, &prompt, &json!({"acceptance":acceptance}))
-        } else {
-            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-            let facts = self.model_facts(&policy,crate::catalogue::Provider::parse(provider).ok_or("invalid review provider")?,model,None);
-            let effort = facts["effort"].as_str().unwrap_or("provider_default");
-            self.run_agent(&AgentRequest {
-                role: if role == "architect" {
-                    "architect_review"
-                } else {
-                    "reviewer"
-                },
-                provider,
-                model,
-                effort: &effort,
-                session: if role == "architect" {
-                    session.as_deref()
-                } else {
-                    None
-                },
-                prompt: &prompt,
-            })
-        }?;
-        if self.session.stop_requested.load(Ordering::SeqCst) {
-            return Err("review stopped; approval invalid".into());
-        }
-        if snapshot(self.project())? != base["snapshot"] {
-            return Err("implementation or HEAD changed during review".into());
-        }
-        if matches!(scope, ReviewScope::Plan) {
-            let current = self.load_plan().ok_or("missing plan after review")?;
-            self.validate_plan_subject(&current)?;
-            if current["plan_review"] != plan["plan_review"] || current["revision"] != base["revision"] {
-                return Err("plan review changed during invocation".into());
+        let invoke = |prompt: &str| -> Result<AgentResult, String> {
+            #[cfg(test)] {
+                let mut settings = self.app.settings.lock().unwrap();
+                if !settings["test_review_sessions"].is_array() { settings["test_review_sessions"] = json!([]); }
+                settings["test_review_sessions"].as_array_mut().unwrap().push(json!({"role":role,"provider":provider,"model":model,"session":if role == "architect" {session.clone()} else {None},"prompt":prompt}));
             }
-        }
-        if !mock {
-            let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
-            let selected = self.model_facts(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model, None);
-            let expected = selected["resolved_id"].as_str().unwrap_or(model);
-            if !result.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, expected, &result.effective_model) {
-                return Err(format!("model routing blocked: {role} effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
-                    result.effective_model, result.model_reported, selected["eligible"]));
+            let result = if mock {
+                self.mock_review(&identity, &prompt, &json!({"acceptance":acceptance}))
+            } else {
+                let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+                let facts = self.model_facts(&policy,crate::catalogue::Provider::parse(provider).ok_or("invalid review provider")?,model,None);
+                let effort = facts["effort"].as_str().unwrap_or("provider_default");
+                self.run_agent(&AgentRequest {
+                    role: if role == "architect" {
+                        "architect_review"
+                    } else {
+                        "reviewer"
+                    },
+                    provider,
+                    model,
+                    effort: &effort,
+                    session: if role == "architect" {
+                        session.as_deref()
+                    } else {
+                        None
+                    },
+                    prompt: &prompt,
+                })
+            }?;
+            if self.session.stop_requested.load(Ordering::SeqCst) {
+                return Err("review stopped; approval invalid".into());
             }
-        }
-        let mut verdict = normalize(
-            &result.output,
-            &identity,
-            &acceptance,
-        )?;
+            if snapshot(self.project())? != base["snapshot"] {
+                return Err("implementation or HEAD changed during review".into());
+            }
+            if matches!(scope, ReviewScope::Plan) {
+                let current = self.load_plan().ok_or("missing plan after review")?;
+                self.validate_plan_subject(&current)?;
+                if current["plan_review"] != plan["plan_review"] || current["revision"] != base["revision"] {
+                    return Err("plan review changed during invocation".into());
+                }
+            }
+            if !mock {
+                let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;
+                let selected = self.model_facts(&policy, crate::catalogue::Provider::parse(provider).ok_or("invalid reviewer provider")?, model, None);
+                let expected = selected["resolved_id"].as_str().unwrap_or(model);
+                if !result.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, expected, &result.effective_model) {
+                    return Err(format!("model routing blocked: {role} effective model or eligibility changed (expected {expected}, reported {}, model_reported {}, eligible {})",
+                        result.effective_model, result.model_reported, selected["eligible"]));
+                }
+            }
+            if role == "architect"
+                && (result.session.as_deref() != session.as_deref()
+                    || result
+                        .session
+                        .as_deref()
+                        .is_none_or(|s| !crate::agent::session_id(s)))
+            {
+                return Err("architect review session identity mismatch".into());
+            }
+            Ok(result)
+        };
+        let initial = invoke(&prompt)?;
+        let mut response_usage: Vec<_> = initial.usage.iter().cloned().collect();
+        let (result, mut verdict) = self.repair_response(&format!("{role} review"), initial,
+            |response| normalize(&response.output, &identity, &acceptance),
+            |response, error| {
+                let correction = crate::response::correction_prompt(&prompt, &response.output, error);
+                let result = invoke(&correction)?;
+                if let Some(usage) = &result.usage { response_usage.push(usage.clone()); }
+                Ok(result)
+            })?;
         verdict["version"] = json!(1);
         verdict["id"] = json!(crate::architecture::identity());
         verdict["plan_id"] = base["plan_id"].clone();
@@ -790,15 +807,6 @@ impl Ctx {
         verdict["revision"] = base["revision"].clone();
         verdict["policy"] = base["policy"].clone();
         verdict["unix"] = json!(unix_timestamp());
-        if role == "architect"
-            && (result.session.as_deref() != session.as_deref()
-                || result
-                    .session
-                    .as_deref()
-                    .is_none_or(|s| !crate::agent::session_id(s)))
-        {
-            return Err("architect review session identity mismatch".into());
-        }
         match scope {
             ReviewScope::Stage(idx) => {
                 let stage = &mut plan["stages"][idx];
@@ -848,9 +856,11 @@ impl Ctx {
         } else {
             self.save_plan(plan)?;
         }
-        match scope {
-            ReviewScope::Stage(idx) => self.record_stage_usage(plan, idx, role, provider, result.usage)?,
-            ReviewScope::Plan => self.record_plan_usage(plan, role, provider, result.usage)?,
+        for usage in response_usage {
+            match scope {
+                ReviewScope::Stage(idx) => self.record_stage_usage(plan, idx, role, provider, Some(usage))?,
+                ReviewScope::Plan => self.record_plan_usage(plan, role, provider, Some(usage))?,
+            }
         }
         Ok(verdict)
     }
@@ -908,10 +918,11 @@ impl Ctx {
             .map(|a| a.remove(0));
         let mut v = supplied.unwrap_or(json!({"approved":true,"summary":"Inspected mock implementation","issues":[],"checks":["Verified fixture"]}));
         if let Some(raw) = v.as_str() {
-            return Ok(AgentResult {
-                output: raw.into(),
-                ..AgentResult::default()
-            });
+            let raw = raw.to_string();
+            drop(settings);
+            let session = self.architecture_store().checkpoint(&self.load_plan().unwrap())?["session"]["reference"]
+                .as_str().map(str::to_owned);
+            return Ok(AgentResult { output:raw, session, completed:true, ..AgentResult::default() });
         }
         if v["identity"].is_null() {
             v["identity"] = identity.clone();
@@ -1107,6 +1118,36 @@ impl Ctx {
                     }
                 }
             };
+            let effective = &assignment["effective"];
+            let provider = effective["provider"].as_str().unwrap();
+            let model = effective["model"].as_str().unwrap();
+            let effort = effective["native_effort"].as_str().unwrap();
+            let mut original_snapshot = None;
+            let outcome_context = self.outcome_prompt(plan, idx, &turn);
+            let structured = output.output.trim_start().starts_with('{');
+            let mut correction_usage = Vec::new();
+            let (output, ()) = self.repair_response("implementer outcome", output,
+                |response| {
+                    if structured && !response.output.trim_start().starts_with('{') {
+                        return Err("a corrected structured outcome must remain JSON".into());
+                    }
+                    self.validate_implementer_response(plan, idx, &turn, &response.output)
+                },
+                |response, error| {
+                    if original_snapshot.is_none() { original_snapshot = Some(snapshot(self.project())?); }
+                    let correction = crate::response::correction_prompt(&outcome_context, &response.output, error);
+                    let result = self.run_agent(&AgentRequest { role:"response_correction", provider, model, effort,
+                        session:None, prompt:&correction })?;
+                    if Some(snapshot(self.project())?) != original_snapshot {
+                        return Err("implementation or HEAD changed during outcome correction".into());
+                    }
+                    if !result.completed || !result.model_reported || !crate::agent::same_model(provider, model, &result.effective_model) {
+                        return Err("outcome correction model changed or did not complete".into());
+                    }
+                    if let Some(usage) = &result.usage { correction_usage.push(usage.clone()); }
+                    Ok(result)
+                })?;
+            for usage in correction_usage { self.record_stage_usage(plan, idx, role, provider, Some(usage))?; }
             let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
             if let Some((kind,evidence)) = trigger {
                 // A scope escalation says this stage cannot be built as written.

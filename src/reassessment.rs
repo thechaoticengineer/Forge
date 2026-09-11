@@ -31,7 +31,47 @@ fn signature(kind: &str, evidence: &Value) -> String {
     crate::metadata::fingerprint(format!("{kind}:{evidence}").as_bytes())
 }
 
+fn parse_outcome(plan: &Value, idx: usize, turn: &str, text: &str) -> Result<Option<Outcome>, String> {
+    // Legacy completion prose is allowed, but never interpreted as an escalation.
+    if !text.trim_start().starts_with('{') {
+        return Ok(None);
+    }
+    let o: Outcome = serde_json::from_str(text)
+        .map_err(|e| format!("invalid implementer outcome: {e}"))?;
+    if o.version != 1
+        || json!(o.plan_id) != plan["plan_id"]
+        || json!(o.stage_id) != plan["stages"][idx]["id"]
+        || json!(o.attempt_id) != plan["stages"][idx]["attempt_id"]
+        || o.turn_id != turn
+        || !["completed", "test_failure", "escalation"].contains(&o.status.as_str())
+        || o.evidence.len() > 16
+        || o.evidence
+            .iter()
+            .any(|s| s.trim().is_empty() || s.len() > 2000)
+        || (o.status == "escalation") != o.request.is_some()
+    {
+        return Err("invalid implementer outcome identity or fields".into());
+    }
+    if o.status != "completed" && o.evidence.is_empty() {
+        return Err("implementer failure/escalation requires evidence".into());
+    }
+    if let Some(r) = &o.request {
+        if !["reasoning", "scope", "capability"].contains(&r.kind.as_str())
+            || [&r.reason, &r.required_capability]
+                .iter()
+                .any(|s| s.trim().is_empty() || s.len() > 2000)
+        {
+            return Err("invalid implementer escalation request".into());
+        }
+    }
+    Ok(Some(o))
+}
+
 impl Ctx {
+    pub(super) fn validate_implementer_response(&self, plan: &Value, idx: usize, turn: &str, text: &str) -> Result<(), String> {
+        parse_outcome(plan, idx, turn, text).map(|_| ())
+    }
+
     fn reassessment_init(&self, plan: &mut Value, idx: usize) {
         if plan["stages"][idx]["reassessment"]["attempt_id"] == plan["stages"][idx]["attempt_id"]
             && plan["stages"][idx]["reassessment"].is_object()
@@ -262,38 +302,7 @@ impl Ctx {
         turn: &str,
         output: &crate::agent::AgentResult,
     ) -> Result<Option<(String, Value)>, String> {
-        // Legacy completion prose is allowed, but never interpreted as an escalation.
-        if !output.output.trim_start().starts_with('{') {
-            return Ok(None);
-        }
-        let o: Outcome = serde_json::from_str(&output.output)
-            .map_err(|e| format!("invalid implementer outcome: {e}"))?;
-        if o.version != 1
-            || json!(o.plan_id) != plan["plan_id"]
-            || json!(o.stage_id) != plan["stages"][idx]["id"]
-            || json!(o.attempt_id) != plan["stages"][idx]["attempt_id"]
-            || o.turn_id != turn
-            || !["completed", "test_failure", "escalation"].contains(&o.status.as_str())
-            || o.evidence.len() > 16
-            || o.evidence
-                .iter()
-                .any(|s| s.trim().is_empty() || s.len() > 2000)
-            || (o.status == "escalation") != o.request.is_some()
-        {
-            return Err("invalid implementer outcome identity or fields".into());
-        }
-        if o.status != "completed" && o.evidence.is_empty() {
-            return Err("implementer failure/escalation requires evidence".into());
-        }
-        if let Some(r) = &o.request {
-            if !["reasoning", "scope", "capability"].contains(&r.kind.as_str())
-                || [&r.reason, &r.required_capability]
-                    .iter()
-                    .any(|s| s.trim().is_empty() || s.len() > 2000)
-            {
-                return Err("invalid implementer escalation request".into());
-            }
-        }
+        let Some(o) = parse_outcome(plan, idx, turn, &output.output)? else { return Ok(None); };
         plan["stages"][idx]["implementer_outcome"] = json!(o);
         self.save_plan(plan)?;
         if o.status == "test_failure" {

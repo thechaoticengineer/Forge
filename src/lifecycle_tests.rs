@@ -260,7 +260,7 @@ fn reported_failed_checks_cannot_be_bypassed_or_buy_extra_selection_rounds() {
         {"command":"./scripts/build.sh","status":"failed","evidence":"Fixture build exited 1"},
         {"command":"cargo test","status":"passed","evidence":"Fixture tests passed"}
     ]);
-    f.set("mock_verdicts",json!([bad]));
+    f.set("mock_verdicts",json!(vec![bad; 4]));
     f.ctx.run_worker();
     let p = f.ctx.load_plan().unwrap();
     assert_ne!(p["stages"][0]["status"],"committed");
@@ -271,7 +271,7 @@ fn reported_failed_checks_cannot_be_bypassed_or_buy_extra_selection_rounds() {
     assert_eq!(f.calls(),(1,1));
     let settings = f.ctx.app.settings.lock().unwrap();
     let sessions = settings["test_review_sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(),1); assert_eq!(sessions[0]["role"],"reviewer");
+    assert_eq!(sessions.len(),4); assert!(sessions.iter().all(|session| session["role"] == "reviewer"));
 }
 
 #[test]

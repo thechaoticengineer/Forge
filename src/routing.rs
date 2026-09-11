@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const POLICY: &str = "stage-routing-1";
-const PROPOSAL_REPAIR_ATTEMPTS: u32 = 2;
 pub(crate) const CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","provider":"exact provider","model":"exact registry ID","native_effort":"provider_default or supported native effort","rationale":"stage-specific adequacy, failure impact and cost reasoning"}.
 Use exactly those seven proposal fields; put all explanation, including effort changes, in rationale. Do not add fields.
@@ -38,6 +37,46 @@ struct Evaluation {
     task: String,
 }
 
+/// Validate planner-owned proposal fields before paying for an architect turn.
+/// Missing proposals can still be supplied by the separate selection operation.
+pub(crate) fn validate_candidate_proposals(plan: &Value) -> Result<(), String> {
+    for stage in plan["stages"].as_array().ok_or("invalid stages")? {
+        if stage["status"] == "committed" || stage["model_proposal"].is_null() { continue; }
+        let proposal: Proposal = serde_json::from_value(stage["model_proposal"].clone())
+            .map_err(|e| format!("stage {} model_proposal: {e}", stage["id"]))?;
+        validate_proposal(&proposal)?;
+    }
+    Ok(())
+}
+
+fn validate_proposal(p: &Proposal) -> Result<(), String> {
+    classification(&p.risk, &p.complexity, &p.task)?;
+    if (p.provider != "mock" && (Provider::parse(&p.provider).is_none()
+        || !crate::catalogue::identifier(&p.model)
+        || !crate::catalogue::identifier(&p.native_effort)))
+        || p.rationale.trim().is_empty() || p.rationale.len() > 4000 {
+        return Err("invalid model proposal provider, model, effort or rationale".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_evaluations(value: &Value, ids: &[i64]) -> Result<(), String> {
+    if ids.is_empty() && value.is_null() { return Ok(()); }
+    let rows: Vec<Evaluation> = serde_json::from_value(value.clone())
+        .map_err(|e| format!("invalid architect model evaluations: {e}"))?;
+    if rows.len() != ids.len() { return Err("architect evaluation count mismatch".into()); }
+    for id in ids {
+        let matched: Vec<_> = rows.iter().filter(|r| r.stage_id == *id).collect();
+        if matched.len() != 1 { return Err("duplicate/missing architect model evaluation".into()); }
+        let e = matched[0];
+        classification(&e.risk, &e.complexity, &e.task)?;
+        if e.rationale.trim().is_empty() || e.rationale.len() > 4000 {
+            return Err("missing architect rationale".into());
+        }
+    }
+    Ok(())
+}
+
 fn parse_proposals(output: &Value, ids: &[i64]) -> Result<Vec<(i64, Proposal)>, String> {
     let rows = output["proposals"].as_array().ok_or("planner omitted routing proposals")?;
     if rows.len() != ids.len() {
@@ -50,6 +89,7 @@ fn parse_proposals(output: &Value, ids: &[i64]) -> Result<Vec<(i64, Proposal)>, 
         }
         let proposal = serde_json::from_value(matches[0]["proposal"].clone())
             .map_err(|e| format!("stage {id}: {e}"))?;
+        validate_proposal(&proposal)?;
         Ok((*id, proposal))
     }).collect()
 }
@@ -452,44 +492,48 @@ impl Ctx {
             self.routing_prompt()?
         );
         let prompt = prompt + &self.routing_handoff(plan)?;
-        let mut turn_prompt = prompt.clone();
-        let requirements = self.model_requirements("planner",None)?;
-        for attempt in 0..=PROPOSAL_REPAIR_ATTEMPTS {
-            let (output,(provider,model,effort)) = self.with_selected_model(&requirements,None,
-                |(provider,model,effort)| self.routing_dialogue("planner",provider,model,effort,&turn_prompt,plan,ids))?;
-            if let Some(u) = output.get("_engine_usage") {
-                let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
-                accumulate_invocation_usage(plan,"usage",&provider,&usage);
-                accumulate_invocation_usage(&mut plan["role_usage"],"planner",&provider,&usage);
-            }
-            // Validate the entire batch before replacing any stage's proposal.
-            let proposals = match parse_proposals(&output, ids) {
-                Ok(proposals) => proposals,
-                Err(error) if attempt < PROPOSAL_REPAIR_ATTEMPTS => {
-                    self.log_event("model", &format!(
-                        "routing proposals rejected: {error}; asking the planner to correct the response ({}/{PROPOSAL_REPAIR_ATTEMPTS})", attempt + 1));
-                    turn_prompt = format!("{prompt}\nRESPONSE CORRECTION: {error}\nRejected response: {output}\nCorrect the response schema for the same stage IDs. Preserve the task and model-selection constraints. Put explanatory notes in rationale. Return only the complete proposals JSON.");
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            for (id, p) in proposals {
-                let idx = plan["stages"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .position(|s| s["id"] == id)
-                    .unwrap();
-                let inputs = self.proposal_inputs(plan, idx);
-                plan["stages"][idx]["model_proposal"] = json!(p);
-                plan["stages"][idx]["model_proposal_inputs"] = inputs;
-                plan["stages"][idx]["model_proposer"] =
-                    json!({"provider":provider,"model":model,"native_effort":effort});
-            }
-            return Ok(());
+        let reply = self.validated_routing_response("planner", &prompt, plan, ids)?;
+        for usage in &reply.usage {
+            accumulate_invocation_usage(plan, "usage", &reply.choice.0, usage);
+            accumulate_invocation_usage(&mut plan["role_usage"], "planner", &reply.choice.0, usage);
         }
-        unreachable!("proposal correction loop always returns")
+        for (id, p) in parse_proposals(&reply.value, ids)? {
+            let idx = plan["stages"].as_array().unwrap().iter().position(|s| s["id"] == id).unwrap();
+            let inputs = self.proposal_inputs(plan, idx);
+            plan["stages"][idx]["model_proposal"] = json!(p);
+            plan["stages"][idx]["model_proposal_inputs"] = inputs;
+            plan["stages"][idx]["model_proposer"] = json!({"provider":reply.choice.0,"model":reply.choice.1,"native_effort":reply.choice.2});
+        }
+        Ok(())
     }
+
+    fn validated_routing_response(&self, role: &str, prompt: &str, plan: &Value, ids: &[i64])
+        -> Result<crate::response::ValidatedReply<Value>, String>
+    {
+        let requirements = self.model_requirements(role, None)?;
+        let (initial, choice) = self.with_selected_model(&requirements, None,
+            |choice| self.routing_dialogue(role, &choice.0, &choice.1, &choice.2, prompt, plan, ids))?;
+        let mut usage: Vec<_> = initial.usage.iter().cloned().collect();
+        let (result, value) = self.repair_response(&format!("{role} routing"), initial,
+            |reply| {
+                if reply.output.len() > 48 * 1024 { return Err("routing output exceeds 48 KiB".into()); }
+                let mut value: Value = serde_json::from_str(&reply.output)
+                    .map_err(|e| format!("invalid selection output: {e}"))?;
+                value.as_object_mut().ok_or("selection output must be an object")?.remove("_engine_usage");
+                if role == "planner" { parse_proposals(&value, ids)?; }
+                else { validate_evaluations(&value["model_evaluations"], ids)?; }
+                Ok(value)
+            },
+            |reply, error| {
+                let correction = crate::response::correction_prompt(prompt, &reply.output, error)
+                    + "\nPut explanatory notes in rationale.";
+                let result = self.routing_dialogue(role, &choice.0, &choice.1, &choice.2, &correction, plan, ids)?;
+                if let Some(u) = &result.usage { usage.push(u.clone()); }
+                Ok(result)
+            })?;
+        Ok(crate::response::ValidatedReply { value, result, choice, usage })
+    }
+
     pub(crate) fn routing_dialogue(
         &self,
         role: &str,
@@ -499,7 +543,7 @@ impl Ctx {
         prompt: &str,
         plan: &Value,
         ids: &[i64],
-    ) -> Result<Value, String> {
+    ) -> Result<crate::agent::AgentResult, String> {
         if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
         if provider == "mock" {
             let mut settings = self.app.settings.lock().unwrap();
@@ -515,20 +559,19 @@ impl Ctx {
                 .as_array_mut()
                 .filter(|a| !a.is_empty())
             {
-                return Ok(outputs.remove(0));
+                let output = outputs.remove(0);
+                return Ok(crate::agent::AgentResult { output:output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string()), completed:true, ..Default::default() });
             }
             drop(settings);
             if role == "architect" {
-                return Ok(json!({"model_evaluations":mock_evaluations(plan, ids)}));
+                return Ok(crate::agent::AgentResult { output:json!({"model_evaluations":mock_evaluations(plan, ids)}).to_string(), completed:true, ..Default::default() });
             }
             let option = self
                 .routing_candidates()?
                 .into_iter()
                 .find(|o| o["eligible"] == true)
                 .ok_or("no eligible model")?;
-            return Ok(
-                json!({"proposals":ids.iter().map(|id| json!({"stage_id":id,"proposal":{"risk":"standard","complexity":"standard","task":"functionality","provider":option["provider"],"model":option["model"],"native_effort":option["effort"],"rationale":"Planner: configured adequacy for this stage."}})).collect::<Vec<_>>()}),
-            );
+            return Ok(crate::agent::AgentResult { output:json!({"proposals":ids.iter().map(|id| json!({"stage_id":id,"proposal":{"risk":"standard","complexity":"standard","task":"functionality","provider":option["provider"],"model":option["model"],"native_effort":option["effort"],"rationale":"Planner: configured adequacy for this stage."}})).collect::<Vec<_>>()}).to_string(), completed:true, ..Default::default() });
         }
         // The selected model's own context window is the real bound, so the
         // budget follows the catalogue rather than a fixed ceiling. Tokens are
@@ -560,17 +603,8 @@ impl Ctx {
         let policy = Policy::from_settings(&self.app.settings.lock().unwrap())?;
         let selected = self.model_facts(&policy, Provider::parse(provider).ok_or("invalid selection provider")?, model, Some(effort));
         if !output.model_reported || selected["eligible"] != true || !crate::agent::same_model(provider, selected["resolved_id"].as_str().unwrap_or(model), &output.effective_model) { return Err("selection effective-model mismatch or missing report".into()); }
-        if output.output.len() > 48 * 1024 {
-            return Err("routing output exceeds 48 KiB".into());
-        }
-        if !output.completed {
-            return Err("incomplete selection dialogue".into());
-        }
-        let mut value: Value = serde_json::from_str(&output.output).map_err(|e| format!("invalid selection output: {e}"))?;
-        let obj = value.as_object_mut().ok_or("selection output must be an object")?;
-        obj.remove("_engine_usage");
-        if let Some(u) = output.usage { obj.insert("_engine_usage".into(),json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"total_tokens":u.total_tokens,"model":u.model})); }
-        Ok(value)
+        if !output.completed { return Err("incomplete selection dialogue".into()); }
+        Ok(output)
     }
     pub(crate) fn agree_routing(
         &self,
@@ -643,24 +677,12 @@ impl Ctx {
                     json!(disagreements)
                 );
                 let prompt = prompt + &self.routing_handoff(plan)?;
-                let requirements = self.model_requirements("architect",None)?;
-                let (output,(provider,_,_)) = self.with_selected_model(&requirements,None,
-                    |(provider,model,effort)| self.routing_dialogue("architect",provider,model,effort,&prompt,plan,&affected))?;
-                if let Some(u) = output.get("_engine_usage") {
-                    let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
-                    accumulate_invocation_usage(plan,"usage",&provider,&usage);
-                    accumulate_invocation_usage(&mut plan["role_usage"],"architect",&provider,&usage);
+                let reply = self.validated_routing_response("architect", &prompt, plan, &affected)?;
+                for usage in &reply.usage {
+                    accumulate_invocation_usage(plan,"usage",&reply.choice.0,usage);
+                    accumulate_invocation_usage(&mut plan["role_usage"],"architect",&reply.choice.0,usage);
                 }
-                let replacements = output["model_evaluations"]
-                    .as_array()
-                    .ok_or("missing reconciliation evaluations")?;
-                if replacements.len() != affected.len()
-                    || affected
-                        .iter()
-                        .any(|id| replacements.iter().filter(|r| r["stage_id"] == *id).count() != 1)
-                {
-                    return Err("invalid reconciliation evaluation IDs".into());
-                }
+                let replacements = reply.value["model_evaluations"].as_array().unwrap();
                 let all = evaluations.as_array_mut().unwrap();
                 all.retain(|r| !affected.contains(&r["stage_id"].as_i64().unwrap_or(0)));
                 all.extend(replacements.iter().cloned());

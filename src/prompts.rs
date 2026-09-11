@@ -19,23 +19,6 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
 Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
 
-pub(crate) const REPAIR_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
-The plan candidate below was rejected by Forge's validator. Repair it.
-
-REJECTION:
-{error}
-
-CANDIDATE:
-{candidate}
-
-Change only what the rejection requires. Keep every stage's id, title, instructions,
-acceptance, commit and model_proposal otherwise byte-identical; do not rewrite, shorten
-or reorder work that was already accepted. Every stage needs "title", "instructions",
-"acceptance" and "commit" as strings; acceptance and commit may be empty, title and
-instructions may not. Do not explore the repository, do not write any file, and do not
-implement anything. Return the complete corrected candidate as one JSON object in your
-final response, with no prose and no markdown fences."#;
-
 pub(crate) const REFACTOR_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
 Explore this repository and read the code. Identify concrete refactoring opportunities:
 duplication, dead code, overly long functions, unclear naming, and poor module structure.

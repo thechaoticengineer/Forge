@@ -478,11 +478,11 @@ fn reviewers_and_qa_are_always_fresh_and_unknown_effort_is_never_mapped() {
 }
 
 #[test]
-fn enhancement_uses_chat_permissions_and_requires_readonly_capabilities() {
-    for provider in ["codex", "claude"] {
+fn enhancement_and_response_corrections_require_readonly_capabilities() {
+    for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "response_correction"].map(|role| (provider, role))) {
         let mut req = AgentRequest {role:"chat",session:None,..request(provider)};
         let chat = command(&req).unwrap();
-        req.role = "enhance";
+        req.role = role;
         let enhance = command(&req).unwrap();
         assert_eq!(enhance.get_args().collect::<Vec<_>>(), chat.get_args().collect::<Vec<_>>());
         req.session = Some(ID);

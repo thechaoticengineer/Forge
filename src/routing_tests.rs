@@ -237,7 +237,7 @@ fn exact_ids_native_efforts_constraints_and_review_conflicts_are_validated() {
         let f = Fixture::new();
         let mut p = proposal("strong-test", "critical", "security");
         p[key] = json!(value);
-        f.select(p);
+        f.set("mock_routing_planner_outputs", json!(vec![json!({"proposals":[{"stage_id":1,"proposal":p}]}); 4]));
         assert!(f.publish(plan()).is_err());
     }
     let f = Fixture::new();
@@ -292,9 +292,9 @@ fn disagreement_gets_exactly_one_exchange_and_both_participants_must_agree() {
         }
     }
     let f = Fixture::new();
-    f.set("mock_model_evaluations", json!([[]]));
+    f.set("mock_model_evaluations", json!([[],[],[],[]]));
     assert!(f.publish(plan()).is_err());
-    assert_eq!(f.counts(), (1, 1)); // Planner cannot substitute for missing architect.
+    assert_eq!(f.counts(), (1, 4)); // Only the architect corrects its missing evaluations.
 }
 #[test]
 fn unchanged_boundaries_restart_refresh_and_unrelated_edits_reuse_only_valid_agreements() {
@@ -681,12 +681,31 @@ fn invalid_routing_batch_is_bounded_and_never_partially_applied() {
     let response = json!({"proposals":[
         {"stage_id":1,"proposal":valid}, {"stage_id":2,"proposal":malformed},
     ]});
-    f.set("mock_routing_planner_outputs", json!(vec![response; 3]));
+    f.set("mock_routing_planner_outputs", json!(vec![response; 4]));
     let mut p = plan();
     p["stages"].as_array_mut().unwrap().push(stage(2));
     let before = p.clone();
     let error = f.ctx.propose_routing(&mut p, &[1, 2], &Value::Null).unwrap_err();
     assert!(error.contains("unknown field `native_effort_note`"), "{error}");
-    assert_eq!(f.counts(), (3, 0));
+    assert_eq!(f.counts(), (4, 0));
+    assert_eq!(p, before);
+}
+
+#[test]
+fn malformed_architect_evaluations_return_to_architect_without_repeating_planner() {
+    let f = Fixture::new();
+    f.set("mock_model_evaluations", json!([[], [evaluation(true, "standard", "standard")]]));
+    assert!(f.publish(plan()).is_ok());
+    assert_eq!(f.counts(), (1, 2));
+}
+
+#[test]
+fn invalid_routing_json_and_then_invalid_schema_share_one_correction_budget() {
+    let f = Fixture::new();
+    f.set("mock_routing_planner_outputs", json!(["{broken", {"proposals":[]}, "{also broken", {"proposals":[]}]));
+    let mut p = plan();
+    let before = p.clone();
+    assert!(f.ctx.propose_routing(&mut p, &[1], &Value::Null).is_err());
+    assert_eq!(f.counts(), (4, 0));
     assert_eq!(p, before);
 }

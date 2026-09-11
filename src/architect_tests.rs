@@ -344,8 +344,8 @@ fn a_rejected_turn_is_corrected_in_the_same_session_before_being_abandoned() {
     assert_eq!(requests[requests.len() - 2]["session"], requests.last().unwrap()["session"]);
     assert_eq!(f.cp(&next)["context_status"], "ready");
     assert!(f.ctx.read_history().as_array().unwrap().iter().any(|event|
-        event["text"].as_str().is_some_and(|t| t.starts_with("turn rejected")
-            && t.contains("asking for a correction (1/2)"))));
+        event["text"].as_str().is_some_and(|t| t.starts_with("architect rejected")
+            && t.contains("asking for a correction (1/3)"))));
 }
 
 #[test]

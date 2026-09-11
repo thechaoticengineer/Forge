@@ -22,6 +22,7 @@ mod app;
 mod http;
 mod plan;
 mod candidate_draft;
+mod response;
 mod routing;
 mod model_selection;
 mod prompts;

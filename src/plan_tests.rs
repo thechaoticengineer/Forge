@@ -66,16 +66,15 @@ fn a_rejected_candidate_is_repaired_instead_of_discarding_the_planning_run() {
     let events: Vec<&str> = history.as_array().unwrap().iter()
         .filter_map(|event| event["text"].as_str()).collect();
     assert!(events.iter().any(|text| text.starts_with(
-        "candidate rejected: stage content fields must be strings — asking the planner to repair it (1/2)")));
-    assert!(events.contains(&"repaired candidate accepted"));
+        "planner rejected: stage content fields must be strings; asking for a correction (1/3)")));
     assert!(events.contains(&"plan ready with 1 stages"));
     assert!(!events.iter().any(|text| text.starts_with("planning failed")));
     // The repair round is a correction, not a fresh planning run.
     let settings = test.app.app.settings.lock().unwrap();
     let prompt = settings["mock_planner_prompt"].as_str().unwrap();
-    assert!(prompt.contains("The plan candidate below was rejected by Forge's validator."));
+    assert!(prompt.contains("RESPONSE CORRECTION: Your last response was rejected by the engine:"));
     assert!(prompt.contains("stage content fields must be strings"));
-    assert!(prompt.contains("Do not explore the repository"));
+    assert!(prompt.contains("Do not implement changes, repeat side effects"));
 }
 
 #[test]
@@ -861,7 +860,7 @@ fn candidate_publication_preserves_selection_counts_and_failure_effects() {
                 // A turn the engine rejects is handed back for correction before
                 // it is abandoned, so each attempt is one more architect call.
                 let architect_calls = if outcome == "failed publication" {
-                    expected_calls + crate::architect::REPAIR_ATTEMPTS as usize
+                    expected_calls + crate::response::MAX_CORRECTIONS
                 } else { expected_calls };
                 let settings = test.app.app.settings.lock().unwrap();
                 for key in ["mock_architect_requests", "mock_routing_architect_requests"] {

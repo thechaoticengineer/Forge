@@ -615,6 +615,47 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tok
 }
 
 #[test]
+fn fake_cli_repairs_outcome_with_same_model_readonly_and_preserves_single_implementation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let cli = f.root.join("fake-codex");
+    fs::write(&cli, r#"#!/usr/bin/env python3
+import sys,json,pathlib
+if '--help' in sys.argv:
+    print('--sandbox read-only --ignore-user-config --ignore-rules --json resume')
+    sys.exit(0)
+model=sys.argv[sys.argv.index('-m')+1]
+prompt=sys.stdin.read() if sys.argv[-1]=='-' else sys.argv[-1]
+outcome,_=json.JSONDecoder().raw_decode(prompt.split('Finish with ONLY JSON: ',1)[1])
+if 'RESPONSE CORRECTION:' in prompt:
+    assert sys.argv[sys.argv.index('--sandbox')+1]=='read-only'
+else:
+    with pathlib.Path('unfinished.txt').open('a') as work: work.write('implemented once\n')
+    outcome['unexpected_field']='repair this report without repeating work'
+print(json.dumps({'type':'thread.started','thread_id':'11111111-2222-4333-8444-555555555555','model':model}))
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps(outcome)}}))
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':5}}))
+"#).unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+    f.set("test_cli_codex", json!(cli));
+    f.set("test_real_implementation_cli", json!(true));
+    let p = f.run();
+    let stage = &p["stages"][0];
+    assert_eq!(stage["status"], "committed", "{stage}");
+    assert_eq!(stage["rounds"], 1);
+    assert_eq!(stage["implementer_outcome"]["status"], "completed");
+    assert_eq!(fs::read_to_string(f.root.join("unfinished.txt")).unwrap(), "implemented once\n");
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    let implementer = requests.iter().find(|r| r["role"] == "implementer").unwrap();
+    let corrections: Vec<_> = requests.iter().filter(|r| r["role"] == "response_correction").collect();
+    assert_eq!(corrections.len(), 1);
+    assert_eq!(corrections[0]["provider"], implementer["provider"]);
+    assert_eq!(corrections[0]["model"], implementer["model"]);
+    assert_eq!(corrections[0]["effort"], implementer["effort"]);
+}
+
+#[test]
 fn stopped_architect_review_recovers_checkpoint_without_reselecting_or_resetting_budget() {
     let f = Fixture::new();
     let original = f.ctx.load_plan().unwrap();
@@ -687,6 +728,22 @@ fn an_unchanged_scope_response_without_explanation_does_not_authorize_continuati
     let ScopeResolution::Blocked(message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap() else { panic!("expected unchanged response to block") };
     assert!(message.contains("unchanged without clarification"));
     assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["acceptance"], "Greeting works");
+}
+
+#[test]
+fn scope_answer_json_and_fields_are_corrected_before_saving_clarification() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    f.set("mock_scope_output", json!(["{broken", {"revised":{"instructions":42}},
+        {"refused":"Implement the existing requirements using the documented boundary."}]));
+    let resolution = f.ctx.renegotiate_scope(&mut p, 0, &scope_escalation()).unwrap();
+    assert!(matches!(resolution, ScopeResolution::Clarified(_)));
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["acceptance"], "Greeting works");
+    assert_eq!(saved["stages"][0]["scope_clarification"]["pending"], true);
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let calls = settings["mock_agent_requests"].as_array().unwrap();
+    assert_eq!(calls.iter().filter(|call| call["role"] == "planner").count(), 3);
 }
 
 fn scope_escalation() -> Value {
@@ -814,7 +871,7 @@ fn pending_scope_revision_survives_routing_failure_and_restart_before_implementa
     f.set("mock_scope_output", json!({"revised":{
         "instructions":"Implement greeting with normalised text","acceptance":"Greeting works on normalised text"},
         "removed":"Dropped impossible byte equality"}));
-    f.set("mock_routing_planner_outputs", json!([{"proposals":[]},{"proposals":[]},{"proposals":[]}]));
+    f.set("mock_routing_planner_outputs", json!(vec![json!({"proposals":[]}); 4]));
     let error = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap_err();
     assert!(error.contains("proposal count mismatch"), "{error}");
     let saved = f.ctx.load_plan().unwrap();

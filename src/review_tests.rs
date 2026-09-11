@@ -94,6 +94,50 @@ fn clean() -> Value {
 }
 
 #[test]
+fn review_response_corrections_do_not_repeat_implementation_or_spend_fix_rounds() {
+    let f = Fixture::new("Implement feature", 0);
+    f.setting("mock_verdicts", json!(["malformed", "malformed", "malformed", clean()]));
+    let p = f.run();
+    assert_eq!(p["stages"][0]["status"], "committed");
+    assert_eq!(p["stages"][0]["rounds"], 1);
+    assert_eq!(f.count("reviewer"), 4);
+    assert_eq!(f.count("architect"), 1);
+    assert_eq!(fs::read_to_string(f.root.join("mock.txt")).unwrap().lines().count(), 1);
+    let sessions = f.ctx.app.settings.lock().unwrap()["test_review_sessions"].clone();
+    assert!(sessions.as_array().unwrap().iter().filter(|s| s["role"] == "reviewer").all(|s| s["session"].is_null()));
+    assert_eq!(p["stages"][0]["reviews"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn mutation_or_stop_during_a_correction_prevents_further_calls_and_publication() {
+    for action in [json!({"write":{"mock.txt":"changed during correction"}}), json!({"stop":true})] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("mock_verdicts", json!(["malformed", clean()]));
+        f.setting("mock_reviewer_actions", json!([{}, action]));
+        f.run();
+        f.assert_no_commit();
+        assert_eq!(f.count("reviewer"), 2);
+        assert_eq!(f.count("architect"), 0);
+        assert!(!f.ctx.forge_path("verdict.json").exists());
+    }
+}
+
+#[test]
+fn malformed_implementer_report_is_corrected_readonly_without_repeating_work() {
+    let f = Fixture::new("Implement feature", 0);
+    f.setting("mock_implementation_outputs", json!([{}, {}, {}, {}]));
+    let p = f.run();
+    f.assert_no_commit();
+    assert_eq!(p["stages"][0]["status"], "blocked");
+    assert_eq!(p["stages"][0]["rounds"], 1);
+    assert_eq!(fs::read_to_string(f.root.join("mock.txt")).unwrap().lines().count(), 1);
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let calls = settings["mock_agent_requests"].as_array().unwrap();
+    assert_eq!(calls.iter().filter(|r| r["role"] == "implementer").count(), 1);
+    assert_eq!(calls.iter().filter(|r| r["role"] == "response_correction").count(), 3);
+}
+
+#[test]
 fn stages_review_and_commit_with_ignored_or_unignored_runtime() {
     for ignored in [true, false] {
         for code in [false, true] {
@@ -326,7 +370,7 @@ fn stale_malformed_contradictory_or_unevidenced_verdicts_never_commit() {
         json!({"approved":true,"issues":[],"summary":""}),
     ] {
         let f = Fixture::new("Implement feature", 0);
-        f.setting("mock_verdicts", json!([bad]));
+        f.setting("mock_verdicts", json!(vec![bad; 4]));
         fs::write(f.ctx.forge_path("verdict.json"), clean().to_string()).unwrap();
         let p = f.run();
         f.assert_no_commit();
@@ -340,7 +384,7 @@ fn stale_malformed_contradictory_or_unevidenced_verdicts_never_commit() {
 #[test]
 fn partial_pair_failure_retains_history_but_never_reuses_approval_or_budget() {
     let f = Fixture::new("Implement feature", 1);
-    f.setting("mock_architect_verdicts", json!(["malformed", clean()]));
+    f.setting("mock_architect_verdicts", json!(["malformed", "malformed", "malformed", "malformed", clean()]));
     let first = f.run();
     f.assert_no_commit();
     assert_eq!(first["stages"][0]["reviews"].as_array().unwrap().len(), 1);
@@ -348,13 +392,13 @@ fn partial_pair_failure_retains_history_but_never_reuses_approval_or_budget() {
     let p = f.run();
     assert_eq!(p["stages"][0]["status"], "committed");
     assert_eq!(f.count("reviewer"), 2);
-    assert_eq!(f.count("architect"), 2);
+    assert_eq!(f.count("architect"), 5);
     assert_eq!(
         p["stages"][0]["attempt_id"],
         first["stages"][0]["attempt_id"]
     );
     let f = Fixture::new("Implement feature", 0);
-    f.setting("mock_architect_verdicts", json!(["malformed"]));
+    f.setting("mock_architect_verdicts", json!(vec!["malformed"; 4]));
     f.run();
     let p = f.run();
     f.assert_no_commit();
@@ -570,7 +614,7 @@ fn criterion_evidence_is_complete_and_prompts_preserve_literal_inputs() {
     let mut p = f.plan();
     p["stages"][0]["acceptance"] = json!("First {verdict_path}\nSecond {review_context}");
     f.ctx.save_plan(&p).unwrap();
-    f.setting("mock_verdicts",json!([{"approved":true,"issues":[],"criteria":[{"criterion":"First {verdict_path}","status":"passed","evidence":"One check"}]}]));
+    f.setting("mock_verdicts",json!(vec![json!({"approved":true,"issues":[],"criteria":[{"criterion":"First {verdict_path}","status":"passed","evidence":"One check"}]}); 4]));
     f.run();
     f.assert_no_commit();
     let settings = f.ctx.app.settings.lock().unwrap();
@@ -1383,7 +1427,7 @@ fn plan_review_errors_stops_and_budget_never_publish_partial_approval() {
         f.two_deferred_stages();
         match kind {
             "reject" => f.setting("mock_architect_verdicts",json!([reject("Fix cross-stage integration")])),
-            "evidence" => f.setting("mock_verdicts",json!([{"approved":true,"issues":[],"criteria":[]}])),
+            "evidence" => f.setting("mock_verdicts",json!(vec![json!({"approved":true,"issues":[],"criteria":[]}); 4])),
             "stop" => f.setting("mock_architect_actions",json!([{"stop":true}])),
             "mutation" => f.setting("mock_architect_actions",json!([{"write":{"first.rs":"changed during review"}}])),
             _ => f.setting("mock_architect_actions",json!([{"error":"review provider unavailable"}])),
