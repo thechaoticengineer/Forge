@@ -894,6 +894,42 @@ fn cli_limit_fallback_preserves_explicit_choices_and_capability_floor() {
 }
 
 #[test]
+fn default_cadence_defers_stage_roles_until_plan_review() {
+    let f = Fixture::with_settings("Implement feature", 0, false, crate::plan::default_settings());
+    f.setting("mock_edits", json!([{"feature.rs":"fn feature() {}\n"}]));
+    let base = f.ctx.git(&["rev-parse", "HEAD"]).unwrap();
+    let p = f.run();
+    let stage = &p["stages"][0];
+    assert_eq!(stage["status"], "committed", "{p}");
+    assert_eq!(stage["review_cadence"], json!({"architect":"per_plan","reviewer":"per_plan"}));
+    assert_eq!(stage["review_policy"]["deferred_roles"], json!(["architect","reviewer"]));
+    assert_eq!(stage["review_gate"]["status"], "deferred");
+    assert_eq!(stage["review_gate"]["roles"], json!({"architect":"deferred","reviewer":"deferred"}));
+    assert_eq!(stage["reviews"], json!([]));
+    for role in ["architect", "reviewer", "fixer"] {
+        assert_eq!(f.count(role), 0, "unexpected stage {role} invocation");
+    }
+    assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    assert_eq!(f.ctx.git(&["rev-parse", "HEAD^"]).unwrap(), base);
+    assert_eq!(f.ctx.git(&["show", "HEAD:feature.rs"]).unwrap(), "fn feature() {}");
+    assert_eq!(f.ctx.git(&["rev-parse", "--short", "HEAD"]).unwrap(), stage["sha"]);
+
+    let review = &p["plan_review"];
+    assert_eq!(review["required_roles"], stage["review_policy"]["deferred_roles"]);
+    assert_eq!(review["gate"]["status"], "approved");
+    assert_eq!(review["gate"]["roles"], json!({"architect":"approved","reviewer":"approved"}));
+    assert_eq!(review["base"], base);
+    assert_eq!(review["head"], f.ctx.git(&["rev-parse", "HEAD"]).unwrap());
+    let calls = f.plan_calls();
+    assert_eq!(calls.len(), 2);
+    for role in ["architect", "reviewer"] {
+        assert_eq!(calls.iter().filter(|call| call["role"] == role).count(), 1);
+    }
+    f.ctx.validate_plan_approval(&p).unwrap();
+    assert_eq!(p["status"], "done", "{p}");
+}
+
+#[test]
 fn deferred_architect_commits_with_only_independent_verdicts_including_promotion() {
     for promote in [false, true] {
         let f = Fixture::new(if promote { "Fix prose spelling" } else { "Implement feature" }, 0);

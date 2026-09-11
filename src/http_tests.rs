@@ -214,7 +214,7 @@ fn review_cadence_settings_are_returned_in_state() {
     let app = &test.app.app;
     let (code, state) = api_request(app, "GET", "/api/state", json!({}));
     assert_eq!(code, 200);
-    assert_eq!(state["settings"]["review_cadence"], default_settings()["review_cadence"]);
+    assert_eq!(state["settings"]["review_cadence"], json!({"architect":"per_plan","reviewer":"per_plan"}));
     for architect in ["per_plan", "per_stage"] {
         for reviewer in ["per_stage", "per_plan"] {
             let cadence = json!({"architect":architect,"reviewer":reviewer});

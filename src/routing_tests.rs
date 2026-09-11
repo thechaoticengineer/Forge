@@ -11,10 +11,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("forge-routing-test-{}", identity()));
-        fs::create_dir_all(&root).unwrap();
         let mut s = crate::plan::default_settings();
         s["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
+        Self::with_settings(s)
+    }
+    fn with_settings(mut s: Value) -> Self {
+        let root = std::env::temp_dir().join(format!("forge-routing-test-{}", identity()));
+        fs::create_dir_all(&root).unwrap();
         s["planner"] = json!("mock");
         s["architect"] = json!("mock");
         s["reviewer"] = json!("claude");
@@ -78,6 +81,7 @@ fn plan() -> Value {
 fn proposal(model: &str, risk: &str, task: &str) -> Value {
     json!({"risk":risk,"complexity":if risk == "critical" {"complex"} else {risk},"task":task,"provider":"codex","model":model,"native_effort":"provider_default","rationale":"Planner assessed this stage and configured adequacy separately from cost."})
 }
+
 fn evaluation(agree: bool, risk: &str, complexity: &str) -> Value {
     json!({"stage_id":1,"agree":agree,"risk":risk,"complexity":complexity,"task":"functionality","rationale":"Architect checked downstream interface compatibility and failure impact independently."})
 }
@@ -126,6 +130,41 @@ fn automatic_reviewer_selector_changes_reuse_all_stage_agreements() {
     f.set("automatic_routing", json!(false));
     assert_eq!(f.ctx.routing_required(&p, &cp).unwrap(), vec![1, 2]);
 }
+
+#[test]
+fn default_cadence_defers_reviewer_and_reuses_all_stage_agreements() {
+    let f = Fixture::with_settings(crate::plan::default_settings());
+    f.set("reviewer", json!("claude"));
+    let mut candidate = plan();
+    candidate["stages"].as_array_mut().unwrap().push(stage(2));
+    // Keep implementer constraints stable when automatic routing is disabled,
+    // so only the changed reviewer selector could invalidate these agreements.
+    for stage in candidate["stages"].as_array_mut().unwrap() {
+        stage["model_constraint"] = json!({"provider":"codex"});
+    }
+    let p = f.publish(candidate).unwrap();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    let counts = f.counts();
+    assert_eq!(counts, (1, 1));
+    for idx in 0..2 {
+        let agreement = &p["stages"][idx]["model_agreement"];
+        assert_eq!(agreement["reviewer"], json!({"status":"deferred"}));
+        assert_eq!(cp["agreements"][(idx + 1).to_string()], *agreement);
+    }
+
+    f.set("reviewer", json!("codex"));
+    for (reviewer_model, automatic_routing) in [("", true), ("other-test", true), ("", false)] {
+        f.set("reviewer_model", json!(reviewer_model));
+        f.set("automatic_routing", json!(automatic_routing));
+        assert_eq!(f.ctx.routing_required(&p, &cp).unwrap(), Vec::<i64>::new(),
+            "reviewer_model={reviewer_model:?}, automatic_routing={automatic_routing}");
+        for idx in 0..2 {
+            assert_eq!(f.ctx.validated_assignment(&p, idx).unwrap(), p["stages"][idx]["model_agreement"]);
+        }
+        assert_eq!(f.counts(), counts);
+    }
+}
+
 #[test]
 fn critical_work_never_uses_cheapest_unclassified_or_inadequate_tier() {
     for model in ["budget-test", "hallucinated"] {
