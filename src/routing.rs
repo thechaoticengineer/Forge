@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const POLICY: &str = "stage-routing-1";
+const PROPOSAL_REPAIR_ATTEMPTS: u32 = 2;
 pub(crate) const CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","provider":"exact provider","model":"exact registry ID","native_effort":"provider_default or supported native effort","rationale":"stage-specific adequacy, failure impact and cost reasoning"}.
+Use exactly those seven proposal fields; put all explanation, including effort changes, in rationale. Do not add fields.
 Use only eligible catalogue/registry options. Configured tiers are explicit adequacy policy, not official evidence. Critical or complex work requires strong; never infer quality from price or model name. Simple work prefers a cheaper adequate option only with comparable published billing data or configured relative preferences. Unknown price remains unknown. Constraints narrow choices first, but never waive capability or independent-review requirements. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +36,22 @@ struct Evaluation {
     risk: String,
     complexity: String,
     task: String,
+}
+
+fn parse_proposals(output: &Value, ids: &[i64]) -> Result<Vec<(i64, Proposal)>, String> {
+    let rows = output["proposals"].as_array().ok_or("planner omitted routing proposals")?;
+    if rows.len() != ids.len() {
+        return Err("planner proposal count mismatch".into());
+    }
+    ids.iter().map(|id| {
+        let matches: Vec<_> = rows.iter().filter(|r| r["stage_id"] == *id).collect();
+        if matches.len() != 1 {
+            return Err("duplicate or missing planner proposal".into());
+        }
+        let proposal = serde_json::from_value(matches[0]["proposal"].clone())
+            .map_err(|e| format!("stage {id}: {e}"))?;
+        Ok((*id, proposal))
+    }).collect()
 }
 
 pub(crate) fn validate_constraint(value: &Value) -> Result<(), String> {
@@ -434,40 +452,43 @@ impl Ctx {
             self.routing_prompt()?
         );
         let prompt = prompt + &self.routing_handoff(plan)?;
+        let mut turn_prompt = prompt.clone();
         let requirements = self.model_requirements("planner",None)?;
-        let (output,(provider,model,effort)) = self.with_selected_model(&requirements,None,
-            |(provider,model,effort)| self.routing_dialogue("planner",provider,model,effort,&prompt,plan,ids))?;
-        if let Some(u) = output.get("_engine_usage") {
-            let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
-            accumulate_invocation_usage(plan,"usage",&provider,&usage);
-            accumulate_invocation_usage(&mut plan["role_usage"],"planner",&provider,&usage);
-        }
-        let rows = output["proposals"]
-            .as_array()
-            .ok_or("planner omitted routing proposals")?;
-        if rows.len() != ids.len() {
-            return Err("planner proposal count mismatch".into());
-        }
-        for id in ids {
-            let matches: Vec<_> = rows.iter().filter(|r| r["stage_id"] == *id).collect();
-            if matches.len() != 1 {
-                return Err("duplicate or missing planner proposal".into());
+        for attempt in 0..=PROPOSAL_REPAIR_ATTEMPTS {
+            let (output,(provider,model,effort)) = self.with_selected_model(&requirements,None,
+                |(provider,model,effort)| self.routing_dialogue("planner",provider,model,effort,&turn_prompt,plan,ids))?;
+            if let Some(u) = output.get("_engine_usage") {
+                let usage = crate::agent::AgentUsage { input_tokens:u["input_tokens"].as_i64().unwrap_or(0), output_tokens:u["output_tokens"].as_i64().unwrap_or(0), total_tokens:u["total_tokens"].as_i64().unwrap_or(0), model:u["model"].as_str().unwrap_or("").into() };
+                accumulate_invocation_usage(plan,"usage",&provider,&usage);
+                accumulate_invocation_usage(&mut plan["role_usage"],"planner",&provider,&usage);
             }
-            let p: Proposal = serde_json::from_value(matches[0]["proposal"].clone())
-                .map_err(|e| e.to_string())?;
-            let idx = plan["stages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .position(|s| s["id"] == *id)
-                .unwrap();
-            let inputs = self.proposal_inputs(plan, idx);
-            plan["stages"][idx]["model_proposal"] = json!(p);
-            plan["stages"][idx]["model_proposal_inputs"] = inputs;
-            plan["stages"][idx]["model_proposer"] =
-                json!({"provider":provider,"model":model,"native_effort":effort});
+            // Validate the entire batch before replacing any stage's proposal.
+            let proposals = match parse_proposals(&output, ids) {
+                Ok(proposals) => proposals,
+                Err(error) if attempt < PROPOSAL_REPAIR_ATTEMPTS => {
+                    self.log_event("model", &format!(
+                        "routing proposals rejected: {error}; asking the planner to correct the response ({}/{PROPOSAL_REPAIR_ATTEMPTS})", attempt + 1));
+                    turn_prompt = format!("{prompt}\nRESPONSE CORRECTION: {error}\nRejected response: {output}\nCorrect the response schema for the same stage IDs. Preserve the task and model-selection constraints. Put explanatory notes in rationale. Return only the complete proposals JSON.");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for (id, p) in proposals {
+                let idx = plan["stages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|s| s["id"] == id)
+                    .unwrap();
+                let inputs = self.proposal_inputs(plan, idx);
+                plan["stages"][idx]["model_proposal"] = json!(p);
+                plan["stages"][idx]["model_proposal_inputs"] = inputs;
+                plan["stages"][idx]["model_proposer"] =
+                    json!({"provider":provider,"model":model,"native_effort":effort});
+            }
+            return Ok(());
         }
-        Ok(())
+        unreachable!("proposal correction loop always returns")
     }
     pub(crate) fn routing_dialogue(
         &self,

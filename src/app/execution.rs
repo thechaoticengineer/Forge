@@ -276,7 +276,13 @@ impl Ctx {
     /// Recover committed work and reuse architectural guidance only for matching saved inputs.
     fn recover_execution_plan(&self) -> Result<Value, String> {
         self.recover_committed_stages()?;
-        let loaded = self.load_plan().ok_or("no plan")?;
+        let mut loaded = self.load_plan().ok_or("no plan")?;
+        for idx in 0..loaded["stages"].as_array().ok_or("invalid stages")?.len() {
+            if loaded["stages"][idx]["status"] != "committed"
+                && !loaded["stages"][idx]["scope_revision_pending"].is_null() {
+                self.resume_scope_revision(&mut loaded, idx)?;
+            }
+        }
         let cp = if loaded["architecture"].is_object() { self.architecture_store().checkpoint(&loaded)? } else { Value::Null };
         let pending_turn = loaded["plan_id"].as_str().and_then(|id| fs::read(self.forge_path("architecture").join(id).join("architect-pending.json")).ok())
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap_or(json!({"turn":"invalid"})));

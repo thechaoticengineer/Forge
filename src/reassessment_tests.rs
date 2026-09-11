@@ -699,3 +699,58 @@ fn a_refused_or_unchanged_scope_revision_leaves_the_stage_exactly_as_written() {
         assert!(saved["stages"][0]["scope_renegotiations"].is_null());
     }
 }
+
+#[test]
+fn pending_scope_revision_survives_routing_failure_and_restart_before_implementation() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    let outcome = json!({"status":"escalation","evidence":["The old acceptance is impossible"],
+        "request":{"kind":"scope","reason":"Contradictory acceptance","required_capability":"Revise acceptance"}});
+    f.set("mock_scope_output", json!({"revised":{
+        "instructions":"Implement greeting with normalised text","acceptance":"Greeting works on normalised text"},
+        "removed":"Dropped impossible byte equality"}));
+    f.set("mock_routing_planner_outputs", json!([{"proposals":[]},{"proposals":[]},{"proposals":[]}]));
+    let error = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap_err();
+    assert!(error.contains("proposal count mismatch"), "{error}");
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["acceptance"], "Greeting works");
+    assert_eq!(saved["stages"][0]["scope_renegotiations"], 1);
+    assert_eq!(saved["stages"][0]["scope_revision_pending"]["acceptance"], "Greeting works on normalised text");
+    assert_eq!(p, saved);
+
+    // A fresh engine resumes publication before running the implementer. No
+    // replacement scope answer is available, so another negotiation would fail.
+    let mut settings = f.ctx.app.settings.lock().unwrap().clone();
+    settings["mock_scope_output"] = Value::Null;
+    settings["mock_agent_requests"] = json!([]);
+    let app = Arc::new(App::new(f.root.to_str().unwrap(), settings));
+    let ctx = app.context(f.root.to_str().unwrap());
+    ctx.run_worker();
+    let completed = ctx.load_plan().unwrap();
+    let stage = &completed["stages"][0];
+    assert_eq!(stage["status"], "committed", "{completed}");
+    assert_eq!(stage["acceptance"], "Greeting works on normalised text");
+    assert_eq!(stage["scope_renegotiations"], 1);
+    assert_eq!(stage["scope_history"].as_array().unwrap().len(), 1);
+    assert!(stage.get("scope_revision_pending").is_none());
+    let settings = ctx.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    assert!(!requests.iter().any(|r| r["role"] == "planner"));
+    let implementer = requests.iter().find(|r| r["role"] == "implementer").unwrap();
+    assert!(implementer["prompt"].as_str().unwrap().contains("Greeting works on normalised text"));
+}
+
+#[test]
+fn pending_scope_revision_cannot_overwrite_changed_stage_inputs() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    p["stages"][0]["scope_revision_pending"] = json!({
+        "source_inputs":crate::plan::stage_inputs(&p, 0),
+        "instructions":"Old planner instructions", "acceptance":"Old planner acceptance",
+    });
+    p["stages"][0]["instructions"] = json!("New user instructions");
+    f.ctx.save_plan(&p).unwrap();
+    let error = f.ctx.resume_scope_revision(&mut p, 0).unwrap_err();
+    assert!(error.contains("no longer matches stage inputs"), "{error}");
+    assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["instructions"], "New user instructions");
+}

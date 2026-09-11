@@ -225,6 +225,9 @@ impl Ctx {
     pub(super) fn renegotiate_scope(&self, plan: &mut Value, idx: usize, outcome: &Value)
         -> Result<(bool, String), String>
     {
+        if !plan["stages"][idx]["scope_revision_pending"].is_null() {
+            return self.resume_scope_revision(plan, idx).map(|message| (true, message));
+        }
         let sid = plan["stages"][idx]["id"].clone();
         let request = &outcome["request"];
         let reason = request["reason"].as_str().unwrap_or("").to_string();
@@ -290,10 +293,32 @@ impl Ctx {
         let entry = json!({"unix": unix_timestamp(), "revision": current["revision"],
             "reason": reason, "changed": changed});
         current["stages"][target]["scope_history"].as_array_mut().unwrap().push(entry);
-        self.save_plan(&current)?;
-        plan["stages"][idx]["scope_renegotiations"] = json!(done + 1);
-        plan["stages"][idx]["scope_history"] = current["stages"][target]["scope_history"].clone();
+        current["stages"][target]["scope_revision_pending"] = json!({
+            "source_inputs": crate::plan::stage_inputs(&current, target),
+            "instructions": instructions, "acceptance": acceptance, "changed": changed,
+        });
+        *plan = self.publish_plan(&current, false)?;
+        self.resume_scope_revision(plan, target).map(|message| (true, message))
+    }
+
+    /// A failed routing/guidance publication must not discard the planner's
+    /// accepted revision or spend another scope negotiation after restart.
+    pub(super) fn resume_scope_revision(&self, plan: &mut Value, idx: usize) -> Result<String, String> {
         let current = self.load_plan().ok_or("missing plan")?;
+        if current["plan_id"] != plan["plan_id"]
+            || current["stages"][idx]["id"] != plan["stages"][idx]["id"] {
+            return Err("stale pending scope revision".into());
+        }
+        let sid = current["stages"][idx]["id"].clone();
+        let pending = &current["stages"][idx]["scope_revision_pending"];
+        if pending["source_inputs"] != crate::plan::stage_inputs(&current, idx) {
+            return Err("pending scope revision no longer matches stage inputs; reconcile the edited stage".into());
+        }
+        let (instructions, acceptance) = match (pending["instructions"].as_str(), pending["acceptance"].as_str()) {
+            (Some(i), Some(a)) if !i.trim().is_empty() => (i, a),
+            _ => return Err("invalid pending scope revision".into()),
+        };
+        let changed = pending["changed"].as_str().unwrap_or("").to_owned();
         let stages: Vec<Value> = current["stages"].as_array().unwrap().iter().map(|s| {
             let mut edited = json!({"id": s["id"], "title": s["title"],
                 "instructions": s["instructions"], "acceptance": s["acceptance"],
@@ -311,8 +336,9 @@ impl Ctx {
         // The user approved this plan. Narrowing one stage to something buildable
         // is not a new plan to approve, so the run keeps its approval.
         edited["status"] = current["status"].clone();
+        edited["stages"][idx].as_object_mut().unwrap().remove("scope_revision_pending");
         *plan = self.architect_publish(edited, Some(&current), "stage scope renegotiation")?;
         self.log_event("plan", &format!("stage {sid} revised by the planner: {changed}"));
-        Ok((true, changed))
+        Ok(changed)
     }
 }

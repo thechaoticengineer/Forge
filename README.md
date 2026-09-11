@@ -1322,6 +1322,15 @@ request (`kind`, `reason`, `required_capability`). Unknown fields and stale IDs
 are rejected. Legacy prose is accepted as ordinary completion and cannot request
 an escalation. Agents must never write routing or outcome data into `.forge`.
 
+A scope escalation returns the stage to the planner for one revision of its
+instructions and acceptance. Forge saves that revision before selecting models
+and refreshing architectural guidance; a failed publication can resume after
+restart without another scope negotiation. Implementation then repeats under the
+revised requirements, followed by review at each role's configured cadence.
+Malformed routing proposal fields are returned to the planner with the validation
+error for up to two corrections. The full proposal batch must validate before any
+stage receives a replacement proposal; unknown fields are never silently ignored.
+
 A stop preserves the worktree, unresolved requests and last committed architect
 checkpoint. Restart retains spent fix rounds, retry/evaluation counts and trigger
 signatures. An interrupted or failed selection reservation blocks automatic replay,

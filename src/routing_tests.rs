@@ -613,3 +613,41 @@ fn routing_input_is_bounded_by_the_selected_model_context_not_a_fixed_ceiling() 
     assert!(context_budget_error(512 * 1024, 100_000, 85, "codex", "small").is_some());
     assert_eq!(context_budget_error(64 * 1024 * 1024, 0, 85, "codex", "unknown"), None);
 }
+
+#[test]
+fn malformed_routing_proposal_is_returned_to_planner_for_correction() {
+    let f = Fixture::new();
+    let valid = proposal("strong-test", "standard", "functionality");
+    let mut malformed = valid.clone();
+    malformed["native_effort_note"] = json!("A note belongs in rationale");
+    f.set("mock_routing_planner_outputs", json!([
+        {"proposals":[{"stage_id":1,"proposal":malformed}]},
+        {"proposals":[{"stage_id":1,"proposal":valid}]},
+    ]));
+    let p = f.publish(plan()).unwrap();
+    assert_eq!(f.counts(), (2, 1));
+    assert_eq!(p["stages"][0]["model_agreement"]["validated_proposal"], valid);
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let correction = settings["mock_routing_planner_requests"][1]["prompt"].as_str().unwrap();
+    assert!(correction.contains("unknown field `native_effort_note`"));
+    assert!(correction.contains("Put explanatory notes in rationale"));
+}
+
+#[test]
+fn invalid_routing_batch_is_bounded_and_never_partially_applied() {
+    let f = Fixture::new();
+    let valid = proposal("strong-test", "standard", "functionality");
+    let mut malformed = valid.clone();
+    malformed["native_effort_note"] = json!("unexpected field");
+    let response = json!({"proposals":[
+        {"stage_id":1,"proposal":valid}, {"stage_id":2,"proposal":malformed},
+    ]});
+    f.set("mock_routing_planner_outputs", json!(vec![response; 3]));
+    let mut p = plan();
+    p["stages"].as_array_mut().unwrap().push(stage(2));
+    let before = p.clone();
+    let error = f.ctx.propose_routing(&mut p, &[1, 2], &Value::Null).unwrap_err();
+    assert!(error.contains("unknown field `native_effort_note`"), "{error}");
+    assert_eq!(f.counts(), (3, 0));
+    assert_eq!(p, before);
+}
