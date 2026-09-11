@@ -37,22 +37,24 @@ records the committed outcome in the architectural checkpoint so subsequent
 stages retain context without an architect approval or summary turn.
 
 `review_cadence` sets when each required role reviews:
-`{"architect":"per_stage","reviewer":"per_stage"}` is the default and preserves
-per-stage behavior. Either role can independently use `per_plan` instead. The
-engine's scope policy still decides which roles are required at all; cadence
-only schedules those required reviews. Each fresh stage attempt durably captures
-both normalized cadence values alongside its review budget. Changing settings
-mid-run does not alter an in-flight attempt's gate, including on resume. Missing
-legacy or unknown cadence values behave as `per_stage`.
+`{"architect":"per_plan","reviewer":"per_plan"}` is the default. Either role
+can independently be set back to `per_stage`. The engine's scope policy still
+decides which roles are required at all; cadence only schedules those required
+reviews. Each fresh stage attempt durably captures both normalized cadence
+values alongside its review budget. Changing settings
+mid-run does not alter an in-flight attempt's gate, including on resume. Captured
+attempts retain their recorded values, including `per_plan`. Missing, legacy or
+unknown cadence values behave as `per_stage`.
 
 The recorded policy keeps `required_roles` and partitions it into
 `stage_required_roles` and `deferred_roles`. A required role with `per_plan`
 cadence receives no stage review invocation; its stage gate outcome is `deferred`,
-never an approval or `not_required`. If every required role is deferred, the
-stage commits locally after implementation with a `deferred` gate and no stage
-review or fix call. With mixed cadence, the stage-required roles must approve
-before that local commit; the other roles remain deferred. These recorded
-obligations survive settings changes and must be discharged by plan review.
+never an approval or `not_required`. Under the default, every required role is
+deferred, so the stage commits locally after implementation with a `deferred`
+gate and no stage review or fix call. With mixed cadence, the stage-required
+roles must approve before that local commit; the other roles remain deferred.
+These recorded obligations survive settings changes and must be discharged by
+plan review.
 Deferring architect review does not disable architectural guidance or routing.
 
 The documentation exception requires both prose-oriented stage intent and the
@@ -118,11 +120,12 @@ uses its persistent session. The independent plan reviewer must use a provider
 no stage implementer used, including recorded implementation/fixer invocation
 provenance and plan fixes; retries and fallback cannot waive this exclusion.
 Unknown or unverified implementation provenance blocks independent plan review.
-If no eligible independent provider remains, the run blocks and commits stay local, with guidance
-to use reviewer cadence per stage for a revised plan or pin the implementer
-provider. These choices can prevent conflicts in future work; changing current
-settings or approving a revision cannot erase committed stages' existing
-deferrals or provider history.
+This independence requirement applies under the default per-plan cadence. If no
+eligible independent provider remains, the run blocks and commits stay local,
+with guidance to use reviewer cadence per stage for a revised plan or pin the
+implementer provider. These choices can prevent conflicts in future work;
+changing current settings or approving a revision cannot erase committed stages'
+existing deferrals or provider history.
 
 ### Verdict protocol and verification
 
@@ -609,8 +612,9 @@ project path, type the goal, create the plan, approve, start.
 
 The settings row has **architect review: per stage | per plan** and
 **reviewer review: per stage | per plan** controls. Each reflects the current
-setting, shows an unavailable placeholder before settings arrive, and toggles
-only its role while posting both cadence keys. They are disabled offline;
+setting, initially **per plan** for both roles on engine startup, and shows an
+unavailable placeholder before settings arrive. Each toggles only its role while
+posting both cadence keys. They are disabled offline;
 Tab, Space and Enter operate them, and Escape returns to panel shortcuts.
 The new value applies to fresh attempts, not an already captured stage gate.
 
@@ -1391,7 +1395,7 @@ not one nested key. Missing or extra keys, non-objects and invalid values return
 HTTP 400 with an `invalid review_cadence` error, leaving all settings unchanged
 even if the same request included other updates. Omitting `review_cadence`
 retains its current value. Accepted values are process settings returned as
-`settings.review_cadence` by `GET /api/state`; both default to `per_stage` on
+`settings.review_cadence` by `GET /api/state`; both default to `per_plan` on
 engine startup.
 Saved attempt cadence and deferred obligations survive independently of those
 current settings.
