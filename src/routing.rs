@@ -292,6 +292,7 @@ fn policy_inputs(
     let pending = &stage["reassessment"]["pending"];
     let old = &pending["old_agreement"];
     let min = minimum(stage, p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)).max(if pending.is_object() { old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) } else { 0 });
+    let cost_sensitive = min == 1 || p.task == "documentation";
     let adequate = |o: &&Value| {
         o["eligible"] == true
             && rank(&o["tier"]) >= min
@@ -301,12 +302,9 @@ fn policy_inputs(
     };
     if !adequate(&selected) {
         return Err(format!(
-            "no adequate selection: stage requires {} configured capability tier and task suitability; correct registry or constraint",
-            if min == 3 {
-                "strong (strongest suitable)"
-            } else {
-                "standard/basic"
-            }
+            "no adequate selection: stage requires at least the configured {} capability tier and task suitability; {}/{} is configured {}; correct the registry, the constraint or the proposal",
+            match min { 1 => "basic", 2 => "standard", _ => "strong" },
+            p.provider, p.model, selected["tier"].as_str().unwrap_or("unclassified")
         ));
     }
     let reviewer_deferred = crate::plan::review_cadence(settings, "reviewer") == "per_plan";
@@ -340,7 +338,7 @@ fn policy_inputs(
             return Err("context pressure requires a measured larger context window".into());
         }
     }
-    if min == 1
+    if cost_sensitive
         && !pending.is_object() && stage["routing_validity_only"] != true
         && options.iter().filter(adequate).any(|o| {
             matches_constraint(o, &c)
@@ -354,7 +352,7 @@ fn policy_inputs(
                 && cheaper(o, selected, &settings["routing_billing_basis"])
         })
     {
-        return Err("simple stage must prefer a cheaper adequate eligible option under comparable billing or configured preferences".into());
+        return Err("simple or documentation stage must prefer a cheaper adequate eligible option under comparable billing or configured preferences".into());
     }
     // Record only facts used about the chosen option. Re-running the policy above
     // detects new cheaper alternatives without invalidating on unrelated catalogue updates.
@@ -362,8 +360,8 @@ fn policy_inputs(
         json!({"policy":POLICY,"constraint":c,"reviewer":settings["reviewer"],"minimum_tier":min,
         "provider":selected["provider"],"model":selected["model"],"resolved_id":selected["resolved_id"].as_str().unwrap_or(&p.model),
         "effort":selected["effort"],"tier":selected["tier"],"suitability":selected["suitability"],"limits":selected["limits"],
-        "tier_provenance":selected["provenance"],"relative_cost_preference":if min == 1 {selected["relative_cost_preference"].clone()} else {Value::Null},
-        "pricing":if min == 1 && settings["routing_billing_basis"].is_string() {billing_facts(&selected["pricing"])} else {Value::Null},"billing_basis":if min == 1 {settings["routing_billing_basis"].clone()} else {Value::Null}}),
+        "tier_provenance":selected["provenance"],"relative_cost_preference":if cost_sensitive {selected["relative_cost_preference"].clone()} else {Value::Null},
+        "pricing":if cost_sensitive && settings["routing_billing_basis"].is_string() {billing_facts(&selected["pricing"])} else {Value::Null},"billing_basis":if cost_sensitive {settings["routing_billing_basis"].clone()} else {Value::Null}}),
     )
 }
 

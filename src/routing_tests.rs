@@ -42,6 +42,15 @@ impl Fixture {
     fn set(&self, key: &str, v: Value) {
         self.ctx.app.settings.lock().unwrap()[key] = v;
     }
+    fn with_standard_model() -> Self {
+        let f = Self::new();
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"]
+            .as_array_mut().unwrap().push(json!({
+                "provider":"codex","model":"standard-test","tier":"standard",
+                "relative_cost_preference":2
+            }));
+        f
+    }
     fn counts(&self) -> (usize, usize) {
         let s = self.ctx.app.settings.lock().unwrap();
         (
@@ -199,33 +208,125 @@ fn simple_documentation_and_functionality_prefer_configured_cheaper_adequate() {
     }
 }
 #[test]
-fn unknown_and_incomparable_prices_do_not_create_an_order() {
-    let f = Fixture::new();
-    let mut settings = f.ctx.app.settings.lock().unwrap().clone();
-    let p: Proposal =
-        serde_json::from_value(proposal("strong-test", "simple", "documentation")).unwrap();
-    let mut options = f.ctx.routing_options().unwrap();
-    for o in &mut options {
-        o["relative_cost_preference"] = Value::Null;
+fn standard_documentation_prefers_cheaper_adequate_and_reuses_agreement() {
+    let f = Fixture::with_standard_model();
+    let mut candidate = plan();
+    candidate["stages"][0]["instructions"] = json!("Document greeting usage in README");
+    f.select(proposal("strong-test", "standard", "documentation"));
+    assert!(f.publish(candidate.clone()).unwrap_err().contains("cheaper"));
+    assert!(f.ctx.load_plan().is_none());
+
+    f.select(proposal("standard-test", "standard", "documentation"));
+    let published = f.publish(candidate).unwrap();
+    let agreement = &published["stages"][0]["model_agreement"];
+    assert_eq!(agreement["effective"]["model"], "standard-test");
+    assert_eq!(agreement["policy_inputs"]["minimum_tier"], 2);
+    assert_eq!(agreement["policy_inputs"]["relative_cost_preference"], 2);
+    let checkpoint = f.ctx.architecture_store().checkpoint(&published).unwrap();
+    let counts = f.counts();
+    assert!(f.ctx.routing_required(&published, &checkpoint).unwrap().is_empty());
+    assert_eq!(f.ctx.validated_assignment(&published, 0).unwrap(), *agreement);
+    assert_eq!(f.counts(), counts);
+}
+
+#[test]
+fn standard_functionality_still_accepts_strong() {
+    let f = Fixture::with_standard_model();
+    f.select(proposal("strong-test", "standard", "functionality"));
+    let published = f.publish(plan()).unwrap();
+    let inputs = &published["stages"][0]["model_agreement"]["policy_inputs"];
+    assert_eq!(inputs["minimum_tier"], 2);
+    assert_eq!(inputs["model"], "strong-test");
+    for key in ["relative_cost_preference", "pricing", "billing_basis"] {
+        assert!(inputs[key].is_null(), "{key}");
     }
-    assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
-    options[0]["pricing"] =
-        json!({"currency":"USD","unit":"million tokens","basis":"API","input":10,"output":20});
-    options[1]["pricing"] =
-        json!({"currency":"EUR","unit":"million tokens","basis":"API","input":1,"output":2});
-    settings["routing_billing_basis"] = json!("API");
-    assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
-    options[1]["pricing"]["currency"] = json!("USD");
-    assert!(
-        policy_inputs(&settings, &stage(1), &p, &options)
-            .unwrap_err()
-            .contains("cheaper")
-    );
-    options[1]["pricing"]["output"] = json!(30); // Different input/output tradeoff is incomparable.
-    assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
-    options[1]["pricing"]["output"] = json!(2);
-    settings["routing_billing_basis"] = Value::Null;
-    assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok()); // API price is not subscription billing.
+}
+
+#[test]
+fn sensitive_or_critical_documentation_keeps_strong_floor() {
+    for (risk, complexity, instructions) in [
+        ("standard", "standard", "Document normative security policy requirements"),
+        ("critical", "standard", "Document greeting usage in README"),
+        ("standard", "complex", "Document greeting usage in README"),
+    ] {
+        let f = Fixture::with_standard_model();
+        let mut candidate = plan();
+        candidate["stages"][0]["instructions"] = json!(instructions);
+        let mut choice = proposal("standard-test", risk, "documentation");
+        choice["complexity"] = json!(complexity);
+        f.select(choice.clone());
+        let error = f.publish(candidate.clone()).unwrap_err();
+        assert!(error.contains("at least the configured strong capability tier"), "{error}");
+        assert!(error.contains("codex/standard-test is configured standard"), "{error}");
+        choice["model"] = json!("strong-test");
+        f.select(choice);
+        let published = f.publish(candidate).unwrap();
+        let inputs = &published["stages"][0]["model_agreement"]["policy_inputs"];
+        assert_eq!(inputs["minimum_tier"], 3);
+        assert_eq!(inputs["relative_cost_preference"], 5);
+    }
+}
+
+#[test]
+fn inadequacy_names_required_floor_and_configured_tier() {
+    let f = Fixture::new();
+    let settings = f.ctx.app.settings.lock().unwrap().clone();
+    for (risk, floor) in [("simple", "basic"), ("standard", "standard"), ("critical", "strong")] {
+        let p: Proposal = serde_json::from_value(proposal("budget-test", risk, "documentation")).unwrap();
+        for tier in [Value::Null, json!("basic")] {
+            if risk == "simple" && tier == "basic" { continue; }
+            let option = json!({"provider":"codex","model":"budget-test","effort":"provider_default","eligible":true,"tier":tier});
+            let error = policy_inputs(&settings, &stage(1), &p, &[option]).unwrap_err();
+            assert!(error.contains(&format!("at least the configured {floor} capability tier")), "{error}");
+            let configured = tier.as_str().unwrap_or("unclassified");
+            assert!(error.contains(&format!("codex/budget-test is configured {configured}")), "{error}");
+        }
+    }
+}
+
+#[test]
+fn unknown_and_incomparable_prices_do_not_create_an_order() {
+    for risk in ["simple", "standard"] {
+        let f = Fixture::with_standard_model();
+        let mut settings = f.ctx.app.settings.lock().unwrap().clone();
+        let p: Proposal =
+            serde_json::from_value(proposal("strong-test", risk, "documentation")).unwrap();
+        let mut options = f.ctx.routing_options().unwrap();
+        // Keep both priced options adequate even for standard documentation.
+        options.retain(|o| o["model"] == "strong-test" || o["model"] == "standard-test");
+        for o in &mut options {
+            o["relative_cost_preference"] = Value::Null;
+        }
+        assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
+        options[0]["pricing"] =
+            json!({"currency":"USD","unit":"million tokens","basis":"API","input":10,"output":20});
+        options[1]["pricing"] =
+            json!({"currency":"EUR","unit":"million tokens","basis":"API","input":1,"output":2});
+        settings["routing_billing_basis"] = json!("API");
+        assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
+        options[1]["pricing"]["currency"] = json!("USD");
+        assert!(
+            policy_inputs(&settings, &stage(1), &p, &options)
+                .unwrap_err()
+                .contains("cheaper")
+        );
+        let cheaper_proposal: Proposal =
+            serde_json::from_value(proposal("standard-test", risk, "documentation")).unwrap();
+        let inputs = policy_inputs(&settings, &stage(1), &cheaper_proposal, &options).unwrap();
+        assert_eq!(inputs["pricing"], billing_facts(&options[1]["pricing"]));
+        assert_eq!(inputs["billing_basis"], "API");
+        assert!(inputs["relative_cost_preference"].is_null());
+        for (key, value) in [("unit", "thousand tokens"), ("basis", "subscription")] {
+            let mut incomparable = options.clone();
+            incomparable[1]["pricing"][key] = json!(value);
+            assert!(policy_inputs(&settings, &stage(1), &p, &incomparable).is_ok());
+        }
+        options[1]["pricing"]["output"] = json!(30); // Different input/output tradeoff is incomparable.
+        assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok());
+        options[1]["pricing"]["output"] = json!(2);
+        settings["routing_billing_basis"] = Value::Null;
+        assert!(policy_inputs(&settings, &stage(1), &p, &options).is_ok()); // API price is not subscription billing.
+    }
 }
 #[test]
 fn exact_ids_native_efforts_constraints_and_review_conflicts_are_validated() {
