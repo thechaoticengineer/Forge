@@ -968,6 +968,13 @@ impl Ctx {
     ) -> Result<&'static str, String> {
         let budget = plan["stages"][idx]["review_budget"].as_u64().unwrap_or(0);
         let sid = plan["stages"][idx]["id"].as_i64().unwrap();
+        if plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx)
+            && let Some(reason) = plan["stages"][idx]["scope_clarification"]["blocked_reason"].as_str() {
+            plan["stages"][idx]["review_gate"] = json!({"status":"scope_blocked","reason":reason,
+                "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
+            self.save_plan(plan)?;
+            return Ok("scope_blocked");
+        }
         // The anchor exists so a review judges the diff against the base the
         // attempt started from. A HEAD that moved while nothing is in flight —
         // clean worktree, nothing committed by this attempt — carries no such
@@ -1013,6 +1020,14 @@ impl Ctx {
                 Some(self.reviewer_config(assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?)
                     .map_err(|e| format!("model routing blocked: {e}"))?)
             } else { None };
+            let clarifying = plan["stages"][idx]["scope_clarification"]["pending"] == true
+                && plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx);
+            // Reserve clarification delivery with the round, before invocation.
+            // Neither a restart nor repeated escalation refunds this follow-up.
+            if clarifying {
+                plan["stages"][idx]["scope_clarification"]["pending"] = json!(false);
+                plan["stages"][idx]["scope_clarification"]["delivered_round"] = json!(round + 1);
+            }
             // Reserve the round before any invocation; errors/restarts cannot replenish it.
             plan["stages"][idx]["rounds"] = json!(round + 1);
             plan["stages"][idx]["review_gate"] =
@@ -1024,21 +1039,21 @@ impl Ctx {
             }
             plan["stages"][idx]["last_verdict_valid"] = json!(false);
             self.save_plan(plan)?;
-            let template = if round == 0 {
+            let template = if round == 0 || clarifying {
                 IMPLEMENT_PROMPT
             } else {
                 FIX_PROMPT
             };
             self.set_step(
                 Some(sid),
-                if round == 0 { "implementing" } else { "fixing" },
+                if round == 0 || clarifying { "implementing" } else { "fixing" },
             );
             let mut stage = plan["stages"][idx].clone();
             if round > 0 {
                 stage["last_verdict"] = stage["previous_requests"].clone();
                 stage["last_verdict_valid"] = json!(true);
             }
-            let role = if round == 0 { "implementer" } else { "fixer" };
+            let role = if round == 0 || clarifying { "implementer" } else { "fixer" };
             let (output, turn) = loop {
                 if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
                 let turn = crate::architecture::identity();
@@ -1098,8 +1113,14 @@ impl Ctx {
                 // Re-running it against the same words only spends the remaining
                 // fix rounds, so the planner that owns the text decides instead.
                 if kind == "material_scope_change" {
-                    let (revised, message) = self.renegotiate_scope(plan, idx, &evidence)?;
-                    if revised { return Ok("renegotiated"); }
+                    let message = match self.renegotiate_scope(plan, idx, &evidence)? {
+                        super::planning::ScopeResolution::Revised(_) => return Ok("renegotiated"),
+                        super::planning::ScopeResolution::Clarified(_) => {
+                            if round < budget { continue; }
+                            return Ok("exhausted");
+                        }
+                        super::planning::ScopeResolution::Blocked(message) => message,
+                    };
                     plan["stages"][idx]["review_gate"] = json!({"status":"scope_blocked","reason":message,
                         "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
                     self.save_plan(plan)?;

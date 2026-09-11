@@ -1331,6 +1331,11 @@ instructions and acceptance. Forge saves that revision before selecting models
 and refreshing architectural guidance; a failed publication can resume after
 restart without another scope negotiation. Implementation then repeats under the
 revised requirements, followed by review at each role's configured cadence.
+If the planner instead explains why the existing requirements are buildable,
+Forge saves that explanation and returns it to the implementer for one follow-up
+within the current attempt's remaining budget. This does not change acceptance or
+approve the implementation. The handoff survives restart; another scope escalation
+under the same requirements blocks without repeating the planner dialogue.
 Malformed routing proposal fields are returned to the planner with the validation
 error for up to two corrections. The full proposal batch must validate before any
 stage receives a replacement proposal; unknown fields are never silently ignored.

@@ -126,6 +126,10 @@ impl Ctx {
                 .map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"sha":s["sha"]})).collect();
             prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes: {}\nRecent execution outcomes: {}\nRead the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), cp["execution_outcomes"]));
             prompt.push_str(&format!("\n[implementer] Last validated outcome/escalation request: {}\n[engine] Latest routing handoff: {}\n", stage["implementer_outcome"], stage["reassessment"]["history"].as_array().and_then(|h| h.last()).map(|h| json!({"kind":h["kind"],"evidence":h["evidence"]})).unwrap_or(Value::Null)));
+            let clarification = &stage["scope_clarification"];
+            if clarification["source_inputs"] == crate::plan::stage_inputs(&current, idx) {
+                prompt.push_str(&format!("\nPLANNER CLARIFICATION OF YOUR SCOPE ESCALATION:\n{}\nComplete this stage under its unchanged instructions and acceptance, using this explanation. Preserve inherited work and unresolved review findings. This clarification is not a review approval: verify the implementation and required checks before reporting completion.\n", clarification["message"].as_str().unwrap_or("")));
+            }
             let worktree = self.git(&["status", "--short"])?;
             let diff = self.git(&["diff", "HEAD", "--", ".", ":(exclude).forge"])?;
             prompt.push_str(&format!("\nSAVED ARCHITECTURAL SUMMARY: {}\nRelevant decisions: {}\nWORKTREE: {}\nDIFF (bounded preview; inspect full staged/unstaged diff and all untracked contents yourself):\n{}\nOUTSTANDING FINDINGS:\n{}\nYou may be inheriting partial work from another agent. Inspect and preserve all existing changes, completed interfaces and accepted decisions before editing. Saved findings remain authoritative until resolved with evidence.\n", cp["summary"], cp["recent_decisions"], worktree, diff.chars().take(16000).collect::<String>(), Self::stage_review_context(stage)));

@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::App;
+use crate::app::{App, planning::ScopeResolution};
 use std::sync::Arc;
 use std::fs;
 use std::path::PathBuf;
@@ -660,9 +660,8 @@ fn a_scope_escalation_revises_the_stage_once_and_then_belongs_to_a_human() {
     f.set("mock_scope_output", json!(format!(
         "I inspected settings[\"reviewer\"]. The escalation is correct.\n\n{revision}"
     )));
-    let (revised, message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
-    assert!(revised);
-    assert_eq!(message, "Dropped byte equality; Qt normalises newlines");
+    let resolution = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
+    assert_eq!(resolution, ScopeResolution::Revised("Dropped byte equality; Qt normalises newlines".into()));
     let saved = f.ctx.load_plan().unwrap();
     assert_eq!(saved["stages"][0]["acceptance"], "Greeting works on normalised text");
     // Reconciliation replenishes the rounds the unbuildable text consumed, and
@@ -674,30 +673,136 @@ fn a_scope_escalation_revises_the_stage_once_and_then_belongs_to_a_human() {
         "Acceptance demands byte equality Qt cannot provide");
     // A second escalation on the same stage stops instead of looping.
     let mut again = saved;
-    let (revised, message) = f.ctx.renegotiate_scope(&mut again, 0, &outcome).unwrap();
-    assert!(!revised);
+    let ScopeResolution::Blocked(message) = f.ctx.renegotiate_scope(&mut again, 0, &outcome).unwrap() else { panic!("expected bounded negotiation") };
     assert!(message.contains("already revised once"), "{message}");
     assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["scope_renegotiations"], 1);
 }
 
 #[test]
-fn a_refused_or_unchanged_scope_revision_leaves_the_stage_exactly_as_written() {
+fn an_unchanged_scope_response_without_explanation_does_not_authorize_continuation() {
     let f = Fixture::new();
-    let outcome = json!({"status":"escalation","evidence":["cannot be done"],
-        "request":{"kind":"scope","reason":"too hard","required_capability":"more"}});
-    for (answer, expected) in [
-        (json!({"refused":"The acceptance is met by trimming the input first"}), "holds the stage buildable"),
-        (json!({"revised":{"instructions":"Implement greeting","acceptance":"Greeting works"}}), "unchanged"),
-    ] {
-        let mut p = f.attempt();
-        f.set("mock_scope_output", answer);
-        let (revised, message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap();
-        assert!(!revised);
-        assert!(message.contains(expected), "{message}");
-        let saved = f.ctx.load_plan().unwrap();
-        assert_eq!(saved["stages"][0]["acceptance"], "Greeting works");
-        assert!(saved["stages"][0]["scope_renegotiations"].is_null());
+    let mut p = f.attempt();
+    let outcome = scope_escalation();
+    f.set("mock_scope_output", json!({"revised":{"instructions":"Implement greeting","acceptance":"Greeting works"}}));
+    let ScopeResolution::Blocked(message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap() else { panic!("expected unchanged response to block") };
+    assert!(message.contains("unchanged without clarification"));
+    assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["acceptance"], "Greeting works");
+}
+
+fn scope_escalation() -> Value {
+    json!({"status":"escalation","evidence":["The worker has no production caller until the next stage"],
+        "request":{"kind":"scope","reason":"Interim dead-code warnings","required_capability":"Clarify stage boundaries"}})
+}
+
+#[test]
+fn planner_clarification_survives_restart_without_changing_scope_or_resetting_budget() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    p["stages"][0]["rounds"] = json!(1);
+    p["stages"][0]["review_budget"] = json!(3);
+    p["stages"][0]["previous_requests"] = json!({"approved":false,"issues":["Preserve the existing empty-input check"]});
+    f.ctx.save_plan(&p).unwrap();
+    let explanation = "Interim warnings are expected; wire the caller in the next stage.";
+    f.set("mock_scope_output", json!({"refused":explanation}));
+    let before = p.clone();
+    let resolution = f.ctx.renegotiate_scope(&mut p, 0, &scope_escalation()).unwrap();
+    assert_eq!(resolution, ScopeResolution::Clarified(explanation.into()));
+    let saved = f.ctx.load_plan().unwrap();
+    for key in ["instructions", "acceptance", "rounds", "review_budget", "attempt_id", "previous_requests"] {
+        assert_eq!(saved["stages"][0][key], before["stages"][0][key], "{key}");
     }
+    assert_eq!(saved["revision"], p["revision"]);
+    assert!(saved["stages"][0]["scope_renegotiations"].is_null());
+    let mut settings = f.ctx.app.settings.lock().unwrap().clone();
+    settings["mock_scope_output"] = Value::Null;
+    settings["mock_agent_requests"] = json!([]);
+    let app = Arc::new(App::new(f.root.to_str().unwrap(), settings));
+    let ctx = app.context(f.root.to_str().unwrap());
+    ctx.run_worker();
+    let completed = ctx.load_plan().unwrap();
+    assert_eq!(completed["stages"][0]["status"], "committed");
+    assert_eq!(completed["stages"][0]["rounds"], 2);
+    assert_eq!(completed["stages"][0]["review_budget"], 3);
+    assert_eq!(completed["stages"][0]["attempt_id"], p["stages"][0]["attempt_id"]);
+    let settings = ctx.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    assert!(!requests.iter().any(|r| r["role"] == "planner"));
+    let implementer = requests.iter().find(|r| r["role"] == "implementer").unwrap();
+    let prompt = implementer["prompt"].as_str().unwrap();
+    assert!(prompt.contains(explanation));
+    assert!(prompt.contains("Preserve the existing empty-input check"));
+}
+
+fn install_scope_cli(f: &Fixture, repeat: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = f.root.join("fake-scope-codex");
+    fs::write(&cli, format!(r#"#!/usr/bin/env python3
+import sys,json,pathlib
+model=sys.argv[sys.argv.index('-m')+1]
+prompt=sys.argv[-1]
+outcome,_=json.JSONDecoder().raw_decode(prompt.split('Finish with ONLY JSON: ',1)[1])
+with pathlib.Path('unfinished.txt').open('a') as output: output.write('preserved work\n')
+clarified='Interim warnings are expected; wire the caller in the next stage.' in prompt
+if not clarified or {repeat}:
+    outcome.update(status='escalation',evidence=['Caller is introduced in the next stage'],request={{'kind':'scope','reason':'Interim warnings','required_capability':'Clarify stage boundaries'}})
+print(json.dumps({{'type':'thread.started','thread_id':'11111111-2222-4333-8444-555555555555','model':model}}))
+print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':json.dumps(outcome)}}}}))
+print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':10,'output_tokens':5}}}}))
+"#, repeat=if repeat {"True"} else {"False"})).unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+    f.set("test_cli_codex", json!(cli));
+    f.set("test_real_implementation_cli", json!(true));
+    f.set("mock_scope_output", json!({"refused":"Interim warnings are expected; wire the caller in the next stage."}));
+}
+
+#[test]
+fn refused_scope_returns_to_implementation_then_obeys_each_review_cadence() {
+    for cadence in ["per_stage", "per_plan"] {
+        let f = Fixture::new();
+        f.set("review_cadence", json!({"architect":cadence,"reviewer":cadence}));
+        install_scope_cli(&f, false);
+        let p = f.run();
+        let s = &p["stages"][0];
+        assert_eq!(s["status"], "committed", "{p}");
+        assert_eq!(s["rounds"], 2);
+        assert_eq!(s["instructions"], "Implement greeting");
+        assert_eq!(s["acceptance"], "Greeting works");
+        assert_eq!(s["scope_clarification"]["delivered_round"], 2);
+        assert_eq!(fs::read_to_string(f.root.join("unfinished.txt")).unwrap(), "preserved work\npreserved work\n");
+        let roles: Vec<_> = s["model_invocations"].as_array().unwrap().iter()
+            .filter(|r| matches!(r["role"].as_str(), Some("implementer" | "fixer")))
+            .map(|r| r["role"].clone()).collect();
+        assert_eq!(roles, vec![json!("implementer"), json!("implementer")]);
+        if cadence == "per_plan" {
+            assert_eq!(s["review_gate"]["status"], "deferred");
+            assert!(s["reviews"].as_array().unwrap().is_empty());
+            assert_eq!(p["plan_review"]["gate"]["status"], "approved");
+        } else {
+            assert_eq!(s["review_gate"]["status"], "approved");
+            assert!(!s["reviews"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn repeated_scope_escalation_after_clarification_blocks_without_replaying_after_restart() {
+    let f = Fixture::new();
+    install_scope_cli(&f, true);
+    let p = f.run();
+    assert_eq!(p["stages"][0]["status"], "blocked");
+    assert_eq!(p["stages"][0]["review_gate"]["status"], "scope_blocked");
+    assert_eq!(p["stages"][0]["rounds"], 2);
+    let settings = f.ctx.app.settings.lock().unwrap().clone();
+    let scope_calls = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").count();
+    assert_eq!(scope_calls, 1);
+    let work = fs::read_to_string(f.root.join("unfinished.txt")).unwrap();
+    let app = Arc::new(App::new(f.root.to_str().unwrap(), settings));
+    let ctx = app.context(f.root.to_str().unwrap());
+    ctx.run_worker();
+    let resumed = ctx.load_plan().unwrap();
+    assert_eq!(resumed["stages"][0]["status"], "blocked");
+    assert_eq!(resumed["stages"][0]["rounds"], 2);
+    assert_eq!(fs::read_to_string(f.root.join("unfinished.txt")).unwrap(), work);
 }
 
 #[test]

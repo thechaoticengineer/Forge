@@ -4,6 +4,13 @@
 const REPAIR_ATTEMPTS: u32 = 2;
 /// Scope renegotiations allowed per stage before the block belongs to a human.
 const SCOPE_RENEGOTIATIONS: u64 = 1;
+
+#[derive(Debug, PartialEq)]
+pub(super) enum ScopeResolution {
+    Revised(String),
+    Clarified(String),
+    Blocked(String),
+}
 use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
 use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
@@ -221,19 +228,25 @@ impl Ctx {
     /// A scope escalation reports that the stage as written cannot be built. The
     /// planner owns the stage text, so hand the report back to it once instead of
     /// spending the remaining fix rounds re-running the same impossible stage.
-    /// Returns whether the stage was revised, with the message either way.
+    /// A planner may revise the scope or explain how to complete it unchanged.
     pub(super) fn renegotiate_scope(&self, plan: &mut Value, idx: usize, outcome: &Value)
-        -> Result<(bool, String), String>
+        -> Result<ScopeResolution, String>
     {
         if !plan["stages"][idx]["scope_revision_pending"].is_null() {
-            return self.resume_scope_revision(plan, idx).map(|message| (true, message));
+            return self.resume_scope_revision(plan, idx).map(ScopeResolution::Revised);
         }
         let sid = plan["stages"][idx]["id"].clone();
         let request = &outcome["request"];
         let reason = request["reason"].as_str().unwrap_or("").to_string();
+        if plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx) {
+            let message = format!("the implementer still reports a scope blocker after the planner's clarification: {reason}");
+            plan["stages"][idx]["scope_clarification"]["blocked_reason"] = json!(message);
+            self.save_plan(plan)?;
+            return Ok(ScopeResolution::Blocked(message));
+        }
         let done = plan["stages"][idx]["scope_renegotiations"].as_u64().unwrap_or(0);
         if done >= SCOPE_RENEGOTIATIONS {
-            return Ok((false, format!(
+            return Ok(ScopeResolution::Blocked(format!(
                 "the stage was already revised once and the implementer still calls it unbuildable: {reason}")));
         }
         self.set_step(sid.as_i64(), "renegotiating stage scope");
@@ -267,7 +280,14 @@ impl Ctx {
         let answer: Value = serde_json::from_str(json_payload_with_keys(&text, &["revised", "refused"]))
             .map_err(|e| format!("invalid scope revision: {e}"))?;
         if let Some(refused) = answer["refused"].as_str().filter(|r| !r.trim().is_empty()) {
-            return Ok((false, format!("the planner holds the stage buildable as written: {refused}")));
+            plan["stages"][idx]["scope_clarification"] = json!({
+                "source_inputs":crate::plan::stage_inputs(plan, idx),
+                "message":refused, "reason":reason, "pending":true,
+                "unix":unix_timestamp(),
+            });
+            self.save_plan(plan)?;
+            self.log_event("plan", &format!("stage {sid}: planner clarified the existing requirements; returning to implementation"));
+            return Ok(ScopeResolution::Clarified(refused.to_owned()));
         }
         let revised = &answer["revised"];
         let (instructions, acceptance) = match (revised["instructions"].as_str(), revised["acceptance"].as_str()) {
@@ -276,7 +296,7 @@ impl Ctx {
         };
         if instructions == stage["instructions"].as_str().unwrap_or("")
             && acceptance == stage["acceptance"].as_str().unwrap_or("") {
-            return Ok((false, "the planner returned the stage unchanged".into()));
+            return Ok(ScopeResolution::Blocked("the planner returned the stage unchanged without clarification".into()));
         }
         let changed = answer["removed"].as_str().unwrap_or("").to_owned();
         // Record the renegotiation before the edit so it survives reconciliation
@@ -298,7 +318,7 @@ impl Ctx {
             "instructions": instructions, "acceptance": acceptance, "changed": changed,
         });
         *plan = self.publish_plan(&current, false)?;
-        self.resume_scope_revision(plan, target).map(|message| (true, message))
+        self.resume_scope_revision(plan, target).map(ScopeResolution::Revised)
     }
 
     /// A failed routing/guidance publication must not discard the planner's
