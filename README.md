@@ -262,6 +262,37 @@ to use "Refactor the codebase" as the plan goal. The `mode` field is optional;
 omitting it keeps standard goal-based planning. Unknown modes are rejected
 with HTTP 400.
 
+### Improving the goal description
+
+Type a rough description in the goal field and press **Enhance with AI**.
+The configured planner tool reads the repository read-only and returns a
+rewritten description, with instructions to preserve your intent, invent no
+requirements, and neither split the work into stages nor implement changes.
+If the field still matches the text submitted, the rewrite replaces it
+automatically. If you edited the field while waiting, the rewrite waits behind
+**Apply AI description**. **Undo enhance** restores the text that was in the
+field immediately before the rewrite was applied. A failed enhancement leaves
+the field text unchanged and reports its error.
+
+Enhancement never modifies the plan, chat transcript or repository source
+content. Forge still records operational activity. When the provider reports
+token usage, it appears in the live feed and session role totals under `enhance`;
+like Plan Q&A, it is not added to plan totals.
+
+The JSON API accepts `POST /api/goal/enhance` with `{"goal":"…"}` and returns
+HTTP 200 `{"ok":true,"request_id":n}`, with an increasing request ID per
+accepted request in that project session. No existing plan is required. The
+usual optional `project` field targets another project. Input is trimmed and
+limited to 20000 characters: blank, missing or non-string goals return HTTP 400
+`{"error":"goal required"}`, and over-long goals return HTTP 400
+`{"error":"goal too long"}`. A busy project or active queue returns HTTP 409
+`{"error":"busy"}`.
+
+`GET /api/state` exposes the targeted session's result under `goal_enhancement`:
+initially `null`, then an object with `status` (`running`, `ready` or `failed`),
+`request_id`, `original` (the trimmed input) and `unix` (a Unix timestamp).
+A `ready` result adds `goal` (the trimmed rewrite); a `failed` result adds `error`.
+
 ### Editing the plan
 
 After the planner writes a draft, use **Edit plan** in the panel to repair
@@ -782,6 +813,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
+| `E` | Enhance the goal description with AI |
 | `e` | Edit plan stages by hand |
 | `a` | Approve draft plan |
 | `r` | Run approved or completed plan |

@@ -275,6 +275,16 @@ keep their existing purposes. The compact behavior does not change persisted
 strings or storage/API boundaries. Legacy opaque logs cannot recover boundaries
 or characters discarded before complete records were introduced.
 
+Goal enhancement uses the pure `goalEnhancementAction` decision helper in
+`Panel.qml` to reconcile polled results. Request IDs and project-visit scoping
+discard stale results and callbacks, and project changes clear enhancement
+state. Each terminal result is consumed once so later polls preserve Apply and
+Undo. The helper chooses `apply` when the field matches the submitted text and
+`offer` otherwise, protecting text typed while waiting until **Apply AI
+description** is pressed. `tests/panel_goal.test.mjs` exercises this reconciliation,
+failures, Undo and project resets using extracted panel functions. This is an
+isolated fixture check, not full-panel live validation.
+
 ### Stage-4 verification and scope
 
 `python3 tests/run_panel_details.py` extracts the current Panel local-error,
