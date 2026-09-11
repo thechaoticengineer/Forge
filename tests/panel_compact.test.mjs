@@ -198,6 +198,8 @@ test('leaving and revisiting a project resets both lists and strands the earlier
     liveEntries: model(), historyEntries: model(),
     liveOutput: {...view0}, historyList: {...view0}, reportList: {...view0},
     chatList: {...view0}, goalFlick: {contentY: 0}, goalField: {text: 'draft'},
+    goalEnhancePending: false, goalEnhanceRequest: -1, goalEnhanceSent: '',
+    goalEnhanceReady: '', goalEnhanceUndo: '', goalEnhanceError: '',
     feedbackField: {text: ''}, questionField: {text: ''}, goalDrafts: {},
     cancelPlanEdit(){}, syncReviewViews(){}, calls: [], Qt: {callLater(){}},
     logFeed: view.newFeed(), logError: '', lastProject: '/a', projectViewRevision: 1,
@@ -206,6 +208,7 @@ test('leaving and revisiting a project resets both lists and strands the earlier
   ctx.api = (method, path, body, done, scoped) => ctx.calls.push({path, done, scoped});
   vm.runInNewContext([
     slice('  function syncHistory()', '  onHistoryFilterChanged:'),
+    slice('  function goalEnhancementAction(', '  function revisePlan('),
     slice('  function refreshAgentLog()', '  function act('),
     slice('  onEngineStateChanged: {', '  onBusyChanged: {')
       .replace('onEngineStateChanged: {', 'function engineStateChanged() {'),

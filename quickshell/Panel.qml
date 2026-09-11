@@ -46,6 +46,12 @@ Item {
   property var goalDrafts: ({})
   property bool revisePending: false
   property bool chatPending: false
+  property bool goalEnhancePending: false
+  property int goalEnhanceRequest: -1
+  property string goalEnhanceSent: ""
+  property string goalEnhanceReady: ""
+  property string goalEnhanceUndo: ""
+  property string goalEnhanceError: ""
   property bool chatExpanded: false
   property bool editingPlan: false
   property var editStages: []
@@ -501,7 +507,7 @@ Item {
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) { syncHistory(); syncReviewViews(); return }
+    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncReviewViews(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
@@ -516,6 +522,12 @@ Item {
     revisePending = false
     questionField.text = ""
     chatPending = false
+    goalEnhancePending = false
+    goalEnhanceRequest = -1
+    goalEnhanceSent = ""
+    goalEnhanceReady = ""
+    goalEnhanceUndo = ""
+    goalEnhanceError = ""
     chatExpanded = false
     chatList.followTail = true
     chatList.readingY = 0
@@ -652,6 +664,70 @@ Item {
     api("POST", path, body || {}, function(resp, status) {
       root.refresh(function() { if (done) done(resp, status) })
     })
+  }
+
+  function goalEnhancementAction(snapshot, requestId, currentText, sentText) {
+    if (requestId < 0 || !snapshot || snapshot.request_id !== requestId
+        || snapshot.status === "running") return { action: "none" }
+    if (snapshot.status === "ready")
+      return { action: currentText === sentText ? "apply" : "offer", text: snapshot.goal }
+    if (snapshot.status === "failed")
+      return { action: "error", error: snapshot.error && snapshot.error.trim()
+        ? snapshot.error : "Could not enhance the description. Try again." }
+    return { action: "none" }
+  }
+
+  function syncGoalEnhancement() {
+    const outcome = goalEnhancementAction(engineState ? engineState.goal_enhancement : null,
+      goalEnhanceRequest, goalField.text, goalEnhanceSent)
+    if (outcome.action === "none") return
+    // Consume terminal results once; later polls must preserve Apply and Undo.
+    goalEnhanceRequest = -1
+    if (outcome.action === "apply") {
+      goalEnhanceUndo = goalField.text
+      goalField.text = outcome.text
+      goalEnhanceReady = ""
+      goalEnhanceError = ""
+    } else if (outcome.action === "offer") {
+      goalEnhanceReady = outcome.text
+    } else if (outcome.action === "error") {
+      goalEnhanceError = outcome.error
+    }
+    goalEnhancePending = false
+  }
+
+  function enhanceGoal() {
+    if (!enhanceGoalButton.enabled) return
+    const text = goalField.text
+    const revision = projectViewRevision
+    goalEnhanceRequest = -1
+    goalEnhancePending = true
+    goalEnhanceSent = text
+    goalEnhanceReady = ""
+    goalEnhanceError = ""
+    act("/api/goal/enhance", { goal: text }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.goalEnhanceRequest = resp.request_id
+        // act refreshes before its callback, so the result may already be ready.
+        root.syncGoalEnhancement()
+      } else {
+        root.goalEnhancePending = false
+        if (resp && resp.error) root.goalEnhanceError = resp.error
+        else root.localError = "Could not enhance the description. Check the engine connection and try again."
+      }
+    })
+  }
+
+  function applyGoalEnhancement() {
+    goalEnhanceUndo = goalField.text
+    goalField.text = goalEnhanceReady
+    goalEnhanceReady = ""
+  }
+
+  function undoGoalEnhancement() {
+    goalField.text = goalEnhanceUndo
+    goalEnhanceUndo = ""
   }
 
   function revisePlan() {
@@ -1448,6 +1524,9 @@ Item {
             feedbackField.forceActiveFocus()
             panelScroll.reveal(feedbackField.parent)
             event.accepted = true
+          } else if (event.key === Qt.Key_E && event.modifiers === Qt.ShiftModifier) {
+            root.enhanceGoal()
+            event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
             if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
             event.accepted = true
@@ -2020,6 +2099,19 @@ Item {
           }
         }
 
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.goalEnhancePending ? "enhancing the description…"
+            : root.goalEnhanceError !== "" ? root.goalEnhanceError
+            : root.goalEnhanceReady !== "" ? "AI rewrite ready — press Apply AI description" : ""
+          textFormat: Text.PlainText
+          color: root.goalEnhanceError !== "" ? root.urgent : root.mutedForeground
+          wrapMode: Text.Wrap
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(11)
+        }
+
         Flow {
           width: parent.width
           spacing: Style.space(8)
@@ -2029,6 +2121,23 @@ Item {
             primary: true
             enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
             onClicked: root.act("/api/plan", { goal: goalField.text })
+          }
+          PanelButton {
+            id: enhanceGoalButton
+            label: "Enhance with AI"
+            enabled: root.engineOnline && !root.busy && !root.editingPlan && !root.revisePending
+              && !root.goalEnhancePending && goalField.text.trim() !== ""
+            onClicked: root.enhanceGoal()
+          }
+          PanelButton {
+            label: "Apply AI description"
+            visible: root.goalEnhanceReady !== ""
+            onClicked: root.applyGoalEnhancement()
+          }
+          PanelButton {
+            label: "Undo enhance"
+            visible: root.goalEnhanceUndo !== ""
+            onClicked: root.undoGoalEnhancement()
           }
           PanelButton {
             label: "Refactor plan"
@@ -3773,6 +3882,7 @@ Item {
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
                     { key: "6", description: "History: Reports (when available)" },
                     { key: "p", description: "Create plan from goal" },
+                    { key: "E", description: "Enhance the goal description with AI" },
                     { key: "e", description: "Edit plan stages by hand" },
                     { key: "a", description: "Approve draft plan" },
                     { key: "r", description: "Run approved or completed plan" },
