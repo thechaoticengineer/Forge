@@ -23,7 +23,7 @@ const LIMIT: &str =
 fn all_fresh_roles_share_fallback_and_report_the_actual_choice() {
     let f = QueueTest::new(false);
     let ctx = configured(&f);
-    for role in ["planner", "architect", "chat", "reviewer"] {
+    for role in ["planner", "architect", "chat", "enhance", "reviewer"] {
         let requirements = ctx.model_requirements(role, Some("codex")).unwrap();
         let mut calls = vec![];
         let (output, choice) = ctx
@@ -81,8 +81,8 @@ fn shared_fallback_is_bounded_and_preserves_explicit_choices_and_failure_kind() 
         assert_eq!(result.unwrap_err(), error);
         assert_eq!(calls, 1);
     }
-    for role in ["planner", "architect", "chat", "reviewer"] {
-        let key = format!("{}_model", if role == "chat" { "planner" } else { role });
+    for role in ["planner", "architect", "chat", "enhance", "reviewer"] {
+        let key = format!("{}_model", if matches!(role, "chat" | "enhance") { "planner" } else { role });
         ctx.app.settings.lock().unwrap()[&key] = json!("claude-fable-5-1[1m]");
         let requirements = ctx.model_requirements(role, Some("codex")).unwrap();
         let mut calls = 0;

@@ -291,6 +291,166 @@ fn plan_chat_bad_output_logs_error_without_appending_or_changing_plan() {
 }
 
 #[test]
+fn plan_enhance_stores_trimmed_goal_and_preserves_plan_transcript_and_phase() {
+    let test = QueueTest::new(false);
+    let goal = " \tbuild a thing with {goal} and {answer_path} 界🙂\n";
+    let plan = b"{\"goal\":\"Existing goal\",\"stages\":[]}\n";
+    let chat = b"{\"role\":\"user\",\"text\":\"keep this\"}\n";
+    fs::write(test.app.forge_path("plan.json"), plan).unwrap();
+    fs::write(test.app.forge_path("chat.jsonl"), chat).unwrap();
+    fs::write(test.app.forge_path("enhanced-goal.json"), "stale answer").unwrap();
+    test.app.set_phase("plan_ready");
+    {
+        let mut settings = test.app.app.settings.lock().unwrap();
+        settings["planner_model"] = json!("enhance-model");
+        settings["mock_enhance_output"] = json!({"goal":" \tA clearer goal 界🙂\n\u{2003}"});
+    }
+    {
+        let mut state = test.app.session.state.lock().unwrap();
+        assert!(state.goal_enhancement.is_null());
+        assert_eq!(state.goal_enhancement_serial, 0);
+        state.goal_enhancement_serial = 7;
+    }
+    test.app.acquire_busy().unwrap();
+    test.app.enhance_goal_worker(goal, 7);
+    wait_for_worker(&test.app);
+    let state = test.app.session.state.lock().unwrap();
+    let result = &state.goal_enhancement;
+    assert_eq!(result["status"], "ready");
+    assert_eq!(result["request_id"], 7);
+    assert_eq!(result["original"], goal);
+    assert_eq!(result["goal"], "A clearer goal 界🙂");
+    assert!(result["unix"].as_i64().unwrap() > 0);
+    assert_eq!(state.phase, "plan_ready");
+    assert_eq!(state.current_step, "");
+    assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    drop(state);
+    assert_eq!(fs::read(test.app.forge_path("plan.json")).unwrap(), plan);
+    assert_eq!(fs::read(test.app.forge_path("chat.jsonl")).unwrap(), chat);
+    let settings = test.app.app.settings.lock().unwrap();
+    assert_eq!(settings["mock_enhance_model"], "enhance-model");
+    assert_eq!(settings["mock_enhance_step"], "enhancing goal description");
+    assert_eq!(settings["mock_enhance_busy"], true);
+    let prompt = settings["mock_enhance_prompt"].as_str().unwrap();
+    assert!(prompt.contains(goal));
+    assert!(prompt.contains(".forge/enhanced-goal.json"));
+    assert!(prompt.contains("{\"goal\": \"...\"}"));
+    assert!(prompt.contains("Do NOT implement anything."));
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["role"], "enhance");
+    assert_eq!(requests[0]["provider"], "mock");
+    assert!(requests[0]["session"].is_null());
+    drop(settings);
+    assert!(test.app.read_history().as_array().unwrap().iter().any(|event|
+        event["kind"] == "plan" && event["text"] == "goal description enhanced"));
+}
+
+#[test]
+fn plan_enhance_bad_output_logs_error_and_preserves_existing_content() {
+    for (tool, output) in [
+        ("unknown-planner", Value::Null), ("mock", Value::Null),
+        ("mock", json!("not JSON")), ("mock", json!({})),
+        ("mock", json!({"goal":42})), ("mock", json!({"goal":null})),
+        ("mock", json!({"goal":[]})), ("mock", json!({"goal":{}})),
+        ("mock", json!({"goal":false})), ("mock", json!({"goal":""})),
+        ("mock", json!({"goal":" \n\t\u{2003}"})),
+        ("mock", json!({"goal":"a".repeat(20001)})),
+        ("mock", json!({"goal":"界🙂".repeat(10000) + "界"})),
+    ] {
+        let test = QueueTest::new(false);
+        fs::write(test.app.forge_path("plan.json"), "plan bytes must stay intact").unwrap();
+        fs::write(test.app.forge_path("chat.jsonl"), "transcript bytes must stay intact\n").unwrap();
+        fs::write(test.app.forge_path("enhanced-goal.json"), r#"{"goal":"stale goal"}"#).unwrap();
+        test.app.set_phase("blocked");
+        {
+            let mut settings = test.app.app.settings.lock().unwrap();
+            settings["planner"] = json!(tool);
+            settings["mock_enhance_output"] = output;
+        }
+        test.app.session.state.lock().unwrap().goal_enhancement_serial = 3;
+        test.app.acquire_busy().unwrap();
+        test.app.enhance_goal_worker("rough goal", 3);
+        wait_for_worker(&test.app);
+        let state = test.app.session.state.lock().unwrap();
+        let result = &state.goal_enhancement;
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["request_id"], 3);
+        assert_eq!(result["original"], "rough goal");
+        assert!(result["unix"].as_i64().unwrap() > 0);
+        let error = result["error"].as_str().unwrap();
+        assert!(!error.trim().is_empty());
+        let message = format!("goal enhancement failed: {error}");
+        assert_eq!(state.phase, "blocked");
+        assert_eq!(state.current_step, "");
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        drop(state);
+        assert_eq!(fs::read_to_string(test.app.forge_path("plan.json")).unwrap(), "plan bytes must stay intact");
+        assert_eq!(fs::read_to_string(test.app.forge_path("chat.jsonl")).unwrap(), "transcript bytes must stay intact\n");
+        assert!(test.app.read_history().as_array().unwrap().iter().any(|event|
+            event["kind"] == "error" && event["text"] == message));
+    }
+}
+
+#[test]
+fn plan_enhance_accepts_unicode_character_boundary_and_default_without_plan() {
+    for output in [None, Some(json!({"goal":format!(" \n{}\t ", "界🙂".repeat(10000))}))] {
+        let test = QueueTest::new(false);
+        let expected = output.as_ref().map(|_| "界🙂".repeat(10000)).unwrap_or_else(|| "mock enhanced goal".into());
+        if let Some(output) = output { test.app.app.settings.lock().unwrap()["mock_enhance_output"] = output; }
+        test.app.session.state.lock().unwrap().goal_enhancement_serial = 1;
+        test.app.acquire_busy().unwrap();
+        test.app.enhance_goal_worker("rough goal", 1);
+        wait_for_worker(&test.app);
+        let state = test.app.session.state.lock().unwrap();
+        assert_eq!(state.goal_enhancement["status"], "ready");
+        assert_eq!(state.goal_enhancement["goal"], expected);
+        assert!(!test.app.forge_path("plan.json").exists());
+        assert!(!test.app.forge_path("chat.jsonl").exists());
+    }
+}
+
+#[test]
+fn plan_enhance_cleanup_failure_is_terminal_without_invocation() {
+    let test = QueueTest::new(false);
+    fs::create_dir(test.app.forge_path("enhanced-goal.json")).unwrap();
+    test.app.session.state.lock().unwrap().goal_enhancement_serial = 1;
+    test.app.acquire_busy().unwrap();
+    test.app.enhance_goal_worker("rough goal", 1);
+    wait_for_worker(&test.app);
+    let state = test.app.session.state.lock().unwrap();
+    assert_eq!(state.goal_enhancement["status"], "failed");
+    assert!(state.goal_enhancement["error"].as_str().unwrap().starts_with("could not remove previous enhanced goal: "));
+    assert_eq!(state.current_step, "");
+    drop(state);
+    assert!(test.app.app.settings.lock().unwrap()["mock_agent_requests"].is_null());
+    assert!(test.app.read_history().as_array().unwrap().iter().any(|event|
+        event["kind"] == "error" && event["text"].as_str().unwrap().starts_with("goal enhancement failed: ")));
+}
+
+#[test]
+fn plan_enhance_stale_success_and_failure_leave_newer_result_untouched() {
+    for output in [json!({"goal":"old request result"}), Value::Null] {
+        let test = QueueTest::new(false);
+        let newer = json!({"status":"ready","request_id":9,"original":"new rough goal","goal":"newer result","unix":123});
+        {
+            let mut state = test.app.session.state.lock().unwrap();
+            state.goal_enhancement_serial = 9;
+            state.goal_enhancement = newer.clone();
+        }
+        test.app.app.settings.lock().unwrap()["mock_enhance_output"] = output;
+        test.app.acquire_busy().unwrap();
+        test.app.enhance_goal_worker("old rough goal", 8);
+        wait_for_worker(&test.app);
+        let state = test.app.session.state.lock().unwrap();
+        assert_eq!(state.goal_enhancement_serial, 9);
+        assert_eq!(state.goal_enhancement, newer);
+        assert_eq!(state.current_step, "");
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
 fn plan_chat_state_keeps_last_100_valid_entries() {
     let test = QueueTest::new(false);
     test.app.ensure_forge_dir();

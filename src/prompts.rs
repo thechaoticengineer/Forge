@@ -102,6 +102,19 @@ Write your answer as JSON to the file {answer_path} (create the directory if nee
 
 Do NOT implement anything. Do NOT modify the plan or any other file. Only write {answer_path}."#;
 
+pub(crate) const ENHANCE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+The user has supplied a rough description of what they want built in this repository. You may read the repository for context.
+Rewrite it into one clear, concrete, self-contained goal description that preserves the user's intent. Add no invented requirements and do not split the work into stages.
+
+Here is the user's rough description:
+{goal}
+
+Write your answer as JSON to the file {answer_path} (create the directory if needed) with exactly this schema:
+{"goal": "..."}
+
+The goal must be plain text without markdown fences, normally under 2000 characters. The JSON must also have no markdown fences.
+Do NOT implement anything. Do NOT modify the plan or any repository content. Only write the answer to {answer_path}."#;
+
 pub(crate) const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:

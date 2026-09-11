@@ -13,7 +13,7 @@ pub(super) enum ScopeResolution {
 }
 use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
-use crate::prompts::{CHAT_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
+use crate::prompts::{CHAT_PROMPT, ENHANCE_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REPAIR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
 use crate::candidate_draft::prepare_candidate_draft;
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{fill_template, json_payload, json_payload_with_keys, unix_timestamp};
@@ -107,6 +107,45 @@ impl Ctx {
         if let Err(error) = result {
             self.log_event("error", &format!("chat failed: {error}"));
         }
+    }
+
+    pub(crate) fn enhance_goal_worker(&self, goal: &str, request_id: i64) {
+        let _worker = WorkerGuard(&self.session);
+        self.set_step(None, "enhancing goal description");
+        let result = (|| -> Result<String, String> {
+            self.ensure_forge_dir();
+            match fs::remove_file(self.forge_path("enhanced-goal.json")) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(format!("could not remove previous enhanced goal: {e}")),
+            }
+            let prompt = fill_template(ENHANCE_PROMPT, &[
+                ("{goal}", goal), ("{answer_path}", ".forge/enhanced-goal.json"),
+            ]);
+            let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only. Do not write files, do not modify the plan or any repository content. Return ONLY {{\"goal\":\"rewritten description\"}} as JSON in your final response.");
+            let requirements = self.model_requirements("enhance", None)?;
+            let (result,(tool,_,_)) = self.with_selected_model(&requirements, None, |(tool,model,effort)|
+                self.run_agent(&AgentRequest {role:"enhance",provider:tool,model,effort,session:None,
+                    prompt:if tool == "mock" {&prompt} else {&readonly_prompt}}))?;
+            let text = if tool == "mock" { fs::read_to_string(self.forge_path("enhanced-goal.json")).map_err(|e| format!("could not read enhanced goal file: {e}"))? } else { result.output };
+            let output: Value = serde_json::from_str(json_payload(&text))
+                .map_err(|e| format!("invalid enhanced goal JSON: {e}"))?;
+            let enhanced = output["goal"].as_str().map(str::trim).filter(|goal| !goal.is_empty())
+                .ok_or_else(|| "agent did not produce a non-empty goal string".to_string())?;
+            if enhanced.chars().count() > 20000 { return Err("enhanced description too long".into()); }
+            Ok(enhanced.to_string())
+        })();
+        let (enhancement, kind, message) = match result {
+            Ok(enhanced) => (json!({"status":"ready","request_id":request_id,"original":goal,"goal":enhanced,"unix":unix_timestamp()}),
+                "plan", "goal description enhanced".to_string()),
+            Err(error) => (json!({"status":"failed","request_id":request_id,"original":goal,"error":error,"unix":unix_timestamp()}),
+                "error", format!("goal enhancement failed: {error}")),
+        };
+        {
+            let mut state = self.session.state.lock().unwrap();
+            if state.goal_enhancement_serial == request_id { state.goal_enhancement = enhancement; }
+        }
+        self.log_event(kind, &message);
     }
 
     fn generate_plan(&self, prompt: &str) -> Result<Value, String> {

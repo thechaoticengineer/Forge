@@ -98,7 +98,7 @@ impl Ctx {
         implementer: Option<&str>,
     ) -> Result<ModelRequirements, String> {
         let settings = self.app.settings.lock().unwrap();
-        let configured_role = if role == "chat" { "planner" } else { role };
+        let configured_role = if matches!(role, "chat" | "enhance") { "planner" } else { role };
         let automatic = settings["automatic_routing"] != false;
         let model = settings[format!("{configured_role}_model")]
             .as_str()

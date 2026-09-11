@@ -216,6 +216,15 @@ impl Ctx {
             settings["mock_chat_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
         }
         #[cfg(test)]
+        if role == "enhance" {
+            let mut settings = self.app.settings.lock().unwrap();
+            let state = self.session.state.lock().unwrap();
+            settings["mock_enhance_prompt"] = json!(prompt);
+            settings["mock_enhance_model"] = json!(model);
+            settings["mock_enhance_step"] = json!(state.current_step);
+            settings["mock_enhance_busy"] = json!(self.session.busy.load(Ordering::SeqCst));
+        }
+        #[cfg(test)]
         if role == "fixer" || role == "reviewer" {
             let mut settings = self.app.settings.lock().unwrap();
             // Reviewer capture is opt-in to keep unrelated API test settings small.
@@ -420,6 +429,20 @@ impl Ctx {
                     return Ok(());
                 }
                 fs::write(self.forge_path("answer.json"), json!({"answer": "mock answer"}).to_string())
+                    .map_err(|e| e.to_string())?;
+            }
+            "enhance" => {
+                #[cfg(test)]
+                if let Some(output) = self.app.settings.lock().unwrap().get("mock_enhance_output") {
+                    // Null simulates an agent exiting without writing an answer.
+                    if !output.is_null() {
+                        fs::write(self.forge_path("enhanced-goal.json"),
+                            output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    return Ok(());
+                }
+                fs::write(self.forge_path("enhanced-goal.json"), json!({"goal": "mock enhanced goal"}).to_string())
                     .map_err(|e| e.to_string())?;
             }
             "implementer" | "fixer" => {

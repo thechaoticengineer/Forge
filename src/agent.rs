@@ -70,12 +70,12 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
     }
     if !matches!(
         role,
-        "architect" | "architect_review" | "chat" | "planner" | "implementer" | "fixer" | "reviewer"
+        "architect" | "architect_review" | "chat" | "enhance" | "planner" | "implementer" | "fixer" | "reviewer"
     ) {
         return Err("unknown agent role".into());
     }
     let review = matches!(role, "architect_review" | "reviewer");
-    let readonly = matches!(role, "architect" | "chat" | "planner") || review;
+    let readonly = matches!(role, "architect" | "chat" | "enhance" | "planner") || review;
     let mut c = Command::new(provider);
     match provider {
         "codex" => {
@@ -175,7 +175,7 @@ pub(crate) fn verify_capabilities(
     use crate::catalogue_process::{Budget, CommandSpec, Launcher, SystemLauncher};
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
-    if !matches!(request.role, "architect" | "architect_review" | "reviewer" | "chat" | "planner") {
+    if !matches!(request.role, "architect" | "architect_review" | "reviewer" | "chat" | "enhance" | "planner") {
         return Ok(());
     }
     let args = if request.provider == "codex" {

@@ -478,6 +478,71 @@ fn reviewers_and_qa_are_always_fresh_and_unknown_effort_is_never_mapped() {
 }
 
 #[test]
+fn enhancement_uses_chat_permissions_and_requires_readonly_capabilities() {
+    for provider in ["codex", "claude"] {
+        let mut req = AgentRequest {role:"chat",session:None,..request(provider)};
+        let chat = command(&req).unwrap();
+        req.role = "enhance";
+        let enhance = command(&req).unwrap();
+        assert_eq!(enhance.get_args().collect::<Vec<_>>(), chat.get_args().collect::<Vec<_>>());
+        req.session = Some(ID);
+        assert!(command(&req).is_err());
+        req.session = None;
+        let fixture = Cli::new(provider, "raise Exception('must not launch')");
+        fs::write(fixture.root.join(provider), "#!/bin/sh\necho 'old CLI without safe tools'\n").unwrap();
+        assert!(verify_capabilities(&req, fixture.ctx.project(), fixture.root.join(provider).to_str().unwrap())
+            .unwrap_err().contains("capability failure"));
+        assert!(!fixture.root.join("argv.json").exists());
+    }
+}
+
+#[test]
+fn enhancement_parses_final_response_and_reports_provider_failure() {
+    for fail in [false, true] {
+        let body = if fail { "sys.exit('provider failed')".to_string() } else {
+            format!("print(json.dumps({{'type':'result','subtype':'success','session_id':'{ID}','is_error':False,'structured_output':{{'goal':'  clearer goal  '}}}}))")
+        };
+        let fixture = Cli::new("claude", &body);
+        {
+            let mut settings = fixture.ctx.app.settings.lock().unwrap();
+            settings["planner"] = json!("claude");
+            settings["planner_model"] = json!("exact-model");
+            settings["model_catalogue"]["entries"] = json!([{"provider":"claude","model":"exact-model","tier":"strong"}]);
+        }
+        fixture.ctx.set_phase("plan_ready");
+        fs::write(fixture.ctx.forge_path("plan.json"), "unchanged plan").unwrap();
+        fs::write(fixture.ctx.forge_path("chat.jsonl"), "unchanged transcript").unwrap();
+        fs::write(fixture.ctx.forge_path("enhanced-goal.json"), r#"{"goal":"stale"}"#).unwrap();
+        fixture.ctx.session.state.lock().unwrap().goal_enhancement_serial = 1;
+        fixture.ctx.acquire_busy().unwrap();
+        fixture.ctx.enhance_goal_worker("rough goal", 1);
+        crate::test_support::wait_for_worker(&fixture.ctx);
+        let state = fixture.ctx.session.state.lock().unwrap();
+        assert_eq!(state.goal_enhancement["status"], if fail { "failed" } else { "ready" });
+        if fail {
+            assert!(state.goal_enhancement["error"].as_str().unwrap().contains("provider failed"));
+        } else { assert_eq!(state.goal_enhancement["goal"], "clearer goal"); }
+        assert_eq!(state.phase, "plan_ready");
+        assert_eq!(state.current_step, "");
+        drop(state);
+        assert!(!fixture.ctx.forge_path("enhanced-goal.json").exists());
+        assert_eq!(fs::read_to_string(fixture.ctx.forge_path("plan.json")).unwrap(), "unchanged plan");
+        assert_eq!(fs::read_to_string(fixture.ctx.forge_path("chat.jsonl")).unwrap(), "unchanged transcript");
+        let args = fixture.args();
+        assert!(pair(&args, "--tools", "Read,Glob,Grep"));
+        assert!(!args.iter().any(|arg| arg == "--resume"));
+        let settings = fixture.ctx.app.settings.lock().unwrap();
+        let requests = settings["mock_agent_requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]["prompt"].as_str().unwrap().ends_with(
+            "OUTPUT CONTRACT OVERRIDE: read-only. Do not write files, do not modify the plan or any repository content. Return ONLY {\"goal\":\"rewritten description\"} as JSON in your final response."));
+        drop(settings);
+        if fail { assert!(fixture.ctx.read_history().as_array().unwrap().iter().any(|event|
+            event["kind"] == "error" && event["text"].as_str().unwrap().starts_with("goal enhancement failed: "))); }
+    }
+}
+
+#[test]
 fn failed_result_wrong_session_and_incomplete_stream_fail_closed() {
     for body in [
         format!("print(json.dumps({{'type':'result','session_id':'{ID}','subtype':'error_during_execution','is_error':True,'result':'failed'}}))"),

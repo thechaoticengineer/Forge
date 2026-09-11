@@ -78,6 +78,8 @@ impl Drop for WorkerGuard<'_> {
 pub(crate) struct State {
     pub(crate) phase: String, // idle|planning|plan_ready|running|blocked|done|failed
     pub(crate) goal: String,
+    pub(crate) goal_enhancement: Value,
+    pub(crate) goal_enhancement_serial: i64,
     pub(crate) current_stage: Option<i64>,
     pub(crate) current_step: String,
     pub(crate) run_started_unix: i64,
