@@ -9,6 +9,7 @@
 //! Serves a JSON API on 127.0.0.1:8734 for the Quickshell panel.
 
 mod catalogue;
+mod engine_settings;
 mod catalogue_process;
 mod metadata;
 mod agent;
@@ -71,11 +72,21 @@ fn main() {
     let mut settings = default_settings();
     settings["projects_root"] = json!(projects_root);
     let policy_path = crate::catalogue::policy_path();
-    let loaded = crate::catalogue::load_policy(&policy_path);
-    if let Ok(Some(policy)) = &loaded { settings["model_catalogue"] = json!(policy); }
+    let settings_path = policy_path.with_file_name("settings.json");
+    let policy_error = match engine_settings::load(&settings_path, &settings) {
+        Ok(Some(saved)) => { settings = saved; None }
+        Ok(None) => {
+            // Upgrade installations which persisted only model policy.
+            let loaded = crate::catalogue::load_policy(&policy_path);
+            if let Ok(Some(policy)) = &loaded { settings["model_catalogue"] = json!(policy); }
+            loaded.err()
+        }
+        Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+    };
     let mut app = App::new(&project, settings);
     app.model_policy_path = Some(policy_path);
-    *app.model_policy_error.lock().unwrap() = loaded.err();
+    app.settings_path = Some(settings_path);
+    *app.model_policy_error.lock().unwrap() = policy_error;
     let app = Arc::new(app);
     if std::env::args().nth(2).as_deref() == Some("--recover-committed") {
         let ctx = app.context(&project);

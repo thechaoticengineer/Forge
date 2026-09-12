@@ -384,19 +384,8 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     if obj.contains_key("reviewer") && !obj.contains_key("reviewer_provider_mode") {
         candidate["reviewer_provider_mode"] = json!("configured");
     }
-    if !candidate["automatic_routing"].is_boolean() || !(candidate["routing_billing_basis"].is_null() || candidate["routing_billing_basis"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) {
-        return (400, json!({"error":"automatic_routing must be boolean; routing_billing_basis must be null or an exact billing basis (max 64 bytes)"}));
-    }
-    if !matches!(candidate["reviewer_provider_mode"].as_str(), Some("other_provider" | "configured")) {
-        return (400, json!({"error":"reviewer_provider_mode must be other_provider or configured"}));
-    }
-    let limits = &candidate["reassessment_limits"];
-    if limits.as_object().is_none_or(|o| o.len() != 4) || [("max_reassessments",0,8),("max_operational_retries",0,5),("repeat_threshold",2,10),("context_percent",50,95)].iter().any(|(k,min,max)| limits[*k].as_u64().is_none_or(|v| v < *min || v > *max)) {
-        return (400,json!({"error":"invalid reassessment_limits: reassessments 0..8, retries 0..5, repeat threshold 2..10, context percent 50..95"}));
-    }
-    let cadence = &candidate["review_cadence"];
-    if cadence.as_object().is_none_or(|o| o.len() != 2) || ["architect", "reviewer"].iter().any(|role| !matches!(cadence[*role].as_str(), Some("per_stage" | "per_plan"))) {
-        return (400,json!({"error":"invalid review_cadence: use exactly architect and reviewer, each set to \"per_stage\" or \"per_plan\""}));
+    if let Err(error) = crate::engine_settings::validate(&candidate) {
+        return (400, json!({"error":error}));
     }
     let policy = match crate::catalogue::Policy::from_settings(&candidate) {
         Ok(p) => p, Err(e) => return (400,json!({"error":e})),
@@ -420,15 +409,21 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     let refresh = candidate["model_catalogue"]["codex_scope"] != settings["model_catalogue"]["codex_scope"]
         || candidate["model_catalogue"]["claude_scope"] != settings["model_catalogue"]["claude_scope"]
         || candidate["model_catalogue"]["claude_bridge"] != settings["model_catalogue"]["claude_bridge"];
-    if candidate["model_catalogue"] != settings["model_catalogue"] {
+    // A single authoritative file commits role settings and model policy together.
+    // The legacy policy-only path remains available to embedded callers.
+    if let Some(path) = &app.settings_path {
+        if let Err(error) = crate::engine_settings::save(path, &candidate) {
+            return (500, json!({"error":error}));
+        }
+    } else if candidate["model_catalogue"] != settings["model_catalogue"] {
         if let Some(path) = &app.model_policy_path {
             if let Err(error) = crate::catalogue::save_policy(path, &policy) {
                 *app.model_policy_error.lock().unwrap() = Some(error.clone());
                 return (500,json!({"error":error}));
             }
         }
-        *app.model_policy_error.lock().unwrap() = None;
     }
+    *app.model_policy_error.lock().unwrap() = None;
     *settings = candidate;
     drop(settings);
     if refresh { app.catalogue.refresh(policy); }

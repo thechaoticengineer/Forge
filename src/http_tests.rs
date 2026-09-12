@@ -621,3 +621,65 @@ fn reviewer_provider_mode_is_explicit_and_invalid_updates_are_atomic() {
     assert_eq!(api_request(&test.app.app,"POST","/api/settings",json!({"reviewer":"claude","reviewer_provider_mode":"invalid"})).0,400);
     assert_eq!(*test.app.app.settings.lock().unwrap(), saved);
 }
+
+#[test]
+fn engine_settings_survive_restart_and_resolve_codex_only_roles() {
+    let f = QueueTest::new(false);
+    let path = f.path.join("settings.json");
+    let mut app = App::new(f.app.project(), default_settings());
+    app.settings_path = Some(path.clone());
+    let app = Arc::new(app);
+    let mut policy = json!(crate::catalogue::Policy::default());
+    policy["policy_revision"] = json!("codex-only");
+    policy["entries"] = json!([
+        {"provider":"codex","model":"gpt-6-astra","tier":"strong","relative_cost_preference":80},
+        {"provider":"codex","model":"gpt-5.6-sol","tier":"strong","relative_cost_preference":50}
+    ]);
+    let (status, response) = api_request(&app, "POST", "/api/settings", json!({
+        "planner":"codex","architect":"codex","implementer":"codex","reviewer":"codex",
+        "queue_auto_approve":true,"auto_push":false,"max_fix_rounds":5,
+        "model_catalogue":policy,"projects_root":f.path
+    }));
+    assert_eq!(status, 200, "{response}");
+    let saved = app.settings.lock().unwrap().clone();
+    assert_eq!(saved["reviewer_provider_mode"], "configured");
+    let loaded = crate::engine_settings::load(&path, &default_settings()).unwrap().unwrap();
+    assert_eq!(loaded, saved);
+    let restarted = Arc::new(App::new(f.app.project(), loaded));
+    let ctx = restarted.context(f.app.project());
+    for role in ["planner", "architect", "reviewer"] {
+        let requirements = ctx.model_requirements(role, Some("codex")).unwrap();
+        let choice = ctx.select_model(&requirements, &[]).unwrap();
+        assert_eq!((choice.0.as_str(), choice.1.as_str()), ("codex", "gpt-5.6-sol"));
+    }
+    // A normal toggle persists the complete registry even though /api/state
+    // intentionally omits its entries from the presentation snapshot.
+    assert_eq!(api_request(&app,"POST","/api/settings",json!({"auto_push":true})).0,200);
+    let loaded = crate::engine_settings::load(&path, &default_settings()).unwrap().unwrap();
+    assert_eq!(loaded["model_catalogue"], policy);
+    assert_eq!(loaded["auto_push"], true);
+}
+
+#[test]
+fn engine_settings_write_failure_rejects_entire_update() {
+    let f = QueueTest::new(false);
+    let path = f.path.join("settings.json");
+    fs::create_dir(&path).unwrap(); // Forces atomic replacement to fail.
+    let mut app = App::new(f.app.project(), default_settings());
+    app.settings_path = Some(path);
+    let legacy = f.path.join("model-policy.json");
+    let old_policy = crate::catalogue::Policy::default();
+    crate::catalogue::save_policy(&legacy, &old_policy).unwrap();
+    app.model_policy_path = Some(legacy.clone());
+    let app = Arc::new(app);
+    let before = app.settings.lock().unwrap().clone();
+    let mut policy = json!(old_policy);
+    policy["policy_revision"] = json!("new-policy");
+    let (status, response) = api_request(&app,"POST","/api/settings",json!({
+        "planner":"codex","auto_push":false,"model_catalogue":policy
+    }));
+    assert_eq!(status,500,"{response}");
+    assert!(response["error"].as_str().unwrap().contains("could not save engine settings"));
+    assert_eq!(*app.settings.lock().unwrap(),before);
+    assert_eq!(crate::catalogue::load_policy(&legacy).unwrap().unwrap(),old_policy);
+}

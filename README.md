@@ -958,11 +958,21 @@ request ID. `/api/state` includes only request status; `GET
 /api/models/suggestion?project=...` returns the full draft result. One request at
 a time shares the project's worker/cancellation controls.
 
-Use **Model settings & options** to edit the JSON policy. The policy is saved
-atomically to `$XDG_CONFIG_HOME/forge/model-policy.json` (default
-`~/.config/forge/model-policy.json`) and loaded at engine startup. An invalid
-file is reported in the panel; Forge uses an empty registry. Set a new
-`policy_revision` whenever changing the policy. For example, replace
+Use **Model settings & options** to edit the JSON policy. Every successful
+settings update saves the full engine configuration atomically to
+`$XDG_CONFIG_HOME/forge/settings.json` (default `~/.config/forge/settings.json`).
+This includes role providers/models, reviewer mode, routing, review cadence and
+budgets, auto-push, queue auto-approval, project root and model policy. A failed
+save returns an error and leaves the active settings unchanged. Startup reloads
+this snapshot; a corrupt settings file stops startup with a diagnostic instead
+of silently reverting providers or publication preferences.
+
+For older installations without `settings.json`, Forge imports the existing
+`model-policy.json` from the same directory and uses defaults for preferences
+that older engines never persisted. The next settings update writes the complete
+snapshot. The legacy file is retained, but `settings.json` takes precedence once
+it exists. A corrupt legacy policy is reported in the panel with an empty registry.
+Set a new `policy_revision` whenever changing the policy. For example, replace
 `your-exact-model-id` with an ID from your CLI or your explicit configuration:
 
 ```json
