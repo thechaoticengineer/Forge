@@ -991,9 +991,15 @@ permits every task; otherwise use explicit task tags: `documentation`,
 `functionality`, `concurrency`, `persistence`, or `security`. Older descriptive
 suitability strings must be replaced with these tags before using an entry for
 stage assignments. Numeric limits are descriptive inputs for both participants;
-they do not grant a higher capability tier. `relative_cost_preference` is nullable, ranges
-from 0 to 1000, and lower means preferred; it is not a monetary amount. Configured
-entries do not supply verified prices; missing official prices remain null.
+they do not grant a higher capability tier. `relative_cost_preference` is a
+relative user preference rather than a monetary amount: it accepts `null` or a
+value from 0 through 1000, and a lower value favours a model as the cheaper
+choice. `null` means that cost is unknown — neither cheap nor expensive.
+Configured entries do not supply verified prices; missing official prices remain
+`null`. Within a tier, cost ordering applies only when every candidate has a
+configured preference; otherwise the registry order is retained. Ties also
+retain registry order. This configured ordering applies independently of whether
+official prices are available.
 No current model IDs or capability rankings are built into Forge.
 The planner and architect use these inputs to agree on stage assignments before
 approval, with the engine enforcing adequacy and supported native efforts.
@@ -1069,9 +1075,10 @@ fetch failures and are kept for audit (flagged `removed`) when discovery drops
 a model. Unknown costs stay null. A reported rate is stored only complete —
 currency, unit, billing basis, source date and the explicit `api_list_rate`
 label — and is never turned into an inferred CLI subscription charge;
-`relative_cost_preference` is user policy, not a measured rate. When official
-metadata contradicts discovery (e.g. reasoning support), the conflict is
-surfaced and discovered native support wins. The store lives beside the
+`relative_cost_preference` follows the policy-field definition above, not a
+measured rate. When official metadata contradicts discovery (e.g. reasoning
+support), the conflict is surfaced and discovered native support wins. The store
+lives beside the
 discovery cache at `$XDG_CACHE_HOME/forge/models/v1/metadata.json`. Freshness,
 provenance, unknown pricing, negative-cache and retry/error details appear in
 the panel's catalogue view and under `metadata` in `GET /api/models` and
@@ -1162,12 +1169,10 @@ on top.
 
 With automatic routing and an empty role model setting, selection skips known
 exhausted models. The shared resolver selects the weakest adequate eligible tier.
-Within a tier, it orders candidates by lowest `relative_cost_preference` only
-when every candidate in that tier has a configured preference; ties retain
-registry order. If any candidate lacks a preference, the entire tier retains
-registry order: a missing preference is never assumed cheap or expensive.
-For example, without cost preferences, configure Fable followed by Opus in the
-same tier to use Opus when the Fable pool is depleted.
+Within that tier, it follows the `relative_cost_preference` ordering rule in the
+policy-field description above. For example, with no configured preferences,
+configure Fable followed by Opus in the same tier to use Opus when the Fable
+pool is depleted.
 If the pre-launch probe discovers exhaustion after selection, or the CLI explicitly
 reports the selected family's quota limit, the same resolver chooses another
 eligible model without revisiting one already attempted. This also works when
@@ -1228,7 +1233,7 @@ The planner and architect have separate provider/model settings: `planner` /
 (default provider `codex`). Each selects an eligible `strong` entry from the
 configured model registry. For these two roles, an explicit model must match a
 strong registry entry; an empty model selects an eligible strong entry for that
-provider using the shared cost/order rules above. Chat and enhance specifically
+provider using the policy-field ordering rule above. Chat and enhance specifically
 use the planner settings and keep the same strong floor.
 This uses configured tiers even when official comparative metadata is absent. An
 explicit registry model may remain `configured_unverified` under the existing
@@ -1317,9 +1322,9 @@ within the **currently selected implementer provider**, using the current model
 catalogue. For example, with Terra and Sonnet configured as `standard`, the same
 standard-tier plan uses Terra when Codex is selected and Sonnet when Claude is
 selected. Changing the implementer after planning requires no new AI planning turn.
-Within the chosen tier, configured cost preferences order models only when all
-candidates have a preference; otherwise registry order is preserved. Price never
-allows a weaker tier or silently changes the selected provider.
+Within the chosen tier, selection follows the `relative_cost_preference` ordering
+rule in the policy-field description above. Price never allows a weaker tier or
+silently changes the selected provider.
 
 A missing, unavailable or inadequate model blocks launch with an actionable error;
 the tier agreement stays valid. Update the catalogue or change the implementer and
@@ -1401,11 +1406,12 @@ that the selected option is suitable for the specific work.
 
 Planning does not compare provider prices or consult implementation quota. Local
 launch selection uses configured capability and task suitability first, then
-relative preferences within the weakest adequate tier of the selected provider.
-Unknown prices remain unknown. Execution reassessment can compare eligible
-alternatives using configured preferences or comparable published billing facts,
-while preserving its capability floor and retry budget. API prices do not establish
-CLI subscription cost. Every model has the same acceptance checks and review gate.
+the `relative_cost_preference` ordering rule above within the weakest adequate
+tier of the selected provider. Unknown prices remain unknown. Execution
+reassessment can compare eligible alternatives using configured preferences or
+comparable published billing facts, while preserving its capability floor and
+retry budget. API prices do not establish CLI subscription cost. Every model has
+the same acceptance checks and review gate.
 
 Agreements retain both reasons, distinct proposal identities, explicit agreement,
 bootstrap provenance, relevant goal/stage/dependency/constraint inputs, an input
@@ -1541,11 +1547,11 @@ placeholder IDs, not verified provider capability claims:
 ```
 
 `standard` permits ordinary functionality and simpler tasks; `basic` is sufficient
-only for simple tasks, and `strong` is required for critical/complex work. These
-are your configured judgments. A lower relative preference chooses among adequate
-options even when every price is unknown. An absent preference establishes no cost
-ordering. Published prices are used for comparison only with matching explicit
-`routing_billing_basis`; its default `null` leaves API list rates informational.
+only for simple tasks, and `strong` is required for critical/complex work. The
+configured-tier and `relative_cost_preference` policy-field rules above govern
+these adequate options. Published prices are used for comparison only with
+matching explicit `routing_billing_basis`; its default `null` leaves API list
+rates informational.
 
 The default providers are Claude for planning, Codex for architecture and the
 implementation preference, and Claude for independent review. Role model strings
