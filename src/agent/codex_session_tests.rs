@@ -144,8 +144,8 @@ fn lookup_refuses_other_threads_duplicates_symlinks_and_replaced_files() {
 }
 
 #[test]
-fn malformed_partial_and_oversized_metadata_fail_closed() {
-    for case in ["malformed", "partial", "large-line", "large-append"] {
+fn malformed_and_partial_metadata_fail_closed() {
+    for case in ["malformed", "partial"] {
         let f = Fixture::new();
         let snapshot = Snapshot::capture(&f.0).unwrap();
         f.write(&f.events("exact-model"));
@@ -153,10 +153,6 @@ fn malformed_partial_and_oversized_metadata_fail_closed() {
         match case {
             "malformed" => writeln!(file, "not JSON").unwrap(),
             "partial" => write!(file, "{{}}").unwrap(),
-            "large-line" => {
-                writeln!(file, "{}", json!({"type":"turn_context","payload":{"padding":"x".repeat(MAX_LINE as usize)}})).unwrap();
-            }
-            "large-append" => file.set_len(MAX_APPEND + 1).unwrap(),
             _ => unreachable!(),
         }
         assert!(f.model(&snapshot).is_err(), "accepted {case}");
@@ -172,10 +168,10 @@ fn large_compaction_and_response_records_do_not_hide_current_turn_identity() {
         let mut events = f.events("exact-model");
         if resumed { events.remove(0); }
         events.insert(events.len()-1, json!({"type":"compacted","payload":{
-            "replacement_history":[{"role":"user","content":"x".repeat(MAX_LINE as usize)}],
-            "guardian_history":[{"content":"y".repeat(MAX_LINE as usize)}]}}));
+            "replacement_history":[{"role":"user","content":"x".repeat(1024 * 1024)}],
+            "guardian_history":[{"content":"y".repeat(1024 * 1024)}]}}));
         events.insert(events.len()-1, json!({"type":"response_item","payload":{
-            "type":"message","content":[{"text":"z".repeat(MAX_LINE as usize)}]}}));
+            "type":"message","content":[{"text":"z".repeat(1024 * 1024)}]}}));
         f.write(&events);
         assert_eq!(f.model(&snapshot).unwrap(), "exact-model");
     }
@@ -187,15 +183,36 @@ fn ignored_large_records_still_require_valid_json_and_preserve_identity_checks()
         let f = Fixture::new();
         let snapshot = Snapshot::capture(&f.0).unwrap();
         f.write(&f.events("exact-model")[..3]);
-        f.write(&[json!({"type":"compacted","payload":{"history":"x".repeat(MAX_LINE as usize)}})]);
+        f.write(&[json!({"type":"compacted","payload":{"history":"x".repeat(1024 * 1024)}})]);
         if case == "changed-model" { f.write(&[f.events("other-model")[2].clone()]); }
         if case == "aborted" { f.write(&[json!({"type":"event_msg","payload":{"type":"turn_aborted"}})]); }
         f.write(&f.events("exact-model")[3..]);
         if case == "malformed" || case == "partial" {
             let mut file = File::options().append(true).open(f.path()).unwrap();
-            write!(file, "{{\"type\":\"compacted\",\"ignored\":\"{}", "x".repeat(MAX_LINE as usize)).unwrap();
+            write!(file, "{{\"type\":\"compacted\",\"ignored\":\"{}", "x".repeat(1024 * 1024)).unwrap();
             if case == "malformed" { writeln!(file).unwrap(); }
         }
         assert!(f.model(&snapshot).is_err(), "accepted {case}");
+    }
+}
+
+#[test]
+fn large_identity_records_and_appends_preserve_model_verification() {
+    for resumed in [false, true] {
+        let f = Fixture::new();
+        if resumed { f.write(&f.events("old-model")); }
+        let snapshot = Snapshot::capture(&f.0).unwrap();
+        let mut events = f.events("exact-model");
+        events[0]["payload"]["instructions"] = json!("x".repeat(2 * 1024 * 1024));
+        events[2]["payload"]["instructions"] = json!("y".repeat(2 * 1024 * 1024));
+        f.write(&events[if resumed { 1 } else { 0 }..3]);
+        // One valid event and the invocation's append both exceed the old 64 MiB
+        // cap. Write incrementally so the fixture does not duplicate the payload.
+        let mut file = File::options().append(true).open(f.path()).unwrap();
+        write!(file, "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"").unwrap();
+        std::io::copy(&mut std::io::repeat(b'z').take(65 * 1024 * 1024), &mut file).unwrap();
+        writeln!(file, "\"}}}}").unwrap();
+        f.write(&events[3..]);
+        assert_eq!(f.model(&snapshot).unwrap(), "exact-model");
     }
 }

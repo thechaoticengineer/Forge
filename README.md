@@ -1298,13 +1298,15 @@ stream thread UUID and accepts only a completed turn appended during that
 invocation, with matching turn identity and project directory. This fallback was
 checked against Codex CLI 0.153.4's `session_meta`, `task_started`, `turn_context`
 and `task_complete` records. Old resume metadata and requested model names never
-count as a provider report. Missing, ambiguous, changed or oversized metadata
+count as a provider report. Missing, ambiguous or changed metadata
 leaves the report unverified, with a diagnostic in the model log; existing model
-verification gates still block publication. Lookup is capped at 100,000 entries,
-new session data at 64 MiB, and identity-bearing records at 1 MiB. Large
-compaction histories and other unrelated records are validated within the
-64 MiB budget but only their identity-relevant fields are decoded; their
-contents cannot supply a model or substitute for current-turn metadata.
+verification gates still block publication. Lookup is capped at 100,000 directory
+entries, but session records and appended data have no fixed byte-size limit.
+Only bytes present at verification time are read. Large compaction histories and
+other unrelated records are validated, but only their identity-relevant fields
+are decoded; their contents cannot supply a model or substitute for current-turn
+metadata. Provider output events and final responses likewise have no fixed
+byte-size limit; full records are retained independently of bounded UI previews.
 Child process groups are cleaned up on completion, stop and reader failure.
 Neither adapter uses generic `--continue` or `--last`.
 

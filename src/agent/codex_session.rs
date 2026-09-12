@@ -7,9 +7,6 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const MAX_LINE: u64 = 1024 * 1024;
-const MAX_APPEND: u64 = 64 * 1024 * 1024;
-
 pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
@@ -59,7 +56,8 @@ fn files(root: &Path) -> Result<HashMap<PathBuf, Metadata>, String> {
 
 // Deserialize only identity-bearing fields. Serde validates and skips unrelated
 // payloads (including compacted replacement/guardian histories) without building
-// a recursive Value tree. The append and per-event input budgets remain bounded.
+// a recursive Value tree. Large tool output and instructions must not prevent
+// verification of the current turn's identity and model.
 #[derive(Default, Deserialize)]
 struct Payload {
     #[serde(rename = "type", default)]
@@ -78,24 +76,14 @@ struct Event {
 fn line(reader: &mut impl BufRead) -> Result<Option<Event>, String> {
     let mut bytes = Vec::new();
     let size = reader
-        .take(MAX_APPEND + 1)
         .read_until(b'\n', &mut bytes)
         .map_err(|e| e.to_string())?;
     if size == 0 { return Ok(None); }
-    if size as u64 > MAX_APPEND {
-        return Err("Codex session event exceeds 64 MiB".into());
-    }
     if bytes.last() != Some(&b'\n') {
         return Err("incomplete Codex session event".into());
     }
     let event: Event = serde_json::from_slice(&bytes)
         .map_err(|e| format!("invalid Codex session event: {e}"))?;
-    let identity_event = matches!(event.kind.as_str(), "session_meta" | "turn_context")
-        || (event.kind == "event_msg" && event.payload.as_ref().is_some_and(|p|
-            matches!(p.kind.as_str(), "task_started" | "task_complete" | "turn_aborted")));
-    if size as u64 > MAX_LINE && identity_event {
-        return Err("Codex session identity event exceeds 1 MiB".into());
-    }
     Ok(Some(event))
 }
 
@@ -143,9 +131,6 @@ impl Snapshot {
         } else {
             0
         };
-        if current.len() - offset > MAX_APPEND {
-            return Err("Codex session append exceeds 64 MiB".into());
-        }
         let mut reader = BufReader::new(file);
         let meta = line(&mut reader)?.ok_or("empty Codex session")?;
         if meta.kind != "session_meta" || meta.payload.as_ref().and_then(|p| p.id.as_deref()) != Some(session) {
