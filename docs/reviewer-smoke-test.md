@@ -12,6 +12,6 @@
 
    **Expected result:** The card shows the selected and/or execution identity as `codex/<actual-model-id>`. A successful invocation is marked `execution_verified`.
 
-4. After the review gate runs, inspect the review outcome and the completed reviewer record in Forge review history/state or `.forge/plan.json` if the panel omits provenance fields.
+4. Explicit same-provider review is permitted: allow the applicable review gate to run, confirm the independent-review outcome, and inspect the completed reviewer record in Forge review history/state or `.forge/plan.json` if the panel summary omits provenance fields.
 
-   **Expected result:** The independent-review outcome is shown, and the record has `role: reviewer`, `provider: codex`, the provider-reported concrete `model`, and `fresh_session: true`. The review is a fresh read-only session and does not resume the implementer session.
+   **Expected result:** The completed record identifies `role` as `reviewer`, `provider` as `codex`, records the provider-reported concrete `model`, and has `fresh_session: true`; the review gate shows the independent-review outcome. The reviewer invocation is a fresh read-only session and does not resume the implementer session.
