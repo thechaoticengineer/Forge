@@ -590,6 +590,35 @@ fn missing_permission_capabilities_prevent_paid_invocation() {
 }
 
 #[test]
+fn large_cli_events_and_results_drain_both_pipes_to_completion() {
+    for provider in ["codex", "claude"] {
+        let fixture = Cli::new(provider, &format!(r#"
+import threading
+text = '界🦀' * 300000
+stderr = threading.Thread(target=lambda: print(text, file=sys.stderr, flush=True))
+stderr.start()
+if '{provider}' == 'codex':
+    print(json.dumps({{'type':'thread.started','thread_id':'{ID}','model':'exact-model'}}))
+    print(json.dumps({{'type':'item.completed','item':{{'type':'command_execution','aggregated_output':text}}}}))
+    print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':text + ' final marker'}}}}))
+    print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':10,'output_tokens':4}}}}))
+else:
+    print(json.dumps({{'type':'user','message':{{'content':[{{'type':'tool_result','content':text}}]}}}}))
+    print(json.dumps({{'type':'result','subtype':'success','session_id':'{ID}','model':'exact-model',
+        'result':text + ' final marker','usage':{{'input_tokens':10,'output_tokens':4}}}}))
+stderr.join()
+with open('finished', 'w') as f: f.write('complete')
+"#));
+        let result = run_bounded(&fixture, provider, request(provider).prompt.into());
+        assert_eq!(result.output, format!("{} final marker", "界🦀".repeat(300_000)));
+        assert!(result.completed && result.model_reported);
+        assert_eq!(result.session.as_deref(), Some(ID));
+        assert_eq!(result.usage.unwrap().total_tokens, 14);
+        assert!(fixture.root.join("finished").exists());
+    }
+}
+
+#[test]
 fn stop_and_reader_failure_kill_descendants_and_close_pipes() {
     for reader_failure in [false, true] {
         let body = format!(
@@ -600,7 +629,8 @@ with open('descendant.pid','w') as f: f.write(str(child.pid))
 time.sleep(60)
 "#,
             if reader_failure {
-                "print('x' * (1024 * 1024 + 2), flush=True)"
+                // Exercise a genuine persistence failure, not a size rejection.
+                "os.remove('.forge/agent-records/current.json')\nprint('trigger failed log write', flush=True)"
             } else {
                 "print('working', flush=True)"
             }

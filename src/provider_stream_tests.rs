@@ -211,8 +211,8 @@ fn complete_provider_messages_reach_durable_records_without_changing_outcomes() 
         let forge = fixture.app.forge_path("");
         let texts = [format!("\r\n  {}\nsecond line\t \r\n", "界🦀".repeat(500)), "\nnext message\r\n  final  ".into()];
         let command = format!("\t{}\r\n  echo done  \n", "λ".repeat(501));
-        // Larger than the page budget but below the defensive event limit.
-        let output = format!("\n{}\r\n  ", "界".repeat(100_000));
+        // Larger than both the page budget and the former transport limit.
+        let output = format!("\n{}\r\n  ", "界".repeat(700_000));
         let diagnostic = format!("  error\n{}\t ", "ø".repeat(600));
         let mut events = Vec::new();
         for text in &texts {
@@ -294,18 +294,46 @@ fn concurrent_plain_stdout_stderr_keep_terminators_and_final_fragments() {
 }
 
 #[test]
-fn retention_keeps_defensive_event_and_result_limits() {
+fn large_final_responses_are_complete_and_preserve_completion_and_usage() {
     use crate::agent::stream_agent_result;
+    use crate::agent_log::{InvocationLog, page};
     for claude in [false, true] {
-        let state = Mutex::new(State::default());
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let input = "x".repeat(1024 * 1024 + 1);
-        assert!(stream_agent_result(input.as_bytes(), &log, &state, 100, claude).unwrap_err().contains("1 MiB"));
-        let text = "x".repeat(128 * 1024 + 1);
-        let event = if claude { json!({"type":"result","result":text}) }
-            else { json!({"type":"item.completed","item":{"type":"agent_message","text":text}}) };
-        assert!(stream_agent_result(event.to_string().as_bytes(), &log, &state, 100, claude).unwrap_err().contains("128 KiB"));
-        assert!(log.lock().unwrap().is_empty());
+        let fixture = crate::test_support::QueueTest::new(false);
+        let forge = fixture.app.forge_path("");
+        let log = Arc::new(Mutex::new(InvocationLog::start(&forge, "").unwrap()));
+        let text = format!("start {} final marker", "界🦀".repeat(300_000));
+        let input = if claude {
+            json!({"type":"result","subtype":"success","result":text,
+                "usage":{"input_tokens":10,"output_tokens":4}}).to_string()
+        } else {
+            format!("{}\n{}", json!({"type":"item.completed","item":{"type":"agent_message","text":text}}),
+                json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":4}}))
+        };
+        let result = stream_agent_result(input.as_bytes(), &log, &Mutex::new(State::default()), 100, claude).unwrap();
+        assert_eq!(result.output, text);
+        assert!(result.completed);
+        assert!(result.error.is_none());
+        assert_eq!(result.usage.unwrap().total_tokens, 14);
+        let page = page(&forge, fixture.app.project(), None, None, 0, 100, false).unwrap();
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["text"], text);
+        assert_eq!(page["next_cursor"], 1);
+        assert!(std::fs::read_to_string(forge.join("agent.log")).unwrap().contains(&text));
+    }
+}
+
+#[test]
+fn large_plain_streams_retain_every_byte_and_keep_only_a_bounded_fallback() {
+    use crate::agent::stream_agent_result_on;
+    for stream in ["stdout", "stderr"] {
+        for ending in ["", "\r\n"] {
+            let input = format!("{} final marker{ending}", "界🦀".repeat(300_000));
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let result = stream_agent_result_on(input.as_bytes(), &log, &Mutex::new(State::default()), 100, false, stream).unwrap();
+            assert_eq!(*log.lock().unwrap(), input.as_bytes());
+            assert!(result.output.ends_with("final marker"));
+            assert!(result.output.chars().count() <= 100);
+        }
     }
 }
 

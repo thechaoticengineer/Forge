@@ -51,8 +51,11 @@ invocation creates a new session even when it resumes the same provider thread.
 separately; select/copy `text` exactly. Tool command/input fields and output fields
 have separate records. Object-valued fields retain complete JSON. Plain streams
 retain their actual line terminators, trailing whitespace, and final unterminated
-fragment. Provider defensive event/result limits and bounded outcome tails still
-apply; those limits return errors rather than successful partial capture.
+fragment. Provider events and final responses have no fixed byte-size limit;
+large records are read and retained in full without closing the provider pipe.
+The raw-text fallback and live status previews remain bounded; they do not limit
+structured final responses or persisted messages. Records are buffered in memory
+individually, so memory and available disk space remain practical constraints.
 
 ## Historical and legacy sources
 

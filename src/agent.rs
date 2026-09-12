@@ -479,12 +479,10 @@ pub(crate) fn stream_agent_result_on<R: std::io::Read, W: Sink>(
 
     loop {
         bytes.clear();
-        let read = std::io::Read::take(&mut reader, 1024 * 1024 + 1)
-            .read_until(b'\n', &mut bytes)
+        // JSONL events can contain an entire tool output in a single line.
+        // Presentation budgets must never terminate the provider's pipe.
+        let read = reader.read_until(b'\n', &mut bytes)
             .map_err(|e| format!("failed to read agent output: {e}"))?;
-        if read > 1024 * 1024 {
-            return Err("agent event exceeds 1 MiB".into());
-        }
         if read == 0 {
             break;
         }
@@ -579,9 +577,6 @@ pub(crate) fn stream_agent_result_on<R: std::io::Read, W: Sink>(
                 usage = Some(candidate);
             }
         };
-        if result_tail.as_ref().is_some_and(|s| s.len() > 128 * 1024) {
-            return Err("agent result exceeds 128 KiB".into());
-        }
         for message in retained_messages(event.as_ref(), &lossy, claude, stream) {
             log.lock().map_err(|_| "agent log lock was poisoned".to_string())?
                 .append(&message).map_err(|e| format!("failed to persist agent log: {e}"))?;
