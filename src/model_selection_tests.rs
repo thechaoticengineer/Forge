@@ -527,3 +527,23 @@ fn role_effort_defaults_and_explicit_pins_survive_policy_normalization() {
         }
     }
 }
+
+#[test]
+fn configured_reviewer_uses_selected_provider_even_after_same_provider_implementation() {
+    let f = QueueTest::new(false);
+    let ctx = configured(&f);
+    {
+        let mut s = ctx.app.settings.lock().unwrap();
+        s["reviewer_provider_mode"] = json!("configured");
+        s["reviewer"] = json!("codex");
+    }
+    for implementer in ["codex", "claude"] {
+        let requirements = ctx.model_requirements("reviewer", Some(implementer)).unwrap();
+        assert_eq!(requirements.provider, "codex");
+        assert_eq!(requirements.minimum_tier, Some(Tier::Strong));
+        assert_eq!(ctx.reviewer_config(implementer).unwrap(), ("codex".into(), "large".into()));
+    }
+    ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"].as_array_mut().unwrap()
+        .retain(|e| e["provider"] != "codex" || e["tier"] != "strong");
+    assert!(ctx.reviewer_config("codex").is_err()); // Never silently spend Claude quota.
+}

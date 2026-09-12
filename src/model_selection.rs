@@ -125,7 +125,7 @@ impl Ctx {
             .unwrap_or("")
             .to_string();
         let configured = settings[configured_role].as_str().unwrap_or("codex");
-        let provider = if role == "reviewer" {
+        let provider = if role == "reviewer" && settings["reviewer_provider_mode"] != "configured" {
             let other = match implementer {
                 Some("codex") => "claude",
                 Some("claude") => "codex",
@@ -426,6 +426,9 @@ impl Ctx {
 
     pub(crate) fn bootstrap(&self, role: &str) -> Result<ModelChoice, String> {
         self.select_model(&self.model_requirements(role, None)?, &[])
+    }
+    pub(crate) fn configured_reviewer(&self) -> bool {
+        self.app.settings.lock().unwrap()["reviewer_provider_mode"] == "configured"
     }
     pub(crate) fn reviewer_config(&self, implementer: &str) -> Result<(String, String), String> {
         let choice = self.select_model(

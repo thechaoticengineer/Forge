@@ -84,9 +84,9 @@ active-agent/log state.
 The architect checks recorded decisions, cross-stage interfaces and regressions.
 The independent reviewer receives agreed constraints and preceding actionable
 requests, never the architect's current approval as an endorsement. The engine
-resolves a stage reviewer's provider as the other provider relative to the actual
-implementer.
-The configured reviewer must match that provider; known unavailable models or
+uses the reviewer provider selected in the panel, in a fresh read-only session.
+The separate `auto (other provider)` option requires a different provider from
+the implementer. Known unavailable models or
 incompatible effort/permission capabilities block execution. Configured explicit
 unverified fallbacks remain visibly unverified until execution verifies them.
 Stage routing selects a tier; launch resolves a model within the selected implementer provider; the review gate enforces the
@@ -116,11 +116,13 @@ Plan review uses the same exact identity, snapshot, evidence normalization,
 read-only sandbox and independent project-check rules described below. Its
 identity has `stage_id: null` and `scope: "plan"`; each role's validated verdict
 is published as a `plan_review` event in the architecture event log. The architect
-uses its persistent session. The independent plan reviewer must use a provider
-no stage implementer used, including recorded implementation/fixer invocation
+uses its persistent session. In `auto (other provider)` mode, the independent plan
+reviewer must use a provider no stage implementer used, including recorded implementation/fixer invocation
 provenance and plan fixes; retries and fallback cannot waive this exclusion.
 Unknown or unverified implementation provenance blocks independent plan review.
-This independence requirement applies under the default per-plan cadence. If no
+An explicitly selected reviewer may use the same provider in a fresh session;
+provider provenance and all evidence, sandbox and approval checks remain required.
+In automatic other-provider mode, if no
 eligible independent provider remains, the run blocks and commits stay local,
 with guidance to use reviewer cadence per stage for a revised plan or pin the
 implementer provider. These choices can prevent conflicts in future work;
@@ -1336,11 +1338,20 @@ remain readable for older plans and execution reassessment.
 
 `automatic_routing` defaults to `true`. The implementer selector determines the
 provider even with automatic routing enabled. Planner and architect bootstrap
-settings remain separate. An automatic unpinned reviewer follows the other
-provider and uses an eligible strong registry entry; per-plan review resolves
-independence from actual contributors when the plan review starts. A reviewer
-model pin and disabling automatic routing retain the configured reviewer provider.
-These are runtime engine settings; the catalogue has its separate persisted policy.
+settings remain separate. The reviewer control cycles through `auto (other provider)`,
+`codex`, and `claude`. An explicit provider uses `reviewer_provider_mode: configured`
+and is respected even when automatic model routing is enabled and the same provider
+implemented the work. Review always starts in a fresh read-only session. Missing
+eligible models block rather than silently switching to another provider.
+
+`reviewer_provider_mode: other_provider` retains the legacy automatic independence
+policy: unpinned review uses the other provider, with plan review checking all actual
+contributors. This is the default for older settings; the panel labels it as auto.
+Posting `reviewer` alone to `/api/settings` selects configured mode. Clients can
+explicitly include `reviewer_provider_mode` to choose either behavior. Automatic
+review uses an eligible strong registry entry; explicit model pins retain their
+existing capability policy. These are runtime engine settings; the catalogue has
+its separate persisted policy.
 
 Selection precedence at launch is explicit:
 
@@ -1369,9 +1380,9 @@ IDs, unsupported native efforts, catalogue ineligibility, quota blocks and
 inadequate tiers are reported with the validation reason rather than silently
 overriding settings. Tier failures state the required floor and selected model's
 configured tier (`unclassified` if absent). Cross-provider reviewer conflicts are
-checked there when the reviewer is scheduled per stage; that reviewer must use
-the other provider relative to the selected implementer. Deferred reviewer independence
-is checked over the frozen plan subject when plan review runs.
+checked there when the reviewer is scheduled per stage and other-provider mode is
+selected. In that mode, deferred reviewer independence is checked over the frozen
+plan subject when plan review runs.
 
 The planner proposes risk, complexity, task, capability tier and a
 stage-specific rationale in its existing standard/refactor/revision output.

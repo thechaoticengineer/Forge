@@ -1978,3 +1978,27 @@ fn plan_review_recovers_staging_crash_but_rejects_new_content_or_index() {
         assert_eq!(f.plan_calls().len(),4);
     }
 }
+
+#[test]
+fn configured_reviewer_runs_fresh_codex_reviews_after_codex_for_both_cadences() {
+    for cadence in ["per_stage", "per_plan"] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("implementer", json!("codex"));
+        f.setting("reviewer", json!("codex"));
+        f.setting("reviewer_provider_mode", json!("configured"));
+        f.setting("test_fake_providers", json!(true));
+        f.setting("review_cadence", json!({"architect":cadence,"reviewer":cadence}));
+        f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([
+            {"provider":"codex","model":"stage-model","tier":"strong"},
+            {"provider":"claude","model":"other-model","tier":"strong"}
+        ]);
+        let p = f.run();
+        assert_eq!(p["status"], "done", "{cadence}: {p}");
+        assert_eq!(p["stages"][0]["implementer_provider"], "codex");
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let reviewers: Vec<_> = settings["test_review_sessions"].as_array().unwrap().iter()
+            .filter(|r| r["role"] == "reviewer").collect();
+        assert!(!reviewers.is_empty());
+        assert!(reviewers.iter().all(|r| r["provider"] == "codex" && r["session"].is_null()));
+    }
+}

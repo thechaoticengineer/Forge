@@ -12,7 +12,7 @@ pub(crate) const POLICY: &str = "stage-routing-1";
 const EXECUTION_CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","provider":"exact provider","model":"exact registry ID","native_effort":"provider_default or supported native effort","rationale":"stage-specific adequacy, failure impact and cost reasoning"}.
 Use exactly those seven proposal fields; put all explanation, including effort changes, in rationale. Do not add fields.
-Use only eligible catalogue/registry options. Copy the option's model field exactly; resolved_id is execution evidence, not an alternative registry key. Configured tiers are explicit adequacy policy, not official evidence. Critical or complex work requires strong; never infer quality from price or model name. Simple work and documentation at any adequate tier prefer a cheaper adequate option only with comparable published billing data or configured relative preferences. Unknown price remains unknown. Constraints narrow choices first, but never waive capability or independent-review requirements. With per_plan reviewer cadence, stage reviewer selection is deferred: the configured reviewer provider is not a stage implementer constraint. With per_stage cadence, automatic routing and no reviewer model pin, Forge chooses the other reviewer provider automatically; the configured reviewer selector alone does not prohibit an implementer provider. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
+Use only eligible catalogue/registry options. Copy the option's model field exactly; resolved_id is execution evidence, not an alternative registry key. Configured tiers are explicit adequacy policy, not official evidence. Critical or complex work requires strong; never infer quality from price or model name. Simple work and documentation at any adequate tier prefer a cheaper adequate option only with comparable published billing data or configured relative preferences. Unknown price remains unknown. Constraints narrow choices first, but never waive capability or independent-review requirements. With per_plan reviewer cadence, stage reviewer selection is deferred: the configured reviewer provider is not a stage implementer constraint. With reviewer_provider_mode=configured, respect the selected reviewer provider in a fresh session, including same-provider review. Otherwise with per_stage cadence, automatic routing and no reviewer model pin, Forge chooses the other reviewer provider automatically; the configured reviewer selector alone does not prohibit an implementer provider. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
 
 pub(crate) const CONTRACT: &str = r#"STAGE CAPABILITY CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","tier":"basic|standard|strong","rationale":"stage-specific capability and failure-impact reasoning"}.
@@ -311,7 +311,7 @@ fn effort_rank(e: &str) -> u64 {
     match e { "minimal" => 1, "low" => 2, "medium" => 3, "high" => 4, "xhigh" => 5, "max" => 6, _ => 0 }
 }
 fn automatic_reviewer(settings: &Value) -> bool {
-    settings["automatic_routing"] != false
+    settings["reviewer_provider_mode"] != "configured" && settings["automatic_routing"] != false
         && settings["reviewer_model"].as_str().is_none_or(str::is_empty)
 }
 fn material_inputs(v: &Value, settings: &Value) -> Value {
@@ -378,7 +378,7 @@ fn policy_inputs(
         ));
     }
     let reviewer_deferred = crate::plan::review_cadence(settings, "reviewer") == "per_plan";
-    if !reviewer_deferred && p.provider != "mock" && settings["reviewer"] != if p.provider == "codex" { "claude" } else { "codex" }
+    if settings["reviewer_provider_mode"] != "configured" && !reviewer_deferred && p.provider != "mock" && settings["reviewer"] != if p.provider == "codex" { "claude" } else { "codex" }
         && (settings["automatic_routing"] == false || settings["reviewer_model"].as_str().is_some_and(|s| !s.is_empty())) {
         return Err("cross-provider-review conflict: explicit reviewer constraint prevents switch".into());
     }
@@ -412,7 +412,7 @@ fn policy_inputs(
         && !pending.is_object() && stage["routing_validity_only"] != true
         && options.iter().filter(adequate).any(|o| {
             matches_constraint(o, &c)
-                && (reviewer_deferred || o["provider"] == "mock"
+                && (settings["reviewer_provider_mode"] == "configured" || reviewer_deferred || o["provider"] == "mock"
                     || settings["reviewer"]
                         == if o["provider"] == "codex" {
                             "claude"
@@ -501,7 +501,8 @@ impl Ctx {
     pub(crate) fn stage_selection_prompt(&self, plan: &Value, ids: &[i64]) -> Result<String, String> {
         if plan["stages"].as_array().unwrap().iter().any(|s|
             ids.contains(&s["id"].as_i64().unwrap_or(0)) && s["reassessment"]["pending"].is_object()) {
-            Ok(format!("{EXECUTION_CONTRACT}\nOptions: {}", json!(self.routing_candidates()?)))
+            let reviewer_mode = self.app.settings.lock().unwrap()["reviewer_provider_mode"].clone();
+            Ok(format!("{EXECUTION_CONTRACT}\nReviewer settings: {}\nOptions: {}", json!({"reviewer_provider_mode":reviewer_mode}), json!(self.routing_candidates()?)))
         } else { self.routing_prompt() }
     }
     pub(crate) fn routing_required(&self, plan: &Value, cp: &Value) -> Result<Vec<i64>, String> {

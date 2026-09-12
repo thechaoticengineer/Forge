@@ -12,6 +12,7 @@ pub(crate) fn default_settings() -> Value {
         "automatic_routing": true,
         "routing_billing_basis": null,
         "reviewer": "claude",
+        "reviewer_provider_mode": "other_provider",
         "planner_model": "",
         "implementer_model": "",
         "reviewer_model": "",

@@ -122,13 +122,13 @@ impl Ctx {
 
     pub(super) fn validate_plan_reviewer(&self, plan: &Value, provider: &str) -> Result<(), String> {
         let used = providers(plan)?;
-        if used.contains(provider) && !(provider == "mock" && used.len() == 1) { return Err(INDEPENDENCE.into()); }
+        if !self.configured_reviewer() && used.contains(provider) && !(provider == "mock" && used.len() == 1) { return Err(INDEPENDENCE.into()); }
         Ok(())
     }
 
     fn plan_reviewer(&self, plan: &mut Value, identity: &Value) -> Result<Value, String> {
         let used = providers(plan)?;
-        if used.len() != 1 { return Err(INDEPENDENCE.into()); }
+        if !self.configured_reviewer() && used.len() != 1 { return Err(INDEPENDENCE.into()); }
         let implementer = used.iter().next().ok_or(INDEPENDENCE)?;
         let (provider,model) = self.reviewer_config(implementer).map_err(|e| format!("{INDEPENDENCE}: {e}"))?;
         let requirements = self.model_requirements("reviewer",Some(implementer))?;
@@ -204,7 +204,7 @@ impl Ctx {
                 let used = providers(plan)?;
                 if plan["plan_review"]["required_roles"].as_array().unwrap().contains(&json!("reviewer")) {
                     // Do not introduce a contributor that would leave no independent reviewer.
-                    if used.len() != 1 || !used.contains(&choice.0) { return Err(INDEPENDENCE.into()); }
+                    if !self.configured_reviewer() && (used.len() != 1 || !used.contains(&choice.0)) { return Err(INDEPENDENCE.into()); }
                     self.reviewer_config(&choice.0).map_err(|e| format!("{INDEPENDENCE}: {e}"))?;
                 }
                 let cp = self.architecture_store().checkpoint(plan)?;

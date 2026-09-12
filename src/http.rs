@@ -381,8 +381,14 @@ fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     }
     let mut candidate = settings.clone();
     for (k,v) in obj { if candidate.get(k).is_some() { candidate[k] = v.clone(); } }
+    if obj.contains_key("reviewer") && !obj.contains_key("reviewer_provider_mode") {
+        candidate["reviewer_provider_mode"] = json!("configured");
+    }
     if !candidate["automatic_routing"].is_boolean() || !(candidate["routing_billing_basis"].is_null() || candidate["routing_billing_basis"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) {
         return (400, json!({"error":"automatic_routing must be boolean; routing_billing_basis must be null or an exact billing basis (max 64 bytes)"}));
+    }
+    if !matches!(candidate["reviewer_provider_mode"].as_str(), Some("other_provider" | "configured")) {
+        return (400, json!({"error":"reviewer_provider_mode must be other_provider or configured"}));
     }
     let limits = &candidate["reassessment_limits"];
     if limits.as_object().is_none_or(|o| o.len() != 4) || [("max_reassessments",0,8),("max_operational_retries",0,5),("repeat_threshold",2,10),("context_percent",50,95)].iter().any(|(k,min,max)| limits[*k].as_u64().is_none_or(|v| v < *min || v > *max)) {

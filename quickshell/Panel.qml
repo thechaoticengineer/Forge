@@ -1459,6 +1459,23 @@ Item {
     }
   }
 
+  function reviewerLabel() {
+    const s = engineState ? engineState.settings : {}
+    return s.reviewer_provider_mode === "configured" || s.reviewer_model || s.automatic_routing === false
+      ? "reviewer: " + (s.reviewer || "…")
+      : "reviewer: auto (other provider)"
+  }
+
+  function cycleReviewer() {
+    const s = engineState ? engineState.settings : {}
+    if (s.reviewer_provider_mode !== "configured")
+      act("/api/settings", {reviewer:"codex", reviewer_provider_mode:"configured", reviewer_model:""})
+    else if (s.reviewer === "codex")
+      act("/api/settings", {reviewer:"claude", reviewer_provider_mode:"configured", reviewer_model:""})
+    else
+      act("/api/settings", {reviewer_provider_mode:"other_provider", automatic_routing:true, reviewer_model:""})
+  }
+
   function cycleTool(key) {
     const current = engineState ? engineState.settings[key] : "claude"
     const next = current === "claude" ? "codex" : "claude"
@@ -2032,9 +2049,8 @@ Item {
             onClicked: root.cycleTool("implementer")
           }
           PanelButton {
-            label: "reviewer: "
-              + (root.engineState ? root.engineState.settings.reviewer : "…")
-            onClicked: root.cycleTool("reviewer")
+            label: root.reviewerLabel()
+            onClicked: root.cycleReviewer()
           }
           CadenceButton { role: "architect" }
           CadenceButton { role: "reviewer" }

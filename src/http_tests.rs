@@ -610,3 +610,14 @@ fn settings_persistence_preserves_omitted_and_explicit_default_effort() {
         }
     }
 }
+
+#[test]
+fn reviewer_provider_mode_is_explicit_and_invalid_updates_are_atomic() {
+    let test = QueueTest::new(false);
+    assert_eq!(api_request(&test.app.app,"POST","/api/settings",json!({"reviewer":"codex"})).0,200);
+    assert_eq!(test.app.app.settings.lock().unwrap()["reviewer_provider_mode"], "configured");
+    assert_eq!(api_request(&test.app.app,"POST","/api/settings",json!({"reviewer_provider_mode":"other_provider"})).0,200);
+    let saved = test.app.app.settings.lock().unwrap().clone();
+    assert_eq!(api_request(&test.app.app,"POST","/api/settings",json!({"reviewer":"claude","reviewer_provider_mode":"invalid"})).0,400);
+    assert_eq!(*test.app.app.settings.lock().unwrap(), saved);
+}
