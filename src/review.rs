@@ -1076,7 +1076,7 @@ impl Ctx {
                 let model = effective["model"].as_str().ok_or("missing agreed model")?;
                 let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
                 plan["stages"][idx]["implementer_provider"] = json!(implementer);
-                let invocation = json!({"turn_id":turn,"agreement_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
+                let invocation = json!({"turn_id":turn,"agreement_id":assignment["agreement_id"],"selection_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
                 if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
                 plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
                 self.save_plan(plan)?;

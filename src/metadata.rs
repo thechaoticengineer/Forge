@@ -19,7 +19,8 @@ pub(crate) const ALLOWED_HOSTS: [&str; 5] = [
 ];
 /// Routing-relevant fields an official document may provide. Anything else,
 /// including quality comparisons, stays unknown rather than fabricated.
-const ROUTING_FIELDS: [&str; 5] = [
+const ROUTING_FIELDS: [&str; 6] = [
+    "description",
     "context_window",
     "max_output_tokens",
     "supports_reasoning",
@@ -258,7 +259,7 @@ fn pricing(v: &Value) -> Option<Value> {
 /// "max_output_tokens","reasoning","lifecycle","pricing":{...}}]}, or the
 /// providers' official markdown model pages. Fields are optional; absent or
 /// unparseable values remain unknown rather than guessed.
-fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value>>, String> {
+pub(crate) fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value>>, String> {
     if body.len() > MAX_BODY {
         return Err("document exceeds size limit".into());
     }
@@ -281,6 +282,9 @@ fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value
             continue;
         };
         let mut fields = BTreeMap::new();
+        if let Some(description) = row["description"].as_str().filter(|s| !s.trim().is_empty() && s.len() <= 4096) {
+            fields.insert("description".into(), json!(description));
+        }
         for key in ["context_window", "max_output_tokens"] {
             if let Some(n) = row[key].as_u64() {
                 fields.insert(key.to_string(), json!(n));
@@ -306,9 +310,10 @@ fn parse_document(body: &[u8]) -> Result<BTreeMap<String, BTreeMap<String, Value
 /// Markdown extraction is limited to two exact, bounded patterns the official
 /// pages publish: comparison tables keyed by a "Claude API ID" row (context
 /// window and max output per column) and `slug="…"` model attributes, which
-/// name models without providing routing facts. Prose is never interpreted.
+/// name models. ModelDetails descriptions are retained verbatim for AI policy
+/// advice; they never assign capability tiers inside the metadata service.
 fn parse_markdown(text: &str) -> BTreeMap<String, BTreeMap<String, Value>> {
-    let mut models = BTreeMap::new();
+    let mut models: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
     let mut rest = text;
     while let Some(i) = rest.find("slug=\"") {
         rest = &rest[i + 6..];
@@ -318,6 +323,20 @@ fn parse_markdown(text: &str) -> BTreeMap<String, BTreeMap<String, Value>> {
             models.entry(id.to_string()).or_default();
         }
         rest = &rest[j + 1..];
+    }
+    for component in text.split("<ModelDetails").skip(1) {
+        let Some((component, _)) = component.split_once("/>") else { continue };
+        let attribute = |name: &str| -> Option<&str> {
+            let (_, tail) = component.split_once(&format!("{name}=\""))?;
+            tail.split_once('"').map(|(value, _)| value)
+        };
+        if let (Some(id), Some(description)) = (attribute("slug"), attribute("description")) {
+            if let Some(fields) = models.get_mut(id) {
+                if !description.trim().is_empty() && description.len() <= 4096 {
+                    fields.insert("description".into(), json!(description));
+                }
+            }
+        }
     }
     let mut table: Vec<Vec<String>> = Vec::new();
     for line in text.lines().map(str::trim) {
@@ -356,11 +375,20 @@ fn table_facts(table: &[Vec<String>], models: &mut BTreeMap<String, BTreeMap<Str
     };
     for row in table {
         let field = match row.first().map(|c| plain_label(c)).as_deref() {
+            Some("Description") => "description",
             Some("Context window") => "context_window",
             Some("Max output") => "max_output_tokens",
             _ => continue,
         };
         for (id, cell) in ids.iter().zip(&row[1..]) {
+            if field == "description" {
+                if let Some(id) = id {
+                    if !cell.is_empty() && cell.len() <= 4096 && (models.len() < 512 || models.contains_key(id)) {
+                        models.entry(id.clone()).or_default().insert(field.into(), json!(cell));
+                    }
+                }
+                continue;
+            }
             if let (Some(id), Some(n)) = (id, token_count(cell)) {
                 if models.len() < 512 || models.contains_key(id) {
                     models.entry(id.clone()).or_default().insert(field.into(), json!(n));

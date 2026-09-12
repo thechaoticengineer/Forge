@@ -33,7 +33,7 @@ impl Ctx {
         &self, role: &str, prompt: &str, mock_file: Option<&str>,
         validate: impl FnMut(&str) -> Result<T, String>,
     ) -> Result<ValidatedReply<T>, String> {
-        if !matches!(role, "planner" | "chat" | "enhance") {
+        if !matches!(role, "planner" | "chat" | "enhance" | "model_policy") {
             return Err("read-only response adapter requires a read-only role".into());
         }
         let invoke = |choice: &crate::model_selection::ModelChoice, prompt: &str| {

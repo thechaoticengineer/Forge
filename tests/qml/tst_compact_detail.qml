@@ -92,6 +92,49 @@ Item {
             compare(fixture.copied, source)
             compare(entries.get(0).expanded, true, "copy cannot collapse a row")
         }
+        function test_collapse_restores_occupied_geometry() {
+            const source = "Full detail line\n".repeat(40)
+            append([record("detail", source), record("following", "Following row")])
+            list.followTail = false
+            list.positionViewAtBeginning()
+            const toggles = controls("detailToggle")
+            const toggle = toggles[0]
+            const detail = toggle.parent.parent
+            const row = detail.parent
+            const column = row.parent
+            const following = toggles[1].parent.parent.parent
+            const body = Array.from(detail.children).find(x => x.sourceComponent !== undefined)
+            verify(!!body, "the production body Loader exists")
+            function geometry() {
+                return { detailHeight: detail.height, detailImplicit: detail.implicitHeight,
+                    loaderHeight: body.height, loaderImplicit: body.implicitHeight, loaderItem: body.item !== null,
+                    rowHeight: row.height, rowImplicit: row.implicitHeight,
+                    columnHeight: column.height, columnImplicit: column.implicitHeight,
+                    followingY: following.mapToItem(list.contentItem, 0, 0).y,
+                    contentHeight: list.contentHeight }
+            }
+            const baseline = geometry()
+            console.log("COLLAPSE baseline " + JSON.stringify(baseline))
+            const occupied = ["detailHeight", "detailImplicit", "rowHeight", "rowImplicit",
+                "columnHeight", "columnImplicit", "followingY", "contentHeight"]
+            for (let cycle = 0; cycle < 5; ++cycle) {
+                mouseClick(toggle)
+                tryCompare(entries.get(0), "expanded", true)
+                tryVerify(() => findChild(detail, "detailFullText") !== null, 2000)
+                compare(findChild(detail, "detailFullText").text, source, "expansion exposes all text")
+                tryVerify(() => occupied.every(key => geometry()[key] > baseline[key] + 1), 2000,
+                    "expansion grows the row, containing Columns and scroll extent")
+                console.log("COLLAPSE expanded " + cycle + " " + JSON.stringify(geometry()))
+                mouseClick(toggle)
+                tryCompare(entries.get(0), "expanded", false)
+                tryVerify(() => body.item === null && findChild(detail, "detailFullText") === null, 2000,
+                    "collapse destroys the lazy editor")
+                tryVerify(() => occupied.every(key => Math.abs(geometry()[key] - baseline[key]) <= 1), 2000,
+                    "collapse restores occupied geometry within 1 logical pixel; baseline="
+                    + JSON.stringify(baseline) + "; observed=" + JSON.stringify(geometry()))
+                console.log("COLLAPSE recollapsed " + cycle + " " + JSON.stringify(geometry()))
+            }
+        }
         function test_blank_and_single_line_keyboard_mouse_controls() {
             append([record("blank", " \r\n\t ")])
             compare(findChild(list, "detailPreview").text, "(empty text)")

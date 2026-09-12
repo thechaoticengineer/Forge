@@ -916,3 +916,30 @@ fn pending_scope_revision_cannot_overwrite_changed_stage_inputs() {
     assert!(error.contains("no longer matches stage inputs"), "{error}");
     assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["instructions"], "New user instructions");
 }
+
+#[test]
+fn tier_plan_executes_local_selection_and_preserves_bounded_failure_escalation() {
+    let f = Fixture::new();
+    f.set("mock_routing_planner_outputs", json!([{"proposals":[{"stage_id":1,"proposal":{
+        "risk":"standard","complexity":"standard","task":"functionality","tier":"standard",
+        "rationale":"Ordinary greeting implementation needs standard capability."}}]}]));
+    let mut candidate = f.ctx.load_plan().unwrap();
+    for key in ["plan_id", "revision", "architecture"] { candidate.as_object_mut().unwrap().remove(key); }
+    for key in ["model_proposal", "model_proposal_inputs", "model_agreement"] {
+        candidate["stages"][0].as_object_mut().unwrap().remove(key);
+    }
+    let p = f.ctx.architect_publish(candidate, None, "tier fixture").unwrap();
+    assert_eq!(p["stages"][0]["model_agreement"]["version"], 2);
+    let tier_agreement = p["stages"][0]["model_agreement"]["id"].clone();
+    f.failures();
+    f.choose("codex", "large", "provider_default");
+    let p = f.run();
+    let s = &p["stages"][0];
+    assert_eq!(s["status"], "committed", "{s}");
+    assert_eq!(s["model_invocations"][0]["agreement_id"], tier_agreement);
+    assert_eq!(s["model_invocations"][0]["requested"]["model"], "small");
+    assert_eq!(s["model_invocations"][2]["requested"]["model"], "large");
+    assert_eq!(s["reassessment"]["count"], 1);
+    assert_eq!(s["rounds"], 3);
+    assert_eq!(s["reassessment"]["history"][0]["old_agreement"]["kind"], "selection");
+}

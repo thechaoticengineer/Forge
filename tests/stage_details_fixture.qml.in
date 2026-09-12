@@ -175,6 +175,35 @@ Item {
             clipboard.clipboardText=""
             wait(80)
         }
+        function test_stage_collapse_releases_geometry_data() {
+            return [{tag:"narrow",width:280},{tag:"wide",width:800}]
+        }
+        function test_stage_collapse_releases_geometry(data) {
+            root.width=data.width
+            // Keep review data settled so loading status cannot change the baseline.
+            const stage=Object.assign({},root.plan.stages[0],{
+                reviews:[],review_count:0,reviews_truncated:false})
+            root.plan=Object.assign({},root.plan,{stages:[stage]})
+            wait(80)
+            const baseline=stageRow.height
+            const listBaseline=stageList.contentHeight
+            const scrollBaseline=panelScroll.contentHeight
+            verify(baseline>0)
+            for (let cycle=0;cycle<5;cycle++) {
+                click(all("stageToggle")[0])
+                tryVerify(()=>stageRow.height>baseline+1,2000)
+                verify(!!prose("Instructions"),"expansion constructs full stage text")
+                compare(prose("Instructions").originalText,stage.instructions)
+                tryVerify(()=>stageList.contentHeight>listBaseline+1,2000)
+                tryVerify(()=>panelScroll.contentHeight>scrollBaseline+1,2000)
+                click(all("stageToggle")[0])
+                assertCollapsed()
+                tryVerify(()=>Math.abs(stageRow.height-baseline)<=1,2000,
+                    "collapsed stage releases the Loader's retained height")
+                tryVerify(()=>Math.abs(stageList.contentHeight-listBaseline)<=1,2000)
+                tryVerify(()=>Math.abs(panelScroll.contentHeight-scrollBaseline)<=1,2000)
+            }
+        }
         function test_status_prose_and_nested_selection() {
             compare(root.calls.length,0)
             verify(stageRow.reviewHistory.length > 0,"collapsed assertions include populated reviews")

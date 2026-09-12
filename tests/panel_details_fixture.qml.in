@@ -56,13 +56,14 @@ Item {
     Flickable {
         id: panelScroll
         anchors.fill: parent
-        contentHeight: pane.height
+        contentHeight: pane.implicitHeight
         clip: true
         Column {
             id: pane
             width: root.width
             Column { visible: root.mode === "planReview"; width: parent.width; // PANEL_PLAN_REVIEW
             }
+            Rectangle { id: followingPlanReview; visible: root.mode === "planReview"; width: parent.width; height: 24 }
             Column { visible: root.mode === "cadence"; width: parent.width; // PANEL_CADENCE
             }
             Column { visible: root.mode === "localError"; width: parent.width; // PANEL_LOCAL_ERROR
@@ -160,6 +161,46 @@ Item {
         }
         function test_plan_review_full_requests_data() {
             return [280,800].map(width=>({tag:String(width),width:width}))
+        }
+        function test_plan_review_collapse_geometry_data() {
+            return [280,800].map(width=>({tag:String(width),width:width}))
+        }
+        function test_plan_review_collapse_geometry(data) {
+            root.mode="planReview";root.width=data.width
+            const source="Full detail line\n".repeat(40)
+            root.plan={plan_id:"collapse",revision:1,plan_review:{attempt_id:"collapse",rounds:1,budget:1,
+                status:"changes_requested",gate:{status:"changes_requested",requests_truncated:false,
+                    requests:[{role:"architect",text:source}]}}}
+            const detail=named(root,"planReviewRequests"), section=named(root,"planReviewSection")
+            const body=Array.from(detail.children).find(x=>x.sourceComponent!==undefined)
+            function geometry() {
+                return {detailHeight:detail.height,detailImplicit:detail.implicitHeight,
+                    loaderHeight:body.height,loaderImplicit:body.implicitHeight,loaderItem:body.item!==null,
+                    sectionHeight:section.height,sectionImplicit:section.implicitHeight,
+                    wrapperHeight:section.parent.height,wrapperImplicit:section.parent.implicitHeight,
+                    columnHeight:pane.height,columnImplicit:pane.implicitHeight,
+                    followingY:followingPlanReview.mapToItem(panelScroll.contentItem,0,0).y,
+                    contentHeight:panelScroll.contentHeight}
+            }
+            tryVerify(()=>detail.textComplete && section.height>detail.height && followingPlanReview.y>0,2000)
+            wait(30)
+            const baseline=geometry()
+            console.log("PLAN_COLLAPSE baseline "+JSON.stringify(baseline))
+            const occupied=Object.keys(baseline).filter(key=>key.indexOf("loader")!==0)
+            for(let cycle=0;cycle<5;++cycle) {
+                click(named(detail,"detailToggle"))
+                tryCompare(detail,"expanded",true)
+                tryVerify(()=>named(detail,"detailFullText")!==null,2000)
+                compare(named(detail,"detailFullText").text,"[architect] "+source)
+                tryVerify(()=>occupied.every(key=>geometry()[key]>baseline[key]+1),2000)
+                console.log("PLAN_COLLAPSE expanded "+cycle+" "+JSON.stringify(geometry()))
+                click(named(detail,"detailToggle"))
+                tryCompare(detail,"expanded",false)
+                tryVerify(()=>body.item===null && named(detail,"detailFullText")===null,2000)
+                console.log("PLAN_COLLAPSE recollapsed "+cycle+" "+JSON.stringify(geometry()))
+                tryVerify(()=>occupied.every(key=>Math.abs(geometry()[key]-baseline[key])<=1),2000,
+                    "collapse returns to baseline within 1px: "+JSON.stringify(geometry()))
+            }
         }
         function test_plan_review_full_requests(data) {
             root.mode="planReview";root.width=data.width

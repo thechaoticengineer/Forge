@@ -178,7 +178,7 @@ fn validate_checkpoint(cp: &Value, plan: &Value) -> Result<(), String> {
                 .get("plan_id")
                 .is_some_and(|id| *id != plan["plan_id"])
                 || stage_key != &stage_id.to_string()
-                || record["version"] != VERSION
+                || (record["version"] != VERSION && !(key == "agreements" && record["version"] == 2))
                 || !record["id"].as_str().is_some_and(safe_id)
                 || !record["valid"].is_boolean()
                 || !record["unix"].as_i64().is_some_and(|t| t >= 0)
@@ -270,22 +270,22 @@ fn validate_model(record: &Value) -> Result<crate::contracts::ModelRecord, Strin
     use crate::contracts::SelectionKind;
     let m: crate::contracts::ModelRecord =
         serde_json::from_value(record.clone()).map_err(|e| e.to_string())?;
-    if m.version != VERSION
+    let effective_valid = if m.version == 2 {
+        matches!(m.kind, SelectionKind::Agreement) && m.effective.is_none()
+            && crate::routing::valid_tier_record(record)
+    } else {
+        m.version == VERSION && m.effective.as_ref().is_some_and(|e|
+            !e.provider.trim().is_empty() && !e.model.trim().is_empty()
+            && record["effective"].as_object().is_some_and(|m| m.contains_key("native_effort"))
+            && e.native_effort.as_ref().is_none_or(|s| !s.trim().is_empty()))
+    };
+    if !effective_valid
         || !safe_id(&m.id)
         || !safe_id(&m.plan_id)
         || m.revision == 0
         || m.stage_id <= 0
         || m.unix < 0
         || m.provenance.checked_unix < 0
-        || m.effective.provider.trim().is_empty()
-        || m.effective.model.trim().is_empty()
-        || !record["effective"]
-            .as_object()
-            .is_some_and(|m| m.contains_key("native_effort"))
-        || m.effective
-            .native_effort
-            .as_ref()
-            .is_some_and(|s| s.trim().is_empty())
         || m.provenance.capability_policy_version.trim().is_empty()
         || m.provenance.catalogue_revision.trim().is_empty()
         || m.trigger.trim().is_empty()

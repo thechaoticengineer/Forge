@@ -177,7 +177,7 @@ fn zero_research_on_fresh_unchanged_startup_and_selective_refresh() {
     assert!(request.last_modified.is_some());
     let details = restarted.details(&[]);
     assert_eq!(details["records"][0]["fields"]["context_window"], 272000);
-    assert_eq!(details["records"][0]["unknown"].as_array().unwrap().len(), 4);
+    assert_eq!(details["records"][0]["unknown"].as_array().unwrap().len(), 5);
 
     // TTL expiry revalidates; 304 keeps facts and fingerprint, bumps only
     // freshness — timestamps alone never look like a material change.
@@ -703,7 +703,7 @@ fn markdown_comparison_table_yields_exact_ids_and_token_counts() {
 }
 
 #[test]
-fn markdown_slug_attributes_name_models_without_fields() {
+fn markdown_model_descriptions_are_preserved_without_inferring_tiers_or_prices() {
     let doc = "\
 ## Recommended models\n\
 <ModelDetails name=\"gpt-x\" slug=\"gpt-x\" description=\"prose\" />\n\
@@ -713,7 +713,12 @@ fn markdown_slug_attributes_name_models_without_fields() {
         models.keys().collect::<Vec<_>>(),
         vec!["gpt-x", "gpt-y-mini"]
     );
-    assert!(models.values().all(BTreeMap::is_empty));
+    assert_eq!(models["gpt-x"]["description"], "prose");
+    assert_eq!(models["gpt-x"].len(), 1);
+    assert!(models["gpt-y-mini"].is_empty());
+    let models = parse_document(b"<ModelDetails\n slug=\"model-one\"\n description=\"Most capable in this family.\"\n />\n<ModelDetails slug=\"model-two\" description=\"Lowest cost in this family.\" />").unwrap();
+    assert_eq!(models["model-one"]["description"],"Most capable in this family.");
+    assert_eq!(models["model-two"]["description"],"Lowest cost in this family.");
 }
 
 #[test]

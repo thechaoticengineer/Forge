@@ -89,7 +89,7 @@ implementer.
 The configured reviewer must match that provider; known unavailable models or
 incompatible effort/permission capabilities block execution. Configured explicit
 unverified fallbacks remain visibly unverified until execution verifies them.
-Automatic stage routing selects the implementer; the review gate enforces the
+Stage routing selects a tier; launch resolves a model within the selected implementer provider; the review gate enforces the
 same requirements for every selected model.
 
 Each role retains its authority. The aggregate keeps requests with `[architect]`
@@ -907,6 +907,55 @@ Execution-auth and model/effort rejections stay blocked within their configurati
 scope even if a later catalogue lists the option. After correcting authentication
 or provider configuration, change the scope identifier to request new evidence.
 
+Use **Model settings & options** in this order:
+
+1. Click **Refresh models** for the latest available model list.
+2. Click **Update shortlist with AI** to generate a proposed shortlist.
+3. Review the proposal in the editor; where applicable, **Apply AI tiers** applies
+   the proposal to the draft and **Undo AI tiers** restores the previous draft.
+4. Click **Save model policy** to activate and persist the policy.
+
+Refresh affects discovery; suggestion, editing, applying, and undoing affect only
+the draft. Only **Save model policy** changes the active/persisted policy.
+
+The AI selects up to four distinct current models per provider, covering simple,
+everyday and complex work. Each explicit request fetches both providers' official
+model pages when metadata research is enabled. It uses their current
+recommendations and descriptions to choose from visible discovered and eligible
+configured models. Family names and generations are not fixed in code: newly
+discovered successors can replace older families. Aliases resolving to the same
+model count once; hidden endpoints are only candidates if explicitly configured.
+The validator requires four selections per provider, or all candidates if fewer
+exist, and rejects invented IDs or duplicates. Incomplete or stale discovery and
+unavailable sources are reported; cached context is not presented as current
+verification, and no unknown model IDs are accepted.
+
+This uses the configured planner in a fresh read-only call (the planner must
+already have an eligible strong model). The AI suggests `basic`, `standard`, or
+`strong` from official model descriptions, with explanations and uncertainty.
+Default or maximum reasoning effort is not evidence of capability tier. The engine
+computes cost preferences separately: when metadata research is enabled, it
+fetches the official OpenAI pricing page and reads Claude prices from the fresh
+official model comparison table. Discovery resolves CLI aliases to exact API IDs,
+including the Claude context modifier; unresolved aliases stay unknown. Comparable
+standard short-context input/output rates share one ranking across providers, with
+equal prices tied. Each rank includes its source and rates in the result. Unknown
+prices, fetch failures and crossing input/output prices stay `null`; a provider's
+failed source does not discard verified prices from the other. AI-supplied cost
+numbers are rejected. These draft preferences are an API-price proxy for user
+policy, not measured CLI subscription costs. Tiers remain suggested user judgments,
+not official capability ratings.
+
+The validated result replaces the editor's entries with the shortlist, supplies a
+new policy revision, and preserves existing scopes, bridge settings and refresh
+settings, along with native efforts, suitability and limits of retained entries.
+Suggestions do not change the plan or remove the existing strong floor for
+planning/review roles. The engine exposes the suggestion as `POST
+/api/models/suggest` with `policy` and optional `project`, returning 202 and a
+request ID. `/api/state` includes only request status; `GET
+/api/models/suggestion?project=...` returns the full draft result. One request at
+a time shares the project's worker/cancellation controls.
+
 Use **Model settings & options** to edit the JSON policy. The policy is saved
 atomically to `$XDG_CONFIG_HOME/forge/model-policy.json` (default
 `~/.config/forge/model-policy.json`) and loaded at engine startup. An invalid
@@ -1259,48 +1308,47 @@ activity/recovery, exact session identity, current guidance, decision details,
 unresolved risks and usage per role, including legacy plans without context.
 
 
-### Joint stage model assignments
+### Stage tiers and implementation-time model selection
 
-`automatic_routing` defaults to `true`, including when older settings omit the
-key. A legacy `implementer` provider alone is a preference, not a pinned model.
-A nonempty legacy `implementer_model` remains a global provider/model constraint,
-including native effort when explicitly configured on its registry entry; saving
-and reloading policy preserves whether effort was omitted.
-Set `automatic_routing: false` to constrain unpinned stages to the configured
-implementer provider while still requiring a validated joint assignment.
-Planner and architect bootstrap settings remain separate. With automatic routing,
-an unpinned reviewer follows the other provider and uses an eligible strong registry
-entry. A nonempty `reviewer_model` pins its configured reviewer provider/model
-and uses its registry effort. This explicit reviewer pin is exempt from the
-automatic reviewer's strong floor, but must remain catalogue-eligible, available
-under quota, and independent of the implementer. Disabling automatic routing also
-preserves the configured reviewer provider. Like other role settings,
-these switches are engine settings; the model registry has its separate persisted
-policy file.
+The planner and architect agree on a stage's required capability tier: `basic`,
+`standard`, or `strong`. They do not choose an implementation provider or concrete
+model. At implementation start, Forge resolves the weakest adequate eligible tier
+within the **currently selected implementer provider**, using the current model
+catalogue. For example, with Terra and Sonnet configured as `standard`, the same
+standard-tier plan uses Terra when Codex is selected and Sonnet when Claude is
+selected. Changing the implementer after planning requires no new AI planning turn.
+Within the chosen tier, configured cost preferences order models only when all
+candidates have a preference; otherwise registry order is preserved. Price never
+allows a weaker tier or silently changes the selected provider.
 
-Selection precedence is explicit:
+A missing, unavailable or inadequate model blocks launch with an actionable error;
+the tier agreement stays valid. Update the catalogue or change the implementer and
+retry. Once an attempt starts, its concrete selection is saved for retries and
+restart recovery. Changing the selector affects subsequent stage attempts. Actual
+invocations retain requested and provider-reported model identities separately
+from the provider-independent tier agreement. Version-one concrete agreements
+remain readable for older plans and execution reassessment.
 
-1. A stage's user-authored `model_constraint` narrows choices first. It accepts
-   `provider`, `model`, and/or `native_effort`. `null` clears it. A partial
-   constraint fixes only its supplied fields and replaces the whole global
-   implementation constraint; it need not specify a complete identity. Supplied
-   fields must be honoured verbatim or refused, without waiving capability,
-   task suitability, catalogue eligibility, quota or independent review.
-2. Otherwise a nonempty `implementer_model` pins that model and its `implementer`
-   provider, plus native `effort` when explicitly configured on that provider/model's
-   registry entry (including an explicit `provider_default`). A conflicting
-   proposal is refused with the required constraint and proposed identity/effort;
-   agreement revalidation enforces the same constraint before stage implementation
-   or fixes. Omitted registry effort stays omitted through normalization, saving
-   and reload: the joint proposal supplies it, and supported effort-only
-   reassessment remains possible. An explicit effort pin can block escalation.
-   A stage constraint still replaces this whole global constraint. With no pinned
-   model, disabling automatic routing pins the provider.
-3. Within the effective constraint, the validated joint assignment determines
-   all remaining fields. Stage implementer and fixer invocations use its effective
-   provider, model and native effort verbatim; unexpected provider substitution
-   blocks with saved work retained. Existing provider settings otherwise serve
-   as preferences/defaults.
+`automatic_routing` defaults to `true`. The implementer selector determines the
+provider even with automatic routing enabled. Planner and architect bootstrap
+settings remain separate. An automatic unpinned reviewer follows the other
+provider and uses an eligible strong registry entry; per-plan review resolves
+independence from actual contributors when the plan review starts. A reviewer
+model pin and disabling automatic routing retain the configured reviewer provider.
+These are runtime engine settings; the catalogue has its separate persisted policy.
+
+Selection precedence at launch is explicit:
+
+1. User-authored stage `model_constraint` fields take precedence over global model
+   pins. It accepts `provider`, `model` and/or `native_effort`; `null` clears it.
+   Omitted provider uses the currently selected implementer. Explicit stage
+   provider constraints intentionally override the global selector.
+2. Otherwise a nonempty `implementer_model` pins that provider/model and any native
+   effort explicitly configured on its registry entry.
+3. Forge resolves remaining fields locally within the required tier or a stronger
+   adequate tier when necessary. Native effort comes from the chosen provider's
+   registry entry, unless explicitly constrained. All selections must satisfy
+   capability, task suitability, eligibility, quota and scheduled independent review.
 
 Older saved policies may already contain serializer-inserted `"effort":"provider_default"`
 values. Their original intent cannot be recovered: stored effort strings remain
@@ -1320,23 +1368,28 @@ checked there when the reviewer is scheduled per stage; that reviewer must use
 the other provider relative to the selected implementer. Deferred reviewer independence
 is checked over the frozen plan subject when plan review runs.
 
-The planner proposes risk, complexity, task, provider/model, native effort and a
+The planner proposes risk, complexity, task, capability tier and a
 stage-specific rationale in its existing standard/refactor/revision output.
 The persistent architect independently evaluates cross-stage constraints and
 failure impact in its guidance turn. Both must explicitly agree on classification
-and selection. Missing proposals from manual edits or legacy plans are batched
-into one strong planner turn. Disagreement allows one further planner/architect
-exchange for only the disputed stages, then blocks with the architect's reasons
+and capability requirements. Missing proposals from manual edits or legacy plans are batched
+into one strong planner turn. Disagreement or an engine rejection of an agreed
+selection allows one further planner/architect exchange for only the affected
+stages. Engine feedback includes the exact policy failure; correcting the tier
+must preserve the already agreed risk, complexity and task.
+Unresolved disagreements or policy failures then block publication with reasons
 and correction instructions. A planner proposal alone never supplies architect
-approval. Malformed output or a policy violation also blocks publication.
+approval, and malformed output cannot be published.
 
-The engine's minimum policy is `stage-routing-1`. Critical risk, complex
+Tier agreements use `stage-tier-2`; concrete execution checks retain `stage-routing-1`. Critical risk, complex
 complexity, or a concurrency, persistence or security task requires `strong`.
 A conservative implementation-text check also protects sensitive
 persistence/security/concurrency work from both participants underclassifying it.
 Explanatory prose about existing behavior is exempt from that text heuristic
 when explicitly classified as documentation;
-contracts, normative requirements and implementation work are not. Documentation
+contracts, normative requirements and implementation work are not. Explicit
+prohibitions on inventing requirements or changing implementation do not themselves
+establish implementation scope; subsequent positive instructions still count. Documentation
 mentioning sensitive work together with implementation or requirement terms can
 therefore still require `strong`. When no strong-floor rule applies, risk and
 complexity both classified simple permit `basic` or higher; otherwise standard
@@ -1346,32 +1399,18 @@ requirements. Tiers express configured adequacy, never quality inferred from
 price, provider, name or list order. The planner and architect must still verify
 that the selected option is suitable for the specific work.
 
-Joint stage routing validates the agreed proposal rather than applying the shared
-resolver's weakest-tier ordering: standard functionality can still accept an
-adequate strong proposal. Simple stages (a `basic` floor) and all documentation
-stages, including standard or strong-floor documentation, must take a cheaper
-adequate eligible option when the comparison establishes one. Alternatives must
-satisfy the effective constraint and preserve cross-provider review; for per-stage
-review, the comparison requires the configured reviewer to be the other provider.
-This check applies to new selection, not pending reassessment or validity-only
-checks of existing agreements, and does not bypass reassessment safeguards.
-
-A cheaper option is established when both options have explicitly configured
-`relative_cost_preference` values and the alternative has a lower value, or
-when published prices have comparable currency, unit and billing basis and one
-option is no more expensive for both input and output (and cheaper for at least
-one). Configured preferences take precedence over published prices. Set
-`routing_billing_basis` to the exact published basis only when it applies to your
-execution billing; its default is `null`, because API list rates do not establish
-CLI subscription cost. Missing prices stay unknown. Different currencies, units,
-bases, or input/output tradeoffs do not establish a cheaper option. Neither price
-nor preference can make an inadequate tier acceptable. Every model has the same
-acceptance checks and review gate regardless of cost.
+Planning does not compare provider prices or consult implementation quota. Local
+launch selection uses configured capability and task suitability first, then
+relative preferences within the weakest adequate tier of the selected provider.
+Unknown prices remain unknown. Execution reassessment can compare eligible
+alternatives using configured preferences or comparable published billing facts,
+while preserving its capability floor and retry budget. API prices do not establish
+CLI subscription cost. Every model has the same acceptance checks and review gate.
 
 Agreements retain both reasons, distinct proposal identities, explicit agreement,
 bootstrap provenance, relevant goal/stage/dependency/constraint inputs, an input
-fingerprint, resolved model and native effort, configured capability facts and
-billing provenance. Previous checkpoints and events retain superseded agreements;
+classification and required tier. The separate launch selection records the
+resolved model, native effort, capability facts and billing provenance. Previous checkpoints and events retain superseded agreements;
 committed stage records remain unchanged. Explicit `depends_on` lists let an
 independent edit affect only its own pending stages; absent lists conservatively
 mean all earlier stages. Goal or applicable constraint changes reconcile affected
@@ -1389,8 +1428,8 @@ substitution. Every handoff includes the saved architecture summary, decisions,
 guidance, constraints, completed interfaces, outstanding findings and worktree/
 diff context, and directs a replacement agent to inspect and preserve partial work.
 
-Collapsed stage cards show model identity/effort, availability verification and
-tier provenance as status lines before approval and during execution. Expanding
+Collapsed stage cards show the required tier and deferred model selection before
+execution. After launch they also show the captured model and actual invocations. Expanding
 the card shows all model-agreement rationale, including both selection reasons
 and retained routing-history rationale. Its single extra **Model agreement and
 routing details** toggle reveals risk classification, constraints, cost

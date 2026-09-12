@@ -210,6 +210,12 @@ Item {
   property var catalogueDetails: null
   property bool catalogueOpen: false
   property string catalogueDraft: ""
+  property bool catalogueAiPending: false
+  property int catalogueAiRequest: -1
+  property string catalogueAiSent: ""
+  property string catalogueAiReady: ""
+  property string catalogueAiUndo: ""
+  property string catalogueAiMessage: ""
   property bool catalogueWasRefreshing: false
   readonly property var catalogue: engineState && engineState.model_catalogue ? engineState.model_catalogue : null
   onCatalogueChanged: {
@@ -237,6 +243,14 @@ Item {
       + e.provider + "/" + e.model + " · " + e.native_effort
       + " · " + (a.verification_state || a.availability || "unverified")
       + " · " + (p.tier || "unclassified") + " (" + (p.tier_provenance || "unknown provenance") + ")"
+    if (a.version === 2) {
+      text = (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
+        + "Tier: " + (p.tier || proposed.tier || "pending")
+        + " · model selected at implementation start"
+      const selected = stage.model_selection || {}, actual = selected.effective || {}
+      if (actual.provider && actual.model)
+        text += "\nSelected: " + actual.provider + "/" + actual.model + " · " + actual.native_effort
+    }
     if (proposed.provider && proposed.model)
       text += "\nProposed: " + proposed.provider + "/" + proposed.model + " · " + proposed.native_effort
     const calls = stage.model_invocations || []
@@ -289,7 +303,7 @@ Item {
   }
 
   function stageModelDiagnostics(stage) {
-    const a = stage.model_agreement || {}, p = a.policy_inputs || {}
+    const a = stage.model_agreement || {}, p = (stage.model_selection || a).policy_inputs || {}
     const fields = []
     function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
     add("Risk", ((a.validated_proposal || {}).risk || "pending") + " · complexity: " + ((a.validated_proposal || {}).complexity || "pending"))
@@ -431,6 +445,10 @@ Item {
   }
 
   function openCatalogue() {
+    if (root.catalogueAiPending || root.catalogueAiUndo || root.catalogueAiReady) {
+      root.catalogueOpen = true
+      return
+    }
     api("GET", "/api/models", null, function(resp, status) {
       if (status !== 200 || !resp) return
       root.catalogueDetails = resp
@@ -442,9 +460,103 @@ Item {
     let policy
     try { policy = JSON.parse(catalogueEditor.text) }
     catch (e) { root.localError = "Model policy must be valid JSON: " + e; return }
-    act("/api/settings", { model_catalogue: policy }, function(resp, status) {
-      if (status === 200) root.openCatalogue()
+    act("/api/settings", { model_catalogue: policy,
+      expected_model_policy: root.catalogueDetails ? root.catalogueDetails.policy : undefined }, function(resp, status) {
+      if (status === 200) {
+        root.catalogueAiUndo = ""
+        root.catalogueAiReady = ""
+        root.catalogueAiMessage = ""
+        root.openCatalogue()
+      } else {
+        root.catalogueAiMessage = resp && resp.error ? resp.error : "Could not save model policy."
+      }
     })
+  }
+
+  function reloadCatalogue() {
+    catalogueAiUndo = ""
+    catalogueAiReady = ""
+    catalogueAiMessage = ""
+    root.openCatalogue()
+  }
+
+  function suggestCatalogue() {
+    if (catalogueAiPending) return
+    let policy
+    try { policy = JSON.parse(catalogueEditor.text) }
+    catch (e) { root.catalogueAiMessage = "Model policy must be valid JSON: " + e; return }
+    const revision = projectViewRevision
+    catalogueAiSent = catalogueEditor.text
+    catalogueAiPending = true
+    catalogueAiRequest = -1
+    catalogueAiReady = ""
+    catalogueAiMessage = "AI is checking official sources and selecting up to 4 models per provider…"
+    api("POST", "/api/models/suggest", { project: lastProject, policy: policy }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 202 && resp) {
+        root.catalogueAiRequest = resp.request_id
+        root.refresh()
+        root.syncCatalogueSuggestion()
+      } else {
+        root.catalogueAiPending = false
+        root.catalogueAiMessage = resp && resp.error ? resp.error : "Could not request AI tiers. Check the engine connection."
+      }
+    }, true)
+  }
+
+  function syncCatalogueSuggestion() {
+    const snapshot = engineState ? engineState.model_policy_suggestion : null
+    if (catalogueAiRequest < 0 || !snapshot || snapshot.request_id !== catalogueAiRequest
+        || snapshot.status === "running") return
+    const requestId = catalogueAiRequest
+    if (snapshot.status === "failed") {
+      catalogueAiRequest = -1
+      catalogueAiPending = false
+      catalogueAiMessage = snapshot.error || "Could not assign model tiers."
+      return
+    }
+    if (snapshot.status !== "ready") return
+    catalogueAiRequest = -1
+    const revision = projectViewRevision
+    api("GET", "/api/models/suggestion?project=" + encodeURIComponent(lastProject), null, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      root.catalogueAiPending = false
+      if (status !== 200 || !resp || resp.request_id !== requestId || resp.status !== "ready" || !resp.policy) {
+        root.catalogueAiMessage = "Could not load AI tiers. Try again."
+        return
+      }
+      root.catalogueAiReady = JSON.stringify(resp.policy, null, 2)
+      root.catalogueAiMessage = "AI tier suggestions — review and save to use them.\n" + resp.summary
+        + (resp.sources && resp.sources.length ? "\n" + resp.sources.map(function(s) {
+          return s.provider + ": " + s.status + " · " + s.url
+        }).join("\n") : "")
+        + (resp.warnings && resp.warnings.length ? "\n" + resp.warnings.join("\n") : "")
+        + (resp.cost_evidence && resp.cost_evidence.length ? "\n" + resp.cost_evidence.map(function(c) {
+          return c.provider + "/" + c.model + ": cost preference "
+            + (c.relative_cost_preference === null ? "unknown" : c.relative_cost_preference)
+            + (c.source_url ? " · standard API USD/1M tokens input " + c.input_per_million
+              + ", output " + c.output_per_million + " · " + c.source_url : "")
+        }).join("\n") : "")
+        + (resp.reasons && resp.reasons.length ? "\n" + resp.reasons.map(function(r) {
+          return r.provider + "/" + r.model + ": " + r.rationale
+        }).join("\n") : "")
+      if (catalogueEditor.text === root.catalogueAiSent) root.applyCatalogueSuggestion()
+    }, true)
+  }
+
+  function applyCatalogueSuggestion() {
+    if (catalogueAiReady === "") return
+    catalogueAiUndo = catalogueEditor.text
+    catalogueEditor.text = catalogueAiReady
+    catalogueDraft = catalogueAiReady
+    catalogueAiReady = ""
+  }
+
+  function undoCatalogueSuggestion() {
+    catalogueEditor.text = catalogueAiUndo
+    catalogueDraft = catalogueAiUndo
+    catalogueAiUndo = ""
+    catalogueAiMessage = "AI changes undone."
   }
 
   property bool helpOpen: false
@@ -507,11 +619,14 @@ Item {
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncReviewViews(); return }
+    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncCatalogueSuggestion(); syncReviewViews(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
     projectViewRevision++
+    catalogueAiPending = false
+    catalogueAiRequest = -1
+    catalogueAiMessage = ""
     reviewViews = ({})
     stageReviewBlocks = ({})
     stageSnapshot = null
@@ -1912,7 +2027,7 @@ Item {
             onClicked: root.act("/api/settings", { automatic_routing: !(root.engineState && root.engineState.settings.automatic_routing !== false) })
           }
           PanelButton {
-            label: "implementer preference: "
+            label: "implementer: "
               + (root.engineState ? root.engineState.settings.implementer : "…")
             onClicked: root.cycleTool("implementer")
           }
@@ -2791,6 +2906,9 @@ Item {
                 Loader {
                   width: stageRow.width
                   active: stageRow.expanded && !stageRow.editable && stageRow.prose !== null
+                  // An inactive Loader retains its height after destroying its item.
+                  // Exclude it from the Column when the stage details are closed.
+                  visible: active
                   sourceComponent: Column {
                     width: stageRow.width
                     spacing: 2
@@ -3381,9 +3499,47 @@ Item {
                 id: catalogueSettings
                 width: parent.width
                 spacing: Style.space(6)
+                Flow {
+                  width: parent.width
+                  spacing: Style.space(8)
+                  PanelButton {
+                    label: root.catalogueAiPending ? "Updating shortlist…" : "Update shortlist with AI"
+                    enabled: root.engineOnline && !(root.engineState && (root.engineState.busy || root.engineState.queue_active)) && !root.catalogueAiPending
+                      && !(root.catalogue && root.catalogue.refreshing)
+                    onClicked: root.suggestCatalogue()
+                  }
+                  PanelButton {
+                    label: "Apply AI tiers"
+                    visible: root.catalogueAiReady !== ""
+                    enabled: !root.catalogueAiPending
+                    onClicked: root.applyCatalogueSuggestion()
+                  }
+                  PanelButton {
+                    label: "Undo AI tiers"
+                    visible: root.catalogueAiUndo !== ""
+                    enabled: !root.catalogueAiPending
+                    onClicked: root.undoCatalogueSuggestion()
+                  }
+                  PanelButton {
+                    label: "Reload saved policy"
+                    enabled: root.engineOnline && !root.catalogueAiPending
+                    onClicked: root.reloadCatalogue()
+                  }
+                }
                 PanelDetail {
                   width: parent.width
-                  originalText: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Automatic routing defaults on: a legacy provider alone is a preference; a nonempty global implementer_model still pins provider/model. Disabling automatic routing constrains choices to the implementer provider. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
+                  metadata: "Automatic model shortlist"
+                  originalText: "AI checks current official model pages and selects up to 4 distinct models per provider, covering simple, everyday and complex work. New model families can replace older ones when discovered locally. Save the draft to use the shortlist."
+                }
+                PanelDetail {
+                  width: parent.width
+                  visible: root.catalogueAiMessage !== ""
+                  metadata: "AI model tiers"
+                  originalText: root.catalogueAiMessage
+                }
+                PanelDetail {
+                  width: parent.width
+                  originalText: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Plans select a capability tier. At implementation start, Forge selects a model within the currently selected implementer provider. Changing the provider after planning needs no replan. A nonempty implementer_model pins a model. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
                   metadata: "Model policy help"
                 }
                 Rectangle {
@@ -3414,7 +3570,7 @@ Item {
                 }
                 PanelButton {
                   label: "Save model policy"
-                  enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
+                  enabled: root.engineOnline && !root.catalogueAiPending && !(root.catalogue && root.catalogue.refreshing)
                   onClicked: root.saveCatalogue()
                 }
                 PanelFields {

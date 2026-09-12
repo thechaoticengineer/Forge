@@ -113,6 +113,8 @@ fn capture_stream(input: &str, claude: bool) -> (String, String, State) {
         goal: String::new(),
         goal_enhancement: Value::Null,
         goal_enhancement_serial: 0,
+        model_policy_suggestion: Value::Null,
+        model_policy_suggestion_serial: 0,
         current_stage: None,
         current_step: String::new(),
         run_started_unix: 0,

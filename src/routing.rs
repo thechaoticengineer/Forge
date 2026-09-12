@@ -9,10 +9,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const POLICY: &str = "stage-routing-1";
-pub(crate) const CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
+const EXECUTION_CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","provider":"exact provider","model":"exact registry ID","native_effort":"provider_default or supported native effort","rationale":"stage-specific adequacy, failure impact and cost reasoning"}.
 Use exactly those seven proposal fields; put all explanation, including effort changes, in rationale. Do not add fields.
-Use only eligible catalogue/registry options. Configured tiers are explicit adequacy policy, not official evidence. Critical or complex work requires strong; never infer quality from price or model name. Simple work prefers a cheaper adequate option only with comparable published billing data or configured relative preferences. Unknown price remains unknown. Constraints narrow choices first, but never waive capability or independent-review requirements. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
+Use only eligible catalogue/registry options. Copy the option's model field exactly; resolved_id is execution evidence, not an alternative registry key. Configured tiers are explicit adequacy policy, not official evidence. Critical or complex work requires strong; never infer quality from price or model name. Simple work and documentation at any adequate tier prefer a cheaper adequate option only with comparable published billing data or configured relative preferences. Unknown price remains unknown. Constraints narrow choices first, but never waive capability or independent-review requirements. With per_plan reviewer cadence, stage reviewer selection is deferred: the configured reviewer provider is not a stage implementer constraint. With per_stage cadence, automatic routing and no reviewer model pin, Forge chooses the other reviewer provider automatically; the configured reviewer selector alone does not prohibit an implementer provider. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
+
+pub(crate) const CONTRACT: &str = r#"STAGE CAPABILITY CONTRACT: Include model_proposal on each new or materially changed pending stage:
+{"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","tier":"basic|standard|strong","rationale":"stage-specific capability and failure-impact reasoning"}.
+Use exactly these five fields. Select the weakest adequate capability tier, never a provider, model or native effort. Basic suits simple low-impact work; standard suits ordinary implementation; strong is required for critical, complex or sensitive implementation. The architect independently checks the classification. Forge resolves a concrete model locally at implementation start using the implementer provider selected THEN and its current model catalogue. The user can change that provider after planning without replanning. Model prices, provider quota and reviewer settings are launch concerns, not planning inputs. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
+
+#[path = "routing_tiers.rs"]
+mod tiers;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,8 +27,14 @@ pub(crate) struct Proposal {
     risk: String,
     complexity: String,
     task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
+    // Older saved agreements and execution reassessments carry concrete choices.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     native_effort: String,
     rationale: String,
 }
@@ -51,6 +64,13 @@ pub(crate) fn validate_candidate_proposals(plan: &Value) -> Result<(), String> {
 
 fn validate_proposal(p: &Proposal) -> Result<(), String> {
     classification(&p.risk, &p.complexity, &p.task)?;
+    if let Some(tier) = &p.tier {
+        if rank(&json!(tier)) == 0 || !p.provider.is_empty() || !p.model.is_empty()
+            || !p.native_effort.is_empty() || p.rationale.trim().is_empty() || p.rationale.len() > 4000 {
+            return Err("tier proposal requires basic/standard/strong and rationale, without a provider, model or effort".into());
+        }
+        return Ok(());
+    }
     if (p.provider != "mock" && (Provider::parse(&p.provider).is_none()
         || !crate::catalogue::identifier(&p.model)
         || !crate::catalogue::identifier(&p.native_effort)))
@@ -58,6 +78,14 @@ fn validate_proposal(p: &Proposal) -> Result<(), String> {
         return Err("invalid model proposal provider, model, effort or rationale".into());
     }
     Ok(())
+}
+
+pub(crate) fn valid_tier_record(record: &Value) -> bool {
+    serde_json::from_value::<Proposal>(record["validated_proposal"].clone()).ok().is_some_and(|p|
+        p.tier.as_ref().is_some_and(|tier| validate_proposal(&p).is_ok()
+            && record["policy_inputs"]["minimum_tier"] == rank(&json!(tier))
+            && record["policy_inputs"]["tier"] == *tier
+            && record["binding"] == "at_implementation_start"))
 }
 
 pub(crate) fn validate_evaluations(value: &Value, ids: &[i64]) -> Result<(), String> {
@@ -170,12 +198,36 @@ fn rank(tier: &Value) -> u64 {
         _ => 0,
     }
 }
+fn capability_intent(stage: &Value) -> String {
+    // A ban on inventing requirements is not a request to implement them.
+    // Only omit explicit no-new-scope clauses; keep ambiguous wording and
+    // split contrast clauses so a subsequent positive instruction still counts.
+    ["title", "instructions", "acceptance"].into_iter()
+        .map(|key| stage[key].as_str().unwrap_or("").to_lowercase())
+        .flat_map(|text| text.split(['.', ';', '\n']).flat_map(|s| s.split(" but "))
+            .flat_map(|s| s.split(" and "))
+            .filter_map(|clause| {
+                let clause = clause.trim();
+                let excluded = ["do not invent ", "do not introduce ", "do not add new ",
+                    "do not modify ", "do not change ", "do not edit ", "do not touch "]
+                    .into_iter().find_map(|prefix| clause.strip_prefix(prefix));
+                // Mixed instructions must retain their conservative floor.
+                let mixed = |tail: &str| ["implement", "change", "define", "update", "rewrite",
+                    "replace", "remove", "create", "enforce", "introduce", "add", "then",
+                    "instead", "however", "persist", "migrate", "encrypt", "authenticate", "authorize"]
+                    .iter().any(|verb| tail.split(|c: char| !c.is_alphanumeric()).any(|word| word == *verb));
+                if excluded.is_some_and(|tail| !mixed(tail)) { return None; }
+                // Preserve any positive work before a no-new-behavior boundary,
+                // e.g. "implement persistence, no new requirements".
+                if let Some((before, tail)) = clause.split_once(" no ") {
+                    if !mixed(tail) { return Some(before.to_owned()); }
+                }
+                Some(clause.to_owned())
+            }).collect::<Vec<_>>())
+        .collect::<Vec<_>>().join(" ")
+}
 fn minimum(stage: &Value, p: &Proposal) -> u64 {
-    let text = format!(
-        "{} {} {}",
-        stage["title"], stage["instructions"], stage["acceptance"]
-    )
-    .to_lowercase();
+    let text = capability_intent(stage);
     // Conservative engine floor for high failure-impact implementation domains.
     let sensitive = [
         "concurren",
@@ -279,20 +331,25 @@ fn billing_facts(price: &Value) -> Value {
     json!({"currency":price["currency"],"unit":price["unit"],"basis":price["basis"],"input":price["input"],"output":price["output"]})
 }
 
+fn proposal_option<'a>(options: &'a [Value], p: &Proposal) -> Result<&'a Value, String> {
+    options.iter().find(|o| o["provider"] == p.provider && o["model"] == p.model && o["effort"] == p.native_effort)
+        .ok_or_else(|| format!("unknown model ID or unsupported native effort: {}/{} with {}; copy an exact option's model and effort fields, not its resolved_id", p.provider, p.model, p.native_effort))
+}
+
 fn policy_inputs(
     settings: &Value,
     stage: &Value,
     p: &Proposal,
     options: &[Value],
 ) -> Result<Value, String> {
+    if p.tier.is_some() { return tiers::policy_inputs(stage, p); }
     classification(&p.risk, &p.complexity, &p.task)?;
     if p.rationale.trim().is_empty() || p.rationale.len() > 4000 {
         return Err("missing/oversized planner rationale".into());
     }
     validate_constraint(&stage["model_constraint"])?;
     let c = constraint(settings, stage);
-    let selected = options.iter().find(|o| o["provider"] == p.provider && o["model"] == p.model && o["effort"] == p.native_effort)
-        .ok_or("unknown model ID or unsupported native effort; choose an exact eligible registry option")?;
+    let selected = proposal_option(options, p)?;
     if selected["eligible"] != true {
         return Err(format!("model unavailable: {}", selected["error"]));
     }
@@ -410,12 +467,16 @@ impl Ctx {
             .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
         if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
         let cp = crate::architecture::prompt_checkpoint(&cp);
-        Ok(format!("\nArchitecture checkpoint and referenced decisions: {cp}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. Higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
+        Ok(format!("\nArchitecture checkpoint and referenced decisions: {cp}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. During execution reassessment only, higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
             self.git(&["status","--short"]).unwrap_or_else(|e| e) , self.git(&["diff","HEAD","--",".",":(exclude).forge"] ).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>()))
     }
     pub(crate) fn has_operational_alternative(&self, plan: &Value, idx: usize) -> Result<bool,String> {
         let stage = &plan["stages"][idx];
-        let old: Proposal = serde_json::from_value(stage["model_agreement"]["validated_proposal"].clone()).map_err(|e| e.to_string())?;
+        let old_agreement = if stage["reassessment"]["pending"]["old_agreement"].is_object() {
+            &stage["reassessment"]["pending"]["old_agreement"]
+        } else if stage["model_selection"].is_object() { &stage["model_selection"] }
+        else { &stage["model_agreement"] };
+        let old: Proposal = serde_json::from_value(old_agreement["validated_proposal"].clone()).map_err(|e| e.to_string())?;
         let settings = self.stage_routing_settings(plan, idx);
         let options = self.routing_candidates()?;
         for o in &options {
@@ -428,19 +489,22 @@ impl Ctx {
         Ok(false)
     }
     pub(crate) fn proposal_inputs(&self, plan: &Value, idx: usize) -> Value {
+        if plan["stages"][idx]["model_proposal"]["tier"].is_string() {
+            return json!({"stage":crate::plan::stage_inputs(plan, idx)});
+        }
         let settings = self.app.settings.lock().unwrap();
         json!({"stage":crate::plan::stage_inputs(plan, idx),"constraint":constraint(&settings, &plan["stages"][idx])})
     }
     pub(crate) fn routing_prompt(&self) -> Result<String, String> {
-        let settings = self.app.settings.lock().unwrap().clone();
-        Ok(format!(
-            "{CONTRACT}\nOptions: {}\nRouting settings: {}",
-            json!(self.routing_candidates()?),
-            json!({"automatic_routing":settings["automatic_routing"],"implementer":settings["implementer"],"implementer_model":settings["implementer_model"],"reviewer":settings["reviewer"],"billing_basis":settings["routing_billing_basis"]})
-        ))
+        Ok(CONTRACT.into())
+    }
+    pub(crate) fn stage_selection_prompt(&self, plan: &Value, ids: &[i64]) -> Result<String, String> {
+        if plan["stages"].as_array().unwrap().iter().any(|s|
+            ids.contains(&s["id"].as_i64().unwrap_or(0)) && s["reassessment"]["pending"].is_object()) {
+            Ok(format!("{EXECUTION_CONTRACT}\nOptions: {}", json!(self.routing_candidates()?)))
+        } else { self.routing_prompt() }
     }
     pub(crate) fn routing_required(&self, plan: &Value, cp: &Value) -> Result<Vec<i64>, String> {
-        let options = self.routing_options()?;
         let mut ids = vec![];
         for (idx, stage) in plan["stages"]
             .as_array()
@@ -454,6 +518,13 @@ impl Ctx {
             let settings = self.stage_routing_settings(plan, idx);
             let a = &cp["agreements"][stage["id"].to_string()];
             let same_inputs = a["relevant_inputs"] == crate::plan::stage_inputs(plan, idx);
+            if a["version"] == 2 {
+                if stage["reassessment"]["pending"].is_object() || !tiers::valid(plan, idx, a) {
+                    ids.push(stage["id"].as_i64().ok_or("invalid stage id")?);
+                }
+                continue;
+            }
+            let options = self.routing_options()?;
             let mut validity_stage = stage.clone();
             validity_stage.as_object_mut().unwrap().remove("reassessment");
             validity_stage["routing_validity_only"] = json!(true);
@@ -499,8 +570,8 @@ impl Ctx {
         }
         let context_plan = selection_plan(plan);
         let prompt = format!(
-            "{}\nRead-only planner selection turn. Return ONLY {{\"proposals\":[{{\"stage_id\":1,\"proposal\":<model_proposal>}}]}} for exactly these IDs: {ids:?}. Plan: {context_plan}\nArchitect disagreement: {feedback}",
-            self.routing_prompt()?
+            "{}\nRead-only planner selection turn. Return ONLY {{\"proposals\":[{{\"stage_id\":1,\"proposal\":<model_proposal>}}]}} for exactly these IDs: {ids:?}. Plan: {context_plan}\nArchitect/engine feedback: {feedback}\nWhen engine_reason rejects an otherwise agreed proposal, preserve its agreed risk, complexity and task. For planning correct only the capability tier. Concrete model/provider/effort changes belong exclusively to execution reassessment. Do not reclassify work to evade the capability policy.",
+            self.stage_selection_prompt(plan, ids)?
         );
         let prompt = prompt + &self.routing_handoff(plan)?;
         let reply = self.validated_routing_response("planner", &prompt, plan, ids)?;
@@ -510,8 +581,8 @@ impl Ctx {
         }
         for (id, p) in parse_proposals(&reply.value, ids)? {
             let idx = plan["stages"].as_array().unwrap().iter().position(|s| s["id"] == id).unwrap();
-            let inputs = self.proposal_inputs(plan, idx);
             plan["stages"][idx]["model_proposal"] = json!(p);
+            let inputs = self.proposal_inputs(plan, idx);
             plan["stages"][idx]["model_proposal_inputs"] = inputs;
             plan["stages"][idx]["model_proposer"] = json!({"provider":reply.choice.0,"model":reply.choice.1,"native_effort":reply.choice.2});
         }
@@ -531,7 +602,17 @@ impl Ctx {
                 let mut value: Value = serde_json::from_str(&reply.output)
                     .map_err(|e| format!("invalid selection output: {e}"))?;
                 value.as_object_mut().ok_or("selection output must be an object")?.remove("_engine_usage");
-                if role == "planner" { parse_proposals(&value, ids)?; }
+                if role == "planner" {
+                    let proposals = parse_proposals(&value, ids)?;
+                    let options = if proposals.iter().any(|(_, p)| p.tier.is_none()) { self.routing_candidates()? } else { vec![] };
+                    for (id, proposal) in proposals {
+                        // Correct catalogue identity errors in the planner's own
+                        // response loop before paying for another architect turn.
+                        if proposal.tier.is_none() && plan["stages"].as_array().unwrap().iter().any(|s| s["id"] == id && s["model_proposal"].is_object()) {
+                            proposal_option(&options, &proposal)?;
+                        }
+                    }
+                }
                 else { validate_evaluations(&value["model_evaluations"], ids)?; }
                 Ok(value)
             },
@@ -630,7 +711,10 @@ impl Ctx {
         let mut evaluations = evaluations.clone();
         let mut dialogue: std::collections::BTreeMap<i64, Vec<Value>> =
             std::collections::BTreeMap::new();
+        let mut engine_corrections: std::collections::BTreeMap<i64, (Proposal, String)> =
+            std::collections::BTreeMap::new();
         for exchange in 0..=1 {
+            let options = if ids.iter().any(|id| plan["stages"].as_array().unwrap().iter().any(|s| s["id"] == *id && !s["model_proposal"]["tier"].is_string())) { self.routing_candidates()? } else { vec![] };
             let rows: Vec<Evaluation> = serde_json::from_value(evaluations.clone())
                 .map_err(|e| format!("invalid architect model evaluations: {e}"))?;
             if rows.len() != ids.len() {
@@ -655,6 +739,11 @@ impl Ctx {
                     .unwrap();
                 let p: Proposal = serde_json::from_value(stage["model_proposal"].clone())
                     .map_err(|e| e.to_string())?;
+                if let Some((agreed, error)) = engine_corrections.get(id) {
+                    if p.risk != agreed.risk || p.complexity != agreed.complexity || p.task != agreed.task {
+                        return Err(format!("{error}; model-selection correction must preserve the agreed risk, complexity and task; revise stage scope separately"));
+                    }
+                }
                 let turns = dialogue.entry(*id).or_default();
                 if turns.last().is_none_or(|last| {
                     last["proposal"] != json!(p) || last["evaluation"] != json!(e)
@@ -665,13 +754,25 @@ impl Ctx {
                 if !e.agree || e.risk != p.risk || e.complexity != p.complexity || e.task != p.task
                 {
                     disagreements.push(json!({"stage_id":id,"architect_reason":e.rationale,"risk":e.risk,"complexity":e.complexity,"task":e.task}));
+                } else {
+                    let idx = plan["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap();
+                    let settings = self.stage_routing_settings(plan, idx);
+                    if let Err(error) = policy_inputs(&settings, stage, &p, &options) {
+                        // Agreement between models does not waive engine policy.
+                        // Return the exact rejection through the same bounded
+                        // exchange, before publishing any stage's agreement.
+                        engine_corrections.entry(*id).or_insert_with(|| (p.clone(), error.clone()));
+                        turns.last_mut().unwrap()["engine_reason"] = json!(error);
+                        disagreements.push(json!({"stage_id":id,"architect_reason":e.rationale,
+                            "engine_reason":error,"risk":e.risk,"complexity":e.complexity,"task":e.task}));
+                    }
                 }
             }
             if !disagreements.is_empty() {
                 if exchange == 1 {
                     return Err(format!(
-                        "planner/architect disagreement after one reconciliation exchange: {}. Revise stage constraints or scope and retry; previous plan retained",
-                        json!(disagreements)
+                        "planner/architect disagreement after one reconciliation exchange: {}. Initial engine rejections: {}. Revise stage constraints or scope and retry; previous plan retained",
+                        json!(disagreements), json!(engine_corrections.iter().map(|(id,(_,error))| json!({"stage_id":id,"error":error})).collect::<Vec<_>>())
                     ));
                 }
                 let affected: Vec<i64> = disagreements
@@ -682,7 +783,7 @@ impl Ctx {
                 let context_plan = selection_plan(plan);
                 let prompt = format!(
                     "{}\n{}\nPlan: {context_plan}\nSaved architecture: {}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
-                    self.routing_prompt()?,
+                    self.stage_selection_prompt(plan, &affected)?,
                     EVALUATION_CONTRACT,
                     crate::architecture::prompt_checkpoint(cp),
                     json!(disagreements)
@@ -699,7 +800,6 @@ impl Ctx {
                 all.extend(replacements.iter().cloned());
                 continue;
             }
-            let options = self.routing_candidates()?;
             for id in ids {
                 let idx = plan["stages"]
                     .as_array()
@@ -711,6 +811,11 @@ impl Ctx {
                 let settings = self.stage_routing_settings(plan, idx);
                 let p: Proposal = serde_json::from_value(stage["model_proposal"].clone())
                     .map_err(|e| e.to_string())?;
+                if p.tier.is_some() {
+                    let e = rows.iter().find(|e| e.stage_id == *id).unwrap();
+                    tiers::publish(plan, cp, idx, &p, e, &dialogue[id])?;
+                    continue;
+                }
                 let inputs = policy_inputs(&settings, stage, &p, &options)?;
                 let reviewer = if crate::plan::review_cadence(&settings, "reviewer") == "per_plan" {
                     json!({"status":"deferred"})
@@ -742,6 +847,7 @@ impl Ctx {
                     "trigger":stage["reassessment"]["pending"]["kind"].as_str().unwrap_or("joint_assignment"),"trigger_evidence":stage["reassessment"]["pending"]["evidence"],"superseded_agreement":old["id"],"unix":crate::util::unix_timestamp()});
                 cp["agreements"][id.to_string()] = record.clone();
                 plan["stages"][idx]["model_agreement"] = record.clone();
+                plan["stages"][idx].as_object_mut().unwrap().remove("model_selection");
                 if plan["stages"][idx]["reassessment"]["pending"].is_object() {
                     let state = &mut plan["stages"][idx]["reassessment"];
                     let pending = state["pending"].clone();
@@ -795,10 +901,11 @@ impl Ctx {
         }
         let a = &cp["agreements"][plan["stages"][idx]["id"].to_string()];
         if a["architectural_constraints"] != cp["constraints"] { return Err("material architectural constraints changed".into()); }
+        if a["version"] == 2 { return self.resolve_tier_assignment(&local, idx, a); }
         Ok(a.clone())
     }
 }
-pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required model proposal against cross-stage constraints, failure impact and capability/cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Explicit agreement requires both classifications to match. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
+pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required capability proposal against cross-stage constraints and failure impact. Planning agrees a tier without a provider or model; only active execution reassessment evaluates a concrete replacement and cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Explicit agreement requires both classifications to match. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
 pub(crate) fn mock_evaluations(plan: &Value, ids: &[i64]) -> Value {
     json!(ids.iter().map(|id| { let p = &plan["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["model_proposal"];
         json!({"stage_id":id,"agree":true,"rationale":"Architect: independently checked cross-stage interfaces and failure impact.","risk":p["risk"],"complexity":p["complexity"],"task":p["task"]}) }).collect::<Vec<_>>())

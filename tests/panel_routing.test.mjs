@@ -195,3 +195,17 @@ test('model partitions preserve missing-value suppression and trigger fallback s
     {label:'values · Planner 3',text:'0'},{label:'values · Architect 3',text:'false'},
   ]);
 });
+
+test('tier drafts defer model identity and show the actual binding only after launch', () => {
+  const draft = {model_agreement:{version:2, valid:true, effective:null,
+    policy_inputs:{tier:'standard'}, validated_proposal:{tier:'standard'},
+    planner_reason:'Ordinary implementation', architect_reason:'Bounded failure impact'}};
+  const text = ctx.stageModelStatus(draft);
+  assert.match(text, /Tier: standard/);
+  assert.match(text, /model selected at implementation start/);
+  assert.doesNotMatch(text, /undefined|codex|claude|unverified/);
+  draft.model_selection = {effective:{provider:'codex',model:'terra-test',native_effort:'provider_default'}};
+  assert.match(ctx.stageModelStatus(draft), /Selected: codex\/terra-test/);
+  draft.model_selection.effective = {provider:'claude',model:'sonnet-test',native_effort:'provider_default'};
+  assert.match(ctx.stageModelStatus(draft), /Selected: claude\/sonnet-test/);
+});

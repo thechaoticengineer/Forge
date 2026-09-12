@@ -72,5 +72,81 @@ test('model settings load full policy and submit JSON; invalid edits stay local'
   sandbox.catalogueEditor.text=JSON.stringify(policy);
   sandbox.saveCatalogue();
   assert.equal(calls[1][1],'/api/settings');
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[1][2])),{model_catalogue:policy});
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1][2])),{model_catalogue:policy,expected_model_policy:policy});
+});
+
+function aiPanel() {
+  const calls = [];
+  const sandbox = {catalogueAiPending:false, catalogueAiRequest:-1, catalogueAiReady:'',
+    catalogueAiUndo:'', catalogueAiMessage:'', catalogueAiSent:'', catalogueDraft:'',
+    catalogueEditor:{text:JSON.stringify({policy_revision:'1',entries:[]})},
+    projectViewRevision:1,lastProject:'/project A',engineState:{},
+    api(method,path,body,done) { calls.push({method,path,body,done}); }, refresh() {},
+    encodeURIComponent, JSON};
+  sandbox.root = sandbox;
+  vm.runInNewContext(qml.slice(qml.indexOf('  function openCatalogue()'),
+    qml.indexOf('  property bool helpOpen:')), sandbox);
+  return {sandbox,calls};
+}
+
+test('AI tiers fill the editor once, preserve concurrent edits and support undo', () => {
+  for (const edited of [false,true]) {
+    const {sandbox:s,calls} = aiPanel();
+    const original = s.catalogueEditor.text;
+    s.suggestCatalogue();
+    assert.equal(calls[0].path,'/api/models/suggest');
+    assert.equal(calls[0].body.project,'/project A');
+    assert.equal(s.catalogueAiPending,true);
+    calls[0].done({request_id:3},202);
+    if (edited) s.catalogueEditor.text = 'manual edit';
+    s.engineState.model_policy_suggestion = {status:'ready',request_id:3};
+    s.syncCatalogueSuggestion();
+    const policy = {policy_revision:'ai-1',entries:[{provider:'claude',model:'exact',tier:'standard'}]};
+    assert.equal(calls[1].path,'/api/models/suggestion?project=%2Fproject%20A');
+    calls[1].done({status:'ready',request_id:3,policy,summary:'Suggested tiers',warnings:['Discovery incomplete'],reasons:[],
+      sources:[{provider:'codex',status:'fresh',url:'https://learn.chatgpt.com/docs/models.md'}]},200);
+    assert.equal(s.catalogueAiPending,false);
+    assert.match(s.catalogueAiMessage,/Discovery incomplete/);
+    assert.match(s.catalogueAiMessage,/codex: fresh · https:\/\/learn.chatgpt.com\/docs\/models.md/);
+    if (edited) {
+      assert.equal(s.catalogueEditor.text,'manual edit');
+      assert.notEqual(s.catalogueAiReady,'');
+      s.applyCatalogueSuggestion();
+    }
+    assert.deepEqual(JSON.parse(s.catalogueEditor.text),policy);
+    s.syncCatalogueSuggestion();
+    assert.equal(calls.length,2); // No repeated application or implicit settings save.
+    s.undoCatalogueSuggestion();
+    assert.equal(s.catalogueEditor.text,edited ? 'manual edit' : original);
+  }
+});
+
+test('AI request errors and stale project responses never replace the editor', () => {
+  const {sandbox:s,calls} = aiPanel();
+  const original = s.catalogueEditor.text;
+  s.suggestCatalogue();
+  calls[0].done({error:'busy'},409);
+  assert.equal(s.catalogueAiPending,false);
+  assert.equal(s.catalogueAiMessage,'busy');
+  s.suggestCatalogue();
+  calls[1].done({request_id:4},202);
+  s.engineState.model_policy_suggestion = {status:'ready',request_id:4};
+  s.syncCatalogueSuggestion();
+  s.projectViewRevision++;
+  calls[2].done({status:'ready',request_id:4,policy:{entries:[]}},200);
+  assert.equal(s.catalogueEditor.text,original);
+  assert.equal(s.catalogueAiReady,'');
+});
+
+test('failed AI response preserves the draft and reports the error', () => {
+  const {sandbox:s,calls} = aiPanel();
+  const original = s.catalogueEditor.text;
+  s.suggestCatalogue();
+  calls[0].done({request_id:5},202);
+  s.engineState.model_policy_suggestion = {status:'failed',request_id:5,error:'No eligible planner'};
+  s.syncCatalogueSuggestion();
+  assert.equal(s.catalogueAiPending,false);
+  assert.equal(s.catalogueAiMessage,'No eligible planner');
+  assert.equal(s.catalogueEditor.text,original);
+  assert.equal(calls.length,1);
 });

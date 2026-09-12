@@ -479,7 +479,7 @@ fn reviewers_and_qa_are_always_fresh_and_unknown_effort_is_never_mapped() {
 
 #[test]
 fn enhancement_and_response_corrections_require_readonly_capabilities() {
-    for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "response_correction"].map(|role| (provider, role))) {
+    for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "model_policy", "response_correction"].map(|role| (provider, role))) {
         let mut req = AgentRequest {role:"chat",session:None,..request(provider)};
         let chat = command(&req).unwrap();
         req.role = role;

@@ -113,7 +113,7 @@ pub(crate) struct ModelRecord {
     pub revision: u64,
     pub stage_id: i64,
     pub relevant_inputs: Value,
-    pub effective: EffectiveModel,
+    pub effective: Option<EffectiveModel>,
     pub planner_reason: String,
     pub architect_reason: String,
     pub provenance: Provenance,

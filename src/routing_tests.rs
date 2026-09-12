@@ -181,7 +181,7 @@ fn critical_work_never_uses_cheapest_unclassified_or_inadequate_tier() {
         f.select(proposal(model, "critical", "security"));
         assert!(f.publish(plan()).is_err());
         assert!(f.ctx.load_plan().is_none());
-        assert_eq!(f.counts(), (1, 1));
+        assert_eq!(f.counts(), (2, 2));
     }
     let f = Fixture::new();
     f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([]);
@@ -227,6 +227,56 @@ fn standard_documentation_prefers_cheaper_adequate_and_reuses_agreement() {
     assert!(f.ctx.routing_required(&published, &checkpoint).unwrap().is_empty());
     assert_eq!(f.ctx.validated_assignment(&published, 0).unwrap(), *agreement);
     assert_eq!(f.counts(), counts);
+}
+
+#[test]
+fn readme_policy_explanation_with_no_new_requirements_keeps_standard_selection() {
+    let f = Fixture::with_standard_model();
+    let mut candidate = plan();
+    candidate["stages"][0]["title"] = json!("Clarify model policy workflow and cost semantics");
+    candidate["stages"][0]["instructions"] = json!("Edit only README.md. Explain that only Save model policy changes the active/persisted policy. Preserve the existing discovery, validation, persistence, tier, suitability, effort, endpoint, and fallback-policy facts. Do not invent features, controls, endpoints, requirements, or model names, and do not edit code, tests, QML, or other files.");
+    candidate["stages"][0]["acceptance"] = json!("README.md explains the workflow and persisted policy. All distinct technical facts remain present. The commit changes README.md only.");
+    f.select(proposal("standard-test", "standard", "documentation"));
+    let published = f.publish(candidate).unwrap();
+    assert_eq!(published["stages"][0]["model_agreement"]["effective"]["model"], "standard-test");
+    assert_eq!(published["stages"][0]["model_agreement"]["policy_inputs"]["minimum_tier"], 2);
+    let checkpoint = f.ctx.architecture_store().checkpoint(&published).unwrap();
+    assert!(f.ctx.routing_required(&published, &checkpoint).unwrap().is_empty());
+    assert_eq!(f.counts(), (1, 1));
+}
+
+#[test]
+fn coordinated_documentation_boundaries_do_not_become_implementation_requests() {
+    let mut candidate = stage(1);
+    candidate["title"] = json!("Document the model configuration workflow");
+    candidate["instructions"] = json!("Edit only README.md. Do not modify code, tests, QML, scripts, or any other file, and do not add new product behaviour, requirements, buttons, endpoints, features or model names. Explain how Save model policy makes it the active, persisted policy. Preserve all API endpoint sentences unchanged.");
+    let p: Proposal = serde_json::from_value(proposal("budget-test", "simple", "documentation")).unwrap();
+    assert_eq!(minimum(&candidate, &p), 1);
+    candidate["instructions"] = json!("Perform a final documentation-only review for coherent style, no new behavior or requirements, and no loss of information.");
+    candidate["acceptance"] = json!("API, persistence and discovery facts remain intact. The stage introduces no normative product requirement.");
+    assert_eq!(minimum(&candidate, &p), 1);
+}
+
+#[test]
+fn a_no_new_scope_clause_cannot_hide_positive_or_critical_work() {
+    let p: Proposal = serde_json::from_value(proposal("strong-test", "standard", "documentation")).unwrap();
+    for instructions in [
+        "Update README. Do not invent requirements; implement atomic persistence.",
+        "Update README. Do not introduce requirements but implement authentication.",
+        "Update README. Do not add new features and implement atomic persistence.",
+        "Update README. Do not invent features. Define normative security policy requirements.",
+        "Document requirements for persistent storage.",
+        "Update README and implement atomic persistence, no new requirements.",
+    ] {
+        let mut stage = stage(1);
+        stage["instructions"] = json!(instructions);
+        assert_eq!(minimum(&stage, &p), 3, "{instructions}");
+    }
+    let mut stage = stage(1);
+    stage["instructions"] = json!("Update README. Do not invent requirements for persistence.");
+    let mut critical = p;
+    critical.risk = "critical".into();
+    assert_eq!(minimum(&stage, &critical), 3);
 }
 
 #[test]
@@ -396,6 +446,75 @@ fn disagreement_gets_exactly_one_exchange_and_both_participants_must_agree() {
     f.set("mock_model_evaluations", json!([[],[],[],[]]));
     assert!(f.publish(plan()).is_err());
     assert_eq!(f.counts(), (1, 4)); // Only the architect corrects its missing evaluations.
+}
+
+#[test]
+fn engine_rejection_returns_to_both_models_and_publishes_only_the_corrected_choice() {
+    let f = Fixture::with_standard_model();
+    let mut candidate = plan();
+    candidate["stages"][0]["instructions"] = json!("Update README to explain greeting usage");
+    f.set("mock_routing_planner_outputs", json!([
+        {"proposals":[{"stage_id":1,"proposal":proposal("strong-test", "standard", "documentation")}]},
+        {"proposals":[{"stage_id":1,"proposal":proposal("standard-test", "standard", "documentation")}]},
+    ]));
+    let result = f.publish(candidate).unwrap();
+    let agreement = &result["stages"][0]["model_agreement"];
+    assert_eq!(agreement["effective"]["model"], "standard-test");
+    assert_eq!(agreement["dialogue"].as_array().unwrap().len(), 2);
+    assert!(agreement["dialogue"][0]["engine_reason"].as_str().unwrap().contains("cheaper adequate"));
+    assert_eq!(f.counts(), (2, 2));
+    let settings = f.ctx.app.settings.lock().unwrap();
+    for key in ["mock_routing_planner_requests", "mock_routing_architect_requests"] {
+        let prompt = settings[key][1]["prompt"].as_str().unwrap();
+        assert!(prompt.contains("engine_reason") && prompt.contains("cheaper adequate"), "{prompt}");
+    }
+}
+
+#[test]
+fn repeated_engine_rejections_are_bounded_and_preserve_the_published_plan() {
+    let f = Fixture::with_standard_model();
+    let saved = f.publish(plan()).unwrap();
+    let mut candidate = saved.clone();
+    candidate["stages"][0]["instructions"] = json!("Explain greeting usage in README");
+    let candidate = crate::plan::edit_plan(&saved, &json!({"plan":candidate})).unwrap();
+    let output = json!({"proposals":[{"stage_id":1,"proposal":proposal("strong-test", "standard", "documentation")}]});
+    f.set("mock_routing_planner_outputs", json!([output,output]));
+    let before = f.counts();
+    let error = f.ctx.architect_publish(candidate, Some(&saved), "test invalid cost selection").unwrap_err();
+    assert!(error.contains("after one reconciliation") && error.contains("cheaper adequate"), "{error}");
+    assert_eq!(f.counts(), (before.0+2,before.1+2));
+    assert_eq!(f.ctx.load_plan().unwrap(), saved);
+}
+
+#[test]
+fn engine_correction_cannot_reclassify_work_to_evade_cost_or_capability() {
+    for original in [proposal("strong-test", "simple", "documentation"),
+        proposal("budget-test", "critical", "security")] {
+        let f = Fixture::new();
+        f.set("mock_routing_planner_outputs", json!([
+            {"proposals":[{"stage_id":1,"proposal":original}]},
+            {"proposals":[{"stage_id":1,"proposal":proposal("strong-test", "standard", "functionality")}]},
+        ]));
+        let error = f.publish(plan()).unwrap_err();
+        assert!(error.contains("must preserve the agreed risk, complexity and task"), "{error}");
+        assert!(f.ctx.load_plan().is_none());
+        assert_eq!(f.counts(), (2,2));
+    }
+}
+
+#[test]
+fn reconciliation_repairs_non_registry_ids_before_another_architect_turn() {
+    let f = Fixture::new();
+    f.set("mock_routing_planner_outputs", json!([
+        {"proposals":[{"stage_id":1,"proposal":proposal("strong-test", "simple", "documentation")}]},
+        {"proposals":[{"stage_id":1,"proposal":proposal("resolved-only-id", "simple", "documentation")}]},
+        {"proposals":[{"stage_id":1,"proposal":proposal("budget-test", "simple", "documentation")}]},
+    ]));
+    let p = f.publish(plan()).unwrap();
+    assert_eq!(p["stages"][0]["model_agreement"]["effective"]["model"], "budget-test");
+    assert_eq!(f.counts(), (3,2));
+    let s = f.ctx.app.settings.lock().unwrap();
+    assert!(s["mock_routing_planner_requests"][2]["prompt"].as_str().unwrap().contains("copy an exact option's model"));
 }
 #[test]
 fn unchanged_boundaries_restart_refresh_and_unrelated_edits_reuse_only_valid_agreements() {
@@ -944,7 +1063,8 @@ fn global_pin_preserves_configured_effort_through_publication_and_revalidation()
         assert_eq!(f.ctx.proposal_inputs(&plan(), 0)["constraint"], effective);
         let mut choice = proposal("strong-test", "standard", "functionality");
         if effort == "high" {
-            f.select(choice.clone());
+            let rejected = json!({"proposals":[{"stage_id":1,"proposal":choice}]});
+            f.set("mock_routing_planner_outputs", json!([rejected,rejected]));
             let error = f.publish(plan()).unwrap_err();
             for detail in [
                 "constraint",
@@ -1217,4 +1337,124 @@ fn stage_implementer_and_fixer_launch_exact_effective_identity_and_effort() {
             assert_eq!(request["effort"], effective["native_effort"]);
         }
     }
+}
+
+// Version-one tests above retain concrete fixtures to cover saved plans and
+// execution reassessment. New planning uses provider-independent tier proposals.
+fn tier_fixture() -> Fixture {
+    let f = Fixture::with_standard_model();
+    f.set("review_cadence", json!({"architect":"per_plan","reviewer":"per_plan"}));
+    f.set("implementer", json!("codex"));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"].as_array_mut().unwrap()
+        .push(json!({"provider":"claude","model":"sonnet-test","tier":"standard","relative_cost_preference":1}));
+    f.select(json!({"risk":"standard","complexity":"standard","task":"functionality",
+        "tier":"standard","rationale":"Ordinary bounded implementation needs the standard tier."}));
+    f
+}
+
+#[test]
+fn tier_plan_binds_current_provider_locally_without_replanning() {
+    let f = tier_fixture();
+    let p = f.publish(plan()).unwrap();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    let a = &p["stages"][0]["model_agreement"];
+    assert_eq!(a["version"], 2);
+    assert_eq!(a["policy_inputs"]["tier"], "standard");
+    assert!(a["effective"].is_null());
+    assert!(a["validated_proposal"].get("provider").is_none());
+    let counts = f.counts();
+    let proposal_inputs = f.ctx.proposal_inputs(&p, 0);
+    for (provider, model) in [("codex", "standard-test"), ("claude", "sonnet-test"), ("codex", "standard-test")] {
+        f.set("implementer", json!(provider));
+        assert!(f.ctx.routing_required(&p, &cp).unwrap().is_empty());
+        assert_eq!(f.ctx.proposal_inputs(&p, 0), proposal_inputs);
+        let selected = f.ctx.validated_assignment(&p, 0).unwrap();
+        assert_eq!(selected["effective"]["provider"], provider);
+        assert_eq!(selected["effective"]["model"], model);
+        assert_eq!(selected["agreement_id"], a["id"]);
+        assert_eq!(f.counts(), counts);
+        assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["model_agreement"], *a);
+    }
+}
+
+#[test]
+fn tier_planning_does_not_require_a_model_catalogue_or_available_provider() {
+    let f = tier_fixture();
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"] = json!([]);
+    let p = f.publish(plan()).unwrap();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(f.ctx.routing_required(&p, &cp).unwrap().is_empty());
+    let counts = f.counts();
+    let error = f.ctx.validated_assignment(&p, 0).unwrap_err();
+    assert!(error.contains("No eligible codex model"), "{error}");
+    assert_eq!(f.counts(), counts);
+}
+
+#[test]
+fn tier_binding_preserves_attempt_and_uses_new_provider_on_next_attempt() {
+    let f = tier_fixture();
+    let mut p = f.publish(plan()).unwrap();
+    p["stages"][0]["attempt_id"] = json!("attempt-one");
+    f.ctx.save_plan(&p).unwrap();
+    let first = f.ctx.assignment_boundary(&mut p, 0).unwrap();
+    assert_eq!(first["effective"]["model"], "standard-test");
+    f.set("implementer", json!("claude"));
+    assert_eq!(f.ctx.assignment_boundary(&mut p, 0).unwrap(), first);
+    let mut restored = f.ctx.load_plan().unwrap();
+    assert_eq!(f.ctx.assignment_boundary(&mut restored, 0).unwrap(), first);
+    p["stages"][0]["attempt_id"] = json!("attempt-two");
+    f.ctx.save_plan(&p).unwrap();
+    let next = f.ctx.assignment_boundary(&mut p, 0).unwrap();
+    assert_eq!(next["effective"]["model"], "sonnet-test");
+    assert_eq!(next["agreement_id"], first["agreement_id"]);
+    assert_ne!(next["id"], first["id"]);
+}
+
+#[test]
+fn tier_launch_honors_pins_but_never_weakens_or_switches_provider() {
+    let f = tier_fixture();
+    let p = f.publish(plan()).unwrap();
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    f.set("implementer_model", json!("budget-test"));
+    assert!(f.ctx.routing_required(&p, &cp).unwrap().is_empty());
+    assert!(f.ctx.validated_assignment(&p, 0).unwrap_err().contains("No eligible codex model"));
+    f.set("implementer_model", json!("strong-test"));
+    assert_eq!(f.ctx.validated_assignment(&p, 0).unwrap()["effective"]["model"], "strong-test");
+    f.set("implementer_model", json!(""));
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"].as_array_mut().unwrap()
+        .retain(|e| e["provider"] != "codex" || e["tier"] == "basic");
+    let counts = f.counts();
+    assert!(f.ctx.validated_assignment(&p, 0).unwrap_err().contains("No eligible codex model"));
+    assert_eq!(f.counts(), counts);
+    f.set("implementer", json!("claude"));
+    assert_eq!(f.ctx.validated_assignment(&p, 0).unwrap()["effective"]["model"], "sonnet-test");
+}
+
+#[test]
+fn tier_contract_rejects_concrete_fields_and_underpowered_sensitive_work() {
+    let mixed = json!({"tier":"standard","provider":"codex","risk":"standard","complexity":"standard",
+        "task":"functionality","rationale":"Needs ordinary capability."});
+    assert!(validate_proposal(&serde_json::from_value(mixed).unwrap()).is_err());
+    let p: Proposal = serde_json::from_value(json!({"tier":"basic","risk":"simple","complexity":"simple",
+        "task":"security","rationale":"Too weak."})).unwrap();
+    assert!(tiers::policy_inputs(&stage(1), &p).unwrap_err().contains("capability floor 3"));
+    assert!(!valid_tier_record(&json!({"validated_proposal":p,"binding":"at_implementation_start",
+        "policy_inputs":{"minimum_tier":2,"tier":"standard"}})));
+}
+
+#[test]
+fn tier_attempt_reassesses_material_changes_after_binding() {
+    let f = tier_fixture();
+    let mut p = f.publish(plan()).unwrap();
+    p["stages"][0]["attempt_id"] = json!("attempt-one");
+    f.ctx.save_plan(&p).unwrap();
+    let first = f.ctx.assignment_boundary(&mut p, 0).unwrap();
+    f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"].as_array_mut().unwrap()
+        .retain(|e| e["model"] != "standard-test");
+    f.select(proposal("strong-test", "standard", "functionality"));
+    let replacement = f.ctx.assignment_boundary(&mut p, 0).unwrap();
+    assert_eq!(replacement["effective"]["model"], "strong-test");
+    assert_eq!(p["stages"][0]["reassessment"]["count"], 1);
+    assert_eq!(p["stages"][0]["reassessment"]["history"][0]["old_agreement"]["id"], first["id"]);
+    assert!(p["stages"][0]["model_selection"].is_null());
 }

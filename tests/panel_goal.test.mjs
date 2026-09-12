@@ -23,7 +23,7 @@ function fixture() {
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput: view(),
     historyList: view(), reportList: view(), logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
-    cancelPlanEdit(){}, syncHistory(){}, syncReviewViews(){}, refreshAgentLog(){} };
+    cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
   ctx.enhanceGoalButton = { get enabled() { return vm.runInNewContext(enabled, ctx); } };

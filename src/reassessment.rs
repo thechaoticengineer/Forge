@@ -96,7 +96,7 @@ impl Ctx {
         Ok(())
     }
     /// Only cheap local checks on unchanged boundaries. No catalogue refresh or paid selection.
-    pub(super) fn assignment_boundary(
+    pub(crate) fn assignment_boundary(
         &self,
         plan: &mut Value,
         idx: usize,
@@ -128,6 +128,25 @@ impl Ctx {
                 return Err("model routing blocked: interrupted selection reservation; revise scope/constraints to recover or inspect saved evidence".into());
             }
         }
+        // Draft tier agreements never need a paid planning turn merely because
+        // a provider/model is unavailable at launch. Resolve locally and retain
+        // the tier contract so changing the selector can recover immediately.
+        if plan["stages"][idx]["model_agreement"]["version"] == 2 {
+            let selection = match self.validated_assignment(plan, idx) {
+                Ok(selection) => selection,
+                Err(error) if plan["stages"][idx]["model_selection"]["attempt_id"].is_string()
+                    && plan["stages"][idx]["model_selection"]["attempt_id"] == plan["stages"][idx]["attempt_id"] => {
+                    self.reassess(plan, idx, "material_assignment_change", json!({"local_validity":error}))?;
+                    return self.validated_assignment(plan, idx);
+                }
+                Err(error) => return Err(error),
+            };
+            if plan["stages"][idx]["model_selection"] != selection {
+                plan["stages"][idx]["model_selection"] = selection.clone();
+                self.save_plan(plan)?;
+            }
+            return Ok(selection);
+        }
         match self.validated_assignment(plan, idx) {
             Ok(a) => Ok(a),
             Err(error) => {
@@ -150,7 +169,14 @@ impl Ctx {
     ) -> Result<(), String> {
         self.boundary_guard(plan, idx)?;
         self.reassessment_init(plan, idx);
-        let old = plan["stages"][idx]["model_agreement"].clone();
+        let old = if plan["stages"][idx]["model_selection"].is_object() {
+            plan["stages"][idx]["model_selection"].clone()
+        } else { plan["stages"][idx]["model_agreement"].clone() };
+        if old["kind"] == "selection" {
+            let floor = plan["stages"][idx]["routing_scope_floor"].as_u64().unwrap_or(0)
+                .max(old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0));
+            plan["stages"][idx]["routing_scope_floor"] = json!(floor);
+        }
         let sig = signature(kind, &evidence);
         let state = &mut plan["stages"][idx]["reassessment"];
         let count = state["count"].as_u64().unwrap_or(0);

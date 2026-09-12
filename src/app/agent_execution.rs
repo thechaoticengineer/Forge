@@ -455,6 +455,21 @@ impl Ctx {
                 fs::write(self.forge_path("enhanced-goal.json"), json!({"goal": "mock enhanced goal"}).to_string())
                     .map_err(|e| e.to_string())?;
             }
+            "model_policy" => {
+                let mut settings = self.app.settings.lock().unwrap();
+                let output = settings.get_mut("mock_model_policy_output");
+                let output = match output {
+                    Some(output) => match output.as_array_mut() {
+                        Some(queue) if queue.len() > 1 => queue.remove(0),
+                        Some(queue) if !queue.is_empty() => queue[0].clone(),
+                        _ => output.clone(),
+                    },
+                    None => json!({"assignments":[],"summary":"No mock model assignments configured"}),
+                };
+                fs::write(self.forge_path("model-policy-suggestion.json"),
+                    output.as_str().map(String::from).unwrap_or_else(|| output.to_string()))
+                    .map_err(|e| e.to_string())?;
+            }
             "response_correction" => {},
             "implementer" | "fixer" => {
                 #[cfg(test)]

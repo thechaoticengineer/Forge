@@ -6,7 +6,7 @@ pub(crate) fn stage_outcome(stage: &Value) -> Value {
     let a = &stage["model_agreement"];
     let p = &a["policy_inputs"];
     let calls = stage["model_invocations"].as_array();
-    json!({"id":stage["id"], "title":stage["title"], "status":stage["status"],
+    let mut outcome = json!({"id":stage["id"], "title":stage["title"], "status":stage["status"],
         "attempt_id":stage["attempt_id"], "rounds":stage["rounds"], "sha":stage["sha"],
         "model_agreement": if a.is_object() { json!({
             "id":a["id"], "valid":a["valid"], "validated_proposal":a["validated_proposal"], "effective":a["effective"],
@@ -22,7 +22,17 @@ pub(crate) fn stage_outcome(stage: &Value) -> Value {
         "review_gate":{"status":stage["review_gate"]["status"], "roles":stage["review_gate"]["roles"],
             "identity":stage["review_gate"]["identity"]},
         "reassessment":{"count":stage["reassessment"]["count"],
-            "operational_retries":stage["reassessment"]["operational_retries"]}, "usage":stage["usage"]})
+            "operational_retries":stage["reassessment"]["operational_retries"]}, "usage":stage["usage"]});
+    if a["version"] == 2 {
+        outcome["model_agreement"]["version"] = a["version"].clone();
+        outcome["model_agreement"]["binding"] = a["binding"].clone();
+    }
+    if let Some(selection) = stage.get("model_selection").filter(|s| s.is_object()) {
+        outcome["model_selection"] = json!({"id":selection["id"],"agreement_id":selection["agreement_id"],
+            "effective":selection["effective"],"policy_inputs":selection["policy_inputs"],
+            "availability":selection["availability"],"verification_state":selection["verification_state"]});
+    }
+    outcome
 }
 
 /// Assemble presentation from the completed plan and already-loaded authoritative summary.

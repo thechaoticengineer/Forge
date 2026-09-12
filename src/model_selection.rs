@@ -114,7 +114,7 @@ impl Ctx {
         implementer: Option<&str>,
     ) -> Result<ModelRequirements, String> {
         let settings = self.app.settings.lock().unwrap();
-        let configured_role = if matches!(role, "chat" | "enhance") {
+        let configured_role = if matches!(role, "chat" | "enhance" | "model_policy") {
             "planner"
         } else {
             role
@@ -159,7 +159,7 @@ impl Ctx {
         let mut requirements = ModelRequirements::for_class(role, provider, Tier::Strong);
         if !matches!(
             role,
-            "planner" | "architect" | "chat" | "enhance" | "reviewer"
+            "planner" | "architect" | "chat" | "enhance" | "model_policy" | "reviewer"
         ) || (role == "reviewer" && !model.is_empty())
         {
             requirements.minimum_tier = None;

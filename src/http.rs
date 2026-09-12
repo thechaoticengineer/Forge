@@ -55,7 +55,7 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
     let _ = req.as_reader().read_to_string(&mut body_text);
     let body: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     let project_endpoint = matches!(path, "/api/state" | "/api/architecture/history" | "/api/architecture/reviews" | "/api/agent_log" | "/api/agent_records" | "/api/diff"
-        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/goal/enhance" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
+        | "/api/plan" | "/api/plan/edit" | "/api/plan/revise" | "/api/plan/chat" | "/api/goal/enhance" | "/api/models/suggest" | "/api/models/suggestion" | "/api/approve" | "/api/run" | "/api/stop" | "/api/reset_plan")
         || path.starts_with("/api/queue/");
     let target = if !project_endpoint {
         Ok(None)
@@ -89,6 +89,9 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Get, "/api/architecture/reviews") => api_architecture_reviews(&ctx, query),
         (tiny_http::Method::Get, "/api/architecture/history") => api_architecture_history(&ctx, query),
         (tiny_http::Method::Get, "/api/models") => api_models(app, query),
+        (tiny_http::Method::Post, "/api/models/suggest") => api_model_suggest(&ctx, &body),
+        (tiny_http::Method::Get, "/api/models/suggestion") =>
+            (200, ctx.session.state.lock().unwrap().model_policy_suggestion.clone()),
         (tiny_http::Method::Post, "/api/quota/refresh") =>
             (202, json!({"ok":true,"started":app.refresh_quota(true)})),
         (tiny_http::Method::Post, "/api/models/refresh") =>
@@ -137,6 +140,11 @@ fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> (u32, Value) {
             "run_started_unix": s.run_started_unix,
             "model_selection": s.model_selection,
             "goal_enhancement": s.goal_enhancement,
+            "model_policy_suggestion": {
+                "status":s.model_policy_suggestion["status"],
+                "request_id":s.model_policy_suggestion["request_id"],
+                "error":s.model_policy_suggestion["error"],
+            },
             "architect_activity":s.architect_activity,
             "role_usage":s.role_usage,
             "agent": {
@@ -331,9 +339,46 @@ fn api_models(app: &App, query: &str) -> (u32, Value) {
     match result { Ok(v) => (200,v), Err(e) => (400,json!({"error":e})) }
 }
 
+fn api_model_suggest(ctx: &Ctx, body: &Value) -> (u32, Value) {
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+    let base = match crate::catalogue::Policy::from_settings(&json!({"model_catalogue":body["policy"]})) {
+        Ok(policy) => policy,
+        Err(error) => return (400, json!({"error":error})),
+    };
+    let mut details = ctx.app.catalogue.details(&base);
+    if details["refreshing"] == true {
+        return (409, json!({"error":"Wait for model discovery to finish, then ask AI to assign tiers."}));
+    }
+    details["metadata"] = ctx.app.metadata.details(&ctx.app.catalogue.metadata_snapshot(&base));
+    let entries = match crate::model_policy_ai::candidates(&base, &details) {
+        Ok(entries) => entries,
+        Err(error) => return (400, json!({"error":error})),
+    };
+    if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+        return (409, json!({"error":"busy"}));
+    }
+    ctx.session.stop_requested.store(false, Ordering::SeqCst);
+    let request_id = {
+        let mut state = ctx.session.state.lock().unwrap();
+        state.model_policy_suggestion_serial += 1;
+        let id = state.model_policy_suggestion_serial;
+        state.model_policy_suggestion = json!({"status":"running","request_id":id});
+        id
+    };
+    let worker = ctx.clone();
+    std::thread::spawn(move || worker.model_policy_worker(base, details, entries, request_id));
+    (202, json!({"ok":true,"request_id":request_id}))
+}
+
 fn api_settings(app: &App, body: &Value) -> (u32, Value) {
     let Some(obj) = body.as_object() else { return (400,json!({"error":"settings must be an object"})); };
     let mut settings = app.settings.lock().unwrap();
+    if let Some(expected) = body.get("expected_model_policy") {
+        let current = crate::catalogue::Policy::from_settings(&settings).map(|p| json!(p));
+        if current.as_ref().ok() != Some(expected) {
+            return (409, json!({"error":"Model policy changed while this editor was open. Use Reload saved policy before saving."}));
+        }
+    }
     let mut candidate = settings.clone();
     for (k,v) in obj { if candidate.get(k).is_some() { candidate[k] = v.clone(); } }
     if !candidate["automatic_routing"].is_boolean() || !(candidate["routing_billing_basis"].is_null() || candidate["routing_billing_basis"].as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) {
