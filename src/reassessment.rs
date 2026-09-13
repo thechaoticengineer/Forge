@@ -108,7 +108,8 @@ impl Ctx {
         }
         if plan["stages"][idx]["reassessment"]["pending"].is_object() {
             let pending = plan["stages"][idx]["reassessment"]["pending"].clone();
-            let restored = (pending["kind"] == "material_assignment_change")
+            let restored = (pending["kind"] == "material_assignment_change"
+                || pending["kind"] == "provider_operational_failure")
                 .then(|| self.restored_assignment(plan, idx)).transpose()?;
             if let Some(agreement) = restored.filter(|a| *a == pending["old_agreement"]) {
                 if crate::plan::review_cadence(&plan["stages"][idx], "reviewer") == "per_stage" {
@@ -116,7 +117,7 @@ impl Ctx {
                 }
                 let state = &mut plan["stages"][idx]["reassessment"];
                 state["history"].as_array_mut().unwrap().push(json!({
-                    "kind":"material_assignment_restored", "reservation":pending,
+                    "kind":if pending["kind"] == "provider_operational_failure" {"provider_operation_resumed"} else {"material_assignment_restored"}, "reservation":pending,
                     "agreement_id":agreement["id"], "unix":unix_timestamp()
                 }));
                 state.as_object_mut().unwrap().remove("pending");

@@ -294,7 +294,7 @@ fn persisted_reservations_stop_loops_and_do_not_cross_projects() {
 
 #[test]
 fn restored_material_assignment_recovers_reservation_without_refunding_or_selecting() {
-    for kind in ["material_assignment_change", "repeated_reasoning_failure"] {
+    for kind in ["material_assignment_change", "provider_operational_failure", "repeated_reasoning_failure"] {
         let f = Fixture::new();
         let mut p = f.attempt();
         p["stages"][0]["rounds"] = json!(1);
@@ -320,10 +320,11 @@ fn restored_material_assignment_recovers_reservation_without_refunding_or_select
         assert!(ctx.load_plan().unwrap()["stages"][0]["reassessment"]["pending"].is_object());
         ctx.app.settings.lock().unwrap()["mock_routing_options"] = json!(options);
         let result = ctx.assignment_boundary(&mut restored, 0);
-        if kind == "material_assignment_change" {
+        if kind != "repeated_reasoning_failure" {
             assert_eq!(result.unwrap(), old);
             assert!(restored["stages"][0]["reassessment"]["pending"].is_null());
-            assert_eq!(restored["stages"][0]["reassessment"]["history"][0]["kind"], "material_assignment_restored");
+            assert_eq!(restored["stages"][0]["reassessment"]["history"][0]["kind"],
+                if kind == "provider_operational_failure" {"provider_operation_resumed"} else {"material_assignment_restored"});
             assert_eq!(ctx.assignment_boundary(&mut restored, 0).unwrap(), old);
         } else {
             assert!(result.is_err());
