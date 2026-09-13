@@ -522,7 +522,7 @@ fn api_queue_start(ctx: &Ctx) -> (u32, Value) {
     let Some(head) = crate::plan::queue_head(&queue) else {
         return (400, json!({"error": "no queued goals"}));
     };
-    if head["status"] != "queued" {
+    if !matches!(head["status"].as_str(), Some("queued" | "blocked" | "failed" | "planning" | "awaiting_approval" | "running")) {
         return (409, json!({"error": crate::plan::queue_order_error(head)}));
     }
     if ctx.acquire_busy().is_err() {

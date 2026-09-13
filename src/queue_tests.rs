@@ -421,34 +421,49 @@ fn queue_agent_failures_halt_and_leave_remaining_goals_queued() {
         let plan = test.app.load_plan();
         for _ in 0..2 {
             let (code, response) = api_request(&test.app.app, "POST", "/api/queue/start", json!({}));
-            assert_eq!(code, 409, "{role}: {response}");
-            assert!(response["error"].as_str().unwrap().contains("goal 1"));
-            assert_eq!(test.app.load_queue(), queue);
-            assert_eq!(test.app.load_plan(), plan);
+            assert_eq!(code, 200, "{role}: {response}");
+            wait_for_worker(&test.app);
+            assert_eq!(test.statuses(), [expected, "queued"], "{role}");
+            assert_eq!(test.app.load_queue()["items"][1], queue["items"][1]);
+            if let Some(plan) = &plan {
+                assert_eq!(test.app.load_plan().unwrap()["plan_id"], plan["plan_id"]);
+            }
             assert!(!test.app.session.busy.load(Ordering::SeqCst));
         }
+        test.app.app.settings.lock().unwrap()[role] = json!("mock");
+        assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})).0, 200);
+        wait_for_worker(&test.app);
+        assert!(test.statuses().is_empty(), "{role}: {:?}", test.statuses());
     }
 }
 
 #[test]
 fn queue_worker_and_start_api_never_pass_an_unfinished_head_after_restart() {
     for status in ["blocked", "failed", "planning", "awaiting_approval", "running", "unknown"] {
-        let test = QueueTest::new(true);
+        let test = QueueTest::new(false);
         let mut queue = test.app.load_queue();
         queue["items"][0]["status"] = json!(status);
         test.app.save_queue(&queue);
         // A fresh engine has no busy flags; persisted queue order is authoritative.
         let app = Arc::new(crate::app::App::new(test.app.project(), test.app.app.settings.lock().unwrap().clone()));
         let ctx = app.context(test.app.project());
-        assert_eq!(api_request(&app, "POST", "/api/queue/start", json!({})).0, 409, "{status}");
-        ctx.acquire_busy().unwrap();
-        ctx.session.queue_active.store(true, Ordering::SeqCst);
-        ctx.queue_worker(None);
-        assert_eq!(ctx.load_queue(), queue, "{status}");
-        assert!(ctx.load_plan().is_none());
-        assert!(!ctx.session.queue_active.load(Ordering::SeqCst));
+        let code = api_request(&app, "POST", "/api/queue/start", json!({})).0;
+        if status == "unknown" {
+            assert_eq!(code, 409);
+            ctx.acquire_busy().unwrap();
+            ctx.session.queue_active.store(true, Ordering::SeqCst);
+            ctx.queue_worker(None);
+            assert_eq!(ctx.load_queue(), queue);
+            assert!(ctx.load_plan().is_none());
+            assert!(!ctx.session.queue_active.load(Ordering::SeqCst));
+        } else {
+            assert_eq!(code, 200, "{status}");
+            wait_for_worker(&ctx);
+            assert_eq!(ctx.load_queue()["items"][0]["status"], "awaiting_approval", "{status}");
+            assert_eq!(ctx.load_queue()["items"][1], queue["items"][1]);
+            assert_eq!(ctx.load_plan().unwrap()["goal"], "first goal");
+        }
         assert!(!ctx.session.busy.load(Ordering::SeqCst));
-        assert!(!ctx.read_history().as_array().unwrap().iter().any(|e| e["kind"] == "agent"));
     }
 }
 
@@ -535,6 +550,100 @@ fn queue_blocked_stage_halts_and_releases_busy() {
     }).expect("blocked stage duration");
     assert_eq!(event["goal"], "first goal");
     assert_eq!(event["stage"], 1);
+    let calls = test.app.app.settings.lock().unwrap()["mock_agent_requests"].clone();
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})).0, 200);
+    wait_for_worker(&test.app);
+    assert_eq!(test.statuses(), ["blocked", "queued"]);
+    assert_eq!(test.app.load_plan().unwrap()["plan_id"], plan["plan_id"]);
+    assert_eq!(test.app.load_plan().unwrap()["stages"][0]["rounds"], plan["stages"][0]["rounds"]);
+    assert_eq!(test.app.app.settings.lock().unwrap()["mock_agent_requests"], calls);
+}
+
+#[test]
+fn start_queue_resumes_stage_three_of_four_after_network_failure_and_restart() {
+    let test = QueueTest::new(true);
+    let mut queue = test.app.load_queue();
+    queue["items"].as_array_mut().unwrap().truncate(1);
+    test.app.save_queue(&queue);
+    {
+        let mut settings = test.app.app.settings.lock().unwrap();
+        settings["mock_plan_output"] = json!({"goal":"first goal","status":"draft","stages":
+            (1..=4).map(|id| json!({"id":id,"title":format!("Stage {id}"),
+                "instructions":format!("Implement stage {id}"),"acceptance":"File exists",
+                "commit":format!("feat: stage {id}")})).collect::<Vec<_>>()});
+        settings["reassessment_limits"]["max_operational_retries"] = json!(0);
+        settings["mock_implementation_errors"] = json!([null,null,"network connection unavailable"]);
+        settings["mock_edits"] = json!([{"one.txt":"one"},{"two.txt":"two"},{},
+            {"three.txt":"three"},{"four.txt":"four"}]);
+    }
+    test.start();
+    assert_eq!(test.statuses(), ["blocked"]);
+    let stopped = test.app.load_plan().unwrap();
+    assert_eq!(stopped["stages"][0]["status"], "committed");
+    assert_eq!(stopped["stages"][1]["status"], "committed");
+    assert_eq!(stopped["stages"][2]["status"], "blocked");
+    assert_eq!(stopped["stages"][3]["status"], "pending");
+    let first_commits = test.app.git(&["log", "--format=%H", "-2"]).unwrap();
+    let settings = test.app.app.settings.lock().unwrap().clone();
+    let count_planner = |settings: &Value| settings["mock_agent_requests"].as_array().unwrap().iter()
+        .filter(|request| request["role"] == "planner").count();
+    let planner_calls = count_planner(&settings);
+    let app = Arc::new(crate::app::App::new(test.app.project(), settings));
+    let ctx = app.context(test.app.project());
+    assert_eq!(api_request(&app, "POST", "/api/queue/start", json!({})).0, 200);
+    wait_for_worker(&ctx);
+    let done = ctx.load_plan().unwrap();
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["plan_id"], stopped["plan_id"]);
+    assert_eq!(done["stages"][0], stopped["stages"][0]);
+    assert_eq!(done["stages"][1], stopped["stages"][1]);
+    assert_eq!(done["stages"][2]["attempt_id"], stopped["stages"][2]["attempt_id"]);
+    assert_eq!(ctx.git(&["log", "--format=%H", "--skip=2", "-2"]).unwrap(), first_commits);
+    assert_eq!(count_planner(&app.settings.lock().unwrap()), planner_calls);
+    assert!(ctx.load_queue()["items"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn start_queue_keeps_saved_draft_and_honors_auto_approve_after_stop() {
+    for auto_approve in [false, true] {
+        let test = QueueTest::new(false);
+        test.start();
+        let saved = test.app.load_plan().unwrap();
+        assert_eq!(api_request(&test.app.app, "POST", "/api/stop", json!({})).0, 200);
+        test.app.app.settings.lock().unwrap()["queue_auto_approve"] = json!(auto_approve);
+        assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})).0, 200);
+        wait_for_worker(&test.app);
+        let settings = test.app.app.settings.lock().unwrap();
+        let planner_calls = settings["mock_agent_requests"].as_array().unwrap().iter()
+            .filter(|request| request["role"] == "planner").count();
+        assert_eq!(settings["queue_auto_approve"], auto_approve);
+        if auto_approve {
+            assert!(test.statuses().is_empty());
+            assert_eq!(planner_calls, 2); // First goal's existing draft, then the next goal.
+        } else {
+            assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
+            assert_eq!(test.app.load_plan().unwrap(), saved);
+            assert_eq!(planner_calls, 1);
+        }
+    }
+}
+
+#[test]
+fn start_queue_reuses_candidate_after_architect_availability_failure() {
+    let test = QueueTest::new(false);
+    test.app.app.settings.lock().unwrap()["mock_architect_errors"] = json!(["no eligible strong architect model"]);
+    test.start();
+    assert_eq!(test.statuses(), ["blocked", "queued"]);
+    assert!(test.app.load_plan().is_none());
+    let candidate: Value = serde_json::from_slice(&fs::read(test.app.forge_path("plan-candidate.json")).unwrap()).unwrap();
+    let count_planner = |settings: &Value| settings["mock_agent_requests"].as_array().unwrap().iter()
+        .filter(|request| request["role"] == "planner").count();
+    let calls = count_planner(&test.app.app.settings.lock().unwrap());
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})).0, 200);
+    wait_for_worker(&test.app);
+    assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
+    assert_eq!(count_planner(&test.app.app.settings.lock().unwrap()), calls);
+    assert_eq!(test.app.load_plan().unwrap()["stages"][0]["instructions"], candidate["stages"][0]["instructions"]);
 }
 
 // Scope, paired verdicts, evidence, budgets and review-history regressions

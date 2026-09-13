@@ -644,8 +644,14 @@ plan for your usual approval. Enable it to approve each plan automatically
 and run the queue unattended. A blocked or failed item stops the queue
 for human intervention; remaining goals stay queued. This also applies to another
 **Start queue** request and after an engine restart: only the first unfinished
-goal may start. A blocked or failed goal is never silently skipped. The start API
-returns HTTP 409 identifying that goal, and the panel disables **Start queue**.
+goal may start. A blocked or failed goal is never silently skipped. After fixing
+the cause of the block (for example, model availability), click **Start queue**
+again. It retries planning if no plan for that goal was published, or continues
+that goal's saved plan. Committed stages and review budgets are preserved.
+Drafts follow the current `queue_auto_approve` setting; with it enabled, the
+queue proceeds through planning, approval and execution without extra clicks.
+An unresolved blocker stops the same goal again. Start is disabled while the
+project is busy or the queue is already active.
 Approving or running a saved plan for a later queued goal cannot bypass this order.
 
 Successfully completed goals are removed from the queue automatically.

@@ -20,6 +20,26 @@ use std::fs;
 use std::io::Write as _;
 
 impl Ctx {
+    /// If planning finished before the architect became unavailable, retry its
+    /// publication without asking the planner to replace the saved candidate.
+    pub(super) fn continue_queue_planning(&self, goal: &str) -> bool {
+        let candidate = fs::read(self.forge_path("plan-candidate.json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|plan| plan["goal"] == goal && plan["status"] == "draft"
+                && plan["planner_selection_actor"].is_object() && plan["stages"].is_array());
+        let Some(candidate) = candidate else {
+            return self.plan_with_busy_claim(goal, &PlanMode::Standard);
+        };
+        match self.finalize_plan(candidate, None, "ready") {
+            Ok(()) => true,
+            Err(error) => {
+                self.set_phase("blocked");
+                self.log_event("error", &format!("planning continuation failed: {error}"));
+                false
+            }
+        }
+    }
+
     pub(crate) fn plan_worker(&self, goal: &str, mode: &PlanMode) {
         let _worker = WorkerGuard(&self.session);
         self.plan_with_busy_claim(goal, mode);

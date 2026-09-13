@@ -97,7 +97,7 @@ impl Ctx {
             return;
         }
         loop {
-            let (id, goal) = {
+            let (id, goal, resume) = {
                 let _queue_guard = self.session.queue_lock.lock().unwrap();
                 if !self.session.queue_active.load(Ordering::SeqCst) {
                     return;
@@ -109,7 +109,7 @@ impl Ctx {
                     self.log_event("queue", "queue complete");
                     return;
                 };
-                if item["status"] != "queued" {
+                if !matches!(item["status"].as_str(), Some("queued" | "blocked" | "failed" | "planning" | "awaiting_approval" | "running")) {
                     self.session.queue_active.store(false, Ordering::SeqCst);
                     self.set_phase("blocked");
                     self.log_event("queue", &crate::plan::queue_order_error(item));
@@ -117,15 +117,44 @@ impl Ctx {
                 }
                 let id = item["id"].as_u64().unwrap();
                 let goal = item["goal"].as_str().unwrap_or("").to_string();
+                // A failed planning attempt may leave the previous goal's plan
+                // on disk. Only resume a plan belonging to this queue head.
+                let retrying = item["status"] != "queued";
+                let saved = if retrying { self.load_plan() } else { None };
+                if let Some(error) = self.session.persistence_error.lock().unwrap().clone() {
+                    self.session.queue_active.store(false, Ordering::SeqCst);
+                    self.set_phase("blocked");
+                    self.log_event("queue", &format!("queue paused: {error}"));
+                    return;
+                }
+                let resume = saved.filter(|plan| plan["goal"] == goal)
+                    .map(|plan| plan["status"].as_str().unwrap_or("invalid").to_owned())
+                    .or_else(|| retrying.then(|| "unpublished".to_owned()));
+                if resume.as_deref().is_some_and(|status| !matches!(status, "draft" | "approved" | "done" | "unpublished")) {
+                    self.session.queue_active.store(false, Ordering::SeqCst);
+                    self.set_phase("blocked");
+                    self.log_event("queue", "queue paused: saved plan has an unsupported status");
+                    return;
+                }
+                let running = matches!(resume.as_deref(), Some("approved" | "done"));
                 {
                     let mut s = self.session.state.lock().unwrap();
                     s.goal = goal.clone();
-                    s.phase = "planning".into();
+                    s.phase = if running { "running" } else { "planning" }.into();
+                    if running { s.run_started_unix = unix_timestamp(); }
                 }
-                self.set_queue_status(&mut queue, id, "planning");
-                (id, goal)
+                self.set_queue_status(&mut queue, id, if running { "running" } else { "planning" });
+                (id, goal, resume)
             };
-            let planned = self.plan_with_busy_claim(&goal, &PlanMode::Standard);
+            if matches!(resume.as_deref(), Some("approved" | "done")) {
+                if !self.run_queue_item(id) { return; }
+                continue;
+            }
+            let planned = match resume.as_deref() {
+                Some("draft") => true,
+                Some("unpublished") => self.continue_queue_planning(&goal),
+                _ => self.plan_with_busy_claim(&goal, &PlanMode::Standard),
+            };
             {
                 let _queue_guard = self.session.queue_lock.lock().unwrap();
                 let mut queue = self.load_queue();
@@ -151,6 +180,7 @@ impl Ctx {
                     self.set_phase("failed");
                     self.log_event("error", &error);
                     self.set_queue_status(&mut queue, id, "failed");
+                    self.session.queue_active.store(false, Ordering::SeqCst);
                     break;
                 }
             }
