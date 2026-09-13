@@ -545,7 +545,7 @@ impl Ctx {
                 |response| {
                     let applied = apply_turn(&candidate, &cp, &response.output, &decisions, &required)?;
                     let parsed: Value = serde_json::from_str(&response.output).map_err(|e| e.to_string())?;
-                    crate::routing::validate_evaluations(&parsed["model_evaluations"], &routing_ids)?;
+                    crate::routing::validate_evaluations(&parsed["model_evaluations"], &routing_ids, &candidate)?;
                     Ok(applied)
                 },
                 |response, error| {

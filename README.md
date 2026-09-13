@@ -142,6 +142,11 @@ This applies to initial plans and revisions, plan Q&A, goal enhancement, scope
 answers, routing proposals and evaluations, architectural guidance, stage and plan
 review verdicts, and structured implementer/fixer stage outcomes. Planner proposal
 schemas are checked before calling the architect, including nested unknown fields.
+An architect evaluation with `agree: true` must match the planner's risk,
+complexity and task fields. A mismatch returns the exact conflicting fields to
+the architect through the same three-correction budget, both in initial guidance
+and after a routing reconciliation. The architect can correct the fields or
+explicitly disagree with `agree: false`; the engine never invents agreement.
 Corrections keep the selected provider/model and operation context. Architectural
 corrections retain the exact session; independent reviews remain fresh and inspect
 the same snapshot. Correcting an implementer's report uses a read-only invocation
@@ -1418,8 +1423,10 @@ failure impact in its guidance turn. Both must explicitly agree on classificatio
 and capability requirements. Missing proposals from manual edits or legacy plans are batched
 into one strong planner turn. Disagreement or an engine rejection of an agreed
 selection allows one further planner/architect exchange for only the affected
-stages. Engine feedback includes the exact policy failure; correcting the tier
-must preserve the already agreed risk, complexity and task.
+stages. Inconsistent `agree: true` responses use the separate response-correction
+budget before they can enter this exchange. Engine feedback includes the exact
+policy failure; correcting the tier must preserve the already agreed risk,
+complexity and task.
 Unresolved disagreements or policy failures then block publication with reasons
 and correction instructions. A planner proposal alone never supplies architect
 approval, and malformed output cannot be published.

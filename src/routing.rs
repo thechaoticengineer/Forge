@@ -88,7 +88,7 @@ pub(crate) fn valid_tier_record(record: &Value) -> bool {
             && record["binding"] == "at_implementation_start"))
 }
 
-pub(crate) fn validate_evaluations(value: &Value, ids: &[i64]) -> Result<(), String> {
+pub(crate) fn validate_evaluations(value: &Value, ids: &[i64], plan: &Value) -> Result<(), String> {
     if ids.is_empty() && value.is_null() { return Ok(()); }
     let rows: Vec<Evaluation> = serde_json::from_value(value.clone())
         .map_err(|e| format!("invalid architect model evaluations: {e}"))?;
@@ -100,6 +100,25 @@ pub(crate) fn validate_evaluations(value: &Value, ids: &[i64]) -> Result<(), Str
         classification(&e.risk, &e.complexity, &e.task)?;
         if e.rationale.trim().is_empty() || e.rationale.len() > 4000 {
             return Err("missing architect rationale".into());
+        }
+        // A claimed agreement with different fields is an inconsistent response,
+        // not a substantive disagreement. Let its author correct it before
+        // consuming the separate planner/architect reconciliation exchange.
+        if e.agree {
+            let stage = plan["stages"].as_array().and_then(|stages|
+                stages.iter().find(|stage| stage["id"] == *id))
+                .ok_or_else(|| format!("missing evaluated stage {id}"))?;
+            let proposal = &stage["model_proposal"];
+            let mismatches: Vec<_> = [("risk", &e.risk), ("complexity", &e.complexity), ("task", &e.task)]
+                .into_iter().filter(|(field, actual)| proposal[field].as_str() != Some(actual.as_str()))
+                .map(|(field, actual)| format!("{field}: planner={}, architect={actual}", proposal[field]))
+                .collect();
+            if !mismatches.is_empty() {
+                return Err(format!("stage {id}: agree=true contradicts the planner classification ({}). \
+                    If you agree, return the same risk, complexity and task. If your independent assessment \
+                    differs, set agree=false and explain the disagreement in rationale; do not change \
+                    your actual findings merely to pass validation", mismatches.join("; ")));
+            }
         }
     }
     Ok(())
@@ -614,7 +633,7 @@ impl Ctx {
                         }
                     }
                 }
-                else { validate_evaluations(&value["model_evaluations"], ids)?; }
+                else { validate_evaluations(&value["model_evaluations"], ids, plan)?; }
                 Ok(value)
             },
             |reply, error| {
@@ -906,7 +925,7 @@ impl Ctx {
         Ok(a.clone())
     }
 }
-pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required capability proposal against cross-stage constraints and failure impact. Planning agrees a tier without a provider or model; only active execution reassessment evaluates a concrete replacement and cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Explicit agreement requires both classifications to match. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
+pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required capability proposal against cross-stage constraints and failure impact. Planning agrees a tier without a provider or model; only active execution reassessment evaluates a concrete replacement and cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Set agree=true only when risk, complexity and task all match the planner proposal. If your independent classification differs, set agree=false and explain why in rationale. Contradictory agree=true fields are returned to you for response correction; do not change actual findings merely to pass validation. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
 pub(crate) fn mock_evaluations(plan: &Value, ids: &[i64]) -> Value {
     json!(ids.iter().map(|id| { let p = &plan["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["model_proposal"];
         json!({"stage_id":id,"agree":true,"rationale":"Architect: independently checked cross-stage interfaces and failure impact.","risk":p["risk"],"complexity":p["complexity"],"task":p["task"]}) }).collect::<Vec<_>>())

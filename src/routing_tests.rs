@@ -920,6 +920,106 @@ fn malformed_architect_evaluations_return_to_architect_without_repeating_planner
 }
 
 #[test]
+fn contradictory_architect_agreement_uses_the_shared_three_corrections() {
+    for repaired in [false, true] {
+        let f = Fixture::new();
+        let saved = f.publish(plan()).unwrap();
+        let mut candidate = saved.clone();
+        candidate["stages"][0]["instructions"] = json!("Add a second greeting");
+        let candidate = crate::plan::edit_plan(&saved, &json!({"plan":candidate})).unwrap();
+        let valid = evaluation(true, "standard", "standard");
+        let mut wrong_task = valid.clone();
+        wrong_task["task"] = json!("documentation");
+        let mut wrong_risk = valid.clone();
+        wrong_risk["risk"] = json!("critical");
+        let mut wrong_complexity = valid.clone();
+        wrong_complexity["complexity"] = json!("complex");
+        f.set("mock_model_evaluations", json!([
+            [wrong_task], [wrong_risk], [wrong_complexity],
+            [if repaired { valid } else { wrong_task }],
+        ]));
+        let before = f.counts();
+        let result = f.ctx.architect_publish(candidate, Some(&saved), "test contradictory agreement");
+        assert_eq!(result.is_ok(), repaired, "{result:?}");
+        assert_eq!(f.counts(), (before.0 + 1, before.1 + 4));
+        if !repaired {
+            assert!(result.unwrap_err().contains("agree=true"));
+            assert_eq!(f.ctx.load_plan().unwrap(), saved);
+        }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        for (offset, field) in ["task", "risk", "complexity"].iter().enumerate() {
+            let prompt = settings["mock_routing_architect_requests"][before.1 + offset + 1]["prompt"].as_str().unwrap();
+            assert!(prompt.contains("RESPONSE CORRECTION") && prompt.contains(field), "{prompt}");
+        }
+        // Rejected evaluations never start a planner reconciliation.
+        assert!(settings["mock_routing_architect_outputs"].is_null());
+    }
+}
+
+#[test]
+fn architect_corrects_contradictory_agreement_after_engine_tier_reconciliation() {
+    for repaired in [false, true] {
+        let f = Fixture::new();
+        let mut candidate = plan();
+        candidate["stages"][0]["instructions"] = json!("Persist comment drafts with atomic writes");
+        let mut p = json!({"risk":"standard","complexity":"standard","task":"persistence",
+            "tier":"standard","rationale":"Use the established draft persistence pattern."});
+        let initial = json!({"proposals":[{"stage_id":1,"proposal":p}]});
+        p["tier"] = json!("strong");
+        f.set("mock_routing_planner_outputs", json!([
+            initial, {"proposals":[{"stage_id":1,"proposal":p}]},
+        ]));
+        let mut valid = evaluation(true, "standard", "standard");
+        valid["task"] = json!("persistence");
+        let mut contradictory = valid.clone();
+        contradictory["task"] = json!("documentation");
+        contradictory["rationale"] = json!("This stores user-written drafts on disk, making it a persistence task.");
+        let rejected = json!({"model_evaluations":[contradictory]});
+        f.set("mock_routing_architect_outputs", json!([
+            rejected, "{broken", {"model_evaluations":[]},
+            if repaired { json!({"model_evaluations":[valid]}) } else { rejected },
+        ]));
+        let result = f.publish(candidate);
+        assert_eq!(result.is_ok(), repaired, "{result:?}");
+        assert_eq!(f.counts(), (2, 5)); // Initial guidance plus four selection responses.
+        if repaired {
+            let result = result.unwrap();
+            let agreement = &result["stages"][0]["model_agreement"];
+            assert_eq!(agreement["validated_proposal"], p);
+            assert_eq!(agreement["dialogue"].as_array().unwrap().len(), 2);
+        } else {
+            assert!(result.unwrap_err().contains("agree=true"));
+            assert!(f.ctx.load_plan().is_none());
+        }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let correction = settings["mock_routing_architect_requests"][2]["prompt"].as_str().unwrap();
+        assert!(correction.contains("RESPONSE CORRECTION") && correction.contains("agree=true"), "{correction}");
+        assert!(correction.contains("persistence") && correction.contains("documentation"));
+    }
+}
+
+#[test]
+fn corrected_architect_disagreement_keeps_its_meaning_and_blocks_publication() {
+    let f = Fixture::new();
+    let mut disagreement = evaluation(false, "standard", "complex");
+    disagreement["task"] = json!("persistence");
+    disagreement["rationale"] = json!("The work changes durable storage and needs a different classification.");
+    let mut contradictory = disagreement.clone();
+    contradictory["agree"] = json!(true);
+    f.set("mock_model_evaluations", json!([[contradictory], [disagreement]]));
+    f.set("mock_routing_architect_outputs", json!([{"model_evaluations":[disagreement]}]));
+    let error = f.publish(plan()).unwrap_err();
+    assert!(error.contains("after one reconciliation"), "{error}");
+    assert_eq!(f.counts(), (2, 3)); // One correction and one substantive exchange.
+    assert!(f.ctx.load_plan().is_none());
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let correction = settings["mock_routing_architect_requests"][1]["prompt"].as_str().unwrap();
+    assert!(correction.contains("set agree=false"));
+    let reconciliation = settings["mock_routing_planner_requests"][1]["prompt"].as_str().unwrap();
+    assert!(reconciliation.contains("durable storage") && reconciliation.contains("persistence"));
+}
+
+#[test]
 fn invalid_routing_json_and_then_invalid_schema_share_one_correction_budget() {
     let f = Fixture::new();
     f.set("mock_routing_planner_outputs", json!(["{broken", {"proposals":[]}, "{also broken", {"proposals":[]}]));
