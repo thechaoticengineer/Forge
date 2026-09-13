@@ -517,6 +517,102 @@ fn pending_goals_cannot_be_moved_across_an_unfinished_nonqueued_goal() {
 }
 
 #[test]
+fn retry_first_goal_recovers_failed_planning_without_skipping_or_changing_settings() {
+    let test = QueueTest::new(false);
+    test.app.app.settings.lock().unwrap()["planner"] = json!("invalid-agent");
+    test.start();
+    assert_eq!(test.statuses(), ["failed", "queued"]);
+    test.app.app.settings.lock().unwrap()["planner"] = json!("mock");
+    let original = test.app.load_queue();
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":2})).0, 409);
+    assert_eq!(test.app.load_queue(), original);
+    let response = api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1}));
+    assert_eq!(response, (200, json!({"ok":true,"mode":"queued"})));
+    wait_for_worker(&test.app);
+    assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
+    assert_eq!(test.app.load_plan().unwrap()["goal"], "first goal");
+    assert_eq!(test.app.load_queue()["items"][0]["id"], 1);
+    assert_eq!(test.app.load_queue()["items"][1], original["items"][1]);
+    assert_eq!(test.app.app.settings.lock().unwrap()["planner"], "mock");
+    assert_eq!(test.app.app.settings.lock().unwrap()["architect"], default_settings()["architect"]);
+}
+
+#[test]
+fn retry_legacy_planning_failure_uses_history_when_a_later_plan_is_saved() {
+    let test = QueueTest::new(false);
+    seed_mock_plan(&test.app);
+    let mut later = test.app.load_plan().unwrap();
+    later["goal"] = json!("second goal");
+    later["status"] = json!("approved");
+    test.app.save_plan(&later).unwrap();
+    let mut queue = test.app.load_queue();
+    queue["items"][0]["status"] = json!("blocked");
+    queue["items"][1]["status"] = json!("blocked");
+    test.app.save_queue(&queue);
+    // Before a matching planning record exists, missing progress is not guessed.
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1})).0, 409);
+    test.app.log_event("queue", "goal 1: planning");
+    test.app.log_event("queue", "goal 1: blocked");
+    // The UI history window may no longer contain the failed planning attempt.
+    use std::io::Write as _;
+    let mut history = fs::OpenOptions::new().append(true).open(test.app.forge_path("history.jsonl")).unwrap();
+    for _ in 0..450 {
+        writeln!(history, "{}", json!({"kind":"agent","unix":unix_timestamp(),"text":"Later goal activity"})).unwrap();
+    }
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1})).0, 200);
+    wait_for_worker(&test.app);
+    assert_eq!(test.statuses(), ["awaiting_approval", "blocked"]);
+    let plan = test.app.load_plan().unwrap();
+    assert_eq!(plan["goal"], "first goal");
+    assert_ne!(plan["plan_id"], later["plan_id"]);
+    assert_eq!(test.app.load_queue()["items"][1], queue["items"][1]);
+}
+
+#[test]
+fn retry_stopped_draft_preserves_identity_and_returns_to_approval() {
+    let test = QueueTest::new(false);
+    test.start();
+    let plan = test.app.load_plan().unwrap();
+    let calls = test.app.app.settings.lock().unwrap()["mock_agent_requests"].clone();
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1})).0, 409);
+    assert_eq!(api_request(&test.app.app, "POST", "/api/stop", json!({})).0, 200);
+    assert_eq!(test.statuses(), ["blocked", "queued"]);
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1})),
+        (200, json!({"ok":true,"mode":"awaiting_approval"})));
+    assert_eq!(test.statuses(), ["awaiting_approval", "queued"]);
+    assert_eq!(test.app.load_plan().unwrap(), plan);
+    assert_eq!(test.app.app.settings.lock().unwrap()["mock_agent_requests"], calls);
+    assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    assert!(test.app.session.queue_active.load(Ordering::SeqCst));
+}
+
+#[test]
+fn retry_never_regenerates_a_missing_execution_plan_or_a_different_plan_identity() {
+    let test = QueueTest::new(false);
+    let mut queue = test.app.load_queue();
+    queue["items"][0]["status"] = json!("blocked");
+    queue["items"][0]["resume_phase"] = json!("running");
+    queue["items"][0]["plan_id"] = json!("missing-plan");
+    test.app.save_queue(&queue);
+    for with_plan in [false, true] {
+        if with_plan {
+            seed_mock_plan(&test.app);
+            let mut plan = test.app.load_plan().unwrap();
+            plan["goal"] = json!("first goal");
+            test.app.save_plan(&plan).unwrap();
+        }
+        let plan = test.app.load_plan();
+        let (code, response) = api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1}));
+        assert_eq!(code, 409);
+        assert!(response["error"].as_str().unwrap().contains("Restore"));
+        assert_eq!(test.app.load_queue(), queue);
+        assert_eq!(test.app.load_plan(), plan);
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
 fn queue_blocked_stage_halts_and_releases_busy() {
     let test = QueueTest::new(true);
     // An exhausted review budget exercises the blocked-stage exit.
@@ -535,6 +631,14 @@ fn queue_blocked_stage_halts_and_releases_busy() {
     }).expect("blocked stage duration");
     assert_eq!(event["goal"], "first goal");
     assert_eq!(event["stage"], 1);
+    let calls = test.app.app.settings.lock().unwrap()["mock_agent_requests"].clone();
+    assert_eq!(api_request(&test.app.app, "POST", "/api/queue/retry", json!({"id":1})).0, 200);
+    wait_for_worker(&test.app);
+    let resumed = test.app.load_plan().unwrap();
+    assert_eq!(resumed["plan_id"], plan["plan_id"]);
+    assert_eq!(resumed["stages"][0]["rounds"], plan["stages"][0]["rounds"]);
+    assert_eq!(test.app.app.settings.lock().unwrap()["mock_agent_requests"], calls);
+    assert_eq!(test.statuses(), ["blocked", "queued"]);
 }
 
 // Scope, paired verdicts, evidence, budgets and review-history regressions
