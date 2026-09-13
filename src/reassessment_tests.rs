@@ -345,6 +345,16 @@ fn outcome_channel_rejects_forged_identity_and_validates_escalation_evidence() {
     let mut p = f.attempt();
     f.ctx.reassessment_init(&mut p, 0);
     let valid = json!({"version":1,"plan_id":p["plan_id"],"stage_id":1,"attempt_id":"attempt","turn_id":"turn","status":"escalation","evidence":["test greeting fails on empty input"],"request":{"kind":"reasoning","reason":"Repeated attempt cannot establish invariant","required_capability":"stronger reasoning"}});
+    let before = p.clone();
+    for output in [format!("{valid}\n{{\"status\":\"completed\"}}"),
+        format!("```json\n{valid}"),
+        valid.to_string().replacen("\"status\":", "\"status\":\"completed\",\"status\":", 1)] {
+        assert!(f.ctx.validate_implementer_response(&p, 0, "turn", &output).is_err());
+    }
+    let fenced = format!("```json\n{valid}\n```");
+    f.ctx.validate_implementer_response(&p, 0, "turn", &fenced).unwrap();
+    assert_eq!(parse_outcome(&p, 0, "turn", &fenced).unwrap().unwrap().status, "escalation");
+    assert_eq!(p, before);
     for key in ["plan_id", "stage_id", "attempt_id", "turn_id", "extra"] {
         let mut v = valid.clone();
         v[key] = json!("forged");
@@ -726,9 +736,11 @@ fn an_unchanged_scope_response_without_explanation_does_not_authorize_continuati
     let mut p = f.attempt();
     let outcome = scope_escalation();
     f.set("mock_scope_output", json!({"revised":{"instructions":"Implement greeting","acceptance":"Greeting works"}}));
-    let ScopeResolution::Blocked(message) = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap() else { panic!("expected unchanged response to block") };
+    let message = f.ctx.renegotiate_scope(&mut p, 0, &outcome).unwrap_err();
     assert!(message.contains("unchanged without clarification"));
     assert_eq!(f.ctx.load_plan().unwrap()["stages"][0]["acceptance"], "Greeting works");
+    assert_eq!(f.ctx.app.settings.lock().unwrap()["mock_agent_requests"].as_array().unwrap()
+        .iter().filter(|r| r["role"] == "planner").count(), 4);
 }
 
 #[test]
@@ -745,6 +757,36 @@ fn scope_answer_json_and_fields_are_corrected_before_saving_clarification() {
     let settings = f.ctx.app.settings.lock().unwrap();
     let calls = settings["mock_agent_requests"].as_array().unwrap();
     assert_eq!(calls.iter().filter(|call| call["role"] == "planner").count(), 3);
+}
+
+#[test]
+fn contradictory_scope_responses_share_one_budget_and_preserve_the_saved_stage() {
+    for clarified in [false, true] {
+        let f = Fixture::new();
+        let mut p = f.attempt();
+        let saved = f.ctx.load_plan().unwrap();
+        let contradictory = json!({"refused":"The existing task is buildable", "revised":{
+            "instructions":"Different instructions", "acceptance":"Different acceptance"}});
+        f.set("mock_scope_output", json!([
+            contradictory,
+            r#"{"refused":"Keep it","refused":"Change it"}"#,
+            {"revised":{"instructions":"Change it","acceptance":42}},
+            if clarified { json!({"refused":"Keep the existing scope; use the documented boundary."}) } else { contradictory },
+        ]));
+        let result = f.ctx.renegotiate_scope(&mut p, 0, &scope_escalation());
+        assert_eq!(result.is_ok(), clarified, "{result:?}");
+        let current = f.ctx.load_plan().unwrap();
+        if clarified {
+            assert!(matches!(result.unwrap(), ScopeResolution::Clarified(_)));
+            for field in ["instructions", "acceptance", "rounds", "review_budget", "scope_renegotiations"] {
+                assert_eq!(current["stages"][0][field], saved["stages"][0][field]);
+            }
+        } else { assert_eq!(current, saved); }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let calls: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[1]["prompt"].as_str().unwrap().contains("exactly one of revised or refused"));
+    }
 }
 
 fn scope_escalation() -> Value {

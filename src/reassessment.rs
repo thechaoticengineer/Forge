@@ -31,12 +31,26 @@ fn signature(kind: &str, evidence: &Value) -> String {
     crate::metadata::fingerprint(format!("{kind}:{evidence}").as_bytes())
 }
 
+pub(super) fn structured_outcome(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with(['{', '[']) || text.starts_with("```")
+}
+
 fn parse_outcome(plan: &Value, idx: usize, turn: &str, text: &str) -> Result<Option<Outcome>, String> {
+    if text.trim().is_empty() { return Err("missing implementer outcome".into()); }
     // Legacy completion prose is allowed, but never interpreted as an escalation.
-    if !text.trim_start().starts_with('{') {
+    if !structured_outcome(text) {
         return Ok(None);
     }
-    let o: Outcome = serde_json::from_str(text)
+    let text = text.trim();
+    let text = if let Some(fenced) = text.strip_prefix("```json\n")
+        .or_else(|| text.strip_prefix("```\n"))
+        .or_else(|| text.strip_prefix("```json\r\n"))
+        .or_else(|| text.strip_prefix("```\r\n")) {
+        fenced.trim_end().strip_suffix("```")
+            .ok_or("malformed implementer outcome: unclosed JSON fence")?.trim()
+    } else { text };
+    let o: Outcome = crate::response::parse_json(text)
         .map_err(|e| format!("invalid implementer outcome: {e}"))?;
     if o.version != 1
         || json!(o.plan_id) != plan["plan_id"]

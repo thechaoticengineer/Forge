@@ -57,7 +57,7 @@ pub(crate) fn validate_candidate_proposals(plan: &Value) -> Result<(), String> {
         if stage["status"] == "committed" || stage["model_proposal"].is_null() { continue; }
         let proposal: Proposal = serde_json::from_value(stage["model_proposal"].clone())
             .map_err(|e| format!("stage {} model_proposal: {e}", stage["id"]))?;
-        validate_proposal(&proposal)?;
+        validate_stage_proposal(stage, &proposal)?;
     }
     Ok(())
 }
@@ -76,6 +76,18 @@ fn validate_proposal(p: &Proposal) -> Result<(), String> {
         || !crate::catalogue::identifier(&p.native_effort)))
         || p.rationale.trim().is_empty() || p.rationale.len() > 4000 {
         return Err("invalid model proposal provider, model, effort or rationale".into());
+    }
+    Ok(())
+}
+
+fn validate_stage_proposal(stage: &Value, proposal: &Proposal) -> Result<(), String> {
+    validate_proposal(proposal)?;
+    if let Some(tier) = &proposal.tier {
+        let floor = minimum(stage, proposal).max(stage["routing_scope_floor"].as_u64().unwrap_or(0));
+        if rank(&json!(tier)) < floor {
+            return Err(format!("stage {} proposed tier {tier} is below the engine capability floor {floor}; \
+                correct the tier without changing the task's scope, risk or complexity", stage["id"]));
+        }
     }
     Ok(())
 }
@@ -134,6 +146,7 @@ fn parse_proposals(output: &Value, ids: &[i64]) -> Result<Vec<(i64, Proposal)>, 
         if matches.len() != 1 {
             return Err("duplicate or missing planner proposal".into());
         }
+        crate::response::object_fields(matches[0], &["stage_id", "proposal"])?;
         let proposal = serde_json::from_value(matches[0]["proposal"].clone())
             .map_err(|e| format!("stage {id}: {e}"))?;
         validate_proposal(&proposal)?;
@@ -619,13 +632,17 @@ impl Ctx {
         let (result, value) = self.repair_response(&format!("{role} routing"), initial,
             |reply| {
                 if reply.output.len() > 48 * 1024 { return Err("routing output exceeds 48 KiB".into()); }
-                let mut value: Value = serde_json::from_str(&reply.output)
+                let mut value: Value = crate::response::parse_json(&reply.output)
                     .map_err(|e| format!("invalid selection output: {e}"))?;
                 value.as_object_mut().ok_or("selection output must be an object")?.remove("_engine_usage");
+                crate::response::object_fields(&value, if role == "planner" { &["proposals"] } else { &["model_evaluations"] })?;
                 if role == "planner" {
                     let proposals = parse_proposals(&value, ids)?;
                     let options = if proposals.iter().any(|(_, p)| p.tier.is_none()) { self.routing_candidates()? } else { vec![] };
                     for (id, proposal) in proposals {
+                        let stage = plan["stages"].as_array().and_then(|stages| stages.iter().find(|stage| stage["id"] == id))
+                            .ok_or("missing proposed stage")?;
+                        validate_stage_proposal(stage, &proposal)?;
                         // Correct catalogue identity errors in the planner's own
                         // response loop before paying for another architect turn.
                         if proposal.tier.is_none() && plan["stages"].as_array().unwrap().iter().any(|s| s["id"] == id && s["model_proposal"].is_object()) {

@@ -893,6 +893,29 @@ fn malformed_routing_proposal_is_returned_to_planner_for_correction() {
 }
 
 #[test]
+fn underpowered_routing_tiers_are_corrected_before_invoking_the_architect() {
+    for repaired in [false, true] {
+        let f = Fixture::new();
+        let mut p = json!({"risk":"standard","complexity":"standard","task":"persistence",
+            "tier":"standard","rationale":"Use the existing persistence pattern."});
+        let invalid = json!({"proposals":[{"stage_id":1,"proposal":p}]});
+        p["tier"] = json!("strong");
+        f.set("mock_routing_planner_outputs", json!([
+            invalid, invalid, invalid,
+            if repaired { json!({"proposals":[{"stage_id":1,"proposal":p}]}) } else { invalid },
+        ]));
+        let result = f.publish(plan());
+        assert_eq!(result.is_ok(), repaired, "{result:?}");
+        assert_eq!(f.counts(), (4, usize::from(repaired)));
+        if repaired {
+            assert_eq!(result.unwrap()["stages"][0]["model_agreement"]["validated_proposal"], p);
+        } else { assert!(f.ctx.load_plan().is_none()); }
+        let settings = f.ctx.app.settings.lock().unwrap();
+        assert!(settings["mock_routing_planner_requests"][3]["prompt"].as_str().unwrap().contains("capability floor 3"));
+    }
+}
+
+#[test]
 fn invalid_routing_batch_is_bounded_and_never_partially_applied() {
     let f = Fixture::new();
     let valid = proposal("strong-test", "standard", "functionality");
@@ -957,20 +980,23 @@ fn contradictory_architect_agreement_uses_the_shared_three_corrections() {
 }
 
 #[test]
-fn architect_corrects_contradictory_agreement_after_engine_tier_reconciliation() {
+fn architect_corrects_contradictory_agreement_after_classification_reconciliation() {
     for repaired in [false, true] {
         let f = Fixture::new();
         let mut candidate = plan();
         candidate["stages"][0]["instructions"] = json!("Persist comment drafts with atomic writes");
-        let mut p = json!({"risk":"standard","complexity":"standard","task":"persistence",
-            "tier":"standard","rationale":"Use the established draft persistence pattern."});
+        let mut p = json!({"risk":"standard","complexity":"standard","task":"functionality",
+            "tier":"strong","rationale":"Use the established draft persistence pattern."});
         let initial = json!({"proposals":[{"stage_id":1,"proposal":p}]});
-        p["tier"] = json!("strong");
+        p["task"] = json!("persistence");
         f.set("mock_routing_planner_outputs", json!([
             initial, {"proposals":[{"stage_id":1,"proposal":p}]},
         ]));
         let mut valid = evaluation(true, "standard", "standard");
         valid["task"] = json!("persistence");
+        let mut disagreement = valid.clone();
+        disagreement["agree"] = json!(false);
+        f.set("mock_model_evaluations", json!([[disagreement]]));
         let mut contradictory = valid.clone();
         contradictory["task"] = json!("documentation");
         contradictory["rationale"] = json!("This stores user-written drafts on disk, making it a persistence task.");

@@ -124,17 +124,41 @@ fn mutation_or_stop_during_a_correction_prevents_further_calls_and_publication()
 
 #[test]
 fn malformed_implementer_report_is_corrected_readonly_without_repeating_work() {
-    let f = Fixture::new("Implement feature", 0);
-    f.setting("mock_implementation_outputs", json!([{}, {}, {}, {}]));
-    let p = f.run();
-    f.assert_no_commit();
-    assert_eq!(p["stages"][0]["status"], "blocked");
-    assert_eq!(p["stages"][0]["rounds"], 1);
-    assert_eq!(fs::read_to_string(f.root.join("mock.txt")).unwrap().lines().count(), 1);
-    let settings = f.ctx.app.settings.lock().unwrap();
-    let calls = settings["mock_agent_requests"].as_array().unwrap();
-    assert_eq!(calls.iter().filter(|r| r["role"] == "implementer").count(), 1);
-    assert_eq!(calls.iter().filter(|r| r["role"] == "response_correction").count(), 3);
+    for invalid in [json!({}), json!([]), json!(""), json!("```json\n{}\n```")] {
+        let f = Fixture::new("Implement feature", 0);
+        f.setting("mock_implementation_outputs", json!([invalid, invalid, invalid, invalid]));
+        let p = f.run();
+        f.assert_no_commit();
+        assert_eq!(p["stages"][0]["status"], "blocked");
+        assert_eq!(p["stages"][0]["rounds"], 1);
+        assert_eq!(fs::read_to_string(f.root.join("mock.txt")).unwrap().lines().count(), 1);
+        let settings = f.ctx.app.settings.lock().unwrap();
+        let calls = settings["mock_agent_requests"].as_array().unwrap();
+        assert_eq!(calls.iter().filter(|r| r["role"] == "implementer").count(), 1);
+        assert_eq!(calls.iter().filter(|r| r["role"] == "response_correction").count(), 3);
+    }
+}
+
+#[test]
+fn unexplained_review_rejection_is_corrected_without_inventing_issues_or_repeating_work() {
+    for explained in [false, true] {
+        let f = Fixture::new("Implement feature", 0);
+        let empty = json!({"approved":false,"issues":[]});
+        let rejection = reject("The saved draft is lost after restart; preserve it.");
+        f.setting("mock_verdicts", json!([empty, empty, empty, if explained { rejection.clone() } else { empty }]));
+        let p = f.run();
+        f.assert_no_commit();
+        assert_eq!(f.count("reviewer"), 4);
+        assert_eq!(f.count("fixer"), 0);
+        assert_eq!(p["stages"][0]["rounds"], 1);
+        assert_eq!(fs::read_to_string(f.root.join("mock.txt")).unwrap().lines().count(), 1);
+        let reviews = p["stages"][0]["reviews"].as_array().unwrap();
+        if explained {
+            let reviewer = reviews.iter().find(|v| v["role"] == "reviewer").unwrap();
+            assert_eq!(reviewer["approved"], false);
+            assert_eq!(reviewer["issues"], rejection["issues"]);
+        } else { assert!(reviews.is_empty()); }
+    }
 }
 
 #[test]

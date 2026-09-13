@@ -272,10 +272,15 @@ impl Ctx {
                 .map(|a| a.remove(0).as_str().unwrap().to_string()).unwrap_or(effective_model)
         } else { effective_model };
         #[allow(unused_mut)]
-        let mut output = String::new();
+        let mut output = if matches!(role, "implementer" | "fixer" | "response_correction") {
+            "Mock implementation completed.".to_string()
+        } else { String::new() };
         #[cfg(test)]
         if matches!(role, "implementer" | "fixer" | "response_correction") {
-            output = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0).to_string()).unwrap_or_default();
+            if let Some(value) = self.app.settings.lock().unwrap()["mock_implementation_outputs"].as_array_mut()
+                .filter(|a| !a.is_empty()).map(|a| a.remove(0)) {
+                output = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+            }
         }
         Ok(AgentResult { output, usage, effective_model, model_reported:true, completed: true, ..AgentResult::default() })
     }

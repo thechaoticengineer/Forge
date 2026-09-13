@@ -116,7 +116,7 @@ struct Proposal {
 }
 
 fn validate(text: &str, base: &Policy, entries: &[Entry], revision: &str, costs: &Value) -> Result<Value, String> {
-    let proposal: Proposal = serde_json::from_str(json_payload_with_keys(text, &["assignments", "summary"]))
+    let proposal: Proposal = crate::response::parse_json(json_payload_with_keys(text, &["assignments", "summary"]))
         .map_err(|e| format!("invalid model tier proposal: {e}"))?;
     if proposal.summary.trim().is_empty() || proposal.summary.chars().count() > 8000 {
         return Err("summary must contain 1–8000 characters".into());

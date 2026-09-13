@@ -4,6 +4,7 @@
 //! Provider failures, changed repository/session identities and persistence errors
 //! belong outside validation and must never replay an operation's side effects.
 use crate::app::Ctx;
+use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use crate::agent::{AgentRequest, AgentResult, AgentUsage};
 
@@ -15,6 +16,77 @@ pub(crate) struct ValidatedReply<T> {
 }
 
 pub(crate) const MAX_CORRECTIONS: usize = 3;
+
+/// Parse once without silently resolving duplicate fields, including nested ones.
+/// Call inside the operation's correction loop, before any decision or mutation.
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    let UniqueJson(value) = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+pub(crate) fn object_fields(value: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
+    let object = value.as_object().ok_or("response must be an object")?;
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("unknown response field `{key}`"));
+    }
+    Ok(())
+}
+
+struct UniqueJson(Value);
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = UniqueJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON without duplicate keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(json!(v)))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<UniqueJson, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<UniqueJson, A::Error> {
+                let mut values = vec![];
+                while let Some(UniqueJson(v)) = a.next_element()? {
+                    values.push(v);
+                }
+                Ok(UniqueJson(json!(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<UniqueJson, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = a.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate response key `{key}`")));
+                    }
+                    let UniqueJson(v) = a.next_value()?;
+                    values.insert(key, v);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
 
 pub(crate) fn correction_prompt(context: &str, rejected: &str, error: &str) -> String {
     format!("{context}\n\nRESPONSE CORRECTION: Your last response was rejected by the engine: {error}\n\n\

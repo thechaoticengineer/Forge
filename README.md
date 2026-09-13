@@ -138,6 +138,29 @@ kinds does not reset the budget. Parsing and response-field validation share tha
 budget. A valid response needs no extra call; exhausting the budget retains the
 previous published state and reports the last validation error.
 
+Every response parser rejects duplicate JSON fields, including nested fields,
+before converting the response into an operation-specific contract. The same
+correction budget covers the following checks before their results are used:
+
+| Response | Checks inside the correction boundary |
+| --- | --- |
+| Plan generation and revision | Valid stages and dependencies, proposal fields, and the minimum capability tier for the proposed work |
+| Routing selection | Exact proposal/evaluation IDs, complete fields, planning capability floor, and consistent explicit agreement |
+| Architect guidance | Plan/revision identity, required guidance, retained constraints/interfaces, valid decisions and explicit risk resolution |
+| Scope response | Exactly one revision or refusal, valid revision fields, and an actual change or a concrete clarification |
+| Review | Review identity, consistent approval, acceptance/check evidence, and actionable rejection details |
+| Implementer/fixer outcome | Non-empty response, structured outcome identity/status/evidence, and a request consistent with its status |
+| Plan chat, goal enhancement and model policy | Required fields and types, supported fields, and valid model assignments |
+
+An underpowered planning tier returns to the planner before calling the architect.
+A review rejection without actionable details returns to its author instead of
+receiving an engine-invented issue. A scope answer containing both `revised` and
+`refused` is rejected without choosing either branch. Corrections may preserve a
+valid refusal; validation never requires a model to approve something it rejects.
+Existing documented normalization of optional fields and legacy completion prose
+remains supported. Empty outcomes, arrays and malformed fenced outcomes cannot
+bypass structured validation as legacy completion prose.
+
 This applies to initial plans and revisions, plan Q&A, goal enhancement, scope
 answers, routing proposals and evaluations, architectural guidance, stage and plan
 review verdicts, and structured implementer/fixer stage outcomes. Planner proposal

@@ -93,7 +93,7 @@ fn apply_turn(
         return Err("architect output exceeds 48 KiB".into());
     }
     let t: Turn =
-        serde_json::from_str(output).map_err(|e| format!("invalid architect output: {e}"))?;
+        crate::response::parse_json(output).map_err(|e| format!("invalid architect output: {e}"))?;
     let _ = &t.model_evaluations;
     if t.version != 1 || t.plan_id != plan["plan_id"] || t.revision != plan["revision"] {
         return Err("stale architect plan/revision".into());
@@ -544,7 +544,7 @@ impl Ctx {
             let (output, (mut next, records)) = self.repair_response("architect", output,
                 |response| {
                     let applied = apply_turn(&candidate, &cp, &response.output, &decisions, &required)?;
-                    let parsed: Value = serde_json::from_str(&response.output).map_err(|e| e.to_string())?;
+                    let parsed: Value = crate::response::parse_json(&response.output).map_err(|e| e.to_string())?;
                     crate::routing::validate_evaluations(&parsed["model_evaluations"], &routing_ids, &candidate)?;
                     Ok(applied)
                 },
@@ -564,7 +564,7 @@ impl Ctx {
                     if let Some(usage) = &repaired.usage { turn_usage.push(usage.clone()); }
                     Ok(repaired)
                 })?;
-            let evaluation_output: Value = serde_json::from_str(&output.output).map_err(|e| e.to_string())?;
+            let evaluation_output: Value = crate::response::parse_json(&output.output).map_err(|e| e.to_string())?;
             next["routing_evaluator"] = json!({"provider":provider,"model":output.effective_model,"native_effort":effort});
             self.agree_routing(&mut candidate, &mut next, &routing_ids, &evaluation_output["model_evaluations"])?;
             next["session"] = json!({"provider":provider,"reference":reference,"checkpoint_reference":turn,"resume_policy":"exact_if_committed"});

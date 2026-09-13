@@ -326,61 +326,6 @@ fn classify(root: &str, stage: &Value, promoted: bool) -> Result<Value, String> 
         json!({"version":1,"required_roles":["reviewer"],"scope":"ordinary_documentation","rationale":"Prose intent and full diff contain only existing non-executable documents without detected contractual or normative content; independent scope verification required"}),
     )
 }
-struct UniqueJson(Value);
-impl<'de> serde::Deserialize<'de> for UniqueJson {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = UniqueJson;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("JSON without duplicate keys")
-            }
-            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(json!(v)))
-            }
-            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(json!(v)))
-            }
-            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(json!(v)))
-            }
-            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(json!(v)))
-            }
-            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(json!(v)))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<UniqueJson, E> {
-                Ok(UniqueJson(Value::Null))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut a: A,
-            ) -> Result<UniqueJson, A::Error> {
-                let mut values = vec![];
-                while let Some(UniqueJson(v)) = a.next_element()? {
-                    values.push(v);
-                }
-                Ok(UniqueJson(json!(values)))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut a: A,
-            ) -> Result<UniqueJson, A::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some(key) = a.next_key::<String>()? {
-                    if values.contains_key(&key) {
-                        return Err(serde::de::Error::custom("duplicate verdict key"));
-                    }
-                    let UniqueJson(v) = a.next_value()?;
-                    values.insert(key, v);
-                }
-                Ok(UniqueJson(Value::Object(values)))
-            }
-        }
-        d.deserialize_any(V)
-    }
-}
 
 fn criteria(acceptance: &str) -> Vec<&str> {
     acceptance
@@ -395,7 +340,7 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
     }
     // Accept a prose preamble and an optional Markdown fence, but never search
     // past an earlier JSON candidate or ignore content after the verdict.
-    // UniqueJson still rejects duplicate keys at every nesting level.
+    // The shared response parser rejects duplicate keys at every nesting level.
     let output = output.trim();
     let start = output.find(['{', '[']).into_iter()
         .chain(output.find("```"))
@@ -411,8 +356,8 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
     } else {
         output
     };
-    let UniqueJson(mut v) =
-        serde_json::from_str(output).map_err(|e| format!("malformed verdict: {e}"))?;
+    let mut v: Value =
+        crate::response::parse_json(output).map_err(|e| format!("malformed verdict: {e}"))?;
     if v["identity"] != *identity {
         return Err("wrong or missing review identity".into());
     }
@@ -444,6 +389,10 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
     }
     if v["approved"] == true && !v["issues"].as_array().unwrap().is_empty() {
         return Err("contradictory approval with requests".into());
+    }
+    if let Some(gap) = v.get("architecture_context_gap").filter(|gap| !gap.is_null()) {
+        gap.as_str().filter(|text| !text.trim().is_empty())
+            .ok_or("architecture_context_gap must be a non-empty explanation or null")?;
     }
     if let Some(gap) = v["architecture_context_gap"]
         .as_str()
@@ -496,8 +445,7 @@ fn normalize(output: &str, identity: &Value, acceptance: &str) -> Result<Value, 
             );
         }
     } else if Ctx::review_requests(&v).is_empty() {
-        v["issues"] =
-            json!(["Review rejected without actionable details; verify the stage end to end"]);
+        return Err("review rejection requires actionable issues, notes or an architecture context gap; preserve the rejection and explain what needs correction".into());
     }
     Ok(v)
 }
@@ -1124,11 +1072,11 @@ impl Ctx {
             let effort = effective["native_effort"].as_str().unwrap();
             let mut original_snapshot = None;
             let outcome_context = self.outcome_prompt(plan, idx, &turn);
-            let structured = output.output.trim_start().starts_with('{');
+            let structured = super::reassessment::structured_outcome(&output.output);
             let mut correction_usage = Vec::new();
             let (output, ()) = self.repair_response("implementer outcome", output,
                 |response| {
-                    if structured && !response.output.trim_start().starts_with('{') {
+                    if structured && !super::reassessment::structured_outcome(&response.output) {
                         return Err("a corrected structured outcome must remain JSON".into());
                     }
                     self.validate_implementer_response(plan, idx, &turn, &response.output)

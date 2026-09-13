@@ -107,8 +107,9 @@ impl Ctx {
             let context = if current_plan.get("architecture").is_some() { self.architecture_store().checkpoint(current_plan)? } else { crate::architecture::checkpoint_default() };
             let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only Q&A in a fresh conversation. Do not write files or alter plan/decisions. Return ONLY {{\"answer\":\"your answer\"}}. Saved architecture context: {context}");
             let reply = self.readonly_response("chat", &readonly_prompt, Some("answer.json"), |text| {
-                let output: Value = serde_json::from_str(json_payload(text))
+                let output: Value = crate::response::parse_json(json_payload(text))
                     .map_err(|e| format!("invalid answer JSON: {e}"))?;
+                crate::response::object_fields(&output, &["answer"])?;
                 output["answer"].as_str().filter(|answer| !answer.trim().is_empty())
                     .ok_or("agent did not produce a non-empty answer string")?;
                 Ok(output)
@@ -142,8 +143,9 @@ impl Ctx {
             ]);
             let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only. Do not write files, do not modify the plan or any repository content. Return ONLY {{\"goal\":\"rewritten description\"}} as JSON in your final response.");
             let reply = self.readonly_response("enhance", &readonly_prompt, Some("enhanced-goal.json"), |text| {
-                let output: Value = serde_json::from_str(json_payload(text))
+                let output: Value = crate::response::parse_json(json_payload(text))
                     .map_err(|e| format!("invalid enhanced goal JSON: {e}"))?;
+                crate::response::object_fields(&output, &["goal"])?;
                 let enhanced = output["goal"].as_str().map(str::trim).filter(|goal| !goal.is_empty())
                     .ok_or("agent did not produce a non-empty goal string")?;
                 if enhanced.chars().count() > 20000 { return Err("enhanced description too long".into()); }
@@ -174,7 +176,7 @@ impl Ctx {
         }
         let prompt = format!("{prompt}\n{}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.", self.routing_prompt()?);
         let reply = self.readonly_response("planner", &prompt, Some("plan-candidate.json"), |text| {
-            let candidate: Value = serde_json::from_str(json_payload(text))
+            let candidate: Value = crate::response::parse_json(json_payload(text))
                 .map_err(|e| format!("invalid candidate: {e}"))?;
             if !candidate["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
             let (draft, _) = prepare_candidate_draft(candidate, goal, previous)?;
@@ -273,13 +275,31 @@ impl Ctx {
             result.output
         };
         let (_, answer) = self.repair_response("scope revision", text, |text| {
-            let answer: Value = serde_json::from_str(json_payload_with_keys(text, &["revised", "refused"]))
+            let answer: Value = crate::response::parse_json(json_payload_with_keys(text, &["revised", "refused"]))
                 .map_err(|e| format!("invalid scope revision: {e}"))?;
-            if answer["refused"].as_str().is_some_and(|r| !r.trim().is_empty()) { return Ok(answer); }
+            crate::response::object_fields(&answer, &["revised", "refused", "removed"])?;
+            if answer.get("revised").is_some() == answer.get("refused").is_some() {
+                return Err("scope response must contain exactly one of revised or refused; preserve your actual decision".into());
+            }
+            if answer.get("refused").is_some() {
+                if answer.get("removed").is_some() {
+                    return Err("scope clarification cannot also report removed requirements".into());
+                }
+                answer["refused"].as_str().filter(|r| !r.trim().is_empty())
+                    .ok_or("scope refusal requires a non-empty explanation")?;
+                return Ok(answer);
+            }
             let revised = &answer["revised"];
+            crate::response::object_fields(revised, &["instructions", "acceptance"])?;
             match (revised["instructions"].as_str(), revised["acceptance"].as_str()) {
                 (Some(i), Some(_)) if !i.trim().is_empty() => {},
                 _ => return Err("planner returned no usable stage revision".into()),
+            }
+            if let Some(removed) = answer.get("removed") {
+                removed.as_str().ok_or("scope removed explanation must be a string")?;
+            }
+            if revised["instructions"] == stage["instructions"] && revised["acceptance"] == stage["acceptance"] {
+                return Err("the planner returned the stage unchanged without clarification; return refused with an explanation or an actual revision".into());
             }
             Ok(answer)
         }, |text, error| {
@@ -305,14 +325,9 @@ impl Ctx {
             return Ok(ScopeResolution::Clarified(refused.to_owned()));
         }
         let revised = &answer["revised"];
-        let (instructions, acceptance) = match (revised["instructions"].as_str(), revised["acceptance"].as_str()) {
-            (Some(i), Some(a)) if !i.trim().is_empty() => (i.to_owned(), a.to_owned()),
-            _ => return Err("planner returned no usable stage revision".into()),
-        };
-        if instructions == stage["instructions"].as_str().unwrap_or("")
-            && acceptance == stage["acceptance"].as_str().unwrap_or("") {
-            return Ok(ScopeResolution::Blocked("the planner returned the stage unchanged without clarification".into()));
-        }
+        // The complete response was validated before either decision branch.
+        let instructions = revised["instructions"].as_str().unwrap().to_owned();
+        let acceptance = revised["acceptance"].as_str().unwrap().to_owned();
         let changed = answer["removed"].as_str().unwrap_or("").to_owned();
         // Record the renegotiation before the edit so it survives reconciliation
         // and stays visible next to the stage it narrowed. It also goes into the

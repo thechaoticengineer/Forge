@@ -104,3 +104,74 @@ fn chat_and_enhancement_use_the_same_parser_and_field_correction_budget() {
     f.app.enhance_goal_worker("Goal", 1);
     assert_eq!(f.app.session.state.lock().unwrap().goal_enhancement["goal"], "Corrected goal");
 }
+
+#[test]
+fn duplicate_response_fields_are_never_silently_resolved() {
+    for response in [r#"{"approved":false,"approved":true}"#,
+        r#"{"stages":[{"model_proposal":{"task":"persistence","task":"documentation"}}]}"#,
+        r#"{"answer":"first","\u0061nswer":"second"}"#] {
+        assert!(parse_json::<Value>(response).unwrap_err().contains("duplicate response key"));
+    }
+}
+
+#[test]
+fn duplicate_planner_fields_are_corrected_before_any_architect_turn() {
+    let f = QueueTest::new(false);
+    let valid = candidate(&f);
+    let duplicate = valid.to_string().replacen("\"title\":", "\"title\":\"conflicting stage\",\"title\":", 1);
+    f.app.app.settings.lock().unwrap()["mock_plan_output"] = json!([duplicate, valid]);
+    f.app.acquire_busy().unwrap();
+    f.app.plan_worker("Goal", &PlanMode::Standard);
+    assert!(f.app.load_plan().is_some());
+    let settings = f.app.app.settings.lock().unwrap();
+    assert_eq!(settings["mock_architect_requests"].as_array().unwrap().len(), 1);
+    let calls: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[1]["prompt"].as_str().unwrap().contains("duplicate response key `title`"));
+}
+
+#[test]
+fn planning_tier_errors_use_all_three_corrections_before_architecture() {
+    for repaired in [false, true] {
+        let f = QueueTest::new(false);
+        let mut valid = candidate(&f);
+        valid["stages"][0]["instructions"] = json!("Persist drafts with atomic writes");
+        valid["stages"][0]["model_proposal"] = json!({"risk":"standard","complexity":"standard",
+            "task":"persistence","tier":"strong","rationale":"Durable drafts need the strong tier."});
+        let mut invalid = valid.clone();
+        invalid["stages"][0]["model_proposal"]["tier"] = json!("standard");
+        f.app.app.settings.lock().unwrap()["mock_plan_output"] = json!([
+            invalid, invalid, invalid, if repaired { valid } else { invalid },
+        ]);
+        f.app.acquire_busy().unwrap();
+        f.app.plan_worker("Goal", &PlanMode::Standard);
+        assert_eq!(f.app.load_plan().is_some(), repaired);
+        let settings = f.app.app.settings.lock().unwrap();
+        let calls: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[3]["prompt"].as_str().unwrap().contains("capability floor 3"));
+        assert_eq!(settings["mock_architect_requests"].as_array().map_or(0, Vec::len), usize::from(repaired));
+    }
+}
+
+#[test]
+fn chat_and_enhancement_repair_duplicates_and_unknown_fields_before_publishing() {
+    let f = QueueTest::new(false);
+    f.app.app.settings.lock().unwrap()["mock_chat_output"] = json!([
+        r#"{"answer":"first","answer":"second"}"#, {"answer":"answer","approved":true}, {"answer":"Corrected answer"},
+    ]);
+    f.app.acquire_busy().unwrap();
+    f.app.chat_worker(&json!({"stages":[]}), "Question");
+    assert_eq!(f.app.read_chat()[1]["text"], "Corrected answer");
+    f.app.app.settings.lock().unwrap()["mock_enhance_output"] = json!([
+        r#"{"goal":"first","goal":"second"}"#, {"goal":"goal","status":"done"}, {"goal":"Corrected goal"},
+    ]);
+    f.app.session.state.lock().unwrap().goal_enhancement_serial = 1;
+    f.app.acquire_busy().unwrap();
+    f.app.enhance_goal_worker("Goal", 1);
+    assert_eq!(f.app.session.state.lock().unwrap().goal_enhancement["goal"], "Corrected goal");
+    let settings = f.app.app.settings.lock().unwrap();
+    for role in ["chat", "enhance"] {
+        assert_eq!(settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == role).count(), 3);
+    }
+}

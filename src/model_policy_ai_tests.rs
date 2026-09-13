@@ -144,7 +144,9 @@ fn model_policy_worker_repairs_response_without_publishing_settings_or_touching_
     let entries = candidates(&base, &details).unwrap();
     {
         let mut settings = f.app.app.settings.lock().unwrap();
-        settings["mock_model_policy_output"] = json!(["{broken",{"assignments":[],"summary":"Incomplete"},proposal(&entries)]);
+        settings["mock_model_policy_output"] = json!(["{broken",
+            r#"{"assignments":[],"summary":"one","summary":"two"}"#,
+            {"assignments":[],"summary":"Incomplete"},proposal(&entries)]);
     }
     let settings_before = f.app.app.settings.lock().unwrap()["model_catalogue"].clone();
     f.app.ensure_forge_dir();
@@ -162,7 +164,7 @@ fn model_policy_worker_repairs_response_without_publishing_settings_or_touching_
     let settings = f.app.app.settings.lock().unwrap();
     assert_eq!(settings["model_catalogue"], settings_before);
     let calls = settings["mock_agent_requests"].as_array().unwrap();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert!(calls.iter().all(|c| c["role"] == "model_policy" && c["session"].is_null()));
     assert!(calls[0]["prompt"].as_str().unwrap().contains("Select exactly four distinct models per provider"));
     assert_eq!(std::fs::read_to_string(f.app.forge_path("plan.json")).unwrap(), "saved plan bytes");
