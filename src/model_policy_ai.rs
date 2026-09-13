@@ -137,10 +137,6 @@ fn validate(text: &str, base: &Policy, entries: &[Entry], revision: &str, costs:
         }
         let mut entry = entries.iter().find(|e| e.provider == a.provider && e.model == a.model).unwrap().clone();
         entry.tier = a.tier.clone();
-        entry.relative_cost_preference = costs.as_array().into_iter().flatten()
-            .find(|c| c["provider"] == a.provider.name() && c["model"] == a.model)
-            .and_then(|c| c["relative_cost_preference"].as_u64())
-            .and_then(|n| u32::try_from(n).ok()).filter(|n| *n <= 1000);
         policy.entries.push(entry);
         reasons.push(json!({"provider":a.provider,"model":a.model,"rationale":a.rationale}));
     }
@@ -151,8 +147,15 @@ fn validate(text: &str, base: &Policy, entries: &[Entry], revision: &str, costs:
             return Err(format!("select exactly {wanted} distinct {} models to cover different capability levels", provider.name()));
         }
     }
+    let costs = crate::model_policy_cost::shortlist(&policy.entries, costs);
+    for entry in &mut policy.entries {
+        entry.relative_cost_preference = costs.as_array().into_iter().flatten()
+            .find(|c| c["provider"] == entry.provider.name() && c["model"] == entry.model)
+            .and_then(|c| c["relative_cost_preference"].as_u64())
+            .and_then(|n| u32::try_from(n).ok()).filter(|n| *n <= 1000);
+    }
     Policy::from_settings(&json!({"model_catalogue":policy}))?;
-    Ok(json!({"policy":policy,"summary":proposal.summary,"reasons":reasons}))
+    Ok(json!({"policy":policy,"summary":proposal.summary,"reasons":reasons,"cost_evidence":costs}))
 }
 
 impl Ctx {
@@ -196,11 +199,8 @@ Discovery and metadata: {details}"#,
                 }
             }
             if let Some(error) = cost_error { warnings.push(error); }
-            warnings.push("Cost preferences are ranks from published standard short-context API rates, not CLI subscription costs. Unknown or incomparable rates stay null; AI does not assign cost numbers.".into());
+            warnings.push("Cost preferences rank the selected models using published standard short-context API rates, not CLI subscription costs. Unknown rates stay null; crossing input/output rates among selected models prevent a cost ranking. AI does not assign cost numbers.".into());
             output["warnings"] = json!(warnings);
-            output["cost_evidence"] = json!(costs.as_array().into_iter().flatten().filter(|cost|
-                output["policy"]["entries"].as_array().unwrap().iter().any(|e|
-                    e["provider"] == cost["provider"] && e["model"] == cost["model"])).cloned().collect::<Vec<_>>());
             output["sources"] = json!(details["official_sources"].as_array().into_iter().flatten().map(|s|
                 json!({"provider":s["provider"],"url":s["url"],"status":s["status"],"error":s["error"],"checked_unix":s["checked_unix"]})).collect::<Vec<_>>());
             output["actor"] = json!({"provider":reply.choice.0,"model":reply.choice.1});

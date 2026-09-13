@@ -940,9 +940,11 @@ computes cost preferences separately: when metadata research is enabled, it
 fetches the official OpenAI pricing page and reads Claude prices from the fresh
 official model comparison table. Discovery resolves CLI aliases to exact API IDs,
 including the Claude context modifier; unresolved aliases stay unknown. Comparable
-standard short-context input/output rates share one ranking across providers, with
-equal prices tied. Each rank includes its source and rates in the result. Unknown
-prices, fetch failures and crossing input/output prices stay `null`; a provider's
+standard short-context input/output rates of the selected shortlist share one
+ranking across providers, with equal prices tied. Each rank includes its source
+and rates in the result. Unknown
+prices and fetch failures stay `null`. Crossing input/output prices among selected
+models prevent a cost ranking; discarded candidates do not affect it. A provider's
 failed source does not discard verified prices from the other. AI-supplied cost
 numbers are rejected. These draft preferences are an API-price proxy for user
 policy, not measured CLI subscription costs. Tiers remain suggested user judgments,

@@ -77,8 +77,8 @@ fn ai_cannot_invent_cost_preferences_and_hidden_endpoints_are_not_added() {
         json!({"id":"internal","capabilities":{"hidden":true}}));
     let entries = candidates(&base, &details).unwrap();
     assert!(!entries.iter().any(|e| e.model == "internal"));
-    let costs = json!([{"provider":"codex","model":"gpt-6-astra","relative_cost_preference":20},
-        {"provider":"codex","model":"gpt-5.6-luna","relative_cost_preference":10}]);
+    let costs = json!([{"provider":"codex","model":"gpt-6-astra","input_per_million":10,"output_per_million":50},
+        {"provider":"codex","model":"gpt-5.6-luna","input_per_million":0.2,"output_per_million":1.2}]);
     let output = validate(&proposal(&entries).to_string(), &base, &entries, "next", &costs).unwrap();
     assert_eq!(output["policy"]["entries"][0]["relative_cost_preference"],20);
     assert!(output["policy"]["entries"][1]["relative_cost_preference"].is_null());
@@ -86,6 +86,54 @@ fn ai_cannot_invent_cost_preferences_and_hidden_endpoints_are_not_added() {
     let mut invented = proposal(&entries);
     invented["assignments"][0]["relative_cost_preference"] = json!(480);
     assert!(validate(&invented.to_string(), &base, &entries, "next", &costs).is_err());
+}
+
+#[test]
+fn discarded_crossing_prices_do_not_erase_shortlist_preferences() {
+    let base = Policy::default();
+    let models = [
+        ("codex", "gpt-6-astra", 10.0, 50.0, 70),
+        ("codex", "gpt-5.6-sol", 4.0, 20.0, 50),
+        ("codex", "gpt-5.6-terra", 2.0, 12.0, 40),
+        ("codex", "gpt-5.6-luna", 0.2, 1.2, 10),
+        ("claude", "claude-fable-5-1[1m]", 10.0, 50.0, 70),
+        ("claude", "opus[1m]", 5.0, 25.0, 60),
+        ("claude", "sonnet", 2.0, 10.0, 30),
+        ("claude", "haiku", 1.0, 5.0, 20),
+        // Cheaper input but more expensive output than Terra: not shortlisted.
+        ("codex", "gpt-5.2", 1.75, 14.0, 0),
+    ];
+    let entries: Vec<Entry> = models.iter().map(|(provider, model, ..)|
+        serde_json::from_value(json!({"provider":provider,"model":model,"tier":"standard"})).unwrap()).collect();
+    // The full discovery pool has verified prices but no unambiguous ranking.
+    let costs = json!(models.iter().map(|(provider, model, input, output, _)|
+        json!({"provider":provider,"model":model,"input_per_million":input,
+            "output_per_million":output,"relative_cost_preference":null,"basis":"unknown"})).collect::<Vec<_>>());
+    let selected = &entries[..8];
+    let reply = proposal(selected).to_string();
+    let output = validate(&reply, &base, &entries, "next", &costs).unwrap();
+    let evidence = output["cost_evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 8);
+    for (i, (_, model, input, output_rate, rank)) in models[..8].iter().enumerate() {
+        assert_eq!(output["policy"]["entries"][i]["relative_cost_preference"], *rank, "{model}");
+        assert_eq!(evidence[i]["relative_cost_preference"], *rank, "{model}");
+        assert_eq!(evidence[i]["basis"], "api_standard_short_context_rank");
+        assert_eq!(evidence[i]["input_per_million"], *input);
+        assert_eq!(evidence[i]["output_per_million"], *output_rate);
+    }
+    // Unknown selected prices stay null without erasing the verified ranking.
+    let mut missing = costs.clone();
+    missing[7]["input_per_million"] = Value::Null;
+    missing[7]["output_per_million"] = Value::Null;
+    let output = validate(&reply, &base, &entries, "next", &missing).unwrap();
+    assert!(output["policy"]["entries"][7]["relative_cost_preference"].is_null());
+    assert!(output["policy"]["entries"][0]["relative_cost_preference"].is_number());
+    // A crossing price that is actually selected must still prevent a false order.
+    let mut crossing = selected.to_vec();
+    crossing[0] = entries[8].clone();
+    let output = validate(&proposal(&crossing).to_string(), &base, &entries, "next", &costs).unwrap();
+    assert!(output["policy"]["entries"].as_array().unwrap().iter()
+        .all(|e| e["relative_cost_preference"].is_null()));
 }
 
 #[test]

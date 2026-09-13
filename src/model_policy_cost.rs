@@ -75,25 +75,42 @@ fn source_url(provider: Provider) -> &'static str {
 }
 
 fn evidence(entries: &[Entry], details: &Value, prices: &Prices) -> Value {
-    let rates: Vec<_> = entries.iter().map(|e| {
+    let mut costs: Vec<_> = entries.iter().map(|e| {
         let id = crate::model_policy_ai::resolved(e, details);
         let id = if e.provider == Provider::Claude { id.strip_suffix("[1m]").unwrap_or(id) } else { id };
-        (id, prices.get(&(e.provider, id.to_string())))
+        let rate = prices.get(&(e.provider, id.to_string()));
+        json!({"provider":e.provider,"model":e.model,"resolved_id":id,
+            "source_url":rate.map(|_| source_url(e.provider)),
+            "input_per_million":rate.map(|r|r.0),"output_per_million":rate.map(|r|r.1),
+            "currency":rate.map(|_|"USD")})
     }).collect();
-    let mut ordered: Vec<_> = rates.iter().filter_map(|(_, rate)| rate.copied()).collect();
+    rank(&mut costs);
+    json!(costs)
+}
+
+fn rank(costs: &mut [Value]) {
+    let rate = |cost: &Value| cost["input_per_million"].as_f64()
+        .zip(cost["output_per_million"].as_f64());
+    let mut ordered: Vec<_> = costs.iter().filter_map(rate).collect();
     ordered.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
     ordered.dedup();
     // Crossing input/output prices cannot establish a single cost order.
     let comparable = ordered.windows(2).all(|pair| pair[0].1 <= pair[1].1);
-    json!(entries.iter().zip(rates).map(|(e, (id, rate))| {
-        let preference = rate.filter(|_| comparable).and_then(|rate| ordered.iter().position(|v| v == rate))
+    for cost in costs {
+        let preference = rate(cost).filter(|_| comparable).and_then(|rate| ordered.iter().position(|v| *v == rate))
             .map(|rank| (rank as u32 + 1) * 10);
-        json!({"provider":e.provider,"model":e.model,"resolved_id":id,"relative_cost_preference":preference,
-            "basis":if preference.is_some() {"api_standard_short_context_rank"} else {"unknown"},
-            "source_url":rate.map(|_| source_url(e.provider)),
-            "input_per_million":rate.map(|r|r.0),"output_per_million":rate.map(|r|r.1),
-            "currency":rate.map(|_|"USD")})
-    }).collect::<Vec<_>>())
+        cost["relative_cost_preference"] = json!(preference);
+        cost["basis"] = json!(if preference.is_some() {"api_standard_short_context_rank"} else {"unknown"});
+    }
+}
+
+/// Rank the actual draft, so discarded candidates cannot invalidate its costs.
+pub(crate) fn shortlist(entries: &[Entry], costs: &Value) -> Value {
+    let mut selected: Vec<_> = costs.as_array().into_iter().flatten().filter(|cost|
+        entries.iter().any(|e| cost["provider"] == e.provider.name() && cost["model"] == e.model))
+        .cloned().collect();
+    rank(&mut selected);
+    json!(selected)
 }
 
 pub(crate) fn research(entries: &[Entry], details: &Value, enabled: bool) -> (Value, Option<String>) {
