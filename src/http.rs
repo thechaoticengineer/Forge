@@ -519,11 +519,13 @@ fn api_queue_start(ctx: &Ctx) -> (u32, Value) {
         return (409, json!({"error": "busy"}));
     }
     let queue = ctx.load_queue();
-    if !queue["items"].as_array().unwrap().iter()
-        .any(|item| item["status"] == "queued")
-    {
-        (400, json!({"error": "no queued goals"}))
-    } else if ctx.acquire_busy().is_err() {
+    let Some(head) = crate::plan::queue_head(&queue) else {
+        return (400, json!({"error": "no queued goals"}));
+    };
+    if head["status"] != "queued" {
+        return (409, json!({"error": crate::plan::queue_order_error(head)}));
+    }
+    if ctx.acquire_busy().is_err() {
         (409, json!({"error": "busy"}))
     } else {
         ctx.session.stop_requested.store(false, Ordering::SeqCst);
@@ -678,6 +680,9 @@ fn api_approve(ctx: &Ctx) -> (u32, Value) {
     let Some(mut plan) = ctx.load_plan() else {
         return (400, json!({"error": "no plan"}));
     };
+    if let Err(error) = crate::plan::check_queue_plan_order(&ctx.load_queue(), &plan) {
+        return (409, json!({"error": error}));
+    }
     if ctx.acquire_busy().is_err() { return (409, json!({"error":"busy"})); }
     let _approval_guard = crate::app::WorkerGuard(&ctx.session);
     drop(_queue_guard);
@@ -687,8 +692,10 @@ fn api_approve(ctx: &Ctx) -> (u32, Value) {
     };
     let _queue_guard = ctx.session.queue_lock.lock().unwrap();
     let mut queue = ctx.load_queue();
-    let awaiting = queue["items"].as_array().unwrap().iter()
-        .find(|item| !matches!(item["status"].as_str(), Some("done" | "failed" | "blocked")))
+    if let Err(error) = crate::plan::check_queue_plan_order(&queue, &plan) {
+        return (409, json!({"error": error}));
+    }
+    let awaiting = crate::plan::queue_head(&queue)
         .filter(|item| item["status"] == "awaiting_approval")
         .and_then(|item| item["id"].as_u64());
     if let Some(id) = awaiting {
@@ -717,6 +724,11 @@ fn api_run(ctx: &Ctx) -> (u32, Value) {
         return (409, json!({"error": "busy"}));
     }
     let plan = ctx.load_plan();
+    if let Some(plan) = &plan {
+        if let Err(error) = crate::plan::check_queue_plan_order(&ctx.load_queue(), plan) {
+            return (409, json!({"error": error}));
+        }
+    }
     let status = plan
         .as_ref()
         .and_then(|p| p["status"].as_str())

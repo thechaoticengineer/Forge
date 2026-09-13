@@ -417,6 +417,102 @@ fn queue_agent_failures_halt_and_leave_remaining_goals_queued() {
         assert_eq!(test.app.session.state.lock().unwrap().phase, expected);
         assert!(!test.app.session.queue_active.load(Ordering::SeqCst));
         assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        let queue = test.app.load_queue();
+        let plan = test.app.load_plan();
+        for _ in 0..2 {
+            let (code, response) = api_request(&test.app.app, "POST", "/api/queue/start", json!({}));
+            assert_eq!(code, 409, "{role}: {response}");
+            assert!(response["error"].as_str().unwrap().contains("goal 1"));
+            assert_eq!(test.app.load_queue(), queue);
+            assert_eq!(test.app.load_plan(), plan);
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        }
+    }
+}
+
+#[test]
+fn queue_worker_and_start_api_never_pass_an_unfinished_head_after_restart() {
+    for status in ["blocked", "failed", "planning", "awaiting_approval", "running", "unknown"] {
+        let test = QueueTest::new(true);
+        let mut queue = test.app.load_queue();
+        queue["items"][0]["status"] = json!(status);
+        test.app.save_queue(&queue);
+        // A fresh engine has no busy flags; persisted queue order is authoritative.
+        let app = Arc::new(crate::app::App::new(test.app.project(), test.app.app.settings.lock().unwrap().clone()));
+        let ctx = app.context(test.app.project());
+        assert_eq!(api_request(&app, "POST", "/api/queue/start", json!({})).0, 409, "{status}");
+        ctx.acquire_busy().unwrap();
+        ctx.session.queue_active.store(true, Ordering::SeqCst);
+        ctx.queue_worker(None);
+        assert_eq!(ctx.load_queue(), queue, "{status}");
+        assert!(ctx.load_plan().is_none());
+        assert!(!ctx.session.queue_active.load(Ordering::SeqCst));
+        assert!(!ctx.session.busy.load(Ordering::SeqCst));
+        assert!(!ctx.read_history().as_array().unwrap().iter().any(|e| e["kind"] == "agent"));
+    }
+}
+
+#[test]
+fn later_saved_plan_cannot_bypass_queue_order_through_approval_or_run() {
+    for status in ["blocked", "failed", "queued", "planning", "awaiting_approval", "running"] {
+        let test = QueueTest::new(false);
+        seed_mock_plan(&test.app);
+        let mut plan = test.app.load_plan().unwrap();
+        plan["goal"] = json!("second goal");
+        plan["status"] = json!("approved");
+        test.app.save_plan(&plan).unwrap();
+        let plan = test.app.load_plan().unwrap();
+        let mut queue = test.app.load_queue();
+        queue["items"][0]["status"] = json!(status);
+        queue["items"][1]["status"] = json!("awaiting_approval");
+        test.app.save_queue(&queue);
+        for endpoint in ["/api/approve", "/api/run"] {
+            let (code, response) = api_request(&test.app.app, "POST", endpoint, json!({}));
+            assert_eq!(code, 409, "{endpoint}: {status}: {response}");
+            assert!(response["error"].as_str().unwrap().contains("goal 1"));
+            assert_eq!(test.app.load_plan().unwrap(), plan);
+            assert_eq!(test.app.load_queue(), queue);
+            assert!(!test.app.session.busy.load(Ordering::SeqCst));
+        }
+        let mut rejected = plan.clone();
+        assert!(test.app.start_queue_run(&mut queue, 2, &mut rejected).is_err());
+        assert_eq!(rejected, plan);
+        test.app.acquire_busy().unwrap();
+        test.app.session.queue_active.store(true, Ordering::SeqCst);
+        test.app.queue_worker(Some(2));
+        assert_eq!(test.app.load_plan().unwrap(), plan);
+        assert_eq!(test.app.load_queue(), queue);
+        assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn queue_order_allows_completed_heads_and_explicit_removal_of_a_blocker() {
+    for status in ["done", "blocked"] {
+        let test = QueueTest::new(false);
+        let mut queue = test.app.load_queue();
+        queue["items"][0]["status"] = json!(status);
+        test.app.save_queue(&queue);
+        if status == "blocked" {
+            assert_eq!(api_request(&test.app.app, "POST", "/api/queue/remove", json!({"id":1})).0, 200);
+        }
+        assert_eq!(api_request(&test.app.app, "POST", "/api/queue/start", json!({})).0, 200);
+        wait_for_worker(&test.app);
+        assert_eq!(test.app.load_plan().unwrap()["goal"], "second goal");
+        assert_eq!(test.app.load_queue()["items"].as_array().unwrap().last().unwrap()["status"], "awaiting_approval");
+    }
+}
+
+#[test]
+fn pending_goals_cannot_be_moved_across_an_unfinished_nonqueued_goal() {
+    for status in ["blocked", "failed", "running", "planning", "awaiting_approval"] {
+        let original = json!({"items":[{"id":1,"status":"queued"},
+            {"id":2,"status":status},{"id":3,"status":"queued"}]});
+        for body in [json!({"id":1,"dir":"down"}), json!({"id":3,"dir":"up"})] {
+            let mut queue = original.clone();
+            mutate_queue(&mut queue, "move", &body).unwrap();
+            assert_eq!(queue, original, "{status}");
+        }
     }
 }
 

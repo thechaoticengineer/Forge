@@ -127,6 +127,27 @@ pub(crate) fn edit_plan(plan: &Value, body: &Value) -> Result<Value, &'static st
     Ok(edited)
 }
 
+/// Only completed goals may be passed automatically, including after a restart.
+pub(crate) fn queue_head(queue: &Value) -> Option<&Value> {
+    queue["items"].as_array()?.iter().find(|item| item["status"] != "done")
+}
+
+pub(crate) fn queue_order_error(item: &Value) -> String {
+    format!("Queue goal {} is {}. Resolve or explicitly remove it before starting later goals.",
+        item["id"], item["status"].as_str().unwrap_or("invalid"))
+}
+
+/// Legacy plans identify their queue goal by its exact text.
+pub(crate) fn check_queue_plan_order(queue: &Value, plan: &Value) -> Result<(), String> {
+    let Some(head) = queue_head(queue) else { return Ok(()) };
+    let belongs_to_later_goal = queue["items"].as_array().unwrap().iter()
+        .any(|item| item["status"] != "done" && item["goal"] == plan["goal"] && item["id"] != head["id"]);
+    if head["goal"] != plan["goal"] && (belongs_to_later_goal || head["status"] == "awaiting_approval") {
+        return Err(queue_order_error(head));
+    }
+    Ok(())
+}
+
 pub(crate) fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Result<String, &'static str> {
     let items = queue["items"].as_array_mut().ok_or("invalid queue")?;
     match action {
@@ -161,8 +182,10 @@ pub(crate) fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Res
             }
             let dir = body["dir"].as_str().unwrap_or("");
             let neighbor = match dir {
-                "up" => (0..idx).rev().find(|&i| items[i]["status"] == "queued"),
-                "down" => (idx + 1..items.len()).find(|&i| items[i]["status"] == "queued"),
+                "up" => (0..idx).rev().take_while(|&i| matches!(items[i]["status"].as_str(), Some("queued" | "done")))
+                    .find(|&i| items[i]["status"] == "queued"),
+                "down" => (idx + 1..items.len()).take_while(|&i| matches!(items[i]["status"].as_str(), Some("queued" | "done")))
+                    .find(|&i| items[i]["status"] == "queued"),
                 _ => return Err("dir must be up or down"),
             };
             if let Some(neighbor) = neighbor {

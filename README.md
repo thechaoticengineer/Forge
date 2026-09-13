@@ -642,11 +642,18 @@ plan → approve → run loop above.
 The `queue_auto_approve` setting is off by default: Forge pauses at each
 plan for your usual approval. Enable it to approve each plan automatically
 and run the queue unattended. A blocked or failed item stops the queue
-for human intervention; remaining goals stay queued.
+for human intervention; remaining goals stay queued. This also applies to another
+**Start queue** request and after an engine restart: only the first unfinished
+goal may start. A blocked or failed goal is never silently skipped. The start API
+returns HTTP 409 identifying that goal, and the panel disables **Start queue**.
+Approving or running a saved plan for a later queued goal cannot bypass this order.
 
 Successfully completed goals are removed from the queue automatically.
 Failed or blocked goals stay visible until you dismiss them with their
-**×** remove button in the panel.
+**×** remove button in the panel. Removing a failed or blocked goal explicitly
+allows the following goal to proceed; do this only when intentionally abandoning
+that prerequisite. Pending goals can be reordered within a pending group, but
+cannot be moved across a blocked, failed, or active goal.
 
 Queue state lives in `.forge/queue.json` in the project. The panel shows
 each item's status; the bar widget shows the pending count and a queue tooltip.

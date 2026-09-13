@@ -125,7 +125,14 @@ Item {
   readonly property var queue: engineState && engineState.queue ? engineState.queue : []
   readonly property var chat: engineState && engineState.chat ? engineState.chat : []
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
-  readonly property bool hasQueuedGoals: queue.some(function(item) { return item.status === "queued" })
+  readonly property var queueHead: queue.find(function(item) { return item.status !== "done" }) || null
+  readonly property bool hasQueuedGoals: queueHead !== null && queueHead.status === "queued"
+  function canMoveQueueGoal(index, step) {
+    for (let i = index + step; i >= 0 && i < queue.length; i += step) {
+      if (queue[i].status !== "done") return queue[i].status === "queued"
+    }
+    return false
+  }
   readonly property string phase: engineState ? engineState.phase : "offline"
   readonly property string currentActivity: {
     const stage = plan && plan.stages ? plan.stages.find(function(stage) {
@@ -2602,7 +2609,8 @@ Item {
             }
             PanelButton {
               id: startQueueButton
-              label: "Start queue"
+              label: root.queueHead && (root.queueHead.status === "blocked" || root.queueHead.status === "failed")
+                ? "Queue blocked" : "Start queue"
               primary: true
               enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
               onClicked: root.act("/api/queue/start")
@@ -2658,15 +2666,13 @@ Item {
                 PanelButton {
                   label: "↑"
                   visible: queueRow.modelData.status === "queued"
-                  enabled: root.engineOnline && root.queue.slice(0, queueRow.index)
-                    .some(function(item) { return item.status === "queued" })
+                  enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, -1)
                   onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
                 }
                 PanelButton {
                   label: "↓"
                   visible: queueRow.modelData.status === "queued"
-                  enabled: root.engineOnline && root.queue.slice(queueRow.index + 1)
-                    .some(function(item) { return item.status === "queued" })
+                  enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, 1)
                   onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
                 }
                 PanelButton {

@@ -35,6 +35,10 @@ impl Ctx {
 
     /// Caller holds queue_lock and owns the busy claim.
     pub(crate) fn start_queue_run(&self, queue: &mut Value, id: u64, plan: &mut Value) -> Result<(), String> {
+        let head = crate::plan::queue_head(queue).ok_or("no queued goals")?;
+        if head["id"].as_u64() != Some(id) || head["goal"] != plan["goal"] {
+            return Err(crate::plan::queue_order_error(head));
+        }
         *plan = self.architect_publish(plan.clone(), Some(plan), "queue approval")?;
         plan["status"] = json!("approved");
         self.save_plan(plan)?;
@@ -47,6 +51,21 @@ impl Ctx {
     }
 
     fn run_queue_item(&self, id: u64) -> bool {
+        {
+            let _queue_guard = self.session.queue_lock.lock().unwrap();
+            let queue = self.load_queue();
+            let plan = self.load_plan();
+            let valid = crate::plan::queue_head(&queue).is_some_and(|head|
+                head["id"].as_u64() == Some(id)
+                    && matches!(head["status"].as_str(), Some("running" | "blocked" | "failed"))
+                    && plan.as_ref().is_some_and(|plan| head["goal"] == plan["goal"]));
+            if !valid {
+                self.session.queue_active.store(false, Ordering::SeqCst);
+                self.set_phase("blocked");
+                self.log_event("queue", "queue paused: saved plan does not match the first unfinished goal");
+                return false;
+            }
+        }
         self.run_with_busy_claim();
         let _queue_guard = self.session.queue_lock.lock().unwrap();
         let phase = self.session.state.lock().unwrap().phase.clone();
@@ -84,13 +103,18 @@ impl Ctx {
                     return;
                 }
                 let mut queue = self.load_queue();
-                let Some(item) = queue["items"].as_array().unwrap().iter()
-                    .find(|item| item["status"] == "queued")
+                let Some(item) = crate::plan::queue_head(&queue)
                 else {
                     self.session.queue_active.store(false, Ordering::SeqCst);
                     self.log_event("queue", "queue complete");
                     return;
                 };
+                if item["status"] != "queued" {
+                    self.session.queue_active.store(false, Ordering::SeqCst);
+                    self.set_phase("blocked");
+                    self.log_event("queue", &crate::plan::queue_order_error(item));
+                    return;
+                }
                 let id = item["id"].as_u64().unwrap();
                 let goal = item["goal"].as_str().unwrap_or("").to_string();
                 {
