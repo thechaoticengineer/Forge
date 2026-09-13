@@ -28,62 +28,8 @@ impl Ctx {
             .find(|item| item["id"].as_u64() == Some(id))
         {
             item["status"] = json!(status);
-            if matches!(status, "planning" | "awaiting_approval" | "running") {
-                item["resume_phase"] = json!(status);
-            }
-            if matches!(status, "awaiting_approval" | "running") {
-                if let Some(plan) = self.load_plan().filter(|plan| plan["goal"] == item["goal"]) {
-                    item["plan_id"] = plan["plan_id"].clone();
-                }
-            }
             self.save_queue(queue);
             self.log_event("queue", &format!("goal {id}: {status}"));
-        }
-    }
-
-    /// Reuse the saved plan when possible; only a failed planning attempt may
-    /// regenerate a plan. Never reset execution/review budgets to unblock a goal.
-    pub(crate) fn queue_retry_mode(&self, item: &Value, plan: Option<&Value>) -> Result<&'static str, String> {
-        if let Some(plan) = plan.filter(|plan| plan["goal"] == item["goal"]
-            && (item["plan_id"].is_null() || item["plan_id"] == plan["plan_id"])) {
-            return match plan["status"].as_str() {
-                Some("draft") => Ok("awaiting_approval"),
-                Some("approved" | "done") => Ok("running"),
-                _ => Err("The saved queue plan has an unsupported status; restore it before retrying.".into()),
-            };
-        }
-        let phase = if let Some(phase) = item["resume_phase"].as_str() {
-            Some(phase.to_owned())
-        } else {
-            // Older queues did not persist their resume phase. Require a matching
-            // lifecycle record. Stream the durable log, not the UI's last 400
-            // events: a preceding goal may have produced many events meanwhile.
-            use std::io::BufRead as _;
-            let prefix = format!("goal {}: ", item["id"]);
-            let mut phase = None;
-            match fs::File::open(self.forge_path("history.jsonl")) {
-                Ok(file) => for line in std::io::BufReader::new(file).lines() {
-                    let line = line.map_err(|e| format!("Cannot verify queue recovery history: {e}"))?;
-                    if line.trim().is_empty() { continue; }
-                    let event: Value = serde_json::from_str(&line)
-                        .map_err(|e| format!("Cannot verify queue recovery history: {e}"))?;
-                    if event["kind"] == "queue"
-                        && event["unix"].as_i64().unwrap_or(0) >= item["added_unix"].as_i64().unwrap_or(0) {
-                        if let Some(value) = event["text"].as_str().and_then(|text| text.strip_prefix(&prefix))
-                            .filter(|value| matches!(*value, "planning" | "awaiting_approval" | "running")) {
-                            phase = Some(value.to_owned());
-                        }
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-                Err(e) => return Err(format!("Cannot verify queue recovery history: {e}")),
-            }
-            phase
-        };
-        if phase.as_deref() == Some("planning") && item["plan_id"].is_null() {
-            Ok("queued")
-        } else {
-            Err("The saved plan for this queue goal is unavailable. Restore it before retrying; execution progress will not be reset.".into())
         }
     }
 

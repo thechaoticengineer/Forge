@@ -127,8 +127,6 @@ Item {
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
   readonly property var queueHead: queue.find(function(item) { return item.status !== "done" }) || null
   readonly property bool hasQueuedGoals: queueHead !== null && queueHead.status === "queued"
-  readonly property bool canRetryQueueHead: queueHead !== null
-    && ["blocked", "failed", "planning", "awaiting_approval", "running"].includes(queueHead.status)
   function canMoveQueueGoal(index, step) {
     for (let i = index + step; i >= 0 && i < queue.length; i += step) {
       if (queue[i].status !== "done") return queue[i].status === "queued"
@@ -2611,12 +2609,11 @@ Item {
             }
             PanelButton {
               id: startQueueButton
-              label: root.canRetryQueueHead ? "Retry first goal" : "Start queue"
+              label: root.queueHead && (root.queueHead.status === "blocked" || root.queueHead.status === "failed")
+                ? "Queue blocked" : "Start queue"
               primary: true
-              enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive
-                && (root.hasQueuedGoals || root.canRetryQueueHead)
-              onClicked: root.canRetryQueueHead
-                ? root.act("/api/queue/retry", { id: root.queueHead.id }) : root.act("/api/queue/start")
+              enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
+              onClicked: root.act("/api/queue/start")
             }
           }
 

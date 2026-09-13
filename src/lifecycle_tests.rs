@@ -309,8 +309,7 @@ fn report_write_failure_keeps_queue_goal_and_recovers_without_implementation_or_
     fs::remove_dir(f.ctx.forge_path("reports.jsonl")).unwrap();
     let requests = f.ctx.app.settings.lock().unwrap()["mock_agent_requests"].clone();
     f.restart();
-    assert_eq!(api_request(&f.ctx.app,"POST","/api/queue/retry",json!({"id":1})).0,200);
-    crate::test_support::wait_for_worker(&f.ctx);
+    f.ctx.session.queue_active.store(true,Ordering::SeqCst); f.ctx.queue_worker(Some(1));
     assert!(f.ctx.load_queue()["items"].as_array().unwrap().is_empty());
     assert_eq!(f.ctx.read_reports().as_array().unwrap().len(),1);
     assert_eq!(f.ctx.app.settings.lock().unwrap()["mock_agent_requests"],requests);

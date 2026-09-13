@@ -112,7 +112,6 @@ pub(crate) fn handle(app: &Arc<App>, mut req: tiny_http::Request) {
         (tiny_http::Method::Post, "/api/queue/add" | "/api/queue/remove"
             | "/api/queue/move" | "/api/queue/clear") => api_queue_mutate(&ctx, path, &body),
         (tiny_http::Method::Post, "/api/queue/start") => api_queue_start(&ctx),
-        (tiny_http::Method::Post, "/api/queue/retry") => api_queue_retry(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan") => api_plan(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan/revise") => api_plan_revise(&ctx, &body),
         (tiny_http::Method::Post, "/api/plan/chat") => api_plan_chat(&ctx, &body),
@@ -512,55 +511,6 @@ fn api_queue_mutate(ctx: &Ctx, path: &str, body: &Value) -> (u32, Value) {
         }
         Err(e) => (400, json!({"error": e})),
     }
-}
-
-fn api_queue_retry(ctx: &Ctx, body: &Value) -> (u32, Value) {
-    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
-    if ctx.session.busy.load(Ordering::SeqCst) || ctx.session.queue_active.load(Ordering::SeqCst) {
-        return (409, json!({"error": "busy"}));
-    }
-    let Some(id) = body["id"].as_u64() else {
-        return (400, json!({"error": "id required"}));
-    };
-    let mut queue = ctx.load_queue();
-    let Some(head) = crate::plan::queue_head(&queue) else {
-        return (400, json!({"error": "no queued goals"}));
-    };
-    if head["id"].as_u64() != Some(id) {
-        return (409, json!({"error": crate::plan::queue_order_error(head)}));
-    }
-    if !matches!(head["status"].as_str(), Some("blocked" | "failed" | "planning" | "awaiting_approval" | "running")) {
-        return (400, json!({"error": "goal is not paused"}));
-    }
-    let plan = ctx.load_plan();
-    if let Some(error) = ctx.session.persistence_error.lock().unwrap().clone() {
-        return (409, json!({"error": error}));
-    }
-    let mode = match ctx.queue_retry_mode(head, plan.as_ref()) {
-        Ok(mode) => mode,
-        Err(error) => return (409, json!({"error": error})),
-    };
-    let goal = head["goal"].as_str().unwrap_or("").to_string();
-    if ctx.acquire_busy().is_err() { return (409, json!({"error": "busy"})); }
-    let worker = WorkerGuard(&ctx.session);
-    ctx.session.stop_requested.store(false, Ordering::SeqCst);
-    ctx.session.queue_active.store(true, Ordering::SeqCst);
-    ctx.set_queue_status(&mut queue, id, mode);
-    ctx.session.state.lock().unwrap().goal = goal;
-    ctx.log_event("queue", &format!("goal {id}: retry requested by user ({mode})"));
-    if mode == "awaiting_approval" {
-        ctx.set_phase("plan_ready");
-    } else {
-        if mode == "running" {
-            let mut state = ctx.session.state.lock().unwrap();
-            state.phase = "running".into();
-            state.run_started_unix = unix_timestamp();
-        }
-        std::mem::forget(worker);
-        let ctx2 = ctx.clone();
-        std::thread::spawn(move || ctx2.queue_worker((mode == "running").then_some(id)));
-    }
-    (200, json!({"ok": true, "mode": mode}))
 }
 
 fn api_queue_start(ctx: &Ctx) -> (u32, Value) {

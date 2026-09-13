@@ -645,15 +645,8 @@ and run the queue unattended. A blocked or failed item stops the queue
 for human intervention; remaining goals stay queued. This also applies to another
 **Start queue** request and after an engine restart: only the first unfinished
 goal may start. A blocked or failed goal is never silently skipped. The start API
-returns HTTP 409 identifying that goal, and the panel offers **Retry first goal**.
+returns HTTP 409 identifying that goal, and the panel disables **Start queue**.
 Approving or running a saved plan for a later queued goal cannot bypass this order.
-
-**Retry first goal** retries only the first unfinished goal, without removing or
-reordering it. Failed planning can generate a new plan; an existing draft returns
-to approval, and an approved plan resumes its saved execution. Committed stages,
-review history and attempt budgets are preserved. An exhausted review budget still
-requires resolving its blocker. A missing execution plan produces an error rather
-than starting over. The queue continues only after the retried goal completes.
 
 Successfully completed goals are removed from the queue automatically.
 Failed or blocked goals stay visible until you dismiss them with their
@@ -669,9 +662,7 @@ The JSON API accepts POST requests to `/api/queue/add` with `{"goal":"…"}`,
 `/api/queue/remove` with `{"id":1}`, and `/api/queue/move` with
 `{"id":1,"dir":"up"}` (or `"down"`). Removal accepts queued, failed, or
 blocked goals. `/api/queue/clear` removes pending
-goals; `/api/queue/start` starts processing. `/api/queue/retry` with `{"id":1}`
-retries the paused first unfinished goal; later goals and busy sessions are rejected.
-`GET /api/state` includes
+goals; `/api/queue/start` starts processing. `GET /api/state` includes
 the queue and whether it is active.
 
 ## Run

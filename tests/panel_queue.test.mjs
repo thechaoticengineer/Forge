@@ -6,7 +6,6 @@ import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const head = qml.match(/readonly property var queueHead: (.+)/)[1];
 const ready = qml.match(/readonly property bool hasQueuedGoals: (.+)/)[1];
-const retry = qml.match(/readonly property bool canRetryQueueHead: ([\s\S]+?)\n  function/)[1];
 const start = qml.indexOf('  function canMoveQueueGoal(');
 const end = qml.indexOf('  readonly property string phase:', start);
 
@@ -16,13 +15,11 @@ test('queue start stays disabled behind an unfinished goal, including after relo
     const context = {queue};
     context.queueHead = vm.runInNewContext(head, context);
     assert.equal(vm.runInNewContext(ready, context), false, status);
-    assert.equal(vm.runInNewContext(retry, context), status !== 'unknown', status);
   }
   for (const queue of [[], [{status:'done'}], [{status:'done'}, {status:'queued'}], [{status:'queued'}]]) {
     const context = {queue};
     context.queueHead = vm.runInNewContext(head, context);
     assert.equal(vm.runInNewContext(ready, context), queue.some(item => item.status === 'queued'));
-    assert.equal(vm.runInNewContext(retry, context), false);
   }
 });
 
