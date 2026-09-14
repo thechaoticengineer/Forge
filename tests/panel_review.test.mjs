@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
+const planEditor = readFileSync(new URL('../quickshell/PlanEditorView.qml', import.meta.url), 'utf8');
+const architectureReview = readFileSync(new URL('../quickshell/ArchitectureReviewView.qml', import.meta.url), 'utf8');
 const context = {};
 vm.runInNewContext(qml.slice(qml.indexOf('  function reviewGateText('), qml.indexOf('  function reviewRoundLabel(')), context);
 test('documentation architect is explicitly not required, never approved', () => {
   const text = context.reviewGateText({review_policy:{scope:'ordinary_documentation',rationale:'Prose only'},review_gate:{status:'approved',roles:{architect:'not_required',reviewer:'approved'}}});
   assert.match(text,/Architect: review not required/); assert.match(text,/Independent: approved/);
   assert.doesNotMatch(text,/Architect: approved/); assert.doesNotMatch(text,/Prose only/);
-  assert.match(qml, /originalText: stageRow.prose \? stageRow.prose.policyRationale/);
+  assert.match(planEditor, /originalText: stageRow.prose \? stageRow.prose.policyRationale/);
 });
 test('current gate is independent of historical approval and partial outcomes', () => {
   const stage = {last_verdict:{approved:true,issues:[],notes:[]}, review_gate:{status:'error',roles:{reviewer:'approved',architect:'pending'}}};
@@ -77,14 +79,14 @@ test('plan review status, B+1 rounds, outcomes and fix commit are independent of
   assert.equal(planHelpers.planReviewStatusText(null),'');
   assert.match(planHelpers.planReviewStatusText({gate:{roles:{architect:'not_required',reviewer:'deferred'}}}),
     /Architect: review not required · Independent: deferred to the plan review/);
-  const section = qml.slice(qml.indexOf('        Column {\n          id: planReviewSection'),qml.indexOf('// ------------------------------------------------ plan Q&A'));
-  assert.match(section,/root.planReviewStatusText\(root.planReview\)/);
+  const section = architectureReview.slice(architectureReview.indexOf('  Column {\n    id: planReviewSection'));
+  assert.match(section,/view.planReviewStatusText\(view.planReview\)/);
   assert.match(section,/CompactDetail/);
-  assert.match(section,/originalText: planReviewSection.view.text \|\| ""/);
+  assert.match(section,/originalText: planReviewSection.review.text \|\| ""/);
   assert.match(section,/Shortened preview · full change requests have not been loaded/);
-  assert.match(section,/textComplete: planReviewSection.view.complete === true/);
+  assert.match(section,/textComplete: planReviewSection.review.complete === true/);
   assert.match(section,/onCopyRequested: original => Quickshell.clipboardText = original/);
-  assert.ok(qml.indexOf('id: planReviewSection') < qml.indexOf('id: stageList'));
+  assert.ok(qml.indexOf('ArchitectureReviewView {') < qml.indexOf('PlanEditorView {'));
 });
 test('panel disclosure retrieves all large role-tagged requests through bounded history pages',()=>{
   const {plan,records,originals,event} = planFixture();

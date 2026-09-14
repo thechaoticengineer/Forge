@@ -53,7 +53,8 @@ test('model settings load full policy and submit JSON; invalid edits stay local'
   const policy = {policy_revision:'2',entries:[{provider:'codex',model:'test-model',tier:'basic',relative_cost_preference:1}]};
   const calls = [];
   const root = {};
-  const sandbox = {root, catalogueEditor:{text:'{'},
+  const catalogueEditor = {text:'{'};
+  const sandbox = {root, catalogueEditor, catalogueEditorView:{editor:catalogueEditor},
     api(method,path,body,done) { calls.push([method,path,body]); done({policy,options:[]},200); },
     act(path,body,done) { calls.push(['POST',path,body]); done({},200); },
   };
@@ -74,9 +75,10 @@ test('model settings load full policy and submit JSON; invalid edits stay local'
 
 function aiPanel() {
   const calls = [];
+  const catalogueEditor = {text:JSON.stringify({policy_revision:'1',entries:[]})};
   const sandbox = {catalogueAiPending:false, catalogueAiRequest:-1, catalogueAiReady:'',
     catalogueAiUndo:'', catalogueAiMessage:'', catalogueAiSent:'', catalogueDraft:'',
-    catalogueEditor:{text:JSON.stringify({policy_revision:'1',entries:[]})},
+    catalogueEditor, catalogueEditorView:{editor:catalogueEditor},
     projectViewRevision:1,lastProject:'/project A',engineState:{},
     api(method,path,body,done) { calls.push({method,path,body,done}); }, refresh() {},
     encodeURIComponent, JSON};

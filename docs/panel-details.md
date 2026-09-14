@@ -46,6 +46,13 @@ Pre-upgrade legacy output remains one opaque entry; refreshes of its changing
 source are deferred while expanded so selection and copying use the inspected
 original until collapse.
 
+`AgentOutputView.qml` owns the live/history tabs and their viewports, while
+`ReportsView.qml` owns archived report delegates and record/offset reading
+anchors. `Panel.qml` still owns the reconciled models, request generations,
+project/session identity, polling, selected report key and expanded report key;
+the views receive those values explicitly and emit navigation actions back to
+the root.
+
 The history reader adds an opaque `id` to each returned history object without
 rewriting the file or changing `event.text`. IDs combine source device, inode,
 available birth timestamp, and absolute record byte offset. Identical adjacent
@@ -100,6 +107,14 @@ fixtures do not load the panel into the user's live shell and do not constitute
 full-panel live polling validation.
 
 ## Stage details and complete reviews
+
+`PlanEditorView.qml` owns the stage list, read-only stage cards and manual stage
+editors. `ArchitectureReviewView.qml` composes the architecture overview and
+plan-review disclosure. Both use the existing `StageProse`, `DetailFields`,
+`ArchitectureDetails`, `CompactDetail` and `DetailList` components rather than
+forking their behavior. Review request state, publication reconciliation,
+expanded-detail maps and API calls remain owned by `Panel.qml` and cross the
+component boundary through documented properties and signals.
 
 A read-only plan stage card has exactly one disclosure toggle in its header,
 which expands or collapses the whole card. The selected stage's Enter / o / Space
@@ -235,6 +250,15 @@ polling validation. No live Omarchy shell or Forge engine was started or stopped
 The clipboard check uses a separate offscreen Quickshell process.
 
 ## Remaining panel details
+
+The remaining modal presentation is split by state ownership:
+`ProjectChooser.qml` owns discovery filtering and chooser navigation,
+`CatalogueEditor.qml` owns the policy editor surface, and `DiffView.qml` owns
+the structured diff viewport. Their API actions and modal state changes are
+signals handled by `Panel.qml`; aliases expose only the focus/list controls
+needed by top-level keyboard routing. `Panel.qml` remains the manifest entry
+point and the owner of engine state, polling, project/session scoping, request
+IDs and API coordination.
 
 The architecture overview is a bordered card with always-visible context,
 activity and recovery/error fields. Stage guidance, open risks and decisions

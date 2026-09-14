@@ -4,6 +4,11 @@ import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 const read = n => readFileSync(new URL('../quickshell/'+n, import.meta.url),'utf8');
 const fields = {}, preview = {}, panel = read('Panel.qml'), helpers = {};
+const architectureView = read('ArchitectureReviewView.qml');
+const catalogueView = read('CatalogueEditor.qml');
+const diffView = read('DiffView.qml');
+const reportsView = read('ReportsView.qml');
+const markup = panel + architectureView + catalogueView + diffView + reportsView;
 vm.runInNewContext(read('PanelDetails.js'), fields);
 vm.runInNewContext(read('DetailText.js'), preview);
 for (const helper of ['ModelRouting.js','ReportFormat.js','UsageFormat.js','CataloguePresentation.js'])
@@ -92,16 +97,16 @@ test('100-report navigation uses short cached keys without serializing full reco
     assert.ok(ctx.selectedReportKey.length<20);
   }
   assert.equal(serializations,100,'navigation never traverses or serializes reports');
-  assert.match(panel,/active: reportRow.expanded \|\| reportRow.detailsLoaded/);
+  assert.match(reportsView,/active: reportRow.expanded \|\| reportRow.detailsLoaded/);
 });
 test('remaining Panel surfaces use complete sources while inputs and structured diff retain editing/viewing behavior',()=>{
   for(const name of ['architectureDetails','providerDetails','catalogueOptions','catalogueMetadata','catalogueSources','chatDetails','reportGoal','reportDetails'])
-    assert.ok(panel.includes('objectName: "'+name+'"'),name);
+    assert.ok(markup.includes('objectName: "'+name+'"'),name);
   assert.match(panel,/originalText: liveEntries.count > 0 \? liveEntries.get\(liveEntries.count - 1\).originalText/);
   assert.ok(!panel.includes('originalText: root.agentActive ? root.agent.last_line'));
-  for(const id of ['goalField','catalogueEditor','questionField','feedbackField']) assert.ok(panel.includes('id: '+id));
-  assert.match(panel,/model: root.diffText === "" \? \[\] : root.diffText.split\("\\n"\)/);
-  const report=panel.slice(panel.indexOf('id: reportRow'),panel.indexOf('id: keyboardHint'));
+  for(const id of ['goalField','catalogueEditor','questionField','feedbackField']) assert.ok(markup.includes('id: '+id));
+  assert.match(diffView,/model: view.diffText === "" \? \[\] : view.diffText.split\("\\n"\)/);
+  const report=reportsView.slice(reportsView.indexOf('id: reportRow'),reportsView.indexOf('id: keyboardHint'));
   assert.ok(!report.includes('TapHandler'));assert.match(report,/objectName: "reportToggle"/);
 });
 

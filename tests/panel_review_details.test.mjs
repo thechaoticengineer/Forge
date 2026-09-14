@@ -109,12 +109,13 @@ test('errors keep preview incomplete, retry works, invalid pages never offer ful
 });
 
 const panel = read('Panel.qml');
+const planEditor = read('PlanEditorView.qml');
 function panelContext(st = stage([full('a')]), p = plan) {
   const ctx = {ReviewView:review,lastProject:'/a',projectViewRevision:1,plan:{...p,stages:[st]},
     reviewViews:{},reviewViewVersion:0,stageReviewBlocks:{},expandedStageId:-1,editingPlan:false,calls:[],refreshes:0,refresh(){this.refreshes++}};
   ctx.root=ctx;
   ctx.api=(method,path,body,done,scoped)=>ctx.calls.push({method,path,done,scoped});
-  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  component StageProseField:')),ctx);
+  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  function reviewGateText(')),ctx);
   return ctx;
 }
 test('stage prose identity survives publications while review identity remains snapshot scoped', () => {
@@ -134,8 +135,8 @@ test('stage prose identity survives publications while review identity remains s
     assert.notEqual(changed.stageDetailScope(st),key);
   }
   assert.notEqual(ctx.stageDetailScope({...st,id:4}),key);
-  const card=panel.slice(panel.indexOf('id: stageRow'),panel.indexOf('id: stageEditor'));
-  assert.match(card,/detailScope: root.stageDetailScope\(modelData\)/);
+  const card=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));
+  assert.match(card,/detailScope: view.stageDetailScope\(modelData\)/);
   assert.ok(!card.includes("reviewDetailScope"));
   assert.equal((card.match(/detailKey: stageRow.detailScope/g)||[]).length,0);
   assert.equal((card.match(/detailKey: stageRow.reviewDetailScope/g)||[]).length,0);
@@ -168,14 +169,14 @@ test('stage field wiring preserves each original, full prose, review previews, l
   vm.runInNewContext(panel.slice(panel.indexOf('  function reviewGateText('),panel.indexOf('  function reviewRoundLabel(')),ctx);
   const v=full('a'), fields=ctx.reviewFields(v);
   assert.deepEqual(Array.from(fields,f=>f.text),[...v.issues,...v.notes,...v.checks]);
-  const card=panel.slice(panel.indexOf('id: stageRow'),panel.indexOf('id: stageEditor'));
+  const card=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));
   assert.ok(!card.includes('maximumLineCount: 3'));
   assert.match(card,/label: reviewRound.modelData.complete \? "Summary"/);
   assert.ok(!card.includes("StageDetail"));
   assert.ok(!card.includes("textComplete:"));
   assert.ok(!card.includes("detailKey:"));
-  assert.match(card,/model: reviewRound.modelData.complete \? root.reviewFields/);
-  assert.match(card,/editable: root.editingPlan && modelData.status !== "committed"/);
+  assert.match(card,/model: reviewRound.modelData.complete \? view.reviewFields/);
+  assert.match(card,/editable: view.editingPlan && modelData.status !== "committed"/);
   assert.equal((card.match(/objectName: "stageToggle"/g)||[]).length,1);
   assert.equal((card.match(/objectName: "stageRoutingToggle"/g)||[]).length,1);
   assert.ok(!card.includes('TapHandler'));

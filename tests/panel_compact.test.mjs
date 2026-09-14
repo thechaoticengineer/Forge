@@ -160,7 +160,7 @@ test('Panel integration resets only scoped models and rejects stale callbacks be
   const panel = read('Panel.qml');
   const ctx = { DetailView: view, window: {visible:true}, logFeed:view.newFeed(), lastProject:'/a',
     projectViewRevision:1, agentSession:'agent', encodeURIComponent,
-    liveEntries:model(), liveOutput:{beginUpdate(){}, endUpdate(){}, resetView(){}},
+    liveEntries:model(), agentOutput:{liveOutput:{beginUpdate(){}, endUpdate(){}, resetView(){}}},
     calls:[], Qt:{callLater(){}}, api(method,path,body,done,scoped) { this.calls.push({path,done,scoped}); } };
   ctx.root = ctx;
   // api is called as a global function in QML.
@@ -186,7 +186,7 @@ test('Panel integration resets only scoped models and rejects stale callbacks be
   assert.ok(ctx.logFeed.pending);
   ctx.calls[3].done(page([record('s2:1', 'terminal')], {session:'s2', next_cursor:2}));
   assert.equal(ctx.liveEntries.get(1).originalText, 'terminal');
-  assert.match(panel, /onCopyRequested: original => Quickshell.clipboardText = original/);
+  assert.match(read('AgentOutputView.qml'), /onCopyRequested: original => Quickshell.clipboardText = original/);
 });
 
 test('leaving and revisiting a project resets both lists and strands the earlier visit responses', () => {
@@ -194,9 +194,10 @@ test('leaving and revisiting a project resets both lists and strands the earlier
   const slice = (from, to) => panel.slice(panel.indexOf(from), panel.indexOf(to));
   const view0 = { beginUpdate(){}, endUpdate(){}, resetView(){ this.reset = true; },
     positionViewAtBeginning(){}, followTail: true, readingY: 0 };
+  const liveOutput={...view0}, historyList={...view0}, reportList={...view0};
   const ctx = { DetailView: view, window: {visible:true}, encodeURIComponent,
     liveEntries: model(), historyEntries: model(),
-    liveOutput: {...view0}, historyList: {...view0}, reportList: {...view0},
+    liveOutput, historyList, reportList, agentOutput:{liveOutput,historyList,reportList},
     chatList: {...view0}, goalFlick: {contentY: 0}, goalField: {text: 'draft'},
     goalEnhancePending: false, goalEnhanceRequest: -1, goalEnhanceSent: '',
     goalEnhanceReady: '', goalEnhanceUndo: '', goalEnhanceError: '',

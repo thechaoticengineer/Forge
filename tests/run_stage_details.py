@@ -4,12 +4,14 @@ handlers, bindings, delegates and controls are extracted from the current source
 """
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 
 repo = Path(__file__).resolve().parents[1]
 panel = (repo / 'quickshell/Panel.qml').read_text()
+plan_editor = (repo / 'quickshell/PlanEditorView.qml').read_text()
 
 def between(start, end):
     offset = panel.index(start)
@@ -20,15 +22,37 @@ helpers += between('  function reviewScope(', '  function reviewGateText(')
 helpers += between('  function reviewGateText(', '  function reviewRoundLabel(')
 helpers += between('  function reviewRoundLabel(', '  function stageActivity(')
 helpers += between('  function stageActivity(', '  function chooserRows(')
-content = between('              Column {\n                id: stageContent', '              Loader {\n                id: stageEditor')
+def editor_between(start, end):
+    offset = plan_editor.index(start)
+    return plan_editor[offset:plan_editor.index(end, offset)]
+
+stage_prose_component = editor_between('  component StageProseField:', '  component ViewButton:')
+content = editor_between('              Column {\n                id: stageContent', '              Loader {\n                id: stageEditor')
 state = between('  property var reviewViews:', '  function revealDetail(')
 state += between('  property int expandedStageId:', '  property int selectedStageIndex:')
 state += between('  readonly property var displayedStages:', '  readonly property bool editValid:')
-delegate = between('              readonly property var modelData: root.displayedStages[index]', '              readonly property var reviewView:')
-model = between('            model: root.displayedStages.length', '            delegate: Rectangle {')
+delegate = editor_between('              readonly property var modelData: view.displayedStages[index]', '              readonly property var reviewView:')
+model = editor_between('            model: view.displayedStages.length', '            delegate: Rectangle {')
 shortcut = between('              } else if (event.key === Qt.Key_Return', '                event.accepted = true\n              }\n            }')
 shortcut = shortcut.replace('              } else if', '              if', 1) + '                event.accepted = true\n              }\n'
-properties = between('              readonly property var reviewView:', '              width: stageList.width')
+properties = editor_between('              readonly property var reviewView:', '              width: stageList.width')
+def fixture_scope(fragment):
+    fragment = re.sub(r'\bview\.', 'root.', fragment)
+    fragment = fragment.replace('root.detailRevealed(', 'panelScroll.reveal(')
+    fragment = fragment.replace('root.leaveRequested()', 'keyHandler.forceActiveFocus()')
+    fragment = fragment.replace('root.detailInspected(stageProse)', '{}')
+    fragment = fragment.replace('root.expandedStageRequested(stageRow.expanded ? -1 : stageRow.modelData.id)',
+                                'root.expandedStageId = stageRow.expanded ? -1 : stageRow.modelData.id')
+    fragment = fragment.replace('root.stageRoutingExpandedRequested(!root.stageRoutingExpanded)',
+                                'root.stageRoutingExpanded = !root.stageRoutingExpanded')
+    return fragment
+
+helpers += fixture_scope(stage_prose_component)
+content = fixture_scope(content)
+delegate = fixture_scope(delegate)
+model = fixture_scope(model)
+properties = fixture_scope(properties)
+shortcut = shortcut.replace('planEditor.stageList', 'stageList')
 fixture = (repo / 'tests/stage_details_fixture.qml.in').read_text()
 fixture = fixture.replace('import QtTest', 'import QtTest\nimport "components/PanelDetails.js" as PanelDetails')
 fixture = fixture.replace('// PANEL_HELPERS', helpers).replace('// PANEL_STAGE_CONTENT', content)

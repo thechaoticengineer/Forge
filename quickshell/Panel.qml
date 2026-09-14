@@ -4,7 +4,6 @@ import QtQuick
 import QtQuick.Controls
 // qs.Ui exports its own Button, which shadows the Controls one and carries a
 // different API. Controls-specific buttons name it explicitly.
-import QtQuick.Controls as QQC
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -14,7 +13,6 @@ import "ReviewView.js" as ReviewView
 import "PlanReview.js" as PlanReview
 import "PanelDetails.js" as PanelDetails
 import "ModelRouting.js" as ModelRouting
-import "ReportFormat.js" as ReportFormat
 import "UsageFormat.js" as UsageFormat
 import "GoalEnhancement.js" as GoalEnhancement
 import "PlanEdit.js" as PlanEdit
@@ -260,7 +258,7 @@ Item {
   }
   function saveCatalogue() {
     let policy
-    try { policy = JSON.parse(catalogueEditor.text) }
+    try { policy = JSON.parse(catalogueEditorView.editor.text) }
     catch (e) { root.localError = "Model policy must be valid JSON: " + e; return }
     act("/api/settings", { model_catalogue: policy,
       expected_model_policy: root.catalogueDetails ? root.catalogueDetails.policy : undefined }, function(resp, status) {
@@ -285,10 +283,10 @@ Item {
   function suggestCatalogue() {
     if (catalogueAiPending) return
     let policy
-    try { policy = JSON.parse(catalogueEditor.text) }
+    try { policy = JSON.parse(catalogueEditorView.editor.text) }
     catch (e) { root.catalogueAiMessage = "Model policy must be valid JSON: " + e; return }
     const revision = projectViewRevision
-    catalogueAiSent = catalogueEditor.text
+    catalogueAiSent = catalogueEditorView.editor.text
     catalogueAiPending = true
     catalogueAiRequest = -1
     catalogueAiReady = ""
@@ -342,20 +340,20 @@ Item {
         + (resp.reasons && resp.reasons.length ? "\n" + resp.reasons.map(function(r) {
           return r.provider + "/" + r.model + ": " + r.rationale
         }).join("\n") : "")
-      if (catalogueEditor.text === root.catalogueAiSent) root.applyCatalogueSuggestion()
+      if (catalogueEditorView.editor.text === root.catalogueAiSent) root.applyCatalogueSuggestion()
     }, true)
   }
 
   function applyCatalogueSuggestion() {
     if (catalogueAiReady === "") return
-    catalogueAiUndo = catalogueEditor.text
-    catalogueEditor.text = catalogueAiReady
+    catalogueAiUndo = catalogueEditorView.editor.text
+    catalogueEditorView.editor.text = catalogueAiReady
     catalogueDraft = catalogueAiReady
     catalogueAiReady = ""
   }
 
   function undoCatalogueSuggestion() {
-    catalogueEditor.text = catalogueAiUndo
+    catalogueEditorView.editor.text = catalogueAiUndo
     catalogueDraft = catalogueAiUndo
     catalogueAiUndo = ""
     catalogueAiMessage = "AI changes undone."
@@ -364,7 +362,7 @@ Item {
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
     || feedbackField.activeFocus || questionField.activeFocus
-    || filterField.activeFocus || manualField.activeFocus || catalogueEditor.activeFocus
+    || projectChooser.filterField.activeFocus || projectChooser.manualField.activeFocus || catalogueEditorView.editor.activeFocus
     || editFocusedField !== null
 
   onHelpOpenChanged: {
@@ -379,7 +377,7 @@ Item {
 
   onChooserOpenChanged: {
     keyHandler.pendingKey = ""
-    if (chooserOpen) chooserList.resetSelection()
+    if (chooserOpen) projectChooser.chooserList.resetSelection()
     keyHandler.forceActiveFocus()
   }
 
@@ -408,15 +406,15 @@ Item {
   ListModel { id: historyEntries }
 
   function syncHistory() {
-    historyList.beginUpdate()
+    agentOutput.historyList.beginUpdate()
     DetailView.reconcile(historyEntries, engineState ? engineState.history || [] : [], lastProject, "history")
     DetailView.filterRows(historyEntries, historyFilter)
-    historyList.endUpdate()
+    agentOutput.historyList.endUpdate()
   }
   onHistoryFilterChanged: {
-    historyList.beginUpdate()
+    agentOutput.historyList.beginUpdate()
     DetailView.filterRows(historyEntries, historyFilter)
-    historyList.endUpdate()
+    agentOutput.historyList.endUpdate()
   }
 
   onEngineStateChanged: {
@@ -461,15 +459,15 @@ Item {
     logError = ""
     liveEntries.clear()
     historyEntries.clear()
-    liveOutput.resetView()
-    historyList.resetView()
+    agentOutput.liveOutput.resetView()
+    agentOutput.historyList.resetView()
     liveTab = busy
     historyFilter = "all"
-    historyList.positionViewAtBeginning()
+    agentOutput.historyList.positionViewAtBeginning()
     selectedReportKey = ""
     expandedReportKey = ""
-    reportList.readingY = 0
-    reportList.positionViewAtBeginning()
+    agentOutput.reportList.readingY = 0
+    agentOutput.reportList.positionViewAtBeginning()
     syncHistory()
     Qt.callLater(refreshAgentLog)
   }
@@ -565,13 +563,13 @@ Item {
         return
       }
       root.logError = ""
-      liveOutput.beginUpdate()
+      agentOutput.liveOutput.beginUpdate()
       if (page.reset) {
         liveEntries.clear()
-        liveOutput.resetView()
+        agentOutput.liveOutput.resetView()
       }
       DetailView.reconcile(liveEntries, page.entries, request.project, root.logFeed.session)
-      liveOutput.endUpdate()
+      agentOutput.liveOutput.endUpdate()
       if (page.more) Qt.callLater(root.refreshAgentLog)
     }, true)
   }
@@ -728,7 +726,7 @@ Item {
   }
 
   function savePlanEdit() {
-    if (!savePlanButton.enabled) return
+    if (!planEditor.saveButton.enabled) return
     keyHandler.forceActiveFocus()
     const session = editSession
     const content = PlanEdit.payload(editGoal, editStages)
@@ -754,7 +752,7 @@ Item {
     diffText = ""
     diffError = ""
     diffOpen = true
-    diffList.positionViewAtBeginning()
+    diffView.listView.positionViewAtBeginning()
     refreshDiff()
   }
 
@@ -1003,18 +1001,7 @@ Item {
     }
   }
 
-  component StageProseField: StageProse {
-    id: stageProse
-    foreground: root.mutedForeground
-    mutedForeground: root.mutedForeground
-    background: root.background
-    fontFamily: root.fontFamily
-    fontSize: root.fs(11)
-    onCopyRequested: original => Quickshell.clipboardText = original
-    onLeaveRequested: keyHandler.forceActiveFocus()
-    onFocusRevealed: control => panelScroll.reveal(control)
-    onInspecting: root.inspectDetail(stageProse)
-  }
+
 
   function reviewGateText(stage) {
     const gate = stage.review_gate || {}
@@ -1137,7 +1124,7 @@ Item {
       chooserOpen = false
     } else if (row.kind === "path") {
       manualEntry = !manualEntry
-      if (manualEntry) manualField.forceActiveFocus()
+      if (manualEntry) projectChooser.manualField.forceActiveFocus()
       else keyHandler.forceActiveFocus()
     }
   }
@@ -1230,11 +1217,11 @@ Item {
           if (stages.length === 0) return
           root.selectedStageIndex = Math.max(0, Math.min(index, stages.length - 1))
           if (root.editingPlan) {
-            stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
-            panelScroll.reveal(stageFrame)
+            planEditor.stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
+            panelScroll.reveal(planEditor.stageFrame)
           } else {
-            stageList.forceLayout()
-            const row = stageList.itemAtIndex(root.selectedStageIndex)
+            planEditor.stageList.forceLayout()
+            const row = planEditor.stageList.itemAtIndex(root.selectedStageIndex)
             if (row) panelScroll.reveal(row)
           }
         }
@@ -1243,33 +1230,33 @@ Item {
           if (root.reports.length === 0) return
           const selected = Math.max(0, Math.min(index, root.reports.length - 1))
           root.selectedReportKey = root.reportKey(root.reports[selected], selected)
-          reportList.positionViewAtIndex(selected, ListView.Contain)
-          reportList.captureReading()
-          panelScroll.reveal(outputFrame)
+          agentOutput.reportList.positionViewAtIndex(selected, ListView.Contain)
+          agentOutput.reportList.captureReading()
+          panelScroll.reveal(agentOutput.outputFrame)
         }
 
         function scrollOutput(direction) {
-          const view = root.liveTab ? liveOutput : root.reportsVisible ? reportList : historyList
+          const view = root.liveTab ? agentOutput.liveOutput : root.reportsVisible ? agentOutput.reportList : agentOutput.historyList
           view.cancelFlick()
-          if (view !== reportList) view.followTail = false
+          if (view !== agentOutput.reportList) view.followTail = false
           const top = view.originY
           const bottom = top + Math.max(0, view.contentHeight - view.height)
           view.contentY = Math.max(top, Math.min(bottom,
             view.contentY + direction * view.height / 2))
-          if (view !== reportList && direction > 0 && view.contentY >= bottom) {
+          if (view !== agentOutput.reportList && direction > 0 && view.contentY >= bottom) {
             view.followTail = true
             view.scrollToTail()
           }
-          if (view !== reportList) view.captureReading()
-          if (view === reportList) reportList.captureReading()
-          panelScroll.reveal(outputFrame)
+          if (view !== agentOutput.reportList) view.captureReading()
+          if (view === agentOutput.reportList) agentOutput.reportList.captureReading()
+          panelScroll.reveal(agentOutput.outputFrame)
         }
 
         function scrollDiff(amount) {
-          diffList.cancelFlick()
-          const top = diffList.originY
-          const bottom = top + Math.max(0, diffList.contentHeight - diffList.height)
-          diffList.contentY = Math.max(top, Math.min(bottom, diffList.contentY + amount))
+          diffView.listView.cancelFlick()
+          const top = diffView.listView.originY
+          const bottom = top + Math.max(0, diffView.listView.contentHeight - diffView.listView.height)
+          diffView.listView.contentY = Math.max(top, Math.min(bottom, diffView.listView.contentY + amount))
         }
 
         Keys.onPressed: event => {
@@ -1296,22 +1283,22 @@ Item {
               root.diffOpen = false
             } else if (event.modifiers === Qt.ShiftModifier) {
               if (event.key === Qt.Key_G) {
-                diffList.cancelFlick()
-                diffList.positionViewAtEnd()
+                diffView.listView.cancelFlick()
+                diffView.listView.positionViewAtEnd()
               } else if (event.key === Qt.Key_R && !root.diffPending) {
                 root.refreshDiff()
               }
             } else if (event.modifiers === Qt.ControlModifier) {
               if (event.key === Qt.Key_D || event.key === Qt.Key_U)
-                scrollDiff((event.key === Qt.Key_D ? 1 : -1) * diffList.height / 2)
+                scrollDiff((event.key === Qt.Key_D ? 1 : -1) * diffView.listView.height / 2)
             } else if (event.modifiers === Qt.NoModifier) {
               if (event.key === Qt.Key_Q) root.diffOpen = false
               else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
                 scrollDiff(event.key === Qt.Key_J ? 40 : -40)
               else if (event.key === Qt.Key_G) {
                 if (prefix === "g") {
-                  diffList.cancelFlick()
-                  diffList.positionViewAtBeginning()
+                  diffView.listView.cancelFlick()
+                  diffView.listView.positionViewAtBeginning()
                 } else pendingKey = "g"
               }
             }
@@ -1322,11 +1309,11 @@ Item {
             } else if (event.modifiers === Qt.NoModifier) {
               if (event.key === Qt.Key_Q) root.chooserOpen = false
               else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-                chooserList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
+                projectChooser.chooserList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
               else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
-                chooserList.activateSelection()
+                projectChooser.chooserList.activateSelection()
               else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
-                filterField.forceActiveFocus()
+                projectChooser.filterField.forceActiveFocus()
             }
           } else if (question) {
             root.helpOpen = true
@@ -1421,7 +1408,7 @@ Item {
                   root.expandedReportKey = root.expandedReportKey === root.selectedReportKey
                     ? "" : root.selectedReportKey
                 } else if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
-                  const row = stageList.itemAtIndex(root.selectedStageIndex)
+                  const row = planEditor.stageList.itemAtIndex(root.selectedStageIndex)
                   if (root.editingPlan && stages[root.selectedStageIndex].status !== "committed") {
                     if (row) row.focusEditor()
                   } else {
@@ -2064,84 +2051,32 @@ Item {
           }
         }
 
-        Column {
-          visible: root.plan !== null || (root.engineState && root.engineState.architect_activity) || (root.architecture && root.architecture.context_status === "error")
+        ArchitectureReviewView {
           width: parent.width
-          spacing: Style.space(4)
-          ArchitectureDetails {
-            id: architectureCard
-            objectName: "architectureDetails"
-            width: parent.width
-            scope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-            foreground: root.foreground
-            mutedForeground: root.mutedForeground
-            background: root.surface
-            accent: root.accent
-            urgent: root.urgent
-            fontFamily: root.fontFamily
-            fontSize: root.fs(12)
-            onCopyRequested: original => Quickshell.clipboardText = original
-            onLeaveRequested: keyHandler.forceActiveFocus()
-            onFocusRevealed: control => root.revealDetail(control)
-            onInspecting: root.inspectDetail(architectureCard)
-            entries: PanelDetails.architecture(root.architecture,
-              root.engineState ? root.engineState.architect_activity : null,
-              root.engineState ? root.engineState.persistence_error : "")
-          }
-          Text {
-            width: parent.width
-            text: ReportFormat.architectUsageText(root.plan)
-            visible: text !== ""
-            textFormat: Text.PlainText
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            wrapMode: Text.Wrap
-          }
-        }
-
-        Column {
-          id: planReviewSection
-          objectName: "planReviewSection"
-          visible: root.planReview !== null
-          width: parent.width
-          spacing: Style.space(6)
-          readonly property var view: {
-            const version = root.planReviewVersion
-            return Object.assign({}, root.planReviewView || {})
-          }
-          PanelFields {
-            width: parent.width
-            scope: root.planReviewScope
-            entries: [PanelDetails.status("plan-review", root.planReviewStatusText(root.planReview))]
-              .concat(planReviewSection.view.complete ? [] : [PanelDetails.status("plan-review-preview",
-                "Shortened preview · full change requests have not been loaded.")])
-          }
-          CompactDetail {
-            id: planReviewRequests
-            objectName: "planReviewRequests"
-            width: parent.width
-            metadata: "Plan review change requests"
-            originalText: planReviewSection.view.text || ""
-            textComplete: planReviewSection.view.complete === true
-            loading: planReviewSection.view.pending === true
-            detailError: planReviewSection.view.error || "Complete requests have not been loaded."
-            expanded: root.planReviewExpanded
-            foreground: root.foreground
-            mutedForeground: root.mutedForeground
-            background: root.surface
-            fontFamily: root.fontFamily
-            fontSize: root.fs(12)
-            onExpansionRequested: value => {
-              root.planReviewExpanded = value
-              if (value && !textComplete) root.loadPlanReviewRequests()
-            }
-            onLoadRequested: root.loadPlanReviewRequests()
-            onCopyRequested: original => Quickshell.clipboardText = original
-            onLeaveRequested: keyHandler.forceActiveFocus()
-            onFocusRevealed: control => root.revealDetail(control)
-            onInspecting: root.inspectDetail(planReviewRequests)
-          }
+          engineState: root.engineState
+          plan: root.plan
+          architecture: root.architecture
+          planReview: root.planReview
+          planReviewView: root.planReviewView
+          planReviewVersion: root.planReviewVersion
+          planReviewScope: root.planReviewScope
+          planReviewExpanded: root.planReviewExpanded
+          detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+          planReviewStatusText: root.planReviewStatusText
+          foreground: root.foreground
+          mutedForeground: root.mutedForeground
+          background: root.background
+          surface: root.surface
+          accent: root.accent
+          urgent: root.urgent
+          fontFamily: root.fontFamily
+          fontSize11: root.fs(11)
+          fontSize12: root.fs(12)
+          onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
+          onPlanReviewLoadRequested: root.loadPlanReviewRequests()
+          onLeaveRequested: keyHandler.forceActiveFocus()
+          onDetailRevealed: control => root.revealDetail(control)
+          onDetailInspected: control => root.inspectDetail(control)
         }
 
         // ------------------------------------------------ plan Q&A
@@ -2360,790 +2295,103 @@ Item {
           }
         }
 
-        // ------------------------------------------------- stages
-        Flow {
-          visible: root.editingPlan
+        PlanEditorView {
+          id: planEditor
+
           width: parent.width
-          spacing: Style.space(8)
-          PanelButton {
-            label: "Add stage"
-            enabled: !root.editPending
-            onClicked: root.addEditStage()
-          }
-          PanelButton {
-            id: savePlanButton
-            label: root.editPending ? "Saving…" : "Save"
-            primary: true
-            enabled: root.editingPlan && root.editValid && !root.editPending
-              && root.engineOnline && !root.busy && !root.queueActive
-            onClicked: root.savePlanEdit()
-          }
-          PanelButton {
-            label: "Cancel"
-            enabled: !root.editPending
-            onClicked: root.cancelPlanEdit()
-          }
-          Text {
-            text: "Editing plan · title and instructions required"
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(11)
-          }
-        }
-        Rectangle {
-          id: stageFrame
-          width: parent.width
-          height: root.editingPlan
-            ? Math.max(Style.space(260), panelScroll.height * 0.45)
-            : stageList.contentHeight + Style.space(16)
-          color: root.surface
-          radius: 4
-          ListView {
-            id: stageList
-            anchors.fill: parent
-            anchors.margins: Style.space(8)
-            anchors.rightMargin: Style.space(root.editingPlan ? 22 : 8)
-            clip: true
-            interactive: root.editingPlan
-            boundsBehavior: Flickable.StopAtBounds
-            ScrollBar.vertical: ScrollBar {
-              policy: root.editingPlan ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
-            }
-            spacing: Style.space(6)
-            // An integer model keeps delegates alive when polling replaces the
-            // plan/stages array. Live roles update without replacing open editors.
-            model: root.displayedStages.length
-            delegate: Rectangle {
-              id: stageRow
-              readonly property var modelData: root.displayedStages[index] || ({})
-              required property int index
-              readonly property bool expanded: root.expandedStageId === modelData.id
-              readonly property bool editable: root.editingPlan && modelData.status !== "committed"
-              function focusEditor() {
-                if (stageEditor.item && !root.editPending) stageEditor.item.focusTitle()
-              }
-              readonly property double elapsedSecs: modelData.status === "in_progress"
-                && typeof modelData.started_unix === "number"
-                ? Math.max(0, Math.floor(root.agentNow - modelData.started_unix))
-                : typeof modelData.duration_secs === "number"
-                  ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
-              readonly property var reviewView: root.reviewView(modelData)
-              readonly property var reviewHistory: reviewView.rows
-              readonly property string detailScope: root.stageDetailScope(modelData)
-              readonly property var prose: root.stageSnapshot && root.stageSnapshot.key === detailScope
-                ? root.stageSnapshot : null
-              readonly property string reviewMessage: reviewView.error || root.stageReviewBlocks[detailScope] || ""
-              readonly property bool reviewRetryAvailable: reviewMessage !== "" && (!!reviewView.retry
-                || root.stageReviewIncompleteRange(reviewView) !== null || reviewView.older > 0)
-              readonly property var lastReview: reviewHistory.length > 0
-                ? reviewHistory[reviewHistory.length - 1] : null
-              readonly property var lastDecision: lastReview
-                ? root.reviewDecision(lastReview.verdict) : null
-              readonly property string activity: root.stageActivity(modelData)
-              width: stageList.width
-              height: editable ? stageEditor.height : stageContent.implicitHeight
-              radius: 3
-              color: index === root.selectedStageIndex
-                ? Qt.darker(root.accent, 2.8) : "transparent"
-              Column {
-                id: stageContent
-                visible: !stageRow.editable
-                width: stageRow.width
-                spacing: 2
-                QQC.Button {
-                  id: stageToggle
-                  objectName: "stageToggle"
-                  width: stageRow.width
-                  implicitHeight: Math.max(32, headerLabel.implicitHeight + 12)
-                  padding: 6
-                  focusPolicy: Qt.StrongFocus
-                  Accessible.name: (stageRow.expanded ? "Collapse stage " : "Expand stage ") + stageRow.modelData.id
-                  contentItem: Row {
-                    spacing: Style.space(4)
-                    Text {
-                      text: stageRow.expanded ? "▾" : "▸"
-                      textFormat: Text.PlainText
-                      wrapMode: Text.Wrap
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(12)
-                    }
-                    Text {
-                      id: stageGlyph
-                      text: stageRow.modelData.status === "committed" ? "✓"
-                        : stageRow.modelData.status === "in_progress" ? "●"
-                        : stageRow.modelData.status === "blocked" ? "!" : "·"
-                      textFormat: Text.PlainText
-                      wrapMode: Text.Wrap
-                      color: stageRow.modelData.status === "committed" ? root.success
-                        : stageRow.modelData.status === "in_progress" ? root.working
-                        : stageRow.modelData.status === "blocked" ? root.urgent : root.mutedForeground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(12)
-                      font.bold: true
-                    }
-                    Text {
-                      id: headerLabel
-                      width: stageToggle.availableWidth - stageGlyph.width - stageGlyph.x - Style.space(4)
-                      text: stageRow.modelData.id + ". " + stageRow.modelData.title
-                      textFormat: Text.PlainText
-                      color: root.foreground
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(12)
-                      font.bold: true
-                    }
-                  }
-                  background: Rectangle {
-                    radius: 4
-                    color: stageToggle.hovered || stageToggle.down ? Qt.alpha(root.foreground, 0.06) : "transparent"
-                    border.width: stageToggle.visualFocus ? 1 : 0
-                    border.color: root.accent
-                  }
-                  onClicked: root.expandedStageId = stageRow.expanded ? -1 : stageRow.modelData.id
-                  onActiveFocusChanged: if (activeFocus && focusReason !== Qt.MouseFocusReason
-                    && focusReason !== Qt.PopupFocusReason) panelScroll.reveal(stageToggle)
-                  Keys.priority: Keys.AfterItem
-                  Keys.onPressed: event => {
-                    if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) stageToggle.clicked()
-                    else if (event.key === Qt.Key_Escape) keyHandler.forceActiveFocus()
-                    if (event.key !== Qt.Key_Tab && event.key !== Qt.Key_Backtab) event.accepted = true
-                  }
-                }
-                Flow {
-                  width: stageRow.width
-                  spacing: Style.space(8)
-                  Text {
-                    width: Math.min(implicitWidth, stageRow.width)
-                    textFormat: Text.PlainText
-                    text: (root.editingPlan && stageRow.modelData.status === "committed"
-                      ? "committed — locked" : stageRow.modelData.status === "blocked"
-                      ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "scope_blocked"
-                         ? "blocked · stage cannot be built as written"
-                         : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
-                         ? "blocked · fix rounds exhausted" : "blocked") : stageRow.modelData.status)
-                      + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
-                    color: stageRow.modelData.status === "committed" ? root.success
-                      : stageRow.modelData.status === "in_progress" ? root.working
-                      : stageRow.modelData.status === "blocked" ? root.urgent
-                      : root.mutedForeground
-                    wrapMode: Text.Wrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Text {
-                    visible: text !== ""
-                    width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.activity
-                    textFormat: Text.PlainText
-                    color: root.working
-                    wrapMode: Text.Wrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                    font.bold: true
-                  }
-                  Text {
-                    visible: !!stageRow.modelData.review_gate
-                    width: stageRow.width
-                    text: root.reviewGateText(stageRow.modelData)
-                    textFormat: Text.PlainText
-                    color: root.mutedForeground
-                    wrapMode: Text.Wrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Text {
-                    visible: stageRow.reviewHistory.length > 0
-                    width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.lastReview && stageRow.lastDecision
-                      ? "historical review · " + root.reviewRoundLabel(stageRow.lastReview)
-                        + ": " + stageRow.lastDecision.label
-                        + (stageRow.modelData.last_verdict_valid === false ? " · obsolete for current work" : "")
-                      : ""
-                    textFormat: Text.PlainText
-                    color: stageRow.modelData.last_verdict_valid === false ? root.mutedForeground
-                      : stageRow.lastDecision && stageRow.lastDecision.optionalNotes ? root.working
-                      : stageRow.lastDecision && stageRow.lastDecision.clean
-                      ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
-                    wrapMode: Text.Wrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Text {
-                    width: stageRow.width
-                    textFormat: Text.PlainText
-                    wrapMode: Text.Wrap
-                    visible: stageRow.elapsedSecs >= 0
-                    text: visible ? Math.floor(stageRow.elapsedSecs / 60) + "m "
-                      + (stageRow.elapsedSecs % 60) + "s" : ""
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                }
-                Text {
-                  width: stageRow.width
-                  text: ModelRouting.stageModelStatus(stageRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Text {
-                  visible: text !== ""
-                  width: stageRow.width
-                  text: ModelRouting.stageModelErrors(stageRow.modelData)
-                  textFormat: Text.PlainText
-                  color: root.urgent
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Loader {
-                  width: stageRow.width
-                  active: stageRow.expanded && !stageRow.editable && stageRow.prose !== null
-                  // An inactive Loader retains its height after destroying its item.
-                  // Exclude it from the Column when the stage details are closed.
-                  visible: active
-                  sourceComponent: Column {
-                    width: stageRow.width
-                    spacing: 2
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Commit"
-                      originalText: stageRow.prose ? stageRow.prose.commit : ""
-                    }
-                    Column {
-                      width: stageRow.width
-                      spacing: 2
-                      Repeater {
-                        model: stageRow.prose ? stageRow.prose.rationale : []
-                        delegate: StageProseField {
-                          required property var modelData
-                          width: stageRow.width
-                          label: modelData.label
-                          originalText: modelData.text
-                        }
-                      }
-                      QQC.Button {
-                        id: stageRoutingToggle
-                        objectName: "stageRoutingToggle"
-                        width: stageRow.width
-                        implicitHeight: Math.max(32, routingLabel.implicitHeight + 12)
-                        padding: 6
-                        focusPolicy: Qt.StrongFocus
-                        Accessible.name: (root.stageRoutingExpanded ? "Collapse " : "Expand ") + "model agreement and routing details"
-                        contentItem: Text {
-                          id: routingLabel
-                          text: (root.stageRoutingExpanded ? "▾  " : "▸  ") + "Model agreement and routing details"
-                          textFormat: Text.PlainText
-                          wrapMode: Text.Wrap
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: root.fs(11)
-                        }
-                        background: Rectangle {
-                          radius: 4
-                          color: stageRoutingToggle.hovered || stageRoutingToggle.down ? Qt.alpha(root.foreground, 0.06) : "transparent"
-                          border.width: stageRoutingToggle.visualFocus ? 1 : 0
-                          border.color: root.accent
-                        }
-                        onClicked: root.stageRoutingExpanded = !root.stageRoutingExpanded
-                        onActiveFocusChanged: if (activeFocus && focusReason !== Qt.MouseFocusReason
-                          && focusReason !== Qt.PopupFocusReason) panelScroll.reveal(stageRoutingToggle)
-                        Keys.priority: Keys.AfterItem
-                        Keys.onPressed: event => {
-                          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) stageRoutingToggle.clicked()
-                          else if (event.key === Qt.Key_Escape) keyHandler.forceActiveFocus()
-                          if (event.key !== Qt.Key_Tab && event.key !== Qt.Key_Backtab) event.accepted = true
-                        }
-                      }
-                      Repeater {
-                        model: root.stageRoutingExpanded && stageRow.prose ? stageRow.prose.diagnostics : []
-                        delegate: StageProseField {
-                          required property var modelData
-                          width: stageRow.width
-                          label: modelData.label
-                          originalText: modelData.text
-                        }
-                      }
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Review policy rationale"
-                      originalText: stageRow.prose ? stageRow.prose.policyRationale : ""
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Instructions"
-                      originalText: stageRow.prose ? stageRow.prose.instructions : ""
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Acceptance criteria"
-                      originalText: stageRow.prose ? stageRow.prose.acceptance : ""
-                    }
-                    Column {
-                      id: stageReviews
-                      objectName: "stageHistoricalReviews"
-                      readonly property var currentRows: stageRow.reviewHistory
-                      readonly property string currentScope: stageRow.reviewView.scope.key
-                      readonly property bool planEditing: root.editingPlan
-                      readonly property bool heldPreview: root.stageReviewHasHeldPreview(reviewPresentation, stageRow.reviewView)
-                      // A single queued update coalesces publications and runs
-                      // against current delegate state, outside binding evaluation.
-                      onCurrentRowsChanged: reviewUpdate.restart()
-                      onCurrentScopeChanged: reviewUpdate.restart()
-                      onPlanEditingChanged: reviewUpdate.restart()
-                      Timer {
-                        id: reviewUpdate
-                        interval: 0
-                        running: true
-                        onTriggered: {
-                          root.ensureStageReviewsLoaded(stageRow.modelData)
-                          root.reconcileStageReviewPresentation(stageRow.modelData, reviewPresentation, reviewRepeater)
-                        }
-                      }
-                      ListModel { id: reviewPresentation; dynamicRoles: true }
-                      width: stageRow.width
-                      spacing: 2
-                      Text {
-                        visible: stageRow.expanded && stageRow.reviewHistory.length > 0
-                        width: stageRow.width
-                        text: "Historical reviews · showing " + stageRow.reviewHistory.length
-                          + " of " + stageRow.reviewView.scope.count
-                          + (stageRow.reviewHistory.some(function(r) { return !r.complete }) ? " · previews require full-text loading" : "")
-                        textFormat: Text.PlainText
-                        color: root.mutedForeground
-                        wrapMode: Text.Wrap
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fs(11)
-                      }
-                      Text {
-                        objectName: "stageReviewStatus"
-                        visible: text !== ""
-                        width: stageRow.width
-                        text: stageRow.reviewMessage || (stageRow.reviewView.pending ? "Loading complete reviews…"
-                          : root.stageReviewIncompleteRange(stageRow.reviewView) ? "Complete reviews have not been loaded."
-                          : stageReviews.heldPreview ? "Selected preview retained; complete reviews are shown separately." : "")
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        color: stageRow.reviewMessage ? root.urgent : root.mutedForeground
-                        font.family: root.fontFamily
-                        font.pixelSize: root.fs(11)
-                      }
-                      Flow {
-                        width: stageRow.width
-                        spacing: Style.space(6)
-                        Button {
-                          objectName: "stageReviewsOlder"
-                          visible: stageRow.reviewView.older > 0
-                          width: Math.min(implicitWidth, stageRow.width)
-                          text: "Load older reviews (" + stageRow.reviewView.older + ")"
-                          enabled: !stageRow.reviewView.pending
-                          onClicked: root.loadStageReviews(stageRow.modelData.id,
-                            Math.max(0, stageRow.reviewView.older - 8), stageRow.reviewView.older)
-                        }
-                        Button {
-                          objectName: "stageReviewsRetry"
-                          visible: stageRow.reviewRetryAvailable
-                          width: Math.min(implicitWidth, stageRow.width)
-                          text: "Retry reviews"
-                          enabled: !stageRow.reviewView.pending
-                          onClicked: root.retryStageReviews(stageRow.modelData)
-                        }
-                      }
-                      Repeater {
-                        id: reviewRepeater
-                        model: reviewPresentation
-                        delegate: Column {
-                          id: reviewRound
-                          required property var record
-                          required property string sourceScope
-                          readonly property var modelData: record
-                          readonly property var verdict: modelData.verdict
-                          readonly property var decision: root.reviewDecision(verdict)
-                          visible: stageRow.expanded
-                          width: stageRow.width
-                          spacing: 2
-                          Text {
-                            width: stageRow.width
-                            text: "Historical · " + (reviewRound.verdict.role || "reviewer") + " review " + root.reviewRoundLabel(reviewRound.modelData) + " — "
-                              + reviewRound.decision.label
-                              + (reviewRound.sourceScope !== stageReviews.currentScope
-                                ? " · selected text held from an earlier publication" : "")
-                            textFormat: Text.PlainText
-                            color: reviewRound.decision.optionalNotes ? root.working
-                              : reviewRound.decision.clean
-                                ? (stageRow.activity ? root.mutedForeground : root.success) : root.urgent
-                            wrapMode: Text.Wrap
-                            font.family: root.fontFamily
-                            font.pixelSize: root.fs(11)
-                          }
-                          Text {
-                            visible: text !== ""
-                            width: stageRow.width
-                            text: root.reviewTimestamp(reviewRound.verdict)
-                            textFormat: Text.PlainText
-                            color: root.mutedForeground
-                            wrapMode: Text.Wrap
-                            font.family: root.fontFamily
-                            font.pixelSize: root.fs(11)
-                          }
-                          StageProseField {
-                            width: stageRow.width
-                            label: reviewRound.modelData.complete ? "Summary" : "Summary preview · feedback may be omitted"
-                            originalText: reviewRound.verdict.summary || ""
-                            onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
-                          }
-                          Repeater {
-                            // Shortened feedback is never offered as complete. Each full
-                            // request, legacy note and check gets its own copy source.
-                            model: reviewRound.modelData.complete ? root.reviewFields(reviewRound.verdict) : []
-                            delegate: StageProseField {
-                              required property var modelData
-                              width: stageRow.width
-                              label: modelData.label
-                              foreground: modelData.kind === "issues" ? root.urgent : root.mutedForeground
-                              originalText: modelData.text
-                              onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
-                            }
-                          }
-                        }
-                      }
-                    }
-                    Text {
-                      visible: stageRow.expanded && text !== ""
-                      width: stageRow.width
-                      text: UsageFormat.usageSummary(stageRow.modelData.usage)
-                      textFormat: Text.PlainText
-                      color: root.mutedForeground
-                      wrapMode: Text.Wrap
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                    }
-                  }
-                }
-              }
-              Loader {
-                id: stageEditor
-                active: stageRow.editable
-                width: stageRow.width
-                sourceComponent: Column {
-                  width: stageEditor.width
-                  spacing: Style.space(6)
-                  function focusTitle() { titleEditor.focusField() }
-                  Flow {
-                    width: parent.width
-                    spacing: Style.space(8)
-                    Text {
-                      text: stageRow.modelData.id === undefined ? "New stage"
-                        : "Stage " + stageRow.modelData.id
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(12)
-                      font.bold: true
-                    }
-                    PanelButton {
-                      label: "↑ Up"
-                      enabled: !root.editPending && PlanEdit.editableNeighbor(root.editStages, stageRow.index, -1) >= 0
-                      onClicked: root.moveEditStage(stageRow.index, -1)
-                    }
-                    PanelButton {
-                      label: "↓ Down"
-                      enabled: !root.editPending && PlanEdit.editableNeighbor(root.editStages, stageRow.index, 1) >= 0
-                      onClicked: root.moveEditStage(stageRow.index, 1)
-                    }
-                    PanelButton {
-                      label: "Delete"
-                      enabled: !root.editPending
-                      labelColor: root.urgent
-                      onClicked: root.deleteEditStage(stageRow.index)
-                    }
-                  }
-                  PlanEditField {
-                    id: titleEditor
-                    width: parent.width
-                    label: "Title"
-                    value: stageRow.modelData.title
-                    onEdited: value => root.changeStageField(stageRow.index, "title", value)
-                  }
-                  PlanEditField {
-                    width: parent.width
-                    label: "Instructions"
-                    value: stageRow.modelData.instructions
-                    multiline: true
-                    onEdited: value => root.changeStageField(stageRow.index, "instructions", value)
-                  }
-                  PlanEditField {
-                    width: parent.width
-                    label: "Acceptance"
-                    value: stageRow.modelData.acceptance
-                    multiline: true
-                    onEdited: value => root.changeStageField(stageRow.index, "acceptance", value)
-                  }
-                  PlanEditField {
-                    width: parent.width
-                    label: "Commit"
-                    value: stageRow.modelData.commit
-                    onEdited: value => root.changeStageField(stageRow.index, "commit", value)
-                  }
-                  Text {
-                    width: parent.width
-                    text: "Stage constraint overrides the global model. Blank fields allow selection. Capability and independent-review checks still apply."
-                    color: root.mutedForeground
-                    wrapMode: Text.Wrap
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Repeater {
-                    model: ["provider", "model", "native_effort"]
-                    delegate: PlanEditField {
-                      required property string modelData
-                      width: stageEditor.width
-                      label: modelData === "provider" ? "Provider constraint (codex / claude)"
-                        : modelData === "model" ? "Exact model ID constraint" : "Native effort constraint"
-                      value: (stageRow.modelData.model_constraint || {})[modelData] || ""
-                      onEdited: value => root.changeModelConstraint(stageRow.index, modelData, value)
-                    }
-                  }
-                  PanelButton {
-                    label: "Clear stage constraint"
-                    onClicked: root.changeStageField(stageRow.index, "model_constraint", null)
-                  }
-                  Item { width: 1; height: Style.space(6) }
-                }
-              }
-            }
-            Text {
-              visible: !root.editingPlan && root.plan === null
-              text: "no plan yet"
-              color: root.mutedForeground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-            }
-          }
+          editingPlan: root.editingPlan
+          editPending: root.editPending
+          editValid: root.editValid
+          queueActive: root.queueActive
+          engineOnline: root.engineOnline
+          busy: root.busy
+          displayedStages: root.displayedStages
+          editStages: root.editStages
+          plan: root.plan
+          stageSnapshot: root.stageSnapshot
+          expandedStageId: root.expandedStageId
+          selectedStageIndex: root.selectedStageIndex
+          stageRoutingExpanded: root.stageRoutingExpanded
+          stageReviewBlocks: root.stageReviewBlocks
+          agentNow: root.agentNow
+          panelHeight: panelScroll.height
+          editFocusedField: root.editFocusedField
+          fs: root.fs
+          stageActivity: root.stageActivity
+          stageDetailScope: root.stageDetailScope
+          reviewView: root.reviewView
+          reviewGateText: root.reviewGateText
+          reviewDecision: root.reviewDecision
+          reviewFields: root.reviewFields
+          reviewRoundLabel: root.reviewRoundLabel
+          reviewTimestamp: root.reviewTimestamp
+          stageReviewIncompleteRange: root.stageReviewIncompleteRange
+          stageReviewHasHeldPreview: root.stageReviewHasHeldPreview
+          ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
+          reconcileStageReviewPresentation: root.reconcileStageReviewPresentation
+          foreground: root.foreground
+          mutedForeground: root.mutedForeground
+          background: root.background
+          surface: root.surface
+          accent: root.accent
+          urgent: root.urgent
+          success: root.success
+          working: root.working
+          fontFamily: root.fontFamily
+          onSavePlanEdit: root.savePlanEdit()
+          onCancelPlanEdit: root.cancelPlanEdit()
+          onAddEditStage: root.addEditStage()
+          onMoveEditStage: (index, direction) => root.moveEditStage(index, direction)
+          onDeleteEditStage: index => root.deleteEditStage(index)
+          onChangeStageField: (index, field, value) => root.changeStageField(index, field, value)
+          onChangeModelConstraint: (index, key, value) => root.changeModelConstraint(index, key, value)
+          onLoadStageReviews: (stageId, cursor, end) => root.loadStageReviews(stageId, cursor, end)
+          onRetryStageReviews: stage => root.retryStageReviews(stage)
+          onExpandedStageRequested: stageId => root.expandedStageId = stageId
+          onStageRoutingExpandedRequested: expanded => root.stageRoutingExpanded = expanded
+          onEditFocusChanged: field => root.editFocusedField = field
+          onHelpRequested: root.helpOpen = true
+          onLeaveRequested: keyHandler.forceActiveFocus()
+          onDetailRevealed: control => panelScroll.reveal(control)
+          onDetailInspected: control => root.inspectDetail(control)
         }
 
-        // ------------------------------------------- live / history
-        Row {
-          spacing: Style.space(8)
-          PanelButton {
-            label: "Live"
-            primary: root.liveTab
-            onClicked: root.liveTab = true
-          }
-          PanelButton {
-            label: "History"
-            primary: !root.liveTab
-            onClicked: root.liveTab = false
-          }
-        }
+        AgentOutputView {
+          id: agentOutput
 
-        PanelDetail {
-          id: logErrorText
-          visible: root.liveTab && root.logError !== ""
           width: parent.width
-          originalText: root.logError
-          metadata: "Log error"
-          error: true
-        }
-
-        Rectangle {
-          id: outputFrame
-          width: parent.width
-          height: Math.max(Style.space(180), panelScroll.height * 0.3)
-          color: root.surface
-          radius: 4
-          DetailList {
-            id: liveOutput
-            visible: root.liveTab
-            anchors.fill: parent
-            anchors.margins: Style.space(8)
-            model: liveEntries
-            foreground: root.mutedForeground
-            mutedForeground: root.mutedForeground
-            background: root.surface
-            urgent: root.urgent
-            accent: root.accent
-            success: root.success
-            working: root.working
-            fontFamily: root.fontFamily
-            fontSize: root.fs(10)
-            onCopyRequested: original => Quickshell.clipboardText = original
-            onLeaveRequested: keyHandler.forceActiveFocus()
-          }
-          Row {
-            id: historyFilters
-            visible: !root.liveTab
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.margins: Style.space(8)
-            spacing: Style.space(4)
-            Repeater {
-              model: root.hasReports
-                ? ["all", "runs", "git", "reviews", "errors", "reports"]
-                : ["all", "runs", "git", "reviews", "errors"]
-              delegate: PanelButton {
-                required property string modelData
-                label: modelData
-                primary: root.historyFilter === modelData
-                onClicked: root.historyFilter = modelData
-              }
-            }
-          }
-          DetailList {
-            id: historyList
-            visible: !root.liveTab && !root.reportsVisible
-            anchors.top: historyFilters.bottom
-            anchors.bottom: parent.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.margins: Style.space(8)
-            model: historyEntries
-            history: true
-            now: root.agentNow
-            foreground: root.mutedForeground
-            mutedForeground: root.mutedForeground
-            background: root.surface
-            urgent: root.urgent
-            accent: root.accent
-            success: root.success
-            working: root.working
-            fontFamily: root.fontFamily
-            fontSize: root.fs(10)
-            onCopyRequested: original => Quickshell.clipboardText = original
-            onLeaveRequested: keyHandler.forceActiveFocus()
-          }
-          ListView {
-            id: reportList
-            visible: root.reportsVisible
-            anchors.top: historyFilters.bottom
-            anchors.bottom: parent.bottom
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.margins: Style.space(8)
-            clip: true
-            spacing: Style.space(6)
-            boundsBehavior: Flickable.StopAtBounds
-            model: reportEntries
-            // Retain lightweight headers and inspected editors while scrolling.
-            // Unopened report detail trees are created lazily below.
-            cacheBuffer: contentHeight
-            property real readingY: 0
-            property string readingKey: ""
-            property real readingOffset: 0
-            function captureReading() {
-              readingY = contentY
-              const index = indexAt(1, contentY + 1)
-              const row = itemAtIndex(index)
-              if (row) { readingKey = row.key; readingOffset = contentY - row.y }
-            }
-            function sync() {
-              PanelDetails.reconcile(reportEntries, root.reportIndex.rows)
-              Qt.callLater(restoreReadingPosition)
-            }
-            ListModel { id: reportEntries }
-            Connections {
-              target: root
-              function onReportIndexChanged() { reportList.sync() }
-              function onProjectViewRevisionChanged() { reportEntries.clear(); reportList.readingKey = ""; reportList.sync() }
-            }
-            Component.onCompleted: sync()
-
-            function restoreReadingPosition() {
-              if (moving) return
-              let target = readingY
-              for (let i = 0; i < count; ++i) {
-                const row = itemAtIndex(i)
-                if (row && row.key === readingKey) { target = row.y + readingOffset; break }
-              }
-              contentY = Math.max(originY, Math.min(target, originY + Math.max(0, contentHeight - height)))
-            }
-            onContentYChanged: if (moving) captureReading()
-            onMovementEnded: captureReading()
-            onModelChanged: Qt.callLater(restoreReadingPosition)
-            onContentHeightChanged: Qt.callLater(restoreReadingPosition)
-            onWidthChanged: Qt.callLater(restoreReadingPosition)
-            onHeightChanged: Qt.callLater(restoreReadingPosition)
-            onVisibleChanged: if (visible) Qt.callLater(restoreReadingPosition)
-
-            delegate: Rectangle {
-              id: reportRow
-              required property var model
-              required property int index
-              readonly property var modelData: JSON.parse(model.text)
-              readonly property string key: model.key
-              readonly property bool expanded: root.expandedReportKey === key
-              property bool detailsLoaded: false
-              readonly property int commitCount: modelData.commits && typeof modelData.commits.length === "number"
-                ? modelData.commits.length : 0
-              width: reportList.width
-              height: reportContent.implicitHeight + Style.space(8)
-              radius: 3
-              color: key === root.selectedReportKey ? Qt.darker(root.accent, 2.8) : "transparent"
-              Column {
-                id: reportContent
-                x: Style.space(4)
-                y: Style.space(4)
-                width: parent.width - Style.space(8)
-                spacing: Style.space(4)
-                Button {
-                  objectName: "reportToggle"
-                  width: Math.min(implicitWidth, parent.width)
-                  text: reportRow.expanded ? "▾ Collapse report" : "▸ Expand report"
-                  onClicked: {
-                    root.selectedReportKey = reportRow.key
-                    reportList.captureReading()
-                    root.expandedReportKey = reportRow.expanded ? "" : reportRow.key
-                  }
-                }
-                PanelDetail {
-                  objectName: "reportGoal"
-                  width: parent.width
-                  metadata: "Goal"
-                  originalText: reportRow.modelData.goal || ""
-                }
-                Text {
-                  width: parent.width
-                  text: ReportFormat.reportTime(reportRow.modelData, root.agentNow)
-                    + " · " + ReportFormat.reportDuration(reportRow.modelData.duration_secs)
-                    + " · " + reportRow.commitCount + (reportRow.commitCount === 1 ? " commit" : " commits")
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
-                }
-                Text {
-                  visible: text !== ""
-                  width: parent.width
-                  text: UsageFormat.usageSummary(reportRow.modelData.usage)
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
-                }
-                Loader {
-                  id: reportDetailsLoader
-                  visible: reportRow.expanded
-                  width: parent.width
-                  active: reportRow.expanded || reportRow.detailsLoaded
-                  onLoaded: reportRow.detailsLoaded = true
-                  sourceComponent: PanelFields {
-                    objectName: "reportDetails"
-                    width: reportDetailsLoader.width
-                    entries: PanelDetails.report(reportRow.modelData, {stageModelStatus: ModelRouting.stageModelStatus,
-                      stageModelErrors: ModelRouting.stageModelErrors, stageModelDetails: ModelRouting.stageModelDetails,
-                      architectUsageText: ReportFormat.architectUsageText, usageBreakdown: UsageFormat.usageBreakdown})
-                    onInspecting: reportList.captureReading()
-                  }
-                }
-              }
-            }
-          }
+          liveTab: root.liveTab
+          historyFilter: root.historyFilter
+          hasReports: root.hasReports
+          reportsVisible: root.reportsVisible
+          logError: root.logError
+          liveModel: liveEntries
+          historyModel: historyEntries
+          reportIndex: root.reportIndex
+          projectViewRevision: root.projectViewRevision
+          selectedReportKey: root.selectedReportKey
+          expandedReportKey: root.expandedReportKey
+          now: root.agentNow
+          panelHeight: panelScroll.height
+          detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+          foreground: root.foreground
+          mutedForeground: root.mutedForeground
+          background: root.background
+          surface: root.surface
+          accent: root.accent
+          urgent: root.urgent
+          success: root.success
+          working: root.working
+          fontFamily: root.fontFamily
+          fontSize10: root.fs(10)
+          fontSize11: root.fs(11)
+          onLiveTabRequested: live => root.liveTab = live
+          onHistoryFilterRequested: filter => root.historyFilter = filter
+          onReportSelected: key => root.selectedReportKey = key
+          onReportExpansionRequested: key => root.expandedReportKey = key
+          onLeaveRequested: keyHandler.forceActiveFocus()
+          onDetailRevealed: control => root.revealDetail(control)
+          onDetailInspected: control => root.inspectDetail(control)
         }
       }
       }
@@ -3169,493 +2417,97 @@ Item {
       }
 
       // ------------------------------------------- model policy and options
-      Rectangle {
-        visible: root.catalogueOpen
+      CatalogueEditor {
+        id: catalogueEditorView
+
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, 0.55)
-        MouseArea { anchors.fill: parent; onClicked: root.catalogueOpen = false }
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.9
-          height: parent.height * 0.85
-          color: root.surface
-          radius: 6
-          MouseArea { anchors.fill: parent }
-          Column {
-            anchors.fill: parent
-            anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-            PanelButton {
-              label: "Close model settings"
-              onClicked: root.catalogueOpen = false
-            }
-            Flickable {
-              width: parent.width
-              height: parent.height - y
-              contentHeight: catalogueSettings.height
-              clip: true
-              Column {
-                id: catalogueSettings
-                width: parent.width
-                spacing: Style.space(6)
-                Flow {
-                  width: parent.width
-                  spacing: Style.space(8)
-                  PanelButton {
-                    label: root.catalogueAiPending ? "Updating shortlist…" : "Update shortlist with AI"
-                    enabled: root.engineOnline && !(root.engineState && (root.engineState.busy || root.engineState.queue_active)) && !root.catalogueAiPending
-                      && !(root.catalogue && root.catalogue.refreshing)
-                    onClicked: root.suggestCatalogue()
-                  }
-                  PanelButton {
-                    label: "Apply AI tiers"
-                    visible: root.catalogueAiReady !== ""
-                    enabled: !root.catalogueAiPending
-                    onClicked: root.applyCatalogueSuggestion()
-                  }
-                  PanelButton {
-                    label: "Undo AI tiers"
-                    visible: root.catalogueAiUndo !== ""
-                    enabled: !root.catalogueAiPending
-                    onClicked: root.undoCatalogueSuggestion()
-                  }
-                  PanelButton {
-                    label: "Reload saved policy"
-                    enabled: root.engineOnline && !root.catalogueAiPending
-                    onClicked: root.reloadCatalogue()
-                  }
-                }
-                PanelDetail {
-                  width: parent.width
-                  metadata: "Automatic model shortlist"
-                  originalText: "AI checks current official model pages and selects up to 4 distinct models per provider, covering simple, everyday and complex work. New model families can replace older ones when discovered locally. Save the draft to use the shortlist."
-                }
-                PanelDetail {
-                  width: parent.width
-                  visible: root.catalogueAiMessage !== ""
-                  metadata: "AI model tiers"
-                  originalText: root.catalogueAiMessage
-                }
-                PanelDetail {
-                  width: parent.width
-                  originalText: "Explicit model policy (JSON). Tiers: basic, standard, strong. Lower relative_cost_preference is preferred; it is not a price. Increment policy_revision before saving. Explicit configured native efforts may be used when availability is unverified and the adapter supports them; use provider_default otherwise. Plans select a capability tier. At implementation start, Forge selects a model within the currently selected implementer provider. Changing the provider after planning needs no replan. A nonempty implementer_model pins a model. Stage constraints take precedence. Periodic refresh intervals live here too: discovery_refresh_minutes, metadata_refresh_minutes, metadata_ttl_hours, metadata_research."
-                  metadata: "Model policy help"
-                }
-                Rectangle {
-                  width: parent.width
-                  height: Style.space(180)
-                  color: root.surface
-                  border.width: 1
-                  border.color: catalogueEditor.activeFocus ? root.accent : root.mutedForeground
-                  Flickable {
-                    anchors.fill: parent
-                    anchors.margins: Style.space(6)
-                    contentHeight: catalogueEditor.height
-                    clip: true
-                    TextEdit {
-                      id: catalogueEditor
-                      width: parent.width
-                      height: Math.max(contentHeight, parent.height)
-                      text: root.catalogueDraft
-                      textFormat: TextEdit.PlainText
-                      wrapMode: TextEdit.Wrap
-                      selectByMouse: true
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                      Keys.onEscapePressed: keyHandler.forceActiveFocus()
-                    }
-                  }
-                }
-                PanelButton {
-                  label: "Save model policy"
-                  enabled: root.engineOnline && !root.catalogueAiPending && !(root.catalogue && root.catalogue.refreshing)
-                  onClicked: root.saveCatalogue()
-                }
-                PanelFields {
-                  objectName: "catalogueOptions"
-                  width: parent.width
-                  entries: PanelDetails.options(root.catalogueDetails ? root.catalogueDetails.options : [], CataloguePresentation.catalogueOptionText)
-                }
-                Row {
-                  spacing: Style.space(8)
-                  PanelButton {
-                    label: "Refresh official metadata"
-                    enabled: root.engineOnline
-                    onClicked: root.act("/api/models/metadata/refresh", {})
-                  }
-                }
-                Text {
-                  width: parent.width
-                  visible: !!root.catalogueDetails && !!root.catalogueDetails.metadata
-                  text: "Official metadata (allowlisted sources only; never grants availability):"
-                  wrapMode: Text.Wrap
-                  color: root.mutedForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                PanelFields {
-                  objectName: "catalogueMetadata"
-                  width: parent.width
-                  entries: PanelDetails.metadata(root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.records : [], CataloguePresentation.catalogueStamp)
-                }
-                PanelFields {
-                  objectName: "catalogueSources"
-                  width: parent.width
-                  entries: PanelDetails.sources(root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.sources : [], CataloguePresentation.catalogueStamp)
-                }
-                Repeater {
-                  model: root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.negative : []
-                  delegate: Text {
-                    required property var modelData
-                    width: parent.width
-                    text: modelData.provider + "/" + modelData.model + " · not in official source · attempts "
-                      + modelData.attempts + " · retry after " + CataloguePresentation.catalogueStamp(modelData.next_attempt_unix)
-                    wrapMode: Text.Wrap
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(10)
-                  }
-                }
-                Text {
-                  width: parent.width
-                  text: "Full discovered IDs, aliases, efforts, capabilities and changes: GET /api/models"
-                  color: root.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(10)
-                }
-              }
-            }
-          }
-        }
+        open: root.catalogueOpen
+        engineOnline: root.engineOnline
+        engineBusy: !!root.engineState && (root.engineState.busy || root.engineState.queue_active)
+        aiPending: root.catalogueAiPending
+        aiReady: root.catalogueAiReady
+        aiUndo: root.catalogueAiUndo
+        aiMessage: root.catalogueAiMessage
+        catalogue: root.catalogue
+        details: root.catalogueDetails
+        draft: root.catalogueDraft
+        detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+        foreground: root.foreground
+        mutedForeground: root.mutedForeground
+        background: root.background
+        surface: root.surface
+        accent: root.accent
+        urgent: root.urgent
+        fontFamily: root.fontFamily
+        fontSize10: root.fs(10)
+        fontSize11: root.fs(11)
+        onCloseRequested: root.catalogueOpen = false
+        onSuggestRequested: root.suggestCatalogue()
+        onApplyRequested: root.applyCatalogueSuggestion()
+        onUndoRequested: root.undoCatalogueSuggestion()
+        onReloadRequested: root.reloadCatalogue()
+        onSaveRequested: root.saveCatalogue()
+        onMetadataRefreshRequested: root.act("/api/models/metadata/refresh", {})
+        onLeaveRequested: keyHandler.forceActiveFocus()
+        onDetailRevealed: control => root.revealDetail(control)
+        onDetailInspected: control => root.inspectDetail(control)
       }
 
       // ------------------------------------------------ diff viewer
-      Rectangle {
-        visible: root.diffOpen
+      DiffView {
+        id: diffView
+
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, 0.55)
-        MouseArea { anchors.fill: parent; onClicked: root.diffOpen = false }
-
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.82
-          height: parent.height * 0.82
-          radius: 6
-          color: root.surface
-          border.width: 1
-          border.color: Qt.darker(root.foreground, 3)
-          MouseArea { anchors.fill: parent }
-
-          Column {
-            anchors.fill: parent
-            anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-
-            Row {
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                width: parent.width - refreshDiffButton.width - closeDiffButton.width
-                  - parent.spacing * 2
-                anchors.verticalCenter: parent.verticalCenter
-                text: "Uncommitted diff"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-                font.bold: true
-                elide: Text.ElideRight
-              }
-              PanelButton {
-                id: refreshDiffButton
-                label: "Refresh"
-                enabled: root.engineOnline && !root.diffPending
-                onClicked: root.refreshDiff()
-              }
-              PanelButton {
-                id: closeDiffButton
-                label: "Close"
-                onClicked: root.diffOpen = false
-              }
-            }
-
-            PanelDetail {
-              visible: root.diffError !== ""
-              width: parent.width
-              originalText: root.diffError
-              metadata: "Diff error"
-              error: true
-            }
-
-            ListView {
-              id: diffList
-              width: parent.width
-              height: parent.height - y
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              model: root.diffText === "" ? [] : root.diffText.split("\n")
-
-              delegate: Text {
-                id: diffLine
-                required property string modelData
-                readonly property bool header: modelData.indexOf("@@") === 0
-                  || modelData.indexOf("diff ") === 0
-                width: diffList.width
-                text: modelData === "" ? " " : modelData
-                textFormat: Text.PlainText
-                color: header ? root.info
-                  : modelData.indexOf("+") === 0 && modelData.indexOf("+++") !== 0
-                    ? root.success
-                  : modelData.indexOf("-") === 0 && modelData.indexOf("---") !== 0
-                    ? root.urgent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(10)
-                font.bold: header
-                wrapMode: Text.WrapAnywhere
-              }
-
-              Text {
-                visible: root.diffText === "" && root.diffError === ""
-                width: parent.width
-                text: root.diffPending ? "Loading diff…" : "no uncommitted changes"
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(10)
-                wrapMode: Text.WrapAnywhere
-              }
-            }
-          }
-        }
+        open: root.diffOpen
+        engineOnline: root.engineOnline
+        pending: root.diffPending
+        diffText: root.diffText
+        errorText: root.diffError
+        foreground: root.foreground
+        mutedForeground: root.mutedForeground
+        background: root.background
+        surface: root.surface
+        accent: root.accent
+        urgent: root.urgent
+        success: root.success
+        info: root.info
+        fontFamily: root.fontFamily
+        fontSize10: root.fs(10)
+        fontSize11: root.fs(11)
+        onCloseRequested: root.diffOpen = false
+        onRefreshRequested: root.refreshDiff()
+        onLeaveRequested: keyHandler.forceActiveFocus()
+        onDetailInspected: control => root.inspectDetail(control)
       }
 
       // ------------------------------------------------ project chooser
-      Rectangle {
-        visible: root.chooserOpen
+      ProjectChooser {
+        id: projectChooser
+
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, 0.55)
-        MouseArea { anchors.fill: parent; onClicked: root.chooserOpen = false }
-
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.82
-          height: parent.height * 0.82
-          radius: 6
-          color: root.surface
-          border.width: 1
-          border.color: Qt.darker(root.foreground, 3)
-          MouseArea { anchors.fill: parent }
-
-          Column {
-            anchors.fill: parent
-            anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-
-            Row {
-              width: parent.width
-              spacing: Style.space(8)
-              Rectangle {
-                width: parent.width - closeChooserButton.width - parent.spacing
-                height: Style.space(28)
-                color: root.background
-                radius: 4
-                border.width: 1
-                border.color: filterField.activeFocus
-                  ? root.accent : Qt.darker(root.foreground, 3)
-                TextInput {
-                  id: filterField
-                  onAccepted: {
-                    chooserList.resetSelection()
-                    chooserList.activateSelection()
-                  }
-                  Keys.onPressed: event => {
-                    if (event.key === Qt.Key_F1) {
-                      root.helpOpen = true
-                      keyHandler.forceActiveFocus()
-                      event.accepted = true
-                    }
-                  }
-                  Keys.onEscapePressed: event => {
-                    keyHandler.forceActiveFocus()
-                    event.accepted = true
-                  }
-                  anchors.fill: parent
-                  anchors.margins: Style.space(6)
-                  verticalAlignment: TextInput.AlignVCenter
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(12)
-                  clip: true
-                  Text {
-                    visible: filterField.text === "" && !filterField.activeFocus
-                    text: "filter projects…"
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(12)
-                  }
-                }
-              }
-              PanelButton {
-                id: closeChooserButton
-                label: "Close"
-                onClicked: root.chooserOpen = false
-              }
-            }
-
-            ListView {
-              id: chooserList
-              width: parent.width
-              height: parent.height - y - (root.manualEntry ? Style.space(38) : 0)
-              clip: true
-              spacing: 2
-              model: root.chooserRows(root.projectsData, filterField.text)
-              currentIndex: -1
-              onModelChanged: resetSelection()
-
-              function isSelectable(row) {
-                return row && (row.kind === "local" || row.kind === "remote" || row.kind === "path")
-              }
-
-              function moveSelection(direction) {
-                const rows = model || []
-                for (let index = currentIndex + direction;
-                     index >= 0 && index < rows.length; index += direction) {
-                  if (!isSelectable(rows[index])) continue
-                  currentIndex = index
-                  positionViewAtIndex(index, ListView.Contain)
-                  return
-                }
-              }
-
-              function resetSelection() {
-                currentIndex = -1
-                moveSelection(1)
-              }
-
-              function activateSelection() {
-                const row = model && model[currentIndex]
-                if (isSelectable(row)) root.chooseRow(row)
-              }
-
-              delegate: Rectangle {
-                id: chooserRow
-                required property var modelData
-                required property int index
-                readonly property bool selectable: chooserList.isSelectable(modelData)
-                width: chooserList.width
-                height: (chooserError.visible ? chooserError.implicitHeight : rowText.implicitHeight) + Style.space(10)
-                radius: 4
-                color: selectable && (chooserRowArea.containsMouse || chooserList.currentIndex === index)
-                  ? Qt.darker(root.accent, 2.8) : "transparent"
-
-                PanelDetail {
-                  id: chooserError
-                  visible: chooserRow.modelData.kind === "note"
-                  width: parent.width - Style.space(12)
-                  x: Style.space(6)
-                  y: Style.space(5)
-                  metadata: "Project discovery error"
-                  error: true
-                  originalText: visible ? chooserRow.modelData.label : ""
-                }
-                Row {
-                  visible: !chooserError.visible
-                  anchors.verticalCenter: parent.verticalCenter
-                  x: Style.space(6)
-                  spacing: Style.space(8)
-                  Text {
-                    id: rowText
-                    text: chooserRow.modelData.kind === "local"
-                      || chooserRow.modelData.kind === "remote"
-                      ? chooserRow.modelData.name : chooserRow.modelData.label
-                    color: chooserRow.modelData.kind === "header" ? root.accent
-                      : chooserRow.modelData.kind === "local"
-                        || chooserRow.modelData.kind === "remote"
-                        ? root.foreground : root.mutedForeground
-                    font.family: root.fontFamily
-                    font.bold: chooserRow.modelData.kind === "header"
-                    font.pixelSize: root.fs(
-                      chooserRow.modelData.kind === "note" ? 10 : 12)
-                  }
-                  Text {
-                    visible: chooserRow.modelData.kind === "local"
-                    text: chooserRow.modelData.path || ""
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(10)
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                  Text {
-                    visible: chooserRow.modelData.kind === "remote"
-                    text: (chooserRow.modelData.isPrivate ? "private · " : "")
-                      + (chooserRow.modelData.cloned ? "cloned" : "will clone")
-                    color: chooserRow.modelData.cloned
-                      ? root.success : root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(10)
-                    anchors.verticalCenter: parent.verticalCenter
-                  }
-                }
-                MouseArea {
-                  id: chooserRowArea
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  enabled: chooserRow.selectable
-                  onClicked: root.chooseRow(chooserRow.modelData)
-                }
-              }
-            }
-
-            Row {
-              id: manualRow
-              visible: root.manualEntry
-              width: parent.width
-              spacing: Style.space(8)
-              Rectangle {
-                width: parent.width - manualSetButton.width - parent.spacing
-                height: Style.space(28)
-                color: root.background
-                radius: 4
-                border.width: 1
-                border.color: manualField.activeFocus
-                  ? root.accent : Qt.darker(root.foreground, 3)
-                TextInput {
-                  id: manualField
-                  onAccepted: manualSetButton.clicked()
-                  Keys.onPressed: event => {
-                    if (event.key === Qt.Key_F1) {
-                      root.helpOpen = true
-                      keyHandler.forceActiveFocus()
-                      event.accepted = true
-                    }
-                  }
-                  Keys.onEscapePressed: event => {
-                    keyHandler.forceActiveFocus()
-                    event.accepted = true
-                  }
-                  anchors.fill: parent
-                  anchors.margins: Style.space(6)
-                  verticalAlignment: TextInput.AlignVCenter
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(12)
-                  clip: true
-                }
-              }
-              PanelButton {
-                id: manualSetButton
-                label: "Set"
-                onClicked: {
-                  root.act("/api/project", { path: manualField.text })
-                  root.chooserOpen = false
-                }
-              }
-            }
-          }
+        open: root.chooserOpen
+        manualEntry: root.manualEntry
+        rowsForFilter: filter => root.chooserRows(root.projectsData, filter)
+        foreground: root.foreground
+        mutedForeground: root.mutedForeground
+        background: root.background
+        surface: root.surface
+        accent: root.accent
+        urgent: root.urgent
+        success: root.success
+        fontFamily: root.fontFamily
+        fontSize10: root.fs(10)
+        fontSize11: root.fs(11)
+        fontSize12: root.fs(12)
+        onCloseRequested: root.chooserOpen = false
+        onRowChosen: row => root.chooseRow(row)
+        onManualPathRequested: path => {
+          root.act("/api/project", {path: path})
+          root.chooserOpen = false
         }
+        onHelpRequested: root.helpOpen = true
+        onLeaveRequested: keyHandler.forceActiveFocus()
+        onDetailInspected: control => root.inspectDetail(control)
       }
 
       // ------------------------------------------------ keyboard help
@@ -3807,92 +2659,7 @@ Item {
     }
   }
 
-  component PlanEditField: Column {
-    id: editField
-    required property string label
-    required property string value
-    property bool multiline: false
-    signal edited(string value)
-    spacing: Style.space(3)
-    enabled: !root.editPending
 
-    function focusField() { field.forceActiveFocus() }
-
-    Text {
-      text: editField.label
-      color: root.mutedForeground
-      font.family: root.fontFamily
-      font.pixelSize: root.fs(11)
-    }
-    Rectangle {
-      width: parent.width
-      height: Math.min(Math.max(Style.space(editField.multiline ? 48 : 26),
-        field.contentHeight + Style.space(12)), Style.space(editField.multiline ? 96 : 26))
-      color: root.background
-      radius: 4
-      border.width: 1
-      border.color: field.activeFocus ? root.accent : Qt.darker(root.foreground, 3)
-      Flickable {
-        id: fieldFlick
-        anchors.fill: parent
-        anchors.margins: Style.space(6)
-        clip: true
-        contentWidth: field.width
-        contentHeight: field.height
-        flickableDirection: Flickable.VerticalFlick
-        boundsBehavior: Flickable.StopAtBounds
-
-        function ensureCursorVisible() {
-          if (!field.activeFocus) return
-          const cursor = field.cursorRectangle
-          if (contentY > cursor.y) contentY = cursor.y
-          else if (contentY + height < cursor.y + cursor.height)
-            contentY = cursor.y + cursor.height - height
-          contentY = Math.max(0, Math.min(contentY, contentHeight - height))
-          // Keep the active field visible even when its stage exceeds the viewport.
-          const top = editField.mapToItem(stageList.contentItem, 0, 0).y
-          if (top < stageList.contentY) stageList.contentY = top
-          else if (top + editField.height > stageList.contentY + stageList.height)
-            stageList.contentY = top + editField.height - stageList.height
-        }
-        onHeightChanged: Qt.callLater(ensureCursorVisible)
-        TextEdit {
-          id: field
-          width: fieldFlick.width
-          height: Math.max(contentHeight, fieldFlick.height)
-          text: editField.value
-          textFormat: TextEdit.PlainText
-          wrapMode: TextEdit.Wrap
-          selectByMouse: true
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: root.fs(12)
-          onTextChanged: if (activeFocus) editField.edited(text)
-          onActiveFocusChanged: {
-            if (activeFocus) {
-              root.editFocusedField = field
-              fieldFlick.ensureCursorVisible()
-            } else if (root.editFocusedField === field) root.editFocusedField = null
-          }
-          onCursorRectangleChanged: fieldFlick.ensureCursorVisible()
-          Keys.onPressed: event => {
-            if (event.key === Qt.Key_F1) {
-              root.helpOpen = true
-              keyHandler.forceActiveFocus()
-              event.accepted = true
-            } else if (!editField.multiline
-                       && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) {
-              event.accepted = true
-            }
-          }
-          Keys.onEscapePressed: event => {
-            keyHandler.forceActiveFocus()
-            event.accepted = true
-          }
-        }
-      }
-    }
-  }
 
   component CadenceButton: PanelButton {
     id: cadenceButton

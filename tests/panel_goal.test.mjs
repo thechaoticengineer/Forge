@@ -16,12 +16,13 @@ const plain = value => JSON.parse(JSON.stringify(value));
 
 function fixture() {
   const view = () => ({ resetView(){}, positionViewAtBeginning(){} });
+  const liveOutput=view(), historyList=view(), reportList=view();
   const ctx = { ...defaults, goalField: {text: '  rough\nidea  '}, projectViewRevision: 1,
     engineState: {project: '/a'}, lastProject: '/a', engineOnline: true, busy: false,
     editingPlan: false, revisePending: false, localError: '', calls: [], goalDrafts: {},
     feedbackField: {text: ''}, questionField: {text: ''}, chatList: {}, goalFlick: {},
-    liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput: view(),
-    historyList: view(), reportList: view(), logFeed: {},
+    liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
+    historyList, reportList, agentOutput:{liveOutput,historyList,reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
     cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){}, refreshAgentLog(){} };
   ctx.root = ctx;
