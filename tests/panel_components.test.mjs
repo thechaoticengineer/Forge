@@ -44,3 +44,11 @@ test('moved views reuse shared prose and detail components', () => {
   assert.match(output, /ReportsView \{/);
   assert.match(reports, /component ViewFields: DetailFields/);
 });
+
+test('root and extracted views share one button implementation', () => {
+  const button = read('PanelViewButton.qml');
+  assert.match(panel, /component PanelButton: PanelViewButton/);
+  assert.doesNotMatch(panel, /component PanelButton: Rectangle/);
+  assert.match(button, /property bool enabled: true/);
+  assert.match(button, /enabled: button\.enabled/);
+});

@@ -11,6 +11,11 @@ function formatTokens(value) {
     return String(count)
 }
 
+function reportDuration(seconds) {
+    const count = nonNegativeInt(seconds)
+    return count === null ? "—" : Math.floor(count / 60) + "m " + (count % 60) + "s"
+}
+
 function usageTools(usage) {
     return usage && typeof usage === "object" ? Object.keys(usage).sort().filter(function(tool) {
         return usage[tool] && typeof usage[tool] === "object"
@@ -48,6 +53,7 @@ function modelSummary(models) {
 }
 
 function exactTokens(value) {
+    // Keep exact counts in details; only the summary and model list are compact.
     const count = nonNegativeInt(value)
     return count === null ? "—" : String(count)
 }

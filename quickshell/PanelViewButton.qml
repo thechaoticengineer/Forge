@@ -7,6 +7,9 @@ Rectangle {
 
   property string label: ""
   property bool primary: false
+  // Deliberately shadow Item.enabled: disabled controls keep their current
+  // focus so keyboard escape routing continues to work while activation is gated.
+  property bool enabled: true
   required property color foreground
   required property color background
   required property color surface

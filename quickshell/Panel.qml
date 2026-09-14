@@ -2679,40 +2679,12 @@ Item {
     }
   }
 
-  component PanelButton: Rectangle {
-    id: button
-    property string label: ""
-    property bool primary: false
-    property bool enabled: true
-    property color labelColor: primary && enabled ? root.background : root.foreground
-    signal clicked()
-
-    implicitWidth: buttonText.implicitWidth + Style.space(18)
-    width: implicitWidth
-    height: buttonText.implicitHeight + Style.space(10)
-    radius: 4
-    color: button.primary && button.enabled ? root.accent : root.surface
-    border.width: button.primary && button.enabled ? 0 : 1
-    border.color: Qt.darker(root.foreground, 3)
-    opacity: button.enabled ? (buttonArea.containsMouse ? 0.85 : 1.0) : 0.45
-
-    Text {
-      id: buttonText
-      anchors.centerIn: parent
-      width: Math.max(0, button.width - Style.space(18))
-      text: button.label
-      textFormat: Text.PlainText
-      elide: Text.ElideRight
-      color: button.labelColor
-      font.family: root.fontFamily
-      font.pixelSize: root.fs(11)
-    }
-    MouseArea {
-      id: buttonArea
-      anchors.fill: parent
-      hoverEnabled: true
-      enabled: button.enabled
-      onClicked: button.clicked()
-    }
+  component PanelButton: PanelViewButton {
+    foreground: root.foreground
+    background: root.background
+    surface: root.surface
+    accent: root.accent
+    fontFamily: root.fontFamily
+    fontSize: root.fs(11)
   }
 }

@@ -175,6 +175,7 @@ pub(super) fn api_settings(app: &App, body: &Value) -> ApiResponse {
             json!({"error":"increment policy_revision when changing the model catalogue policy"}),
         );
     }
+    // Validate effort overrides against known provider evidence before accepting policy.
     if candidate["model_catalogue"] != settings["model_catalogue"] {
         for e in &policy.entries {
             if e.execution_effort() != "provider_default" {
@@ -193,6 +194,8 @@ pub(super) fn api_settings(app: &App, body: &Value) -> ApiResponse {
             != settings["model_catalogue"]["claude_scope"]
         || candidate["model_catalogue"]["claude_bridge"]
             != settings["model_catalogue"]["claude_bridge"];
+    // A single authoritative file commits role settings and model policy together.
+    // The legacy policy-only path remains available to embedded callers.
     if let Some(path) = &app.settings_path {
         if let Err(error) = crate::engine_settings::save(path, &candidate) {
             return (500, json!({"error":error}));
@@ -301,12 +304,18 @@ pub(super) fn api_self_update(app: &App, ctx: &Ctx) -> ApiResponse {
     if !script.is_file() {
         return (400, json!({"error": format!("no install.sh in {repo}")}));
     }
+    // install.sh restarts this service, so a plain child process would be
+    // killed with us mid-update; a transient unit detaches it. The fixed
+    // unit name also rejects a second update while one is running.
     let out = Command::new("systemd-run")
         .args(["--user", "--collect", "--unit", "forge-update", "bash"])
         .arg(&script)
         .output();
     match out {
         Ok(o) if o.status.success() => {
+            // The confirmation event has to outlive the engine restart
+            // install.sh performs, so leave a marker that the next boot
+            // turns into a "self-update finished" feed event.
             ctx.ensure_forge_dir();
             let _ = fs::write(
                 ctx.forge_path("update-pending"),

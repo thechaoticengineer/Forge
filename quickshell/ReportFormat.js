@@ -69,13 +69,9 @@ function reportTime(report, now) {
     return Math.floor(seconds / 86400) + "d ago"
 }
 
-function reportDuration(seconds) {
-    const count = typeof seconds === "number" && isFinite(seconds) && seconds >= 0 ? Math.floor(seconds) : null
-    return count === null ? "—" : Math.floor(count / 60) + "m " + (count % 60) + "s"
-}
-
 function reportCommits(commits) {
     const lines = []
+    // ListView can expose nested arrays as QML sequences, for which isArray is false.
     if (commits && typeof commits.length === "number") {
         for (let i = 0; i < commits.length; i++) {
             const commit = commits[i]

@@ -235,6 +235,7 @@ pub(super) fn api_stop(ctx: &Ctx) -> ApiResponse {
     let _queue_guard = ctx.session.queue_lock.lock().unwrap();
     ctx.session.stop_requested.store(true, Ordering::SeqCst);
     ctx.session.queue_active.store(false, Ordering::SeqCst);
+    // No worker remains to transition a plan paused for approval.
     let mut queue = ctx.load_queue();
     let awaiting: Vec<u64> = queue["items"]
         .as_array()

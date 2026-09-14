@@ -17,6 +17,8 @@ use super::test_support::*;
         assert_eq!(super::prompt_checkpoint(&json!({"summary": "only"})), json!({"summary": "only"}));
     }
 
+    /// The validator accepts 16 decisions of 1 KiB summary, 4 KiB rationale and
+    /// 8 alternatives of 1 KiB each. Storage has to accept the same turn.
     #[test]
     fn a_maximal_legal_architect_turn_fits_in_one_event() {
         let temp = Temp::new();
@@ -316,4 +318,3 @@ use super::test_support::*;
         assert_eq!(store.checkpoint(&saved).unwrap(),cp);
         assert_eq!(store.load().unwrap().unwrap(),saved);
     }
-

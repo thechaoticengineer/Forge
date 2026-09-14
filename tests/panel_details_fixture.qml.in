@@ -159,8 +159,14 @@ Item {
             compare(root.settingsPatch.review_cadence.reviewer,"per_stage")
             keyClick(Qt.Key_Enter);compare(root.actions,3)
             keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
+            root.engineOnline=false;wait(20)
+            verify(!reviewer.activeFocusOnTab)
+            verify(!architect.activeFocusOnTab)
+            reviewer.forceActiveFocus();verify(reviewer.activeFocus,
+                "disabled cadence remains focusable for Escape routing")
+            keyClick(Qt.Key_Enter);compare(root.actions,3)
+            keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
             root.engineState=null;wait(20);verify(architect.label.indexOf("unavailable")>0)
-            root.engineOnline=false;wait(20);verify(!architect.activeFocusOnTab)
             root.engineOnline=true
         }
         function test_plan_review_full_requests_data() {

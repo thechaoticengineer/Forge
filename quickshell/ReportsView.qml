@@ -44,6 +44,8 @@ ListView {
   spacing: Style.space(6)
   boundsBehavior: Flickable.StopAtBounds
   model: reportEntries
+  // Retain lightweight headers and inspected editors while scrolling.
+  // Unopened report detail trees are created lazily below.
   cacheBuffer: contentHeight
   property real readingY: 0
   property string readingKey: ""
@@ -146,7 +148,7 @@ ListView {
 
       Text {
         width: parent.width
-        text: ReportFormat.reportTime(reportRow.modelData, reportList.now) + " · " + ReportFormat.reportDuration(reportRow.modelData.duration_secs) + " · " + reportRow.commitCount + (reportRow.commitCount === 1 ? " commit" : " commits")
+        text: ReportFormat.reportTime(reportRow.modelData, reportList.now) + " · " + UsageFormat.reportDuration(reportRow.modelData.duration_secs) + " · " + reportRow.commitCount + (reportRow.commitCount === 1 ? " commit" : " commits")
         textFormat: Text.PlainText
         color: reportList.mutedForeground
         wrapMode: Text.Wrap

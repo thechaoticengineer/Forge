@@ -115,6 +115,10 @@ with tempfile.TemporaryDirectory(prefix='forge-panel-details-') as directory:
     for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'PlanReview.js',
                  'ModelRouting.js', 'ReportFormat.js', 'UsageFormat.js', 'CataloguePresentation.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
+    button = (repo / 'quickshell' / 'PanelViewButton.qml').read_text()
+    button = button.replace('import qs.Commons\n', '')
+    button = button.replace('Style.space(18)', '18').replace('Style.space(10)', '10')
+    (path / 'components' / 'PanelViewButton.qml').write_text(button)
     (path / 'tst_panel.qml').write_text(fixture)
     runtime = path / 'runtime'
     runtime.mkdir(mode=0o700)

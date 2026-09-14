@@ -3,6 +3,7 @@ function appendField(fields, label, text) {
     if (text !== undefined && text !== null && text !== "") fields.push({label: label, text: String(text)})
 }
 
+// Status and prose are separate in stage cards and archived reports.
 function stageModelText(stage, detail) {
     return stageModelStatus(stage) + "\n" + stageModelDetails(stage, detail).map(function(field) {
         return field.label + ": " + field.text

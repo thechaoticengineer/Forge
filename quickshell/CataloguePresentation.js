@@ -18,6 +18,9 @@ function catalogueStamp(unix) {
     return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z"
 }
 
+// Official metadata is descriptive only: freshness/provenance for routing
+// context. Pricing appears only as a labelled API list rate, never as an
+// inferred subscription charge or a configured preference.
 function catalogueMetadataText(record) {
     const pricing = record.pricing
         ? record.pricing.label + " " + record.pricing.input + "/" + record.pricing.output
