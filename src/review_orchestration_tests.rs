@@ -1,97 +1,5 @@
 use super::*;
-use crate::app::App;
-use std::sync::Arc;
-
-struct Fixture {
-    root: PathBuf,
-    ctx: Ctx,
-}
-impl Fixture {
-    fn new(intent: &str, budget: u64) -> Self {
-        Self::with_ignored_runtime(intent, budget, false)
-    }
-    fn with_ignored_runtime(intent: &str, budget: u64, ignored: bool) -> Self {
-        let mut settings = crate::plan::default_settings();
-        settings["review_cadence"] = json!({"architect":"per_stage","reviewer":"per_stage"});
-        Self::with_settings(intent, budget, ignored, settings)
-    }
-    fn with_settings(intent: &str, budget: u64, ignored: bool, mut settings: Value) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "forge-gate-test-{}",
-            crate::architecture::identity()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        for role in ["planner", "architect", "implementer", "reviewer"] {
-            settings[role] = json!("mock");
-        }
-        settings["auto_push"] = json!(false);
-        settings["max_fix_rounds"] = json!(budget);
-        let app = Arc::new(App::new(root.to_str().unwrap(), settings));
-        let ctx = app.context(root.to_str().unwrap());
-        ctx.git(&["init", "-q"]).unwrap();
-        ctx.git(&["config", "user.name", "Test"]).unwrap();
-        ctx.git(&["config", "user.email", "test@example.invalid"])
-            .unwrap();
-        ctx.git(&["config", "commit.gpgsign", "false"]).unwrap();
-        fs::write(root.join("README.md"), "The program prints a greeting.\n").unwrap();
-        ctx.git(&["add", "README.md"]).unwrap();
-        if ignored {
-            fs::write(root.join(".gitignore"), ".forge/\n").unwrap();
-            ctx.git(&["add", ".gitignore"]).unwrap();
-        }
-        ctx.git(&["commit", "-qm", "initial"]).unwrap();
-        ctx.ensure_forge_dir();
-        ctx.publish_plan(&json!({"goal":"Improve the project","status":"ready","stages":[{"id":1,"title":intent,"instructions":intent,"acceptance":"The requested change works.","commit":"feat: stage","status":"pending","rounds":0}]}), true).unwrap();
-        Self { root, ctx }
-    }
-    fn setting(&self, key: &str, v: Value) {
-        self.ctx.app.settings.lock().unwrap()[key] = v;
-    }
-    fn plan(&self) -> Value {
-        self.ctx.load_plan().unwrap()
-    }
-    fn run(&self) -> Value {
-        self.ctx.run_worker();
-        self.plan()
-    }
-    fn count(&self, role: &str) -> usize {
-        self.ctx.app.settings.lock().unwrap()[format!("mock_{role}_prompts")]
-            .as_array()
-            .map_or(0, |prompts| prompts.iter().filter(|p| !p.as_str().unwrap_or("").contains("\"scope\":\"plan\"")).count())
-    }
-    fn docs(&self) {
-        self.setting(
-            "mock_edits",
-            json!([{"README.md":"The program prints a friendly greeting.\n"}]),
-        );
-    }
-    fn reviewed(&self) -> Value {
-        let p = self.plan();
-        let mut p = self
-            .ctx
-            .architect_publish(p.clone(), Some(&p), "test")
-            .unwrap();
-        p["stages"][0]["attempt_id"] = json!(crate::architecture::identity());
-        p["stages"][0]["review_budget"] = json!(0);
-        self.ctx.save_plan(&p).unwrap();
-        assert_eq!(self.ctx.run_review_stage(&mut p, 0).unwrap(), "approved");
-        p
-    }
-    fn assert_no_commit(&self) {
-        assert_eq!(self.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "1");
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-fn reject(text: &str) -> Value {
-    json!({"approved":false,"issues":[text]})
-}
-fn clean() -> Value {
-    json!({"approved":true,"issues":[]})
-}
+use super::test_support::*;
 
 #[test]
 fn review_response_corrections_do_not_repeat_implementation_or_spend_fix_rounds() {
@@ -162,148 +70,6 @@ fn unexplained_review_rejection_is_corrected_without_inventing_issues_or_repeati
 }
 
 #[test]
-fn stages_review_and_commit_with_ignored_or_unignored_runtime() {
-    for ignored in [true, false] {
-        for code in [false, true] {
-            let f = Fixture::with_ignored_runtime(
-                if code {
-                    "Implement feature"
-                } else {
-                    "Fix prose spelling"
-                },
-                0,
-                ignored,
-            );
-            if code {
-                f.setting("mock_edits", json!([{"new.rs":"fn main() {}\n"}]));
-            } else {
-                f.docs();
-            }
-            let p = f.run();
-            let stage = &p["stages"][0];
-            assert_eq!(
-                stage["status"], "committed",
-                "ignored={ignored}, code={code}: {p}"
-            );
-            assert_eq!(stage["review_gate"]["status"], "approved");
-            assert_eq!(f.count("reviewer"), 1);
-            assert_eq!(f.count("architect"), usize::from(code));
-            assert_eq!(f.count("fixer"), 0);
-            assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
-            assert_eq!(
-                f.ctx.git(&["rev-parse", "HEAD^{tree}"]).unwrap(),
-                stage["review_gate"]["identity"]["snapshot"]["tree"]
-            );
-            assert!(
-                f.ctx
-                    .git(&["ls-tree", "-r", "--name-only", "HEAD", "--", ".forge"])
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(f.ctx.git(&["ls-files", "--", ".forge"]).unwrap().is_empty());
-            assert!(f.ctx.git(&["diff", "HEAD", "--", "."]).unwrap().is_empty());
-        }
-    }
-}
-
-#[test]
-fn ordinary_documentation_needs_one_fresh_independent_and_records_not_required_outcome() {
-    let f = Fixture::new("Fix prose spelling in documentation", 0);
-    f.docs();
-    let p = f.run();
-    let stage = &p["stages"][0];
-    assert_eq!(stage["status"], "committed");
-    assert_eq!(f.count("reviewer"), 1);
-    assert_eq!(f.count("architect"), 0);
-    assert_eq!(f.count("fixer"), 0);
-    assert_eq!(stage["review_gate"]["roles"]["architect"], "not_required");
-    assert_eq!(stage["reviews"].as_array().unwrap().len(), 1);
-    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
-    assert_eq!(
-        cp["execution_outcomes"][0]["review_gate"]["roles"]["architect"],
-        "not_required"
-    );
-    assert_eq!(
-        f.ctx.app.settings.lock().unwrap()["mock_architect_requests"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-}
-#[test]
-fn code_mixed_contracts_markdown_and_uncertain_intent_require_both() {
-    for (intent, edits) in [
-        ("Implement feature", json!({"new.rs":"fn main() {}"})),
-        (
-            "Fix prose spelling",
-            json!({"new.rs":"fn main() {}","README.md":"A friendly greeting.\n"}),
-        ),
-        (
-            "Fix prose spelling",
-            json!({"README.md":"The API must return a greeting.\n"}),
-        ),
-        (
-            "Fix prose spelling",
-            json!({"README.md":"Example:\n```sh\n./app\n```\n"}),
-        ),
-        (
-            "Change configuration",
-            json!({"README.md":"The program prints greetings.\n"}),
-        ),
-    ] {
-        let f = Fixture::new(intent, 0);
-        f.setting("mock_edits", json!([edits]));
-        let p = f.run();
-        assert_eq!(p["stages"][0]["status"], "committed", "{p}");
-        assert_eq!(f.count("architect"), 1);
-        assert_eq!(f.count("reviewer"), 1);
-        assert_eq!(f.count("fixer"), 0);
-        let reviews = p["stages"][0]["reviews"].as_array().unwrap();
-        assert_eq!(
-            reviews[0]["identity"]["snapshot"],
-            reviews[1]["identity"]["snapshot"]
-        );
-    }
-}
-#[test]
-fn independent_promotion_rebinds_both_verdicts_and_keeps_history() {
-    let f = Fixture::new("Fix prose spelling", 0);
-    f.docs();
-    f.setting("mock_verdicts", json!([{"approved":true,"issues":[],"requires_dual":true,"scope_reason":"Behavioral guarantee found"},clean()]));
-    let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "committed");
-    assert_eq!(f.count("reviewer"), 2);
-    assert_eq!(f.count("architect"), 1);
-    assert_eq!(p["stages"][0]["reviews"].as_array().unwrap().len(), 3);
-    assert_eq!(
-        p["stages"][0]["reviews"][0]["policy"]["scope"],
-        "ordinary_documentation"
-    );
-    assert_eq!(p["stages"][0]["dual_promoted"], true);
-}
-#[test]
-fn scope_changing_fix_promotes_and_promotion_is_sticky() {
-    let f = Fixture::new("Fix prose spelling", 2);
-    f.setting("mock_edits", json!([{"README.md":"A friendly greeting.\n"},{"README.md":"The API must greet.\n"},{"README.md":"A friendly greeting again.\n"}]));
-    f.setting(
-        "mock_verdicts",
-        json!([
-            reject("Improve explanation"),
-            reject("Correct regression"),
-            clean()
-        ]),
-    );
-    let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "committed");
-    assert_eq!(f.count("reviewer"), 3);
-    assert_eq!(f.count("architect"), 2);
-    assert_eq!(
-        p["stages"][0]["review_gate"]["policy"]["scope"],
-        "code_or_contract"
-    );
-}
-#[test]
 fn either_role_can_block_and_all_required_roles_repeat_after_fixes() {
     for role in ["architect", "reviewer"] {
         let f = Fixture::new("Implement feature", 1);
@@ -328,83 +94,7 @@ fn either_role_can_block_and_all_required_roles_repeat_after_fixes() {
         );
     }
 }
-#[test]
-fn combined_conflicting_requests_get_clarification_without_losing_authority() {
-    let f = Fixture::new("Implement feature", 1);
-    f.setting("mock_verdicts", json!([reject("Use format A"), clean()]));
-    f.setting("mock_architect_verdicts", json!([{"approved":false,"issues":["Use format B"],"architecture_context_gap":"A and B conflict; establish compatibility"}, clean()]));
-    let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "committed");
-    let settings = f.ctx.app.settings.lock().unwrap();
-    let prompt = settings["mock_fixer_prompts"][0].as_str().unwrap();
-    assert!(prompt.contains("[architect] Use format B"));
-    assert!(prompt.contains("[reviewer] Use format A"));
-    let turns = settings["mock_architect_requests"].as_array().unwrap();
-    assert_eq!(turns.len(), 2);
-    assert!(
-        turns[1]["prompt"]
-            .as_str()
-            .unwrap()
-            .contains("A and B conflict")
-    );
-    assert!(
-        settings["mock_architect_prompts"][0]
-            .as_str()
-            .unwrap()
-            .contains("Use format A")
-    );
-}
-#[test]
-fn legacy_notes_are_requests_and_new_defects_on_rereview_block() {
-    let f = Fixture::new("Implement feature", 2);
-    f.setting("mock_verdicts", json!([{"approved":true,"issues":[],"notes":["Legacy edit"]},reject("New regression"),clean()]));
-    let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "committed");
-    assert_eq!(f.count("fixer"), 2);
-    let settings = f.ctx.app.settings.lock().unwrap();
-    assert!(
-        settings["mock_fixer_prompts"][0]
-            .as_str()
-            .unwrap()
-            .contains("Legacy edit")
-    );
-    assert!(
-        settings["mock_fixer_prompts"][1]
-            .as_str()
-            .unwrap()
-            .contains("New regression")
-    );
-    assert!(
-        !settings["mock_fixer_prompts"][1]
-            .as_str()
-            .unwrap()
-            .contains("Legacy edit")
-    );
-}
-#[test]
-fn stale_malformed_contradictory_or_unevidenced_verdicts_never_commit() {
-    for bad in [
-        json!("garbage"),
-        json!({"identity":{},"approved":true,"issues":[]}),
-        json!({"approved":true,"issues":["fix"]}),
-        json!({"approved":true,"issues":[],"checks":[null]}),
-        json!({"approved":true,"issues":[],"checks":[]}),
-        json!({"approved":true,"issues":[],"project_checks":[]}),
-        json!({"approved":true,"issues":[],"acceptance_evidence":{"verified":true}}),
-        json!({"approved":true,"issues":[],"summary":""}),
-    ] {
-        let f = Fixture::new("Implement feature", 0);
-        f.setting("mock_verdicts", json!(vec![bad; 4]));
-        fs::write(f.ctx.forge_path("verdict.json"), clean().to_string()).unwrap();
-        let p = f.run();
-        f.assert_no_commit();
-        assert_eq!(p["stages"][0]["review_gate"]["status"], "error");
-        assert_eq!(p["stages"][0]["status"], "blocked");
-        assert!(p["stages"][0]["finished_unix"].as_i64().is_some());
-        assert!(p["stages"][0]["duration_secs"].as_i64().is_some());
-        assert!(!f.ctx.forge_path("verdict.json").exists());
-    }
-}
+
 #[test]
 fn partial_pair_failure_retains_history_but_never_reuses_approval_or_budget() {
     let f = Fixture::new("Implement feature", 1);
@@ -429,6 +119,7 @@ fn partial_pair_failure_retains_history_but_never_reuses_approval_or_budget() {
     assert_eq!(p["stages"][0]["status"], "blocked");
     assert_eq!(f.count("reviewer"), 1);
 }
+
 #[test]
 fn zero_and_nonzero_budgets_stay_exhausted_across_process_reconstruction() {
     for budget in [0, 1, 2] {
@@ -457,6 +148,7 @@ fn zero_and_nonzero_budgets_stay_exhausted_across_process_reconstruction() {
         );
     }
 }
+
 #[test]
 fn stop_during_review_consumes_round_and_invalidates_current_gate() {
     let f = Fixture::new("Implement feature", 1);
@@ -469,6 +161,7 @@ fn stop_during_review_consumes_round_and_invalidates_current_gate() {
     assert_eq!(p["stages"][0]["rounds"], 2);
     assert_eq!(f.count("reviewer"), 2);
 }
+
 #[test]
 fn mutations_during_review_or_before_commit_invalidate_snapshot() {
     for during in [true, false] {
@@ -506,6 +199,7 @@ fn mutations_during_review_or_before_commit_invalidate_snapshot() {
         }
     }
 }
+
 #[test]
 fn final_staging_preserves_partial_index_untracked_and_deletion_content() {
     let f = Fixture::new("Implement feature", 0);
@@ -537,16 +231,7 @@ fn final_staging_preserves_partial_index_untracked_and_deletion_content() {
             .is_some()
     );
 }
-#[test]
-fn missing_current_role_or_changed_identity_cannot_commit() {
-    for field in ["revision", "attempt_id", "round", "policy", "snapshot"] {
-        let f = Fixture::new("Implement feature", 0);
-        let mut p = f.reviewed();
-        p["stages"][0]["reviews"][1]["identity"][field] = json!("wrong");
-        assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err());
-        f.assert_no_commit();
-    }
-}
+
 #[test]
 fn reviewer_provider_is_opposite_and_known_unavailability_blocks() {
     let f = Fixture::new("Implement feature", 0);
@@ -572,6 +257,7 @@ fn reviewer_provider_is_opposite_and_known_unavailability_blocks() {
         assert!(f.ctx.reviewer_config(implementer).is_err());
     }
 }
+
 #[test]
 fn reviewers_verify_project_checks_without_engine_command_name_matching() {
     for intent in ["Fix prose spelling", "Implement feature"] {
@@ -605,16 +291,6 @@ fn reviewers_verify_project_checks_without_engine_command_name_matching() {
 }
 
 #[test]
-fn full_diff_classification_includes_index_content_overwritten_in_worktree() {
-    let f = Fixture::new("Fix prose spelling", 0);
-    fs::write(f.root.join("README.md"), "The API must remain stable.\n").unwrap();
-    f.ctx.git(&["add", "README.md"]).unwrap();
-    f.docs();
-    let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "committed");
-    assert_eq!(f.count("architect"), 1);
-}
-#[test]
 fn partial_rejection_failure_retains_requests_for_the_next_fixer() {
     let f = Fixture::new("Implement feature", 1);
     f.setting(
@@ -632,59 +308,7 @@ fn partial_rejection_failure_retains_requests_for_the_next_fixer() {
             .contains("[reviewer] Keep this unresolved finding")
     );
 }
-#[test]
-fn criterion_evidence_is_complete_and_prompts_preserve_literal_inputs() {
-    let f = Fixture::new("Implement {goal} feature", 0);
-    let mut p = f.plan();
-    p["stages"][0]["acceptance"] = json!("First {verdict_path}\nSecond {review_context}");
-    f.ctx.save_plan(&p).unwrap();
-    f.setting("mock_verdicts",json!(vec![json!({"approved":true,"issues":[],"criteria":[{"criterion":"First {verdict_path}","status":"passed","evidence":"One check"}]}); 4]));
-    f.run();
-    f.assert_no_commit();
-    let settings = f.ctx.app.settings.lock().unwrap();
-    let prompt = settings["mock_reviewer_prompts"][0].as_str().unwrap();
-    assert!(prompt.contains("Implement {goal} feature"));
-    assert!(prompt.contains("First {verdict_path}"));
-    assert!(prompt.contains("Second {review_context}"));
-}
-#[test]
-fn runtime_artifacts_do_not_change_snapshot_and_verdict_identity_fields_are_exact() {
-    let f = Fixture::new("Implement feature", 0);
-    let p = f.reviewed();
-    let identity: Value = serde_json::from_slice(&fs::read(f.ctx.forge_path("review-identity.json")).unwrap()).unwrap();
-    assert_eq!(identity, p["stages"][0]["reviews"].as_array().unwrap().last().unwrap()["identity"]);
-    for role in ["reviewer", "architect"] {
-        let settings = f.ctx.app.settings.lock().unwrap();
-        let prompt = settings[format!("mock_{role}_prompts")][0].as_str().unwrap();
-        assert!(prompt.contains(".forge/review-identity.json"));
-        assert!(prompt.contains("Do not manually transcribe hashes"));
-    }
-    let before = snapshot(f.ctx.project()).unwrap();
-    fs::write(f.ctx.forge_path("unrelated-runtime.json"), "{}").unwrap();
-    assert_eq!(snapshot(f.ctx.project()).unwrap(), before);
-    let record = &p["stages"][0]["reviews"][0];
-    for field in [
-        "plan_id",
-        "revision",
-        "stage_id",
-        "attempt_id",
-        "round",
-        "role",
-        "policy",
-        "snapshot",
-    ] {
-        let mut bad = record.clone();
-        bad["identity"][field] = json!("wrong");
-        assert!(
-            normalize(
-                &bad.to_string(),
-                &record["identity"],
-                "The requested change works."
-            )
-            .is_err()
-        );
-    }
-}
+
 #[test]
 fn reviewer_cli_is_fresh_and_architect_review_resumes_with_scoped_tools() {
     for provider in ["codex", "claude"] {
@@ -724,6 +348,7 @@ fn reviewer_cli_is_fresh_and_architect_review_resumes_with_scoped_tools() {
         }
     }
 }
+
 #[test]
 fn review_sandbox_denies_repository_git_and_runtime_writes_but_allows_scratch_checks() {
     let f = Fixture::new("Implement feature", 0);
@@ -744,84 +369,6 @@ fn review_sandbox_denies_repository_git_and_runtime_writes_but_allows_scratch_ch
         fs::read_to_string(f.root.join("README.md")).unwrap(),
         "The program prints a greeting.\n"
     );
-}
-
-#[test]
-fn documentation_exhaustion_and_restart_keep_architect_not_required() {
-    let f = Fixture::new("Fix prose spelling", 0);
-    f.docs();
-    f.setting("mock_verdicts", json!([reject("Unresolved prose issue")]));
-    f.run();
-    let p = f.run();
-    f.assert_no_commit();
-    assert_eq!(
-        p["stages"][0]["review_gate"]["roles"]["architect"],
-        "not_required"
-    );
-    assert_eq!(f.count("architect"), 0);
-}
-#[test]
-fn duplicate_keys_and_tampered_evidence_cannot_authorize_commit() {
-    let f = Fixture::new("Implement feature", 0);
-    let mut p = f.reviewed();
-    let record = &p["stages"][0]["reviews"][0];
-    let duplicate = record.to_string().replacen(
-        "\"approved\":true",
-        "\"approved\":false,\"approved\":true",
-        1,
-    );
-    assert!(
-        normalize(
-            &duplicate,
-            &record["identity"],
-            "The requested change works."
-        )
-        .is_err()
-    );
-    p["stages"][0]["reviews"][1]["criteria"] = json!([]);
-    assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err());
-    f.assert_no_commit();
-}
-
-#[test]
-fn verdict_presentation_wrappers_preserve_validation() {
-    let f = Fixture::new("Implement feature", 0);
-    let p = f.reviewed();
-    let record = &p["stages"][0]["reviews"][0];
-    let raw = record.to_string();
-    let preamble = "All checks pass. Shared fixtures use `crate::test_support` as intended.";
-    let parse = |output: &str| normalize(output, &record["identity"], "The requested change works.");
-    for wrapped in [
-        format!("  {raw}\n"),
-        format!("{preamble}\n\n{raw}"),
-        format!("```json\n{raw}\n```"),
-        format!("{preamble}\n\n```\n{raw}\n```"),
-        format!("```json\r\n{raw}\r\n```"),
-    ] {
-        assert_eq!(parse(&wrapped).unwrap(), parse(&raw).unwrap());
-    }
-    let duplicate = raw.replacen("\"approved\":true", "\"approved\":false,\"approved\":true", 1);
-    let nested_duplicate = raw.replacen("\"role\":\"reviewer\"", "\"role\":\"architect\",\"role\":\"reviewer\"", 1);
-    for invalid in [
-        format!("{preamble}\n{duplicate}"),
-        format!("```json\n{nested_duplicate}\n```"),
-        format!("{preamble}\n{{}}\n{raw}"),
-        format!("{preamble}\n{raw}\n{raw}"),
-        format!("{preamble}\n{{broken\n{raw}"),
-        format!("{preamble}\n[{raw}]"),
-        format!("{preamble}\n{raw}\nActually, changes are needed."),
-        format!("```json\n{raw}"),
-        format!("```json\n{raw}\n```\nMore text"),
-        format!("```text\n{raw}\n```"),
-        format!("{}\n{raw}", "x".repeat(128 * 1024)),
-    ] {
-        assert!(parse(&invalid).is_err(), "unexpectedly accepted: {invalid}");
-    }
-    for field in ["identity", "criteria", "project_checks", "acceptance_evidence"] {
-        let mut invalid = record.clone();
-        invalid[field] = Value::Null;
-        assert!(parse(&format!("{preamble}\n```json\n{invalid}\n```")).is_err(), "{field}");
-    }
 }
 
 #[test]
@@ -1158,56 +705,6 @@ fn exhausted_attempt_retains_deferred_role_outcomes() {
     }
 }
 
-impl Fixture {
-    fn deferred_gate(&self) -> Value {
-        let p = self.plan();
-        let mut p = self.ctx.architect_publish(p.clone(), Some(&p), "test").unwrap();
-        p["stages"][0]["attempt_id"] = json!(crate::architecture::identity());
-        p["stages"][0]["attempt_revision"] = p["revision"].clone();
-        p["stages"][0]["review_budget"] = json!(0);
-        p["stages"][0]["review_cadence"] = json!({"architect":"per_plan","reviewer":"per_plan"});
-        self.ctx.save_plan(&p).unwrap();
-        assert_eq!(self.ctx.run_review_stage(&mut p, 0).unwrap(), "deferred");
-        p
-    }
-}
-
-#[test]
-fn deferred_commit_rejects_forged_partitions_identity_outcomes_and_attempt_cadence() {
-    for case in ["empty", "overlap", "missing", "unknown", "scope", "stage", "attempt", "round", "cadence", "persisted_cadence", "approved", "roles", "policy"] {
-        let f = Fixture::new("Implement feature", 0);
-        let mut p = f.deferred_gate();
-        let stage = &mut p["stages"][0];
-        let mut policy = stage["review_policy"].clone();
-        match case {
-            "empty" => policy["deferred_roles"] = json!([]),
-            "overlap" => policy["stage_required_roles"] = json!(["architect"]),
-            "missing" => { policy.as_object_mut().unwrap().remove("stage_required_roles"); },
-            "unknown" => policy["deferred_roles"] = json!(["architect","unknown"]),
-            "scope" => policy["required_roles"] = json!(["reviewer"]),
-            "stage" => stage["review_gate"]["identity"]["stage_id"] = json!(2),
-            "attempt" => stage["review_gate"]["identity"]["attempt_id"] = json!("other"),
-            "round" => stage["review_gate"]["identity"]["round"] = json!(2),
-            "cadence" | "persisted_cadence" => stage["review_cadence"]["architect"] = json!("per_stage"),
-            "approved" => stage["review_gate"]["status"] = json!("approved"),
-            "roles" => stage["review_gate"]["roles"]["architect"] = json!("approved"),
-            "policy" => stage["review_policy"]["rationale"] = json!("tampered"),
-            _ => unreachable!(),
-        }
-        if ["empty", "overlap", "missing", "unknown", "scope"].contains(&case) {
-            stage["review_policy"] = policy.clone();
-            stage["review_gate"]["policy"] = policy.clone();
-            stage["review_gate"]["identity"]["policy"] = policy;
-        }
-        f.ctx.save_plan(&p).unwrap();
-        if case == "persisted_cadence" {
-            p["stages"][0]["review_cadence"]["architect"] = json!("per_plan");
-        }
-        assert!(f.ctx.commit_reviewed(&p, 0, "feat: stage").is_err(), "accepted {case}");
-        f.assert_no_commit();
-    }
-}
-
 #[test]
 fn deferred_commit_keeps_snapshot_checks_and_exact_commit_recovery() {
     for case in ["recover", "dirty", "wrong_message", "invalid_policy", "before_commit"] {
@@ -1306,70 +803,6 @@ fn a_new_attempt_captures_new_cadence_while_preserving_the_model_proposal() {
 }
 
 #[test]
-fn documentation_with_deferred_reviewer_has_no_stage_required_roles() {
-    let f = Fixture::new("Fix prose spelling", 0);
-    f.docs();
-    f.setting("review_cadence", json!({"architect":"per_stage","reviewer":"per_plan"}));
-    let p = f.run();
-    let stage = &p["stages"][0];
-    assert_eq!(stage["status"], "committed", "{p}");
-    assert_eq!(stage["review_policy"]["required_roles"], json!(["reviewer"]));
-    assert_eq!(stage["review_policy"]["stage_required_roles"], json!([]));
-    assert_eq!(stage["review_policy"]["deferred_roles"], json!(["reviewer"]));
-    assert_eq!(stage["review_gate"]["status"], "deferred");
-    assert_eq!(stage["review_gate"]["roles"], json!({"architect":"not_required","reviewer":"deferred"}));
-    assert_eq!(stage["reviews"], json!([]));
-    assert_eq!(f.count("reviewer"), 0);
-    assert_eq!(f.count("architect"), 0);
-}
-
-#[test]
-fn legacy_policy_without_partition_still_requires_evidenced_role_approvals() {
-    for invalid in [false, true] {
-        let f = Fixture::new("Implement feature", 0);
-        let mut p = f.reviewed();
-        let stage = &mut p["stages"][0];
-        let mut policy = stage["review_policy"].clone();
-        policy.as_object_mut().unwrap().remove("stage_required_roles");
-        policy.as_object_mut().unwrap().remove("deferred_roles");
-        stage["review_policy"] = policy.clone();
-        let mut base = stage["review_gate"]["identity"].clone();
-        base["policy"] = policy.clone();
-        let records = stage["reviews"].as_array_mut().unwrap();
-        for record in records.iter_mut() {
-            record["policy"] = policy.clone();
-            record["identity"]["policy"] = policy.clone();
-        }
-        if invalid { records[0]["criteria"] = json!([]); }
-        stage["review_gate"] = aggregate(&base, records);
-        f.ctx.save_plan(&p).unwrap();
-        let result = f.ctx.commit_reviewed(&p, 0, "feat: stage");
-        assert_eq!(result.is_err(), invalid, "{result:?}");
-    }
-}
-
-impl Fixture {
-    fn two_deferred_stages(&self) -> String {
-        let mut p = self.plan();
-        let mut second = p["stages"][0].clone();
-        second["id"] = json!(2);
-        second["title"] = json!("Integrate feature");
-        second["instructions"] = json!("Integrate the second feature with the first.");
-        second["acceptance"] = json!("Second feature works.\n\n Both features integrate. ");
-        second["commit"] = json!("feat: second stage");
-        p["stages"].as_array_mut().unwrap().push(second);
-        self.ctx.save_plan(&p).unwrap();
-        self.setting("review_cadence", json!({"architect":"per_plan","reviewer":"per_plan"}));
-        self.setting("mock_edits", json!([{"first.rs":"fn first() {}\n"},{"second.rs":"fn second() {}\n"}]));
-        self.ctx.git(&["rev-parse","HEAD"]).unwrap()
-    }
-    fn plan_calls(&self) -> Vec<Value> {
-        self.ctx.app.settings.lock().unwrap()["test_review_sessions"].as_array().into_iter().flatten()
-            .filter(|r| r["prompt"].as_str().unwrap().contains("\"scope\":\"plan\"" )).cloned().collect()
-    }
-}
-
-#[test]
 fn plan_review_captures_range_evidence_storage_sessions_and_gates_publication() {
     for push in [false,true] {
         let f = Fixture::new("Implement feature",0);
@@ -1418,7 +851,7 @@ fn plan_review_captures_range_evidence_storage_sessions_and_gates_publication() 
             assert!(verdict["identity"]["stage_id"].is_null());
             assert_eq!(verdict["identity"]["round"],1);
             assert_eq!(verdict["criteria"].as_array().unwrap().len(),3);
-            normalize(&verdict.to_string(),&verdict["identity"],r["acceptance"].as_str().unwrap()).unwrap();
+            normalize_review_verdict(&verdict.to_string(),&verdict["identity"],r["acceptance"].as_str().unwrap()).unwrap();
         }
         let raw = f.ctx.architecture_store().load_raw().unwrap().unwrap();
         assert!(raw["plan_review"]["reviews"]["$forge_reviews"].is_string());
@@ -1582,19 +1015,6 @@ fn plan_review_architect_only_marks_independent_reviewer_not_required() {
     let p = f.run();
     assert_eq!(p["plan_review"]["gate"]["roles"],json!({"architect":"approved","reviewer":"not_required"}));
     assert_eq!(f.plan_calls().len(),1);
-}
-
-impl Fixture {
-    fn pending_plan_review(&self) -> Value {
-        self.two_deferred_stages();
-        self.setting("reviewer",json!("unavailable"));
-        let mut p = self.run();
-        assert!(p["stages"].as_array().unwrap().iter().all(|s| s["status"] == "committed"));
-        p.as_object_mut().unwrap().remove("plan_review");
-        self.ctx.save_plan(&p).unwrap();
-        self.setting("reviewer",json!("mock"));
-        self.plan()
-    }
 }
 
 #[test]

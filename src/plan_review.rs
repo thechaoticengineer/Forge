@@ -19,7 +19,7 @@ fn subject(plan: &Value) -> Result<Value, String> {
 }
 fn acceptance(subject: &Value) -> String {
     subject["stages"].as_array().unwrap().iter().flat_map(|stage| {
-        criteria(stage["acceptance"].as_str().unwrap_or("")).into_iter().map(|line|
+        acceptance_criteria_items(stage["acceptance"].as_str().unwrap_or("")).into_iter().map(|line|
             format!("stage {} ({}): {line}", stage["id"], stage["title"].as_str().unwrap_or("")))
     }).collect::<Vec<_>>().join("\n")
 }
@@ -158,11 +158,11 @@ impl Ctx {
             return Err("plan review approval is missing or stale; resume plan review before completion".into());
         }
         let records = review["reviews"].as_array().ok_or("missing plan reviews")?;
-        if aggregate(identity,records) != review["gate"] { return Err("plan gate does not match immutable verdicts".into()); }
+        if aggregate_review_gate(identity,records) != review["gate"] { return Err("plan gate does not match immutable verdicts".into()); }
         for role in review["required_roles"].as_array().ok_or("invalid plan roles")? {
             let mut expected = identity.clone(); expected["role"] = role.clone();
             let verdict = records.iter().find(|r| r["identity"] == expected).ok_or("missing plan role evidence")?;
-            if normalize(&verdict.to_string(),&expected,review["acceptance"].as_str().unwrap_or(""))?["approved"] != true {
+            if normalize_review_verdict(&verdict.to_string(),&expected,review["acceptance"].as_str().unwrap_or(""))?["approved"] != true {
                 return Err("plan verdict is not clean and evidenced".into());
             }
             if role == "reviewer" { self.validate_plan_reviewer(plan,verdict["provider"].as_str().ok_or("missing reviewer provider")?)?; }
@@ -282,7 +282,7 @@ impl Ctx {
         self.validate_plan_evidence(plan)?;
         let expected = &plan["plan_review"]["gate"]["identity"]["snapshot"];
         let parent = expected["head"].as_str().ok_or("missing reviewed HEAD")?;
-        let actual = snapshot_against(self.project(), parent)?;
+        let actual = review_snapshot_against(self.project(), parent)?;
         if actual["tree"] != expected["tree"] || actual["content"] != expected["content"]
             || self.git(&["rev-parse","HEAD^{tree}"])? != expected["tree"] {
             return Err("HEAD/worktree does not match approved plan fixes; finalization refused".into());
@@ -322,7 +322,7 @@ impl Ctx {
         self.validate_plan_evidence(plan)?;
         if plan["plan_review"]["next_action"] == "complete" { return self.validate_plan_approval(plan); }
         let expected = plan["plan_review"]["gate"]["identity"]["snapshot"].clone();
-        let current = snapshot(self.project())?;
+        let current = review_snapshot(self.project())?;
         if current["head"] == expected["head"] {
             if current != expected && !(plan["plan_review"]["commit_state"] == "staging"
                 && current["content"] == expected["content"] && current["tree"] == expected["tree"]
@@ -339,7 +339,7 @@ impl Ctx {
                 return Err("simulated crash after staging plan fixes".into());
             }
             let staged = self.git(&["write-tree"])?;
-            let actual = snapshot(self.project())?;
+            let actual = review_snapshot(self.project())?;
             if actual["head"] != expected["head"] || actual["content"] != expected["content"]
                 || actual["tree"] != expected["tree"] || staged != expected["tree"] {
                 return Err("staged tree differs from reviewed plan content".into());
@@ -348,7 +348,7 @@ impl Ctx {
                 let head = expected["head"].as_str().ok_or("missing reviewed HEAD")?;
                 let sha = self.git(&["commit-tree",&staged,"-p",head,"-m",FIX_MESSAGE])?;
                 self.validate_plan_evidence(plan)?;
-                if snapshot(self.project())? != actual || self.session.stop_requested.load(Ordering::SeqCst) {
+                if review_snapshot(self.project())? != actual || self.session.stop_requested.load(Ordering::SeqCst) {
                     return Err("external edit or stop before plan fix commit".into());
                 }
                 self.git(&["update-ref","-m",FIX_MESSAGE,"HEAD",&sha,head])?;
@@ -383,9 +383,9 @@ impl Ctx {
                 if plan["plan_review"].is_object() {
                     let recoverable_finalization = plan["plan_review"]["next_action"] == "finalize"
                         && self.validate_plan_evidence(plan).is_ok()
-                        && (snapshot(self.project()).is_ok_and(|s| s == plan["plan_review"]["gate"]["identity"]["snapshot"])
+                        && (review_snapshot(self.project()).is_ok_and(|s| s == plan["plan_review"]["gate"]["identity"]["snapshot"])
                             || self.finalized_plan_snapshot(plan).is_ok()
-                            || (plan["plan_review"]["commit_state"] == "staging" && snapshot(self.project()).is_ok_and(|s| {
+                            || (plan["plan_review"]["commit_state"] == "staging" && review_snapshot(self.project()).is_ok_and(|s| {
                                 let expected = &plan["plan_review"]["gate"]["identity"]["snapshot"];
                                 s["head"] == expected["head"] && s["tree"] == expected["tree"] && s["content"] == expected["content"]
                             })));
@@ -505,7 +505,7 @@ impl Ctx {
                 "review_pending" => {
                     let identity = json!({"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":null,"scope":"plan",
                         "attempt_id":plan["plan_review"]["attempt_id"],"round":plan["plan_review"]["rounds"],
-                        "policy":plan_policy(&json!(roles)),"snapshot":snapshot(self.project())?});
+                        "policy":plan_policy(&json!(roles)),"snapshot":review_snapshot(self.project())?});
                     plan["plan_review"]["status"] = json!("reviewing");
                     plan["plan_review"]["next_action"] = json!("reviewing");
                     plan["plan_review"]["gate"] = json!({"status":"pending","identity":identity});
@@ -515,7 +515,7 @@ impl Ctx {
                     if roles.contains(&json!("architect")) { self.architect_review_for_scope(plan,ReviewScope::Plan,&identity)?; }
                     self.validate_plan_subject(plan)?;
                     if self.session.stop_requested.load(Ordering::SeqCst) { return Err("plan review stopped; resume to continue".into()); }
-                    let gate = aggregate(&identity,plan["plan_review"]["reviews"].as_array().ok_or("missing plan reviews")?);
+                    let gate = aggregate_review_gate(&identity,plan["plan_review"]["reviews"].as_array().ok_or("missing plan reviews")?);
                     let approved = gate["status"] == "approved";
                     plan["plan_review"]["outstanding_requests"] = json!(gate["requests"].as_array().unwrap().iter()
                         .map(|r| format!("[{}] {}",r["role"].as_str().unwrap(),r["text"].as_str().unwrap())).collect::<Vec<_>>());
