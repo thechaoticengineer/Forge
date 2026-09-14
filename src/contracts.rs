@@ -1,6 +1,5 @@
 //! Version-one persistence and provider boundary contracts.
-//! Routing and dual-review policy records remain available for later stages.
-#![allow(dead_code)]
+//! Routing and dual-review policy records used by the engine.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,30 +40,6 @@ pub(crate) struct ReviewPolicy {
     pub rationale: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Invocation {
-    pub version: u64,
-    pub id: String,
-    pub plan_id: String,
-    pub revision: u64,
-    pub stage_id: Option<i64>,
-    pub attempt_id: Option<String>,
-    pub role: Role,
-    pub effective: EffectiveModel,
-    pub session: Option<SessionReference>,
-    pub prompt: String,
-    pub review_policy: ReviewPolicy,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct InvocationResult {
-    pub version: u64,
-    pub invocation_id: String,
-    pub effective: EffectiveModel,
-    pub session: Option<SessionReference>,
-    pub output: Value,
-    pub usage: Value,
-    pub error: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Availability {
     Verified,
@@ -77,22 +52,6 @@ pub(crate) struct Provenance {
     pub catalogue_revision: String,
     pub official_sources: Vec<String>,
     pub checked_unix: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Catalogue {
-    pub version: u64,
-    pub revision: String,
-    pub refreshed_unix: i64,
-    pub models: Vec<CatalogueModel>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CatalogueModel {
-    pub provider: String,
-    pub model: String,
-    pub native_efforts: Vec<String>,
-    pub capability_tiers: Vec<String>,
-    pub availability: Availability,
-    pub provenance: Provenance,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
