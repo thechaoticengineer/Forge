@@ -8,9 +8,9 @@ pub(super) fn policy_inputs(stage: &Value, p: &Proposal) -> Result<Value, String
         return Err("execution reassessment requires a concrete replacement and its native effort".into());
     }
     let tier = p.tier.as_ref().ok_or("missing capability tier")?;
-    let floor = minimum(stage, p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0));
+    let floor = minimum(p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0));
     if rank(&json!(tier)) < floor {
-        return Err(format!("proposed tier {tier} is below the engine capability floor {floor}"));
+        return Err(format!("proposed tier {tier} is below the required tier {} (engine capability floor {floor}); propose tier {}", tier_name(floor), tier_name(floor)));
     }
     Ok(json!({"policy":"stage-tier-2","minimum_tier":rank(&json!(tier)),
         "tier":tier,"tier_provenance":"joint_stage_requirement",

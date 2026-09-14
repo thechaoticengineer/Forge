@@ -46,7 +46,10 @@ impl Fixture {
         self.ctx.app.settings.lock().unwrap()[key] = v;
     }
     fn choose(&self, provider: &str, model: &str, effort: &str) {
-        self.set("mock_routing_planner_outputs",json!([{"proposals":[{"stage_id":1,"proposal":{"risk":"standard","complexity":"standard","task":"functionality","provider":provider,"model":model,"native_effort":effort,"rationale":"Concrete failures justify this adequate assignment."}}]}]));
+        self.choose_task(provider, model, effort, "functionality");
+    }
+    fn choose_task(&self, provider: &str, model: &str, effort: &str, task: &str) {
+        self.set("mock_routing_planner_outputs",json!([{"proposals":[{"stage_id":1,"proposal":{"risk":"standard","complexity":"standard","task":task,"provider":provider,"model":model,"native_effort":effort,"rationale":"Concrete failures justify this adequate assignment."}}]}]));
     }
     fn run(&self) -> Value {
         self.ctx.run_worker();
@@ -553,7 +556,7 @@ fn critical_removed_model_blocks_without_weaker_fallback_or_fix_reset() {
     candidate["revision"] = json!(old["revision"].as_u64().unwrap() + 1);
     candidate["stages"][0]["instructions"] = json!("Implement atomic persistence safely");
     candidate["stages"][0]["model_constraint"] = json!({"provider":"codex"});
-    f.choose("codex", "large", "provider_default");
+    f.choose_task("codex", "large", "provider_default", "persistence");
     f.ctx
         .architect_publish(candidate, Some(&old), "critical scope")
         .unwrap();
@@ -568,7 +571,7 @@ fn critical_removed_model_blocks_without_weaker_fallback_or_fix_reset() {
     options[1]["eligible"] = json!(false);
     options[1]["error"] = json!("removed");
     f.set("mock_routing_options", json!(options));
-    f.choose("codex", "small", "provider_default");
+    f.choose_task("codex", "small", "provider_default", "persistence");
     assert!(f.ctx.assignment_boundary(&mut p, 0).is_err());
     assert_eq!(p["stages"][0]["rounds"], 2);
     assert_eq!(

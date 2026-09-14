@@ -1445,26 +1445,22 @@ The persistent architect independently evaluates cross-stage constraints and
 failure impact in its guidance turn. Both must explicitly agree on classification
 and capability requirements. Missing proposals from manual edits or legacy plans are batched
 into one strong planner turn. Disagreement or an engine rejection of an agreed
-selection allows one further planner/architect exchange for only the affected
-stages. Inconsistent `agree: true` responses use the separate response-correction
-budget before they can enter this exchange. Engine feedback includes the exact
-policy failure; correcting the tier must preserve the already agreed risk,
-complexity and task.
+selection allows up to three further planner/architect exchanges for only the
+affected stages; agreement ends them immediately. Inconsistent `agree: true`
+responses use the separate response-correction budget before they can enter an
+exchange. Engine feedback includes the exact policy failure and names the required
+tier; correcting the tier must preserve the already agreed risk, complexity and
+task.
 Unresolved disagreements or policy failures then block publication with reasons
 and correction instructions. A planner proposal alone never supplies architect
 approval, and malformed output cannot be published.
 
 Tier agreements use `stage-tier-2`; concrete execution checks retain `stage-routing-1`. Critical risk, complex
 complexity, or a concurrency, persistence or security task requires `strong`.
-A conservative implementation-text check also protects sensitive
-persistence/security/concurrency work from both participants underclassifying it.
-Explanatory prose about existing behavior is exempt from that text heuristic
-when explicitly classified as documentation;
-contracts, normative requirements and implementation work are not. Explicit
-prohibitions on inventing requirements or changing implementation do not themselves
-establish implementation scope; subsequent positive instructions still count. Documentation
-mentioning sensitive work together with implementation or requirement terms can
-therefore still require `strong`. When no strong-floor rule applies, risk and
+The floor comes only from that agreed classification. Stage wording is never
+keyword-matched, so documentation or refactors that merely mention
+authentication, persistence formats or atomic writes keep the tier their
+classification allows. When no strong-floor rule applies, risk and
 complexity both classified simple permit `basic` or higher; otherwise standard
 work requires `standard` or `strong`. Scope floors and reassessment safeguards
 can raise, but never lower, that minimum. Unclassified models cannot meet these
@@ -1653,7 +1649,7 @@ separately provisioned Agent SDK. Neither is required for offline fixture tests.
 An unsupported discovery mechanism allows explicit configured unverified choices;
 missing executables, authentication failures and known rejected choices block.
 
-One disagreement reconciliation exchange is allowed. Each stage attempt defaults
+Up to three disagreement reconciliation exchanges are allowed. Each stage attempt defaults
 to three reassessments and two transient operational retries; repeat failures
 trigger at two and measured context pressure at 85%. Three additional fix rounds
 are allowed after the initial review. All reservations survive restart. Existing

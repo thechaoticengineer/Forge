@@ -190,9 +190,9 @@ fn critical_work_never_uses_cheapest_unclassified_or_inadequate_tier() {
     let p: Proposal =
         serde_json::from_value(proposal("unclassified", "critical", "concurrency")).unwrap();
     assert!(policy_inputs(&s, &stage(1), &p, &[json!({"provider":"codex","model":"unclassified","effort":"provider_default","eligible":true})]).is_err());
-    // Even if both participants underclassify, engine protects persistence implementation.
+    // Work both participants classify as persistence keeps the strong floor.
     let f = Fixture::new();
-    f.select(proposal("budget-test", "simple", "functionality"));
+    f.select(proposal("budget-test", "simple", "persistence"));
     let mut plan = plan();
     plan["stages"][0]["instructions"] = json!("Add atomic persistent storage");
     assert!(f.publish(plan).unwrap_err().contains("strong"));
@@ -246,37 +246,36 @@ fn readme_policy_explanation_with_no_new_requirements_keeps_standard_selection()
 }
 
 #[test]
-fn coordinated_documentation_boundaries_do_not_become_implementation_requests() {
-    let mut candidate = stage(1);
-    candidate["title"] = json!("Document the model configuration workflow");
-    candidate["instructions"] = json!("Edit only README.md. Do not modify code, tests, QML, scripts, or any other file, and do not add new product behaviour, requirements, buttons, endpoints, features or model names. Explain how Save model policy makes it the active, persisted policy. Preserve all API endpoint sentences unchanged.");
-    let p: Proposal = serde_json::from_value(proposal("budget-test", "simple", "documentation")).unwrap();
-    assert_eq!(minimum(&candidate, &p), 1);
-    candidate["instructions"] = json!("Perform a final documentation-only review for coherent style, no new behavior or requirements, and no loss of information.");
-    candidate["acceptance"] = json!("API, persistence and discovery facts remain intact. The stage introduces no normative product requirement.");
-    assert_eq!(minimum(&candidate, &p), 1);
-}
-
-#[test]
-fn a_no_new_scope_clause_cannot_hide_positive_or_critical_work() {
-    let p: Proposal = serde_json::from_value(proposal("strong-test", "standard", "documentation")).unwrap();
-    for instructions in [
-        "Update README. Do not invent requirements; implement atomic persistence.",
-        "Update README. Do not introduce requirements but implement authentication.",
-        "Update README. Do not add new features and implement atomic persistence.",
-        "Update README. Do not invent features. Define normative security policy requirements.",
-        "Document requirements for persistent storage.",
-        "Update README and implement atomic persistence, no new requirements.",
-    ] {
-        let mut stage = stage(1);
-        stage["instructions"] = json!(instructions);
-        assert_eq!(minimum(&stage, &p), 3, "{instructions}");
+fn capability_floor_follows_agreed_classification_not_stage_wording() {
+    let tier = |risk: &str, complexity: &str, task: &str| -> Proposal {
+        serde_json::from_value(json!({"risk":risk,"complexity":complexity,"task":task,"tier":"basic",
+            "rationale":"Planner classification."})).unwrap()
+    };
+    // Wording from real stages that were forced to strong by keyword matching.
+    let mut docs = stage(1);
+    docs["title"] = json!("Document and verify the release");
+    docs["instructions"] = json!("Update README.md from increment 4 to the implemented release. Provide GitHub CLI authentication and least-privilege access guidance, exact XDG storage locations and privacy warnings.");
+    let mut refactor = stage(1);
+    refactor["title"] = json!("Remove dead contract definitions");
+    refactor["acceptance"] = json!("No serialized contract, API response, persistence format, or runtime behavior changes; atomic writes stay untouched.");
+    for candidate in [&docs, &refactor] {
+        let simple = tier("simple", "simple", "documentation");
+        assert_eq!(minimum(&simple), 1);
+        assert!(validate_stage_proposal(candidate, &simple).is_ok());
+        let standard = tier("standard", "standard", "functionality");
+        assert_eq!(minimum(&standard), 2);
     }
-    let mut stage = stage(1);
-    stage["instructions"] = json!("Update README. Do not invent requirements for persistence.");
-    let mut critical = p;
-    critical.risk = "critical".into();
-    assert_eq!(minimum(&stage, &critical), 3);
+    for strong in [
+        tier("critical", "standard", "functionality"),
+        tier("standard", "complex", "documentation"),
+        tier("simple", "simple", "persistence"),
+        tier("simple", "simple", "concurrency"),
+        tier("simple", "simple", "security"),
+    ] {
+        assert_eq!(minimum(&strong), 3);
+        let error = validate_stage_proposal(&stage(1), &strong).unwrap_err();
+        assert!(error.contains("required tier strong") && error.contains("propose tier strong"), "{error}");
+    }
 }
 
 #[test]
@@ -293,16 +292,16 @@ fn standard_functionality_still_accepts_strong() {
 }
 
 #[test]
-fn sensitive_or_critical_documentation_keeps_strong_floor() {
-    for (risk, complexity, instructions) in [
-        ("standard", "standard", "Document normative security policy requirements"),
-        ("critical", "standard", "Document greeting usage in README"),
-        ("standard", "complex", "Document greeting usage in README"),
+fn sensitive_or_critical_classification_keeps_strong_floor() {
+    for (risk, complexity, task, instructions) in [
+        ("standard", "standard", "security", "Define the security policy enforced by the engine"),
+        ("critical", "standard", "documentation", "Document greeting usage in README"),
+        ("standard", "complex", "documentation", "Document greeting usage in README"),
     ] {
         let f = Fixture::with_standard_model();
         let mut candidate = plan();
         candidate["stages"][0]["instructions"] = json!(instructions);
-        let mut choice = proposal("standard-test", risk, "documentation");
+        let mut choice = proposal("standard-test", risk, task);
         choice["complexity"] = json!(complexity);
         f.select(choice.clone());
         let error = f.publish(candidate.clone()).unwrap_err();
@@ -313,7 +312,8 @@ fn sensitive_or_critical_documentation_keeps_strong_floor() {
         let published = f.publish(candidate).unwrap();
         let inputs = &published["stages"][0]["model_agreement"]["policy_inputs"];
         assert_eq!(inputs["minimum_tier"], 3);
-        assert_eq!(inputs["relative_cost_preference"], 5);
+        // Cost preference is recorded only for cost-sensitive documentation work.
+        assert_eq!(inputs["relative_cost_preference"], if task == "documentation" { json!(5) } else { Value::Null });
     }
 }
 
@@ -423,22 +423,26 @@ fn exact_ids_native_efforts_constraints_and_review_conflicts_are_validated() {
     }
 }
 #[test]
-fn disagreement_gets_exactly_one_exchange_and_both_participants_must_agree() {
-    for agree in [false, true] {
+fn disagreement_gets_up_to_three_exchanges_and_agreement_ends_them() {
+    // (reconciliations the architect still disagrees in, agreement follows, expected calls)
+    for (disagreeing, agree, counts) in [(0, true, (2, 2)), (2, true, (4, 4)), (3, false, (4, 4))] {
         let f = Fixture::new();
         f.set(
             "mock_model_evaluations",
             json!([[evaluation(false, "standard", "standard")]]),
         );
-        f.set(
-            "mock_routing_architect_outputs",
-            json!([{"model_evaluations":[evaluation(agree,"standard","standard")]}]),
-        );
+        let mut outputs: Vec<Value> = (0..disagreeing)
+            .map(|_| json!({"model_evaluations":[evaluation(false,"standard","standard")]}))
+            .collect();
+        if agree {
+            outputs.push(json!({"model_evaluations":[evaluation(true,"standard","standard")]}));
+        }
+        f.set("mock_routing_architect_outputs", json!(outputs));
         let result = f.publish(plan());
         assert_eq!(result.is_ok(), agree);
-        assert_eq!(f.counts(), (2, 2));
+        assert_eq!(f.counts(), counts);
         if !agree {
-            assert!(result.unwrap_err().contains("after one reconciliation"));
+            assert!(result.unwrap_err().contains("after 3 reconciliation exchanges"));
             assert!(f.ctx.load_plan().is_none());
         }
     }
@@ -478,11 +482,11 @@ fn repeated_engine_rejections_are_bounded_and_preserve_the_published_plan() {
     candidate["stages"][0]["instructions"] = json!("Explain greeting usage in README");
     let candidate = crate::plan::edit_plan(&saved, &json!({"plan":candidate})).unwrap();
     let output = json!({"proposals":[{"stage_id":1,"proposal":proposal("strong-test", "standard", "documentation")}]});
-    f.set("mock_routing_planner_outputs", json!([output,output]));
+    f.set("mock_routing_planner_outputs", json!([output,output,output,output]));
     let before = f.counts();
     let error = f.ctx.architect_publish(candidate, Some(&saved), "test invalid cost selection").unwrap_err();
-    assert!(error.contains("after one reconciliation") && error.contains("cheaper adequate"), "{error}");
-    assert_eq!(f.counts(), (before.0+2,before.1+2));
+    assert!(error.contains("after 3 reconciliation exchanges") && error.contains("cheaper adequate"), "{error}");
+    assert_eq!(f.counts(), (before.0+4,before.1+4));
     assert_eq!(f.ctx.load_plan().unwrap(), saved);
 }
 
@@ -1033,10 +1037,11 @@ fn corrected_architect_disagreement_keeps_its_meaning_and_blocks_publication() {
     let mut contradictory = disagreement.clone();
     contradictory["agree"] = json!(true);
     f.set("mock_model_evaluations", json!([[contradictory], [disagreement]]));
-    f.set("mock_routing_architect_outputs", json!([{"model_evaluations":[disagreement]}]));
+    let substantive = json!({"model_evaluations":[disagreement]});
+    f.set("mock_routing_architect_outputs", json!([substantive, substantive, substantive]));
     let error = f.publish(plan()).unwrap_err();
-    assert!(error.contains("after one reconciliation"), "{error}");
-    assert_eq!(f.counts(), (2, 3)); // One correction and one substantive exchange.
+    assert!(error.contains("after 3 reconciliation exchanges"), "{error}");
+    assert_eq!(f.counts(), (4, 5)); // One correction and three substantive exchanges.
     assert!(f.ctx.load_plan().is_none());
     let settings = f.ctx.app.settings.lock().unwrap();
     let correction = settings["mock_routing_architect_requests"][1]["prompt"].as_str().unwrap();
@@ -1190,7 +1195,7 @@ fn global_pin_preserves_configured_effort_through_publication_and_revalidation()
         let mut choice = proposal("strong-test", "standard", "functionality");
         if effort == "high" {
             let rejected = json!({"proposals":[{"stage_id":1,"proposal":choice}]});
-            f.set("mock_routing_planner_outputs", json!([rejected,rejected]));
+            f.set("mock_routing_planner_outputs", json!([rejected,rejected,rejected,rejected]));
             let error = f.publish(plan()).unwrap_err();
             for detail in [
                 "constraint",
@@ -1563,9 +1568,58 @@ fn tier_contract_rejects_concrete_fields_and_underpowered_sensitive_work() {
     assert!(validate_proposal(&serde_json::from_value(mixed).unwrap()).is_err());
     let p: Proposal = serde_json::from_value(json!({"tier":"basic","risk":"simple","complexity":"simple",
         "task":"security","rationale":"Too weak."})).unwrap();
-    assert!(tiers::policy_inputs(&stage(1), &p).unwrap_err().contains("capability floor 3"));
+    let error = tiers::policy_inputs(&stage(1), &p).unwrap_err();
+    assert!(error.contains("capability floor 3") && error.contains("propose tier strong"), "{error}");
     assert!(!valid_tier_record(&json!({"validated_proposal":p,"binding":"at_implementation_start",
         "policy_inputs":{"minimum_tier":2,"tier":"standard"}})));
+}
+
+#[test]
+fn underpowered_tier_guesses_are_corrected_and_the_plan_is_still_published() {
+    let f = tier_fixture();
+    let proposal = |task: &str, tier: &str| json!({"proposals":[{"stage_id":1,"proposal":{"risk":"standard",
+        "complexity":"standard","task":task,"tier":tier,"rationale":"Planner classification."}}]});
+    let mut persistence = evaluation(false, "standard", "standard");
+    persistence["task"] = json!("persistence");
+    persistence["rationale"] = json!("The stage rewrites durable storage.");
+    f.set("mock_model_evaluations", json!([[persistence]]));
+    // The planner accepts the architect's classification but keeps guessing below the floor.
+    f.set("mock_routing_planner_outputs", json!([
+        proposal("functionality", "standard"),
+        proposal("persistence", "basic"),
+        proposal("persistence", "standard"),
+        proposal("persistence", "strong"),
+    ]));
+    let mut agreed = persistence.clone();
+    agreed["agree"] = json!(true);
+    f.set("mock_routing_architect_outputs", json!([{"model_evaluations":[agreed]}]));
+    let p = f.publish(plan()).unwrap();
+    let agreement = &p["stages"][0]["model_agreement"];
+    assert_eq!(agreement["policy_inputs"]["tier"], "strong");
+    assert_eq!(agreement["policy_inputs"]["minimum_tier"], 3);
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let corrections: Vec<_> = settings["mock_routing_planner_requests"].as_array().unwrap().iter()
+        .filter_map(|r| r["prompt"].as_str()).filter(|prompt| prompt.contains("RESPONSE CORRECTION")).collect();
+    assert_eq!(corrections.len(), 2);
+    for prompt in corrections {
+        assert!(prompt.contains("required tier strong") && prompt.contains("propose tier strong"), "{prompt}");
+    }
+}
+
+#[test]
+fn stage_wording_about_sensitive_topics_does_not_force_strong() {
+    let f = Fixture::with_standard_model();
+    f.set("review_cadence", json!({"architect":"per_plan","reviewer":"per_plan"}));
+    f.select(json!({"risk":"simple","complexity":"simple","task":"documentation","tier":"basic",
+        "rationale":"README-only edit."}));
+    let mut candidate = plan();
+    candidate["stages"][0]["title"] = json!("Document and verify the release");
+    candidate["stages"][0]["instructions"] = json!("Update README.md with GitHub CLI authentication guidance, XDG storage locations and privacy warnings.");
+    candidate["stages"][0]["acceptance"] = json!("No serialized contract, persistence format, or runtime behavior changes.");
+    let p = f.publish(candidate).unwrap();
+    let agreement = &p["stages"][0]["model_agreement"];
+    assert_eq!(agreement["policy_inputs"]["tier"], "basic");
+    assert_eq!(agreement["dialogue"].as_array().unwrap().len(), 1);
 }
 
 #[test]

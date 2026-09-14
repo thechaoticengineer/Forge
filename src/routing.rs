@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const POLICY: &str = "stage-routing-1";
+/// Substantive planner/architect exchanges after the first evaluation; agreement ends them early.
+const MAX_RECONCILIATIONS: usize = 3;
 const EXECUTION_CONTRACT: &str = r#"MODEL SELECTION CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","provider":"exact provider","model":"exact registry ID","native_effort":"provider_default or supported native effort","rationale":"stage-specific adequacy, failure impact and cost reasoning"}.
 Use exactly those seven proposal fields; put all explanation, including effort changes, in rationale. Do not add fields.
@@ -16,7 +18,7 @@ Use only eligible catalogue/registry options. Copy the option's model field exac
 
 pub(crate) const CONTRACT: &str = r#"STAGE CAPABILITY CONTRACT: Include model_proposal on each new or materially changed pending stage:
 {"risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security","tier":"basic|standard|strong","rationale":"stage-specific capability and failure-impact reasoning"}.
-Use exactly these five fields. Select the weakest adequate capability tier, never a provider, model or native effort. Basic suits simple low-impact work; standard suits ordinary implementation; strong is required for critical, complex or sensitive implementation. The architect independently checks the classification. Forge resolves a concrete model locally at implementation start using the implementer provider selected THEN and its current model catalogue. The user can change that provider after planning without replanning. Model prices, provider quota and reviewer settings are launch concerns, not planning inputs. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
+Use exactly these five fields. Select the weakest adequate capability tier, never a provider, model or native effort. Basic suits simple low-impact work; standard suits ordinary implementation; strong is required when risk is critical, complexity is complex, or task is concurrency, persistence or security; Forge enforces exactly that floor from the agreed classification. The architect independently checks the classification. Forge resolves a concrete model locally at implementation start using the implementer provider selected THEN and its current model catalogue. The user can change that provider after planning without replanning. Model prices, provider quota and reviewer settings are launch concerns, not planning inputs. Preserve acceptance and committed stages. Unchanged agreements need no new proposal."#;
 
 #[path = "routing_tiers.rs"]
 mod tiers;
@@ -83,10 +85,10 @@ fn validate_proposal(p: &Proposal) -> Result<(), String> {
 fn validate_stage_proposal(stage: &Value, proposal: &Proposal) -> Result<(), String> {
     validate_proposal(proposal)?;
     if let Some(tier) = &proposal.tier {
-        let floor = minimum(stage, proposal).max(stage["routing_scope_floor"].as_u64().unwrap_or(0));
+        let floor = minimum(proposal).max(stage["routing_scope_floor"].as_u64().unwrap_or(0));
         if rank(&json!(tier)) < floor {
-            return Err(format!("stage {} proposed tier {tier} is below the engine capability floor {floor}; \
-                correct the tier without changing the task's scope, risk or complexity", stage["id"]));
+            return Err(format!("stage {} proposed tier {tier} is below the required tier {} (engine capability floor {floor}); \
+                propose tier {} without changing the task's scope, risk or complexity", stage["id"], tier_name(floor), tier_name(floor)));
         }
     }
     Ok(())
@@ -115,7 +117,7 @@ pub(crate) fn validate_evaluations(value: &Value, ids: &[i64], plan: &Value) -> 
         }
         // A claimed agreement with different fields is an inconsistent response,
         // not a substantive disagreement. Let its author correct it before
-        // consuming the separate planner/architect reconciliation exchange.
+        // consuming a separate planner/architect reconciliation exchange.
         if e.agree {
             let stage = plan["stages"].as_array().and_then(|stages|
                 stages.iter().find(|stage| stage["id"] == *id))
@@ -230,69 +232,19 @@ fn rank(tier: &Value) -> u64 {
         _ => 0,
     }
 }
-fn capability_intent(stage: &Value) -> String {
-    // A ban on inventing requirements is not a request to implement them.
-    // Only omit explicit no-new-scope clauses; keep ambiguous wording and
-    // split contrast clauses so a subsequent positive instruction still counts.
-    ["title", "instructions", "acceptance"].into_iter()
-        .map(|key| stage[key].as_str().unwrap_or("").to_lowercase())
-        .flat_map(|text| text.split(['.', ';', '\n']).flat_map(|s| s.split(" but "))
-            .flat_map(|s| s.split(" and "))
-            .filter_map(|clause| {
-                let clause = clause.trim();
-                let excluded = ["do not invent ", "do not introduce ", "do not add new ",
-                    "do not modify ", "do not change ", "do not edit ", "do not touch "]
-                    .into_iter().find_map(|prefix| clause.strip_prefix(prefix));
-                // Mixed instructions must retain their conservative floor.
-                let mixed = |tail: &str| ["implement", "change", "define", "update", "rewrite",
-                    "replace", "remove", "create", "enforce", "introduce", "add", "then",
-                    "instead", "however", "persist", "migrate", "encrypt", "authenticate", "authorize"]
-                    .iter().any(|verb| tail.split(|c: char| !c.is_alphanumeric()).any(|word| word == *verb));
-                if excluded.is_some_and(|tail| !mixed(tail)) { return None; }
-                // Preserve any positive work before a no-new-behavior boundary,
-                // e.g. "implement persistence, no new requirements".
-                if let Some((before, tail)) = clause.split_once(" no ") {
-                    if !mixed(tail) { return Some(before.to_owned()); }
-                }
-                Some(clause.to_owned())
-            }).collect::<Vec<_>>())
-        .collect::<Vec<_>>().join(" ")
+fn tier_name(rank: u64) -> &'static str {
+    match rank {
+        1 => "basic",
+        2 => "standard",
+        _ => "strong",
+    }
 }
-fn minimum(stage: &Value, p: &Proposal) -> u64 {
-    let text = capability_intent(stage);
-    // Conservative engine floor for high failure-impact implementation domains.
-    let sensitive = [
-        "concurren",
-        "persist",
-        "security",
-        "authentication",
-        "authorization",
-        "race condition",
-        "deadlock",
-        "encryption",
-        "atomic",
-        "migration",
-    ]
-    .iter()
-    .any(|word| text.contains(word));
-    let explanatory_docs = p.task == "documentation"
-        && ["document", "explain", "readme", "prose", "typo", "spelling"]
-            .iter()
-            .any(|word| text.contains(word))
-        && ![
-            "implement",
-            "contract",
-            "normative",
-            "security policy",
-            "requirement",
-            "schema",
-            "design decision",
-        ]
-        .iter()
-        .any(|word| text.contains(word));
+/// The engine floor follows the classification both planner and architect
+/// agreed. Stage wording is never keyword-matched: text that only mentions
+/// persistence or authentication (docs, "no format changes") is not such work.
+fn minimum(p: &Proposal) -> u64 {
     if p.risk == "critical"
         || p.complexity == "complex"
-        || (sensitive && !explanatory_docs)
         || ["concurrency", "persistence", "security"].contains(&p.task.as_str())
     {
         3
@@ -393,7 +345,7 @@ fn policy_inputs(
     }
     let pending = &stage["reassessment"]["pending"];
     let old = &pending["old_agreement"];
-    let min = minimum(stage, p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)).max(if pending.is_object() { old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) } else { 0 });
+    let min = minimum(p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)).max(if pending.is_object() { old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) } else { 0 });
     let cost_sensitive = min == 1 || p.task == "documentation";
     let adequate = |o: &&Value| {
         o["eligible"] == true
@@ -405,7 +357,7 @@ fn policy_inputs(
     if !adequate(&selected) {
         return Err(format!(
             "no adequate selection: stage requires at least the configured {} capability tier and task suitability; {}/{} is configured {}; correct the registry, the constraint or the proposal",
-            match min { 1 => "basic", 2 => "standard", _ => "strong" },
+            tier_name(min),
             p.provider, p.model, selected["tier"].as_str().unwrap_or("unclassified")
         ));
     }
@@ -415,7 +367,7 @@ fn policy_inputs(
         return Err("cross-provider-review conflict: explicit reviewer constraint prevents switch".into());
     }
     if pending.is_object() {
-        if minimum(stage,p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)) < old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) { return Err("reassessment cannot lower the agreed risk/capability floor".into()); }
+        if minimum(p).max(stage["routing_scope_floor"].as_u64().unwrap_or(0)) < old["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(0) { return Err("reassessment cannot lower the agreed risk/capability floor".into()); }
         let effective = json!({"provider":p.provider,"model":selected["resolved_id"].as_str().unwrap_or(&p.model),"native_effort":p.native_effort});
         let same = effective == old["effective"];
         let material = pending["kind"] == "material_assignment_change" || pending["kind"] == "material_scope_change";
@@ -750,7 +702,7 @@ impl Ctx {
             std::collections::BTreeMap::new();
         let mut engine_corrections: std::collections::BTreeMap<i64, (Proposal, String)> =
             std::collections::BTreeMap::new();
-        for exchange in 0..=1 {
+        for exchange in 0..=MAX_RECONCILIATIONS {
             let options = if ids.iter().any(|id| plan["stages"].as_array().unwrap().iter().any(|s| s["id"] == *id && !s["model_proposal"]["tier"].is_string())) { self.routing_candidates()? } else { vec![] };
             let rows: Vec<Evaluation> = serde_json::from_value(evaluations.clone())
                 .map_err(|e| format!("invalid architect model evaluations: {e}"))?;
@@ -806,9 +758,9 @@ impl Ctx {
                 }
             }
             if !disagreements.is_empty() {
-                if exchange == 1 {
+                if exchange == MAX_RECONCILIATIONS {
                     return Err(format!(
-                        "planner/architect disagreement after one reconciliation exchange: {}. Initial engine rejections: {}. Revise stage constraints or scope and retry; previous plan retained",
+                        "planner/architect disagreement after {MAX_RECONCILIATIONS} reconciliation exchanges: {}. Initial engine rejections: {}. Revise stage constraints or scope and retry; previous plan retained",
                         json!(disagreements), json!(engine_corrections.iter().map(|(id,(_,error))| json!({"stage_id":id,"error":error})).collect::<Vec<_>>())
                     ));
                 }
@@ -942,7 +894,7 @@ impl Ctx {
         Ok(a.clone())
     }
 }
-pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required capability proposal against cross-stage constraints and failure impact. Planning agrees a tier without a provider or model; only active execution reassessment evaluates a concrete replacement and cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Set agree=true only when risk, complexity and task all match the planner proposal. If your independent classification differs, set agree=false and explain why in rationale. Contradictory agree=true fields are returned to you for response correction; do not change actual findings merely to pass validation. On disagreement, explain corrections; only one planner/architect reconciliation exchange is allowed. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
+pub(crate) const EVALUATION_CONTRACT: &str = r#"Independently evaluate each required capability proposal against cross-stage constraints and failure impact. Planning agrees a tier without a provider or model; only active execution reassessment evaluates a concrete replacement and cost policy. A planner proposal is not your endorsement. Include model_evaluations:[{"stage_id":1,"agree":true,"rationale":"independent architectural reasons","risk":"simple|standard|critical","complexity":"simple|standard|complex","task":"documentation|functionality|concurrency|persistence|security"}]. Set agree=true only when risk, complexity and task all match the planner proposal. If your independent classification differs, set agree=false and explain why in rationale. Contradictory agree=true fields are returned to you for response correction; do not change actual findings merely to pass validation. On disagreement, explain corrections; at most three planner/architect reconciliation exchanges are allowed, and agreement ends them. For a selection-only turn return ONLY {"model_evaluations":[...]} and do not write files."#;
 pub(crate) fn mock_evaluations(plan: &Value, ids: &[i64]) -> Value {
     json!(ids.iter().map(|id| { let p = &plan["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["model_proposal"];
         json!({"stage_id":id,"agree":true,"rationale":"Architect: independently checked cross-stage interfaces and failure impact.","risk":p["risk"],"complexity":p["complexity"],"task":p["task"]}) }).collect::<Vec<_>>())
