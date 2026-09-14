@@ -410,7 +410,7 @@ impl Ctx {
                     }
                 }
                 let goal = self.session.state.lock().unwrap().goal.clone();
-                crate::architecture::atomic_json(&self.forge_path("plan-candidate.json"), &json!({
+                crate::durable_json::publish_pretty(&self.forge_path("plan-candidate.json"), &json!({
                     "goal": goal, "status": "draft",
                     "stages": [
                         {"id": 1, "title": "first", "instructions": "append line one",

@@ -14,6 +14,7 @@ mod catalogue_process;
 mod metadata;
 mod agent;
 mod agent_log;
+mod durable_json;
 mod architecture;
 mod architect;
 mod review_history;

@@ -5,10 +5,11 @@ use std::sync::atomic::AtomicUsize;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "forge-catalogue-test-{}-{}",
             std::process::id(),
-            CACHE_NONCE.fetch_add(1, Ordering::Relaxed)
+            NONCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)

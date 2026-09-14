@@ -1,7 +1,7 @@
 //! Bounded official-metadata enrichment. Documents are data, never instructions;
 //! official pages never grant runtime availability, and configured tiers route
 //! whether or not research has run. Only the fixed adapters below are fetched.
-use crate::catalogue::{Policy, Provider, identifier, write_atomic_json};
+use crate::catalogue::{Policy, Provider, identifier};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -861,7 +861,7 @@ fn run_pass(
         negative: negative.clone(),
         sources: sources.clone(),
     });
-    let write = write_atomic_json(path, &file);
+    let write = crate::durable_json::publish_private_compact(path, &file);
     let mut locked = state.lock().unwrap();
     locked.records = records;
     locked.negative = negative;

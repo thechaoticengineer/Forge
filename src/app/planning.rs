@@ -116,7 +116,7 @@ impl Ctx {
             })?;
             let output = reply.value;
             let answer = output["answer"].as_str().unwrap();
-            crate::architecture::atomic_json(&self.forge_path("answer.json"), &output)?;
+            crate::durable_json::publish_pretty(&self.forge_path("answer.json"), &output)?;
             let user = json!({"role": "user", "text": question, "unix": unix_timestamp()});
             let assistant = json!({"role": "assistant", "text": answer, "unix": unix_timestamp()});
             let mut file = fs::OpenOptions::new().create(true).append(true)
@@ -197,7 +197,7 @@ impl Ctx {
             if !plan["role_usage"].is_object() { plan["role_usage"] = json!({}); }
             plan["role_usage"]["planner"] = plan["planner_usage"].clone();
         }
-        crate::architecture::atomic_json(&self.forge_path("plan-candidate.json"), &plan)?;
+        crate::durable_json::publish_pretty(&self.forge_path("plan-candidate.json"), &plan)?;
         Ok(plan)
     }
 

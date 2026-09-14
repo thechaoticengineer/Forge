@@ -4,6 +4,7 @@
 //! only durable whole records; readers address files directly, without rescanning
 //! the log. A shared filesystem lock orders startup, both streams, and readers.
 //! A durable pending marker makes interrupted dual-file publication explicit.
+use crate::durable_json::{identity, publish_pretty, safe_id, sync_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
@@ -88,17 +89,15 @@ impl Drop for Lock {
         }
     }
 }
-fn sync_dir(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())
-}
 fn read(path: &Path) -> Result<Value, String> {
-    serde_json::from_slice(&fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
-        .map_err(|e| format!("invalid agent log record {}: {e}", path.display()))
+    crate::durable_json::read_json(
+        path,
+        |path, e| format!("{}: {e}", path.display()),
+        |path, e| format!("invalid agent log record {}: {e}", path.display()),
+    )
 }
 fn atomic(path: &Path, value: &Value) -> Result<(), String> {
-    crate::architecture::atomic_json(path, value)
+    publish_pretty(path, value)
 }
 fn pending(dir: &Path) -> Result<(), String> {
     atomic(
@@ -117,9 +116,6 @@ fn check(dir: &Path) -> Result<(), String> {
         Ok(())
     }
 }
-fn safe_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
 fn record(session: &str, sequence: u64, message: &Message) -> Value {
     json!({"version":1,"session":session,"id":format!("{session}:{sequence}"),"sequence":sequence,
         "kind":message.kind,"stream":message.stream,"label":message.label,"text":message.text})
@@ -128,7 +124,7 @@ fn record_path(dir: &Path, sequence: u64) -> PathBuf {
     dir.join(format!("{sequence:020}.json"))
 }
 fn new_session(root: &Path, legacy: bool) -> Result<(String, PathBuf), String> {
-    let session = crate::architecture::identity();
+    let session = identity();
     let dir = root.join(&session);
     fs::create_dir(&dir).map_err(|e| e.to_string())?;
     atomic(
@@ -250,7 +246,7 @@ fn publish_startup(
             // Preserve every collision without overwriting recovery evidence.
             fs::rename(
                 &replacement,
-                journal.join(format!("stale-{}", crate::architecture::identity())),
+                journal.join(format!("stale-{}", identity())),
             )
             .map_err(|e| e.to_string())?;
         }
@@ -321,7 +317,7 @@ impl InvocationLog {
             }
         }
         let legacy = if needs_legacy_archive(forge, &root)? {
-            Some(crate::architecture::identity())
+            Some(identity())
         } else {
             None
         };

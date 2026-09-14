@@ -1,8 +1,9 @@
 //! Plan-owned architect turns. Provider session tails are usable only after publication.
 use crate::agent::{AgentRequest, AgentResult};
 use crate::app::Ctx;
-use crate::architecture::{atomic_json, checkpoint_default, identity};
+use crate::architecture::{checkpoint_default, identity};
 use crate::catalogue::{Policy, Provider};
+use crate::durable_json::publish_pretty;
 use crate::util::unix_timestamp;
 use crate::usage::accumulate_invocation_usage;
 use serde::Deserialize;
@@ -444,7 +445,7 @@ impl Ctx {
             );
             prompt.push_str(&format!("\n{}\n{}\nEvaluate exactly required_model_stage_ids: {:?}. Include model_evaluations in the complete architect output.", self.stage_selection_prompt(&candidate, &routing_ids)?, crate::routing::EVALUATION_CONTRACT, routing_ids));
             let turn = identity();
-            atomic_json(
+            publish_pretty(
                 &pending_path,
                 &json!({"version":1,"plan_id":candidate["plan_id"],"revision":candidate["revision"],"turn":turn,"previous_session":cp["session"],"reason":reason}),
             )?;

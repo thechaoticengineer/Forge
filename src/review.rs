@@ -619,7 +619,7 @@ impl Ctx {
                 "\nCRITERIA TO EVIDENCE:\n{acceptance}\n")),
         }
         prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], guidance, plan["plan_id"].as_str().unwrap()));
-        crate::architecture::atomic_json(&self.forge_path("review-identity.json"), &identity)?;
+        crate::durable_json::publish_pretty(&self.forge_path("review-identity.json"), &identity)?;
         prompt.push_str("\nThe engine also wrote the exact identity to .forge/review-identity.json (read-only during this review). Assemble your final verdict in private /tmp using a script: load that file with json.load, assign the resulting object to verdict['identity'], and serialize the verdict with json.dumps. Return that exact serialized JSON. Do not manually transcribe hashes or reconstruct the identity. The engine still validates the complete identity and rejects any mismatch.\n");
         if role == "architect" {
             let records = match scope { ReviewScope::Stage(idx) => &plan["stages"][idx]["reviews"], ReviewScope::Plan => &plan["plan_review"]["reviews"] };
@@ -659,7 +659,7 @@ impl Ctx {
             if cp["session"]["provider"] != provider || cp["context_status"] != "ready" {
                 return Err("architect session requires recovery".into());
             }
-            crate::architecture::atomic_json(
+            crate::durable_json::publish_pretty(
                 &pending,
                 &json!({"turn":turn,"previous_session":cp["session"]}),
             )?;

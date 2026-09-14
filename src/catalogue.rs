@@ -11,7 +11,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-static CACHE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const VERSION: u32 = 1;
 const MAX_MODELS: usize = 1024;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1275,39 +1274,10 @@ pub(crate) fn load_policy(path: &Path) -> Result<Option<Policy>, String> {
     Policy::from_settings(&json!({"model_catalogue":value})).map(Some)
 }
 pub(crate) fn save_policy(path: &Path, policy: &Policy) -> Result<(), String> {
-    write_atomic_json(path, &json!(policy))
+    crate::durable_json::publish_private_compact(path, &json!(policy))
 }
 fn write_cache(path: &Path, cache: &Cache) -> Result<(), String> {
-    write_atomic_json(path, &json!(cache))
-}
-pub(crate) fn write_atomic_json(path: &Path, value: &Value) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().unwrap();
-    std::fs::create_dir_all(dir).map_err(|_| "cache directory creation failed")?;
-    let tmp = path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        CACHE_NONCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|_| "cache temporary file failed")?;
-        f.write_all(&serde_json::to_vec(value).map_err(|_| "cache encoding failed")?)
-            .map_err(|_| "cache write failed")?;
-        f.sync_all().map_err(|_| "cache sync failed")?;
-        std::fs::rename(&tmp, path).map_err(|_| "cache publication failed")?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| "cache directory sync failed")?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(tmp);
-    result
+    crate::durable_json::publish_private_compact(path, &json!(cache))
 }
 
 #[cfg(test)]

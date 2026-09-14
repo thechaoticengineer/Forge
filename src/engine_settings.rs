@@ -62,7 +62,7 @@ pub(crate) fn save(path: &Path, settings: &Value) -> Result<(), String> {
     for (key, value) in persisted.as_object_mut().unwrap() {
         *value = settings[key].clone();
     }
-    crate::catalogue::write_atomic_json(path, &json!({"version":1,"settings":persisted}))
+    crate::durable_json::publish_private_compact(path, &json!({"version":1,"settings":persisted}))
         .map_err(|e| format!("could not save engine settings {}: {e}", path.display()))
 }
 

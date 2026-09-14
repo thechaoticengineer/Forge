@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(crate) use crate::durable_json::identity;
+use crate::durable_json::{publish_pretty, publish_pretty_checked, safe_id, sync_dir};
 
 #[path = "architecture_storage.rs"]
 mod storage;
@@ -21,7 +23,6 @@ const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 // accepts, so the log line has to hold what a legal turn can produce.
 const EVENT_LIMIT: usize = 512 * 1024;
 const HISTORY_PAGE_BYTES: usize = 256 * 1024;
-static IDS: AtomicU64 = AtomicU64::new(0);
 
 /// Guidance and agreement records carry a `relevant_inputs` fingerprint that
 /// copies the stage text a prompt already contains, and it grows with every
@@ -38,88 +39,12 @@ pub(crate) fn prompt_checkpoint(checkpoint: &Value) -> Value {
     checkpoint
 }
 
-pub(crate) fn identity() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!(
-        "{nanos:x}-{:x}-{:x}",
-        std::process::id(),
-        IDS.fetch_add(1, Ordering::Relaxed)
-    )
-}
-fn safe_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
 fn read_json(path: &Path) -> Result<Value, String> {
-    serde_json::from_slice(&fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-fn sync_dir(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| e.to_string())
-}
-pub(crate) fn atomic_json(path: &Path, value: &Value) -> Result<(), String> {
-    atomic_json_checked(path, value, false)
-}
-fn atomic_json_checked(path: &Path, value: &Value, fail_sync: bool) -> Result<(), String> {
-    let parent = path.parent().ok_or("missing parent")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let tmp = parent.join(format!(".{}.tmp", identity()));
-    let backup = parent.join(format!(".{}.rollback", identity()));
-    let result = (|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| e.to_string())?;
-        f.write_all(&serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())?;
-        if read_json(&tmp)? != *value {
-            return Err("snapshot readback mismatch".into());
-        }
-        let existed = path.exists();
-        if existed {
-            fs::hard_link(path, &backup).map_err(|e| e.to_string())?;
-        }
-        sync_dir(parent)?;
-        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-        let synced = if fail_sync {
-            Err("injected publication sync error".into())
-        } else {
-            sync_dir(parent)
-        };
-        if let Err(error) = synced {
-            // A reported failure restores the old publication. A process crash
-            // instead selects whichever complete commit record survived rename.
-            let restored = if existed {
-                fs::rename(&backup, path)
-            } else {
-                fs::remove_file(path)
-            };
-            restored.map_err(|e| {
-                format!("{error}; publication outcome uncertain, rollback failed: {e}")
-            })?;
-            sync_dir(parent).map_err(|e| {
-                format!("{error}; restored publication but rollback durability uncertain: {e}")
-            })?;
-            return Err(error);
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(tmp);
-    // If rollback itself failed, retain its durable recovery record.
-    if result
-        .as_ref()
-        .err()
-        .is_none_or(|e| !e.contains("outcome uncertain"))
-    {
-        let _ = fs::remove_file(backup);
-    }
-    result
+    crate::durable_json::read_json(
+        path,
+        |path, e| format!("{}: {e}", path.display()),
+        |path, e| format!("{}: {e}", path.display()),
+    )
 }
 
 pub(crate) fn checkpoint_default() -> Value {
@@ -824,7 +749,7 @@ impl Store {
             .map_err(|e| e.to_string())?;
             return Err("injected partial snapshot".into());
         }
-        atomic_json(
+        publish_pretty(
             &dir.join("checkpoints").join(format!("{token}.json")),
             &bundle,
         )?;
@@ -834,7 +759,7 @@ impl Store {
             return Err("injected interruption after checkpoint".into());
         }
         let logical_plan = self.hydrate(plan.clone())?;
-        atomic_json_checked(
+        publish_pretty_checked(
             &self.root.join("plan.json"),
             &plan,
             stop == "publication_error",
@@ -849,7 +774,7 @@ impl Store {
         let dir = self.directory(plan["plan_id"].as_str().ok_or("missing identity")?)?;
         let bundle = read_json(&dir.join("checkpoints").join(format!("{}.json",
             plan["architecture"]["checkpoint"].as_str().ok_or("missing checkpoint")?)))?;
-        atomic_json(&dir.join("archived.json"), &bundle["plan"])
+        publish_pretty(&dir.join("archived.json"), &bundle["plan"])
     }
     pub(crate) fn reset(&self) -> Result<(), String> {
         if let Some(plan) = self.load()? {
@@ -1231,7 +1156,7 @@ mod tests {
             assert_eq!(store.load().unwrap().unwrap(), p);
             let mut bundle: Value = serde_json::from_slice(&bytes).unwrap();
             bundle["checkpoint"] = fault;
-            atomic_json(&path, &bundle).unwrap();
+            publish_pretty(&path, &bundle).unwrap();
             assert!(store.load_raw().is_err());
             fs::write(&path, &bytes).unwrap();
         }
@@ -1333,7 +1258,7 @@ mod tests {
         let temp = Temp::new();
         let store = temp.store();
         let legacy = plan();
-        atomic_json(&temp.0.join("plan.json"), &legacy).unwrap();
+        publish_pretty(&temp.0.join("plan.json"), &legacy).unwrap();
         assert_eq!(store.load().unwrap(), Some(legacy.clone()));
         assert!(!temp.0.join("architecture").exists());
         assert_eq!(
@@ -1639,7 +1564,7 @@ mod tests {
                 "plan" => {
                     let mut p = old.clone();
                     p["goal"] = json!("tampered");
-                    atomic_json(&temp.0.join("plan.json"), &p).unwrap();
+                    publish_pretty(&temp.0.join("plan.json"), &p).unwrap();
                 }
                 "checkpoint" => {
                     fs::write(
@@ -1662,12 +1587,12 @@ mod tests {
                 "version" => {
                     let mut p = old.clone();
                     p["contract_version"] = json!(99);
-                    atomic_json(&temp.0.join("plan.json"), &p).unwrap();
+                    publish_pretty(&temp.0.join("plan.json"), &p).unwrap();
                 }
                 _ => {
                     let mut p = old.clone();
                     p["plan_id"] = json!("../escape");
-                    atomic_json(&temp.0.join("plan.json"), &p).unwrap();
+                    publish_pretty(&temp.0.join("plan.json"), &p).unwrap();
                 }
             }
             assert!(store.load().is_err(), "accepted {fault}");
