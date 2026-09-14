@@ -13,6 +13,12 @@ import "DetailView.js" as DetailView
 import "ReviewView.js" as ReviewView
 import "PlanReview.js" as PlanReview
 import "PanelDetails.js" as PanelDetails
+import "ModelRouting.js" as ModelRouting
+import "ReportFormat.js" as ReportFormat
+import "UsageFormat.js" as UsageFormat
+import "GoalEnhancement.js" as GoalEnhancement
+import "PlanEdit.js" as PlanEdit
+import "CataloguePresentation.js" as CataloguePresentation
 
 Item {
   id: root
@@ -235,220 +241,9 @@ Item {
     catalogueWasRefreshing = refreshing
   }
 
-  // Status and prose are separate in stage cards and archived reports.
-  function stageModelText(stage, detail) {
-    return stageModelStatus(stage) + "\n" + stageModelDetails(stage, detail).map(function(field) {
-      return field.label + ": " + field.text
-    }).join("\n") + (stageModelErrors(stage) ? "\n" + stageModelErrors(stage) : "")
-  }
-
-  function stageModelStatus(stage) {
-    const a = stage.model_agreement || {}
-    const e = a.effective || {}, p = a.policy_inputs || {}, proposed = a.validated_proposal || {}
-    let text = !stage.model_agreement ? "Model agreement pending — reconcile before approval"
-      : (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
-      + e.provider + "/" + e.model + " · " + e.native_effort
-      + " · " + (a.verification_state || a.availability || "unverified")
-      + " · " + (p.tier || "unclassified") + " (" + (p.tier_provenance || "unknown provenance") + ")"
-    if (a.version === 2) {
-      text = (a.valid === false ? "Needs reconciliation · " : "Agreed · ")
-        + "Tier: " + (p.tier || proposed.tier || "pending")
-        + " · model selected at implementation start"
-      const selected = stage.model_selection || {}, actual = selected.effective || {}
-      if (actual.provider && actual.model)
-        text += "\nSelected: " + actual.provider + "/" + actual.model + " · " + actual.native_effort
-    }
-    if (proposed.provider && proposed.model)
-      text += "\nProposed: " + proposed.provider + "/" + proposed.model + " · " + proposed.native_effort
-    const calls = stage.model_invocations || []
-    if (calls.length) {
-      const last = calls[calls.length - 1], actual = last.effective || last.requested || {}
-      text += "\nExecution: " + actual.provider + "/" + actual.model + " · "
-        + (actual.native_effort || (last.requested || {}).native_effort || "provider_default")
-        + " · " + (last.verification_state || last.status)
-    }
-    const routing = stage.reassessment || {}, history = routing.history || []
-    if (routing.status) text += "\nRouting: " + routing.status + " · reassessments " + (routing.count || 0)
-      + "/" + ((routing.limits || {}).max_reassessments ?? 3)
-      + " · operational retries " + (routing.operational_retries || 0)
-      + "/" + ((routing.limits || {}).max_operational_retries ?? 2)
-    const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
-    if (trigger) text += "\nTrigger: " + trigger.kind
-    return text
-  }
-
-  function stageModelErrors(stage) {
-    return [(stage.reassessment || {}).error, stage.model_block].filter(Boolean).join("\n")
-  }
-
-  function stageModelDetails(stage, detail) {
-    return detail ? stageModelRationale(stage).concat(stageModelDiagnostics(stage)) : stageModelReasons(stage)
-  }
-
-  function stageModelReasons(stage) {
-    const a = stage.model_agreement || {}
-    const fields = []
-    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
-    add("Planner", a.planner_reason)
-    add("Architect", a.architect_reason)
-    const routing = stage.reassessment || {}, history = routing.history || []
-    const trigger = routing.pending || (history.length ? history[history.length - 1] : null)
-    if (trigger) add("Trigger evidence", typeof trigger.evidence === "string" ? trigger.evidence
-      : JSON.stringify(trigger.evidence || trigger.error || ""))
-    return fields
-  }
-
-  function stageModelRoutingHistory(stage) {
-    const routing = stage.reassessment || {}, history = routing.history || []
-    const fields = []
-    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
-    history.slice(-4).forEach(function(h, i) {
-      add(h.kind + " · Planner " + (i + 1), h.planner_reason)
-      add(h.kind + " · Architect " + (i + 1), h.architect_reason)
-    })
-    return fields
-  }
-
-  function stageModelDiagnostics(stage) {
-    const a = stage.model_agreement || {}, p = (stage.model_selection || a).policy_inputs || {}
-    const fields = []
-    function add(label, text) { if (text !== undefined && text !== null && text !== "") fields.push({label:label, text:String(text)}) }
-    add("Risk", ((a.validated_proposal || {}).risk || "pending") + " · complexity: " + ((a.validated_proposal || {}).complexity || "pending"))
-    add("Constraint", JSON.stringify(p.constraint || {}))
-    add("Cost", p.relative_cost_preference !== null && p.relative_cost_preference !== undefined
-      ? "configured relative preference " + p.relative_cost_preference + " (not a price)"
-      : "unknown / no comparable billing data used")
-    add("Routing price", p.pricing ? "API list rate (not CLI spend): " + JSON.stringify(p.pricing)
-      : "unavailable / no comparable rate used")
-    add("Agreement", (a.id || "pending") + " · policy: " + (p.policy || "pending"))
-    const calls = stage.model_invocations || []
-    if (calls.length) add("Latest invocation", JSON.stringify(calls[calls.length - 1]))
-    return fields
-  }
-
-  function stageModelRationale(stage) {
-    return stageModelReasons(stage).concat(stageModelRoutingHistory(stage))
-  }
-
   function changeModelConstraint(index, key, value) {
     const stage = editStages[index]
-    const c = Object.assign({}, stage.model_constraint || {})
-    if (value.trim()) c[key] = value.trim()
-    else delete c[key]
-    changeStageField(index, "model_constraint", Object.keys(c).length ? c : null)
-  }
-
-  function architectActivityText(activity, architecture) {
-    const a = activity || {};
-    const cp = architecture || {};
-    let text = "Architect · " + (cp.context_status === "needs_recovery" ? "needs_recovery" : a.status || cp.context_status || "legacy");
-    if (a.error) text += " · " + a.error;
-    else if (a.reason) text += " · " + a.reason;
-    else if (cp.recovery && cp.recovery.reason) text += " · recovered: " + cp.recovery.reason;
-    if (cp.session && cp.session.reference) text += " · session " + cp.session.reference;
-    return text;
-  }
-  function architectGuidanceText(architecture) {
-    const cp = architecture || {};
-    const guidance = cp.guidance || {};
-    return Object.keys(guidance).map(function(id) {
-      const g = guidance[id];
-      return "Stage " + id + (g.valid ? "" : " (needs refresh)") + ": " + (g.text || "");
-    }).join("\n");
-  }
-  function architectDecisionText(d) {
-    let text = d.id + " · " + d.status + " · " + d.summary;
-    if (d.rationale) text += "\nWhy: " + d.rationale;
-    if (d.supersedes) text += "\nSupersedes: " + d.supersedes;
-    (d.alternatives || []).forEach(function(a) { text += "\nAlternative: " + a.description + " — " + a.tradeoffs; });
-    return text;
-  }
-  function architectUsageText(plan) {
-    const usage = plan && plan.role_usage ? plan.role_usage : {};
-    return Object.keys(usage).map(function(role) {
-      const tools = usage[role] || {};
-      let total = 0;
-      Object.keys(tools).forEach(function(tool) { total += tools[tool].total_tokens || 0; });
-      return role + ": " + total + " tokens";
-    }).join(" · ");
-  }
-
-  function reportLifecycleText(report) {
-    if (!report || !report.plan_id) return "";
-    const architecture = report.architecture || {};
-    let text = "Plan " + report.plan_id + " · revision " + report.revision;
-    if (architecture.summary) text += "\nArchitecture: " + architecture.summary;
-    (architecture.recent_decisions || []).forEach(function(d) {
-      text += "\nDecision: " + architectDecisionText(d);
-    });
-    (report.stage_outcomes || []).forEach(function(s) {
-      text += "\nStage " + s.id + ": " + s.title + " · " + s.status;
-      if (s.model_agreement) {
-        const view = Object.assign({}, s, {model_invocations:s.last_invocation ? [s.last_invocation] : []});
-        text += "\n" + stageModelText(view, true);
-      }
-      const gate = s.review_gate || {}, roles = gate.roles || {}, policy = s.review_policy || {};
-      text += "\nRecorded aggregate: " + (gate.status || "unavailable")
-        + " · independent: " + (roles.reviewer || "unavailable")
-        + " · architect: " + (roles.architect === "not_required" ? "not required" : roles.architect || "unavailable");
-      if (policy.rationale) text += "\nPolicy: " + policy.rationale;
-    });
-    const usage = architectUsageText(report);
-    if (usage) text += "\nRole usage: " + usage;
-    text += "\nArchived decisions, supersessions and agreements: /api/architecture/history?plan_id=" + encodeURIComponent(report.plan_id);
-    if (report.project) text += "&project=" + encodeURIComponent(report.project);
-    return text;
-  }
-
-  function catalogueProviderText(provider) {
-    return provider.provider + ": " + provider.status + " · " + provider.model_count + " models"
-      + (provider.cached_stale ? " · cached/stale" : "")
-      + (provider.blocker ? " · " + provider.blocker.message
-        : provider.error ? " · " + provider.error.message : "")
-      + (provider.cache_error ? " · " + provider.cache_error : "")
-  }
-  function catalogueOptionText(option) {
-    return option.provider + "/" + option.model + " · " + option.tier
-      + " · " + option.availability + " · " + option.effort
-      + " · configured revision " + option.policy_revision
-      + (option.error ? " · " + option.error : "")
-  }
-  function catalogueStamp(unix) {
-    return new Date(unix * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z"
-  }
-  // Official metadata is descriptive only: freshness/provenance for routing
-  // context. Pricing appears only as a labelled API list rate, never as an
-  // inferred subscription charge or a configured preference.
-  function catalogueMetadataText(record) {
-    const pricing = record.pricing
-      ? record.pricing.label + " " + record.pricing.input + "/" + record.pricing.output
-        + " " + record.pricing.currency + " " + record.pricing.unit
-        + " · basis " + record.pricing.basis + " · as of " + record.pricing.as_of
-      : "pricing unknown"
-    return record.provider + "/" + record.model + " · " + record.provenance
-      + " · verified " + catalogueStamp(record.verified_unix)
-      + (record.removed ? " · removed (retained for audit)" : "")
-      + (record.conflicts && record.conflicts.length
-        ? " · conflict: discovered native support wins" : "")
-      + " · " + pricing
-  }
-  function catalogueMetadataSourceText(source) {
-    return source.url + (source.error
-      ? " · error: " + source.error + " · failures " + source.failures
-        + " · next attempt " + catalogueStamp(source.next_attempt_unix)
-      : source.checked_unix ? " · ok · checked " + catalogueStamp(source.checked_unix) : "")
-  }
-  function catalogueMetadataSummaryText(meta) {
-    if (!meta) return "Official metadata pending"
-    return "Official metadata: " + meta.records + " records · "
-      + meta.unknown_pricing + " unknown pricing · " + meta.negative + " negative-cached"
-      + (meta.source_errors ? " · " + meta.source_errors + " source errors" : "")
-      + (meta.refreshing ? " · refreshing…"
-        : meta.last_refresh_unix
-          ? " · checked " + catalogueStamp(meta.last_refresh_unix)
-            + " (" + meta.last_requests + " requests)"
-          : " · no research yet")
-      + (meta.store_error ? " · " + meta.store_error : "")
+    changeStageField(index, "model_constraint", PlanEdit.modelConstraint(stage, key, value))
   }
 
   function openCatalogue() {
@@ -788,19 +583,8 @@ Item {
     })
   }
 
-  function goalEnhancementAction(snapshot, requestId, currentText, sentText) {
-    if (requestId < 0 || !snapshot || snapshot.request_id !== requestId
-        || snapshot.status === "running") return { action: "none" }
-    if (snapshot.status === "ready")
-      return { action: currentText === sentText ? "apply" : "offer", text: snapshot.goal }
-    if (snapshot.status === "failed")
-      return { action: "error", error: snapshot.error && snapshot.error.trim()
-        ? snapshot.error : "Could not enhance the description. Try again." }
-    return { action: "none" }
-  }
-
   function syncGoalEnhancement() {
-    const outcome = goalEnhancementAction(engineState ? engineState.goal_enhancement : null,
+    const outcome = GoalEnhancement.goalEnhancementAction(engineState ? engineState.goal_enhancement : null,
       goalEnhanceRequest, goalField.text, goalEnhanceSent)
     if (outcome.action === "none") return
     // Consume terminal results once; later polls must preserve Apply and Undo.
@@ -889,7 +673,7 @@ Item {
 
   function beginPlanEdit() {
     if (!editPlanButton.enabled) return
-    editStages = JSON.parse(JSON.stringify(plan.stages))
+    editStages = PlanEdit.cloneStages(plan)
     editGoal = plan.goal || ""
     editProject = lastProject
     editSession++
@@ -918,32 +702,19 @@ Item {
     editRevision++
   }
 
-  function editableNeighbor(index, direction) {
-    for (let target = index + direction; target >= 0 && target < editStages.length;
-         target += direction) {
-      if (editStages[target].status !== "committed") return target
-    }
-    return -1
-  }
-
   function moveEditStage(index, direction) {
     if (editPending || editStages[index].status === "committed") return
-    const target = editableNeighbor(index, direction)
+    const target = PlanEdit.editableNeighbor(editStages, index, direction)
     if (target < 0) return
     keyHandler.forceActiveFocus()
-    const stages = editStages.slice()
-    const stage = stages[index]
-    stages[index] = stages[target]
-    stages[target] = stage
-    editStages = stages
+    editStages = PlanEdit.moveStages(editStages, index, target)
     keyHandler.selectStage(target)
   }
 
   function deleteEditStage(index) {
     if (editPending || editStages[index].status === "committed") return
     keyHandler.forceActiveFocus()
-    const stages = editStages.slice()
-    stages.splice(index, 1)
+    const stages = PlanEdit.deleteStage(editStages, index)
     editStages = stages
     selectedStageIndex = -1
     keyHandler.selectStage(Math.min(index, stages.length - 1))
@@ -952,7 +723,7 @@ Item {
   function addEditStage() {
     if (editPending) return
     keyHandler.forceActiveFocus()
-    editStages = editStages.concat([{ title: "", instructions: "", acceptance: "", commit: "" }])
+    editStages = PlanEdit.addStage(editStages)
     keyHandler.selectStage(editStages.length - 1)
   }
 
@@ -960,16 +731,9 @@ Item {
     if (!savePlanButton.enabled) return
     keyHandler.forceActiveFocus()
     const session = editSession
-    const stages = editStages.map(function(stage) {
-      const content = { title: stage.title, instructions: stage.instructions,
-        acceptance: stage.acceptance, commit: stage.commit }
-      content.model_constraint = stage.model_constraint || null
-      if (stage.depends_on !== undefined) content.depends_on = stage.depends_on
-      if (stage.id !== undefined) content.id = stage.id
-      return content
-    })
+    const content = PlanEdit.payload(editGoal, editStages)
     editPending = true
-    act("/api/plan/edit", { project: editProject, plan: { goal: editGoal, stages: stages } }, function(resp) {
+    act("/api/plan/edit", { project: editProject, plan: content }, function(resp) {
       if (session !== root.editSession) return
       root.editPending = false
       if (resp && resp.ok) root.cancelPlanEdit()
@@ -1008,67 +772,6 @@ Item {
         root.diffError = "Unable to load diff"
       }
     })
-  }
-
-  function nonNegativeInt(value) {
-    return typeof value === "number" && isFinite(value) && value >= 0
-      ? Math.floor(value) : null
-  }
-
-  function formatTokens(value) {
-    const count = nonNegativeInt(value)
-    if (count === null) return "—"
-    if (count >= 1000000) return (count / 1000000).toFixed(1) + "M"
-    if (count >= 1000) return (count / 1000).toFixed(1) + "k"
-    return String(count)
-  }
-
-  function usageTools(usage) {
-    return usage && typeof usage === "object" ? Object.keys(usage).sort().filter(function(tool) {
-      return usage[tool] && typeof usage[tool] === "object"
-    }) : []
-  }
-
-  function quotaSummary(quota) {
-    if (!quota || quota.status === "pending") return "Claude limits: checking…"
-    const windows = quota.windows || []
-    if (quota.status === "unavailable") return "Claude limits: unavailable" + (quota.error ? " · " + quota.error : "")
-    const rows = windows.map(function(window) {
-      const expired = window.resets_unix && window.resets_unix * 1000 <= Date.now()
-      const remaining = expired ? "awaiting refresh" : typeof window.used_percent === "number"
-        ? Math.max(0, 100 - window.used_percent).toFixed(0) + "% remaining" : "remaining unknown"
-      const reset = window.resets_at ? " · reset " + new Date(window.resets_at).toLocaleString() : ""
-      return window.name + ": " + remaining + reset
-    })
-    if (!rows.length) rows.push("Claude limits: no usage windows reported")
-    if (quota.status === "stale") rows.push("Previous reading · " + (quota.error || "refresh pending"))
-    if (quota.extra_usage_enabled === true) rows.push("Usage credits enabled")
-    if (quota.refreshing) rows.push("Refreshing…")
-    return rows.join("\n")
-  }
-
-  function usageSummary(usage) {
-    return usageTools(usage).map(function(tool) {
-      return tool + " " + formatTokens(usage[tool].total_tokens) + " tok"
-    }).join(" · ")
-  }
-
-  function modelSummary(models) {
-    return models && typeof models === "object" ? Object.keys(models).sort().map(function(model) {
-      return model + " " + formatTokens(models[model])
-    }).join(" · ") : ""
-  }
-
-  function usageBreakdown(usage) {
-    return usageTools(usage).map(function(tool) {
-      const item = usage[tool]
-      const models = modelSummary(item.models)
-      // Keep exact counts in details; only the summary and model list are compact.
-      function exact(value) { const count = nonNegativeInt(value); return count === null ? "—" : String(count) }
-      return tool + ": input " + exact(item.input_tokens) + " · output " + exact(item.output_tokens)
-        + " · total " + exact(item.total_tokens) + " tok · calls " + exact(item.calls)
-        + (models ? "\nmodels: " + models : "")
-    }).join("\n")
   }
 
   property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
@@ -1148,7 +851,7 @@ Item {
     stageSnapshot = {key: stageDetailScope(stage), commit: stage.commit || "",
       instructions: stage.instructions || "", acceptance: stage.acceptance || "",
       policyRationale: (stage.review_policy || {}).rationale || "",
-      rationale: stageModelRationale(stage), diagnostics: stageModelDiagnostics(stage)}
+      rationale: ModelRouting.stageModelRationale(stage), diagnostics: ModelRouting.stageModelDiagnostics(stage)}
   }
   function syncStageSnapshot() {
     const stage = (displayedStages || []).find(s => s.id === expandedStageId)
@@ -1385,12 +1088,12 @@ Item {
   }
 
   function reviewRoundLabel(entry) {
-    const round = nonNegativeInt(entry.round)
+    const round = UsageFormat.nonNegativeInt(entry.round)
     return round !== null && round > 0 ? "round " + round : "round unknown"
   }
 
   function reviewTimestamp(verdict) {
-    const unix = nonNegativeInt(verdict.unix)
+    const unix = UsageFormat.nonNegativeInt(verdict.unix)
     return unix === null ? "" : new Date(unix * 1000).toISOString()
   }
 
@@ -1401,33 +1104,6 @@ Item {
     if (!step) return ""
     const activity = step.indexOf("fixing") === 0 ? "fixing for review" : step
     return "now: " + activity + " · " + reviewRoundLabel({ round: stage.rounds })
-  }
-
-  function reportTime(report, now) {
-    if (typeof report.unix !== "number" || !isFinite(report.unix)) return "—"
-    const seconds = Math.max(0, Math.floor(now - report.unix))
-    if (seconds < 60) return "just now"
-    if (seconds < 3600) return Math.floor(seconds / 60) + "m ago"
-    if (seconds < 86400) return Math.floor(seconds / 3600) + "h ago"
-    return Math.floor(seconds / 86400) + "d ago"
-  }
-
-  function reportDuration(seconds) {
-    const count = nonNegativeInt(seconds)
-    return count === null ? "—" : Math.floor(count / 60) + "m " + (count % 60) + "s"
-  }
-
-  function reportCommits(commits) {
-    const lines = []
-    // ListView can expose nested arrays as QML sequences, for which isArray is false.
-    if (commits && typeof commits.length === "number") {
-      for (let i = 0; i < commits.length; i++) {
-        const commit = commits[i]
-        if (!commit || !(commit.sha || commit.message || commit.title)) continue
-        lines.push(((commit.sha || "—") + " " + (commit.message || commit.title || "")).trim())
-      }
-    }
-    return lines.join("\n")
   }
 
   function chooserRows(data, filter) {
@@ -1920,7 +1596,7 @@ Item {
               }
             }
             Text {
-              readonly property string planUsage: root.usageSummary(root.plan ? root.plan.usage : null)
+              readonly property string planUsage: UsageFormat.usageSummary(root.plan ? root.plan.usage : null)
               visible: root.phase !== "planning"
                 || (root.engineState !== null && root.engineState.run_started_unix > 0)
               width: parent.width
@@ -2105,7 +1781,7 @@ Item {
           }
           Text {
             width: parent.width
-            text: root.quotaSummary(root.engineState && root.engineState.claude_quota
+            text: UsageFormat.quotaSummary(root.engineState && root.engineState.claude_quota
               ? Object.assign({}, root.engineState.claude_quota, {error: ""}) : null)
             textFormat: Text.PlainText
             color: root.foreground
@@ -2155,7 +1831,7 @@ Item {
           Text {
             width: parent.width
             visible: !!root.catalogue
-            text: root.catalogueMetadataSummaryText(root.catalogue && root.catalogue.metadata
+            text: CataloguePresentation.catalogueMetadataSummaryText(root.catalogue && root.catalogue.metadata
               ? Object.assign({}, root.catalogue.metadata, {store_error: ""}) : null)
             color: root.catalogue && root.catalogue.metadata
               && (root.catalogue.metadata.source_errors || root.catalogue.metadata.store_error)
@@ -2414,7 +2090,7 @@ Item {
           }
           Text {
             width: parent.width
-            text: root.architectUsageText(root.plan)
+            text: ReportFormat.architectUsageText(root.plan)
             visible: text !== ""
             textFormat: Text.PlainText
             color: root.mutedForeground
@@ -2907,7 +2583,7 @@ Item {
                 }
                 Text {
                   width: stageRow.width
-                  text: root.stageModelStatus(stageRow.modelData)
+                  text: ModelRouting.stageModelStatus(stageRow.modelData)
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap
@@ -2917,7 +2593,7 @@ Item {
                 Text {
                   visible: text !== ""
                   width: stageRow.width
-                  text: root.stageModelErrors(stageRow.modelData)
+                  text: ModelRouting.stageModelErrors(stageRow.modelData)
                   textFormat: Text.PlainText
                   color: root.urgent
                   wrapMode: Text.Wrap
@@ -3140,7 +2816,7 @@ Item {
                     Text {
                       visible: stageRow.expanded && text !== ""
                       width: stageRow.width
-                      text: root.usageSummary(stageRow.modelData.usage)
+                      text: UsageFormat.usageSummary(stageRow.modelData.usage)
                       textFormat: Text.PlainText
                       color: root.mutedForeground
                       wrapMode: Text.Wrap
@@ -3171,12 +2847,12 @@ Item {
                     }
                     PanelButton {
                       label: "↑ Up"
-                      enabled: !root.editPending && root.editableNeighbor(stageRow.index, -1) >= 0
+                      enabled: !root.editPending && PlanEdit.editableNeighbor(root.editStages, stageRow.index, -1) >= 0
                       onClicked: root.moveEditStage(stageRow.index, -1)
                     }
                     PanelButton {
                       label: "↓ Down"
-                      enabled: !root.editPending && root.editableNeighbor(stageRow.index, 1) >= 0
+                      enabled: !root.editPending && PlanEdit.editableNeighbor(root.editStages, stageRow.index, 1) >= 0
                       onClicked: root.moveEditStage(stageRow.index, 1)
                     }
                     PanelButton {
@@ -3431,8 +3107,8 @@ Item {
                 }
                 Text {
                   width: parent.width
-                  text: root.reportTime(reportRow.modelData, root.agentNow)
-                    + " · " + root.reportDuration(reportRow.modelData.duration_secs)
+                  text: ReportFormat.reportTime(reportRow.modelData, root.agentNow)
+                    + " · " + ReportFormat.reportDuration(reportRow.modelData.duration_secs)
                     + " · " + reportRow.commitCount + (reportRow.commitCount === 1 ? " commit" : " commits")
                   textFormat: Text.PlainText
                   color: root.mutedForeground
@@ -3443,7 +3119,7 @@ Item {
                 Text {
                   visible: text !== ""
                   width: parent.width
-                  text: root.usageSummary(reportRow.modelData.usage)
+                  text: UsageFormat.usageSummary(reportRow.modelData.usage)
                   textFormat: Text.PlainText
                   color: root.mutedForeground
                   wrapMode: Text.Wrap
@@ -3459,7 +3135,9 @@ Item {
                   sourceComponent: PanelFields {
                     objectName: "reportDetails"
                     width: reportDetailsLoader.width
-                    entries: PanelDetails.report(reportRow.modelData, root)
+                    entries: PanelDetails.report(reportRow.modelData, {stageModelStatus: ModelRouting.stageModelStatus,
+                      stageModelErrors: ModelRouting.stageModelErrors, stageModelDetails: ModelRouting.stageModelDetails,
+                      architectUsageText: ReportFormat.architectUsageText, usageBreakdown: UsageFormat.usageBreakdown})
                     onInspecting: reportList.captureReading()
                   }
                 }
@@ -3597,7 +3275,7 @@ Item {
                 PanelFields {
                   objectName: "catalogueOptions"
                   width: parent.width
-                  entries: PanelDetails.options(root.catalogueDetails ? root.catalogueDetails.options : [], root.catalogueOptionText)
+                  entries: PanelDetails.options(root.catalogueDetails ? root.catalogueDetails.options : [], CataloguePresentation.catalogueOptionText)
                 }
                 Row {
                   spacing: Style.space(8)
@@ -3620,13 +3298,13 @@ Item {
                   objectName: "catalogueMetadata"
                   width: parent.width
                   entries: PanelDetails.metadata(root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.records : [], root.catalogueStamp)
+                    ? root.catalogueDetails.metadata.records : [], CataloguePresentation.catalogueStamp)
                 }
                 PanelFields {
                   objectName: "catalogueSources"
                   width: parent.width
                   entries: PanelDetails.sources(root.catalogueDetails && root.catalogueDetails.metadata
-                    ? root.catalogueDetails.metadata.sources : [], root.catalogueStamp)
+                    ? root.catalogueDetails.metadata.sources : [], CataloguePresentation.catalogueStamp)
                 }
                 Repeater {
                   model: root.catalogueDetails && root.catalogueDetails.metadata
@@ -3635,7 +3313,7 @@ Item {
                     required property var modelData
                     width: parent.width
                     text: modelData.provider + "/" + modelData.model + " · not in official source · attempts "
-                      + modelData.attempts + " · retry after " + root.catalogueStamp(modelData.next_attempt_unix)
+                      + modelData.attempts + " · retry after " + CataloguePresentation.catalogueStamp(modelData.next_attempt_unix)
                     wrapMode: Text.Wrap
                     color: root.mutedForeground
                     font.family: root.fontFamily

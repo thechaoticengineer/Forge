@@ -6,10 +6,8 @@ const read = n => readFileSync(new URL('../quickshell/'+n, import.meta.url),'utf
 const fields = {}, preview = {}, panel = read('Panel.qml'), helpers = {};
 vm.runInNewContext(read('PanelDetails.js'), fields);
 vm.runInNewContext(read('DetailText.js'), preview);
-vm.runInNewContext(panel.slice(panel.indexOf('  function stageModelText('),panel.indexOf('  function changeModelConstraint(')), helpers);
-vm.runInNewContext(panel.slice(panel.indexOf('  function architectUsageText('),panel.indexOf('  function reportLifecycleText(')), helpers);
-vm.runInNewContext(panel.slice(panel.indexOf('  function nonNegativeInt('),panel.indexOf('  property var reportIdentityCache:')), helpers);
-vm.runInNewContext(panel.slice(panel.indexOf('  function catalogueProviderText('),panel.indexOf('  function openCatalogue(')), helpers);
+for (const helper of ['ModelRouting.js','ReportFormat.js','UsageFormat.js','CataloguePresentation.js'])
+  vm.runInNewContext(read(helper), helpers);
 const values = ['\n \t\n  first LF  \nlast  \t','\r\n \r\n  first CRLF  \r\nlast\t','\r \rfirst CR\rlast  ',
   ' \r\n\t ','','\n界🙂 é <b>literal</b> & text\nlast  ','x'.repeat(5000)];
 const decision = (text,i) => ({id:'d'+i,status:'accepted',summary:text,rationale:text,supersedes:'old'+i,

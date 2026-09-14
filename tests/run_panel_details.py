@@ -45,11 +45,8 @@ def block(marker, kind):
     raise ValueError(marker)
 
 helpers = between('  function revealDetail(', '  function reviewScope(')
-helpers += between('  function stageModelText(', '  function changeModelConstraint(')
-helpers += between('  function architectUsageText(', '  function reportLifecycleText(')
-helpers += between('  function catalogueProviderText(', '  function openCatalogue(')
-helpers += between('  function nonNegativeInt(', '  property var reviewViews:')
-helpers += between('  function reportTime(', '  function chooserRows(')
+helpers += between('  function canMoveQueueGoal(', '  readonly property string phase:')
+helpers += between('  property var reportIdentityCache:', '  property var reviewViews:')
 helpers += between('  component CadenceButton:', '\n}')
 helpers += between('  readonly property var planReview:', '  property bool chooserOpen:')
 fragments = {
@@ -72,7 +69,8 @@ fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.cl
 with tempfile.TemporaryDirectory(prefix='forge-panel-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'PlanReview.js'):
+    for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'PlanReview.js',
+                 'ModelRouting.js', 'ReportFormat.js', 'UsageFormat.js', 'CataloguePresentation.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_panel.qml').write_text(fixture)
     runtime = path / 'runtime'

@@ -206,9 +206,11 @@ test('leaving and revisiting a project resets both lists and strands the earlier
     agentSession: 'agent', busy: false, historyFilter: 'errors', engineState: null };
   ctx.root = ctx;
   ctx.api = (method, path, body, done, scoped) => ctx.calls.push({path, done, scoped});
+  ctx.GoalEnhancement = {};
+  vm.runInNewContext(read('GoalEnhancement.js'), ctx.GoalEnhancement);
   vm.runInNewContext([
     slice('  function syncHistory()', '  onHistoryFilterChanged:'),
-    slice('  function goalEnhancementAction(', '  function revisePlan('),
+    slice('  function syncGoalEnhancement(', '  function revisePlan('),
     slice('  function refreshAgentLog()', '  function act('),
     slice('  onEngineStateChanged: {', '  onBusyChanged: {')
       .replace('onEngineStateChanged: {', 'function engineStateChanged() {'),

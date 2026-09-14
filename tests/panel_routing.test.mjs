@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const ctx = {};
-vm.runInNewContext(qml.slice(qml.indexOf('  function stageModelText('), qml.indexOf('  function architectActivityText(')), ctx);
+vm.runInNewContext(readFileSync(new URL('../quickshell/ModelRouting.js', import.meta.url), 'utf8'), ctx);
+const planEdit = {};
+vm.runInNewContext(readFileSync(new URL('../quickshell/PlanEdit.js', import.meta.url), 'utf8'), planEdit);
 const stage = {model_agreement: {id:'agreed-1', valid:true, availability:'unverified',
   effective:{provider:'codex',model:'configured-model',native_effort:'high'},
   policy_inputs:{tier:'strong',tier_provenance:'configured',relative_cost_preference:2,policy:'stage-routing-1'},
@@ -13,7 +15,7 @@ const stage = {model_agreement: {id:'agreed-1', valid:true, availability:'unveri
 test('collapsed drafts show both reasons, native effort, unverified availability and configured tier provenance', () => {
   const text = ctx.stageModelText(stage, false);
   for (const part of ['codex/configured-model', 'high', 'unverified', 'strong (configured)', 'Planner: Complex storage', 'Architect: A failure']) assert.ok(text.includes(part));
-  assert.match(qml, /text: root.stageModelStatus\(stageRow.modelData\)/);
+  assert.match(qml, /text: ModelRouting.stageModelStatus\(stageRow.modelData\)/);
 });
 test('expanded details distinguish relative preferences from prices and handle unknowns', () => {
   assert.match(ctx.stageModelText(stage,true), /configured relative preference 2 \(not a price\)/);
@@ -24,13 +26,12 @@ test('expanded details distinguish relative preferences from prices and handle u
   assert.match(ctx.stageModelText(unknown,false), /Needs reconciliation/);
 });
 test('stage constraints can be narrowed or cleared and survive manual save', () => {
-  ctx.editStages = [{model_constraint:{provider:'codex'}}];
-  ctx.changeStageField = (index,key,value) => { ctx.editStages[index][key] = value; };
-  ctx.changeModelConstraint(0,'model',' exact-id ');
-  assert.equal(ctx.editStages[0].model_constraint.model,'exact-id');
-  ctx.changeModelConstraint(0,'model',''); ctx.changeModelConstraint(0,'provider','');
-  assert.equal(ctx.editStages[0].model_constraint,null);
-  assert.match(qml,/content.model_constraint = stage.model_constraint \|\| null/);
+  let constraint = planEdit.modelConstraint({model_constraint:{provider:'codex'}},'model',' exact-id ');
+  assert.equal(constraint.model,'exact-id');
+  constraint = planEdit.modelConstraint({model_constraint:constraint},'model','');
+  constraint = planEdit.modelConstraint({model_constraint:constraint},'provider','');
+  assert.equal(constraint,null);
+  assert.match(qml,/PlanEdit.payload\(editGoal, editStages\)/);
   assert.match(qml,/automatic_routing:/);
 });
 test('routing status shows bounded retry counts, trigger evidence and both decision reasons', () => {
@@ -54,10 +55,10 @@ test('stage status stays live while full rationale and optional diagnostics use 
   assert.equal(fields.find(f => f.label === 'Architect').text, multiline.model_agreement.architect_reason);
   multiline.model_block = 'blocked\nfull error';
   assert.equal(ctx.stageModelErrors(multiline), multiline.model_block);
-  assert.match(qml, /rationale: stageModelRationale\(stage\), diagnostics: stageModelDiagnostics\(stage\)/);
+  assert.match(qml, /rationale: ModelRouting.stageModelRationale\(stage\), diagnostics: ModelRouting.stageModelDiagnostics\(stage\)/);
   assert.match(qml, /model: stageRow.prose \? stageRow.prose.rationale : \[\]/);
   assert.match(qml, /model: root.stageRoutingExpanded && stageRow.prose \? stageRow.prose.diagnostics : \[\]/);
-  assert.match(qml, /text: root.stageModelErrors\(stageRow.modelData\)\s+textFormat: Text.PlainText\s+color: root.urgent\s+wrapMode: Text.Wrap/);
+  assert.match(qml, /text: ModelRouting.stageModelErrors\(stageRow.modelData\)\s+textFormat: Text.PlainText\s+color: root.urgent\s+wrapMode: Text.Wrap/);
 });
 
 test('pending model agreements still expose routing outcomes and execution identity', () => {

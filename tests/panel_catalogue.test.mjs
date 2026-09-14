@@ -3,11 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
-// Exercise the actual panel formatting helpers without a desktop or live engine.
-const start = qml.indexOf('  function catalogueProviderText(');
-const end = qml.indexOf('  function openCatalogue()', start);
 const context = {};
-vm.runInNewContext(qml.slice(start, end), context);
+vm.runInNewContext(readFileSync(new URL('../quickshell/CataloguePresentation.js', import.meta.url), 'utf8'), context);
 test('provider states show unavailable evidence and stale/cache errors', () => {
   for (const status of ['pending', 'discovered', 'cached_stale', 'unsupported_discovery', 'unavailable']) {
     assert.match(context.catalogueProviderText({provider:'claude',status,model_count:0}), new RegExp(status));

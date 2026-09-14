@@ -2,9 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
-const qml=readFileSync(new URL('../quickshell/Panel.qml',import.meta.url),'utf8');
 const context={};
-vm.runInNewContext(qml.slice(qml.indexOf('  function quotaSummary('),qml.indexOf('  function usageSummary(')),context);
+vm.runInNewContext(readFileSync(new URL('../quickshell/UsageFormat.js',import.meta.url),'utf8'),context);
 test('Fable balance is separate from general quota and includes reset',()=>{
   const text=context.quotaSummary({status:'available',windows:[
     {name:'Claude · 5h',used_percent:57},

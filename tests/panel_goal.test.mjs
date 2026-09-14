@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const slice = (start, end) => qml.slice(qml.indexOf(start), qml.indexOf(end));
-const helpers = slice('  function goalEnhancementAction(', '  function revisePlan(');
+const goalCallbacks = slice('  function syncGoalEnhancement(', '  function revisePlan(');
 const stateHandler = slice('  onEngineStateChanged: {', '  onBusyChanged: {')
   .replace('onEngineStateChanged: {', 'function engineStateChanged() {');
 const enabled = qml.match(/id: enhanceGoalButton[\s\S]*?enabled: ([\s\S]*?)\n\s*onClicked:/)[1];
@@ -27,7 +27,10 @@ function fixture() {
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
   ctx.enhanceGoalButton = { get enabled() { return vm.runInNewContext(enabled, ctx); } };
-  vm.runInNewContext(helpers + stateHandler, ctx);
+  const goalEnhancement = {};
+  vm.runInNewContext(readFileSync(new URL('../quickshell/GoalEnhancement.js', import.meta.url), 'utf8'), goalEnhancement);
+  ctx.GoalEnhancement = goalEnhancement;
+  vm.runInNewContext(goalCallbacks + stateHandler, ctx);
   ctx.poll = snapshot => {
     ctx.engineState = {project: ctx.lastProject, goal_enhancement: snapshot};
     ctx.engineStateChanged();
@@ -91,14 +94,14 @@ test('helper ignores absent, inactive, mismatched and running snapshots without 
   ctx.start(2);
   const before = state(ctx), text = ctx.goalField.text;
   for (const snapshot of [null, undefined, ready(1), ready(3), {...ready(2), status: 'running'}]) {
-    assert.deepEqual(plain(ctx.goalEnhancementAction(snapshot, 2, text, text)), {action: 'none'});
+    assert.deepEqual(plain(ctx.GoalEnhancement.goalEnhancementAction(snapshot, 2, text, text)), {action: 'none'});
     ctx.poll(snapshot);
     assert.deepEqual(state(ctx), before);
     assert.equal(ctx.goalField.text, text);
   }
-  assert.deepEqual(plain(ctx.goalEnhancementAction(ready(-1), -1, text, text)), {action: 'none'});
-  assert.deepEqual(plain(ctx.goalEnhancementAction(ready(2), 2, text, text)), {action: 'apply', text: 'Clear description'});
-  assert.deepEqual(plain(ctx.goalEnhancementAction(ready(2), 2, 'edited', text)), {action: 'offer', text: 'Clear description'});
+  assert.deepEqual(plain(ctx.GoalEnhancement.goalEnhancementAction(ready(-1), -1, text, text)), {action: 'none'});
+  assert.deepEqual(plain(ctx.GoalEnhancement.goalEnhancementAction(ready(2), 2, text, text)), {action: 'apply', text: 'Clear description'});
+  assert.deepEqual(plain(ctx.GoalEnhancement.goalEnhancementAction(ready(2), 2, 'edited', text)), {action: 'offer', text: 'Clear description'});
 });
 
 test('worker failures retain the goal and expose reported or nonblank fallback errors once', () => {
@@ -106,7 +109,7 @@ test('worker failures retain the goal and expose reported or nonblank fallback e
     const ctx = fixture(), original = ctx.goalField.text;
     ctx.start();
     const snapshot = {status: 'failed', request_id: 1, error};
-    const outcome = ctx.goalEnhancementAction(snapshot, 1, original, original);
+    const outcome = ctx.GoalEnhancement.goalEnhancementAction(snapshot, 1, original, original);
     assert.equal(outcome.action, 'error');
     assert.ok(outcome.error.trim());
     if (error === 'provider failed') assert.equal(outcome.error, error);

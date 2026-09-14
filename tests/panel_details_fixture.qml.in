@@ -5,6 +5,10 @@ import QtTest
 import "components"
 import "components/PanelDetails.js" as PanelDetails
 import "components/PlanReview.js" as PlanReview
+import "components/ModelRouting.js" as ModelRouting
+import "components/ReportFormat.js" as ReportFormat
+import "components/UsageFormat.js" as UsageFormat
+import "components/CataloguePresentation.js" as CataloguePresentation
 Item {
     id: root
     width: 360

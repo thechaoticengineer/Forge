@@ -5,6 +5,9 @@ import QtQuick.Controls as QQC
 import QtTest
 import "components"
 import "components/ReviewView.js" as ReviewView
+import "components/ModelRouting.js" as ModelRouting
+import "components/UsageFormat.js" as UsageFormat
+import "components/PlanEdit.js" as PlanEdit
 Item {
     id: root
     width: 440
@@ -36,7 +39,6 @@ Item {
     readonly property var currentStageRow: stageList.currentItem
     property int refreshes: 0
     function fs(n) { return n }
-    function usageSummary(u) { return "" }
     function refresh() { refreshes++ }
     function api(method, path, body, done, scoped) { calls.push({path:path,done:done,scoped:scoped}) }
     function respond(index, status, snapshot, pageSize) {
@@ -214,7 +216,7 @@ Item {
             const st=stageRow.modelData
             const originals={Commit:st.commit,Instructions:st.instructions,"Acceptance criteria":st.acceptance,
                 "Review policy rationale":st.review_policy.rationale}
-            for (const f of root.stageModelRationale(st)) originals[f.label]=f.text
+            for (const f of ModelRouting.stageModelRationale(st)) originals[f.label]=f.text
             for (const label of Object.keys(originals)) {
                 const d=prose(label)
                 verify(!!d,label)
@@ -242,13 +244,13 @@ Item {
             compare(instructions.selectedText," instructions first\r\n")
             keyClick(Qt.Key_C,Qt.ControlModifier)
             compare(clipboard.clipboardText," instructions first\r\n")
-            verify(root.stageModelStatus(st).includes("configured-model"))
+            verify(ModelRouting.stageModelStatus(st).includes("configured-model"))
             verify(root.reviewGateText(st).includes("Independent: approved"))
             verify(stageRow.activity.includes("reviewing"))
-            verify(descendants(stageRow).some(d => d instanceof Text && d.text===root.stageModelErrors(st) && d.color===root.urgent))
+            verify(descendants(stageRow).some(d => d instanceof Text && d.text===ModelRouting.stageModelErrors(st) && d.color===root.urgent))
             compare(prose("Risk"),undefined)
             click(all("stageRoutingToggle")[0])
-            for (const f of root.stageModelDiagnostics(st)) {
+            for (const f of ModelRouting.stageModelDiagnostics(st)) {
                 compare(prose(f.label).originalText,f.text)
                 compare(control(prose(f.label),"stageProseText").text,nativeText(f.text))
             }
@@ -500,7 +502,7 @@ Item {
             const start=editor.selectionStart,end=editor.selectionEnd,native=editor.selectedText,exact=d.selectedText
             const original=d.originalText
             const snapshot=root.stageSnapshot
-            const rationaleEditors=root.stageModelRationale(stageRow.modelData).map(f => ({
+            const rationaleEditors=ModelRouting.stageModelRationale(stageRow.modelData).map(f => ({
                 label:f.label,original:f.text,editor:control(prose(f.label),"stageProseText")}))
             for (const publication of ["heartbeat","checkpoint","reviews"]) {
                 const p=JSON.parse(JSON.stringify(root.plan))

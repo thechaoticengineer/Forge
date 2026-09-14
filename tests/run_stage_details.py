@@ -16,10 +16,10 @@ def between(start, end):
     return panel[offset:panel.index(end, offset)]
 
 helpers = between('  function revealDetail(', '  function reviewScope(')
-helpers += between('  function stageModelText(', '  function changeModelConstraint(')
 helpers += between('  function reviewScope(', '  function reviewGateText(')
-helpers += between('  function reviewGateText(', '  function reportTime(')
-helpers += between('  function nonNegativeInt(', '  function formatTokens(')
+helpers += between('  function reviewGateText(', '  function reviewRoundLabel(')
+helpers += between('  function reviewRoundLabel(', '  function stageActivity(')
+helpers += between('  function stageActivity(', '  function chooserRows(')
 content = between('              Column {\n                id: stageContent', '              Loader {\n                id: stageEditor')
 state = between('  property var reviewViews:', '  function revealDetail(')
 state += between('  property int expandedStageId:', '  property int selectedStageIndex:')
@@ -39,7 +39,8 @@ fixture = fixture.replace('Style.space(', 'style.space(').replace('Quickshell.cl
 with tempfile.TemporaryDirectory(prefix='forge-stage-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
-    for name in ('StageProse.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js'):
+    for name in ('StageProse.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js',
+                 'ModelRouting.js', 'UsageFormat.js', 'PlanEdit.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_stage.qml').write_text(fixture)
     runtime = path / 'runtime'

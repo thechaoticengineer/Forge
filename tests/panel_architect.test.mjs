@@ -2,9 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const context = {};
-vm.runInNewContext(qml.slice(qml.indexOf('  function architectActivityText('), qml.indexOf('  function catalogueProviderText(')), context);
+vm.runInNewContext(readFileSync(new URL('../quickshell/ReportFormat.js', import.meta.url), 'utf8'), context);
 test('legacy plans render without architect fields', () => {
   assert.match(context.architectActivityText(null, null), /legacy/);
   assert.equal(context.architectGuidanceText(null), '');

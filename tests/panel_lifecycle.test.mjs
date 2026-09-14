@@ -5,7 +5,8 @@ import vm from 'node:vm';
 const panel = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const bar = readFileSync(new URL('../quickshell/BarWidget.qml', import.meta.url), 'utf8');
 const ctx = {};
-vm.runInNewContext(panel.slice(panel.indexOf('  function stageModelText('), panel.indexOf('  function catalogueProviderText(')), ctx);
+vm.runInNewContext(readFileSync(new URL('../quickshell/ModelRouting.js', import.meta.url), 'utf8'), ctx);
+vm.runInNewContext(readFileSync(new URL('../quickshell/ReportFormat.js', import.meta.url), 'utf8'), ctx);
 vm.runInNewContext(bar.slice(bar.indexOf('  function lifecycleSummary('), bar.indexOf('  readonly property string statusGlyph:')), ctx);
 const agreement = {id:'agreement', valid:true, effective:{provider:'codex',model:'resolved',native_effort:'high'},
   validated_proposal:{provider:'codex',model:'alias',native_effort:'high'},
@@ -20,9 +21,9 @@ test('archived reports retain reasons, separate review outcomes and role totals;
     stage_outcomes:[{id:1,title:'Spelling',status:'committed',model_agreement:agreement,
       review_gate:{status:'approved',roles:{architect:'not_required',reviewer:'approved'}}}],
     role_usage:{reviewer:{claude:{total_tokens:15}}}};
-  const text = ctx.reportLifecycleText(report);
+  const text = ctx.reportLifecycleText(report, ctx.stageModelText);
   for (const value of ['old-plan','Preserve greeting','Configured adequacy','Preserve interfaces','Recorded aggregate: approved','architect: not required','reviewer: 15 tokens','history?plan_id=old-plan']) assert.ok(text.includes(value),value);
-  assert.equal(ctx.reportLifecycleText({goal:'Legacy'}),'');
+  assert.equal(ctx.reportLifecycleText({goal:'Legacy'}, ctx.stageModelText),'');
 });
 test('pending recovery and current gates take precedence over old approval in panel and bar', () => {
   const state = {current_stage:1,architect_activity:{status:'ready'},architecture:{context_status:'needs_recovery'},
