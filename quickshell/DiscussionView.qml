@@ -3,17 +3,18 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import Quickshell
 import qs.Commons
-import "PanelDetails.js" as PanelDetails
 
-// Interface: the discussion transcript, activity and gating booleans enter as
-// properties; sending a message, planning from the discussion, clearing,
-// expanding and focus handoff leave as signals. Panel.qml owns HTTP calls,
-// request correlation and outer-scroll coordination.
+// Interface: the discussion transcript, activity, the message being sent and
+// gating booleans enter as properties and render as a chat; sending a
+// message, planning from the discussion, clearing, expanding and focus
+// handoff leave as signals. Panel.qml owns HTTP calls, request correlation
+// and outer-scroll coordination.
 Column {
   id: view
 
   required property var entries
   required property bool pending
+  required property string sentMessage
   required property string error
   required property bool canSend
   required property bool canPlan
@@ -61,54 +62,38 @@ Column {
   }
 
   Rectangle {
-    visible: view.expanded && view.entries.length > 0
+    visible: view.expanded
     width: parent.width
-    height: Math.min(transcriptList.contentHeight, Style.space(140)) + Style.space(16)
+    height: discussionChat.height
     color: view.surface
     radius: 4
-    Flickable {
-      id: transcriptList
-      anchors.fill: parent
-      anchors.margins: Style.space(8)
-      clip: true
-      boundsBehavior: Flickable.StopAtBounds
-      contentHeight: transcriptFields.height
-      property bool followTail: true
-      property real readingY: 0
-      function scrollToTail() { if (followTail && !moving) contentY = Math.max(0, contentHeight - height) }
-      function restoreReadingPosition() {
-        if (!followTail && !moving) contentY = Math.max(0, Math.min(readingY, Math.max(0, contentHeight - height)))
-      }
-      onContentYChanged: if (moving) { followTail = atYEnd; readingY = contentY }
-      onMovementEnded: { followTail = atYEnd; readingY = contentY }
-      onContentHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
-      onHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
-      onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
-      DetailFields {
-        id: transcriptFields
-        objectName: "discussionTranscript"
-        width: transcriptList.width
-        foreground: view.mutedForeground
-        mutedForeground: view.mutedForeground
-        background: view.background
-        urgent: view.urgent
-        fontFamily: view.fontFamily
-        fontSize: view.fontSize11
-        entries: view.entries.map(function(entry, i) {
-          return PanelDetails.field(JSON.stringify([i, entry]),
-            entry.role === "user" ? "You" : "Forge", entry.text)
-        })
-        onCopyRequested: original => Quickshell.clipboardText = original
-        onLeaveRequested: view.leaveRequested()
-        onFocusRevealed: control => view.detailRevealed(control)
-        onInspecting: { transcriptList.followTail = false; transcriptList.readingY = transcriptList.contentY }
-      }
+    DiscussionChat {
+      id: discussionChat
+      objectName: "discussionTranscript"
+      width: parent.width
+      entries: view.entries
+      pending: view.pending
+      sentMessage: view.sentMessage
+      error: view.error
+      maximumHeight: Style.space(320)
+      foreground: view.foreground
+      mutedForeground: view.mutedForeground
+      background: view.background
+      surface: view.surface
+      accent: view.accent
+      urgent: view.urgent
+      fontFamily: view.fontFamily
+      fontSize: view.fontSize12
+      onCopyRequested: original => Quickshell.clipboardText = original
+      onLeaveRequested: view.leaveRequested()
+      onFocusRevealed: control => view.detailRevealed(control)
+      onInspecting: view.detailInspected(discussionChat)
     }
   }
 
   Text {
     width: parent.width
-    visible: text !== ""
+    visible: !view.expanded && text !== ""
     text: view.pending ? "Forge is replying…" : view.error
     textFormat: Text.PlainText
     color: view.error !== "" ? view.urgent : view.mutedForeground

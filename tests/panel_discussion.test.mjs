@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
+const discussionViewQml = readFileSync(new URL('../quickshell/DiscussionView.qml', import.meta.url), 'utf8');
+const discussionChatQml = readFileSync(new URL('../quickshell/DiscussionChat.qml', import.meta.url), 'utf8');
+const discussionMessageQml = readFileSync(new URL('../quickshell/DiscussionMessage.qml', import.meta.url), 'utf8');
 const discussionJsSource = readFileSync(new URL('../quickshell/Discussion.js', import.meta.url), 'utf8');
 const slice = (start, end) => qml.slice(qml.indexOf(start), qml.indexOf(end));
 const discussionCallbacks = slice('  function sendDiscussionMessage(', '  function beginPlanEdit(');
@@ -321,6 +324,40 @@ test('reconcileChat: a pending row is replaced by transcript rows, then entries 
   assert.ok(!model.rows.includes(delegate));
   d.reconcileChat(model, []);
   assert.equal(model.count, 0);
+});
+
+test('DiscussionView renders the chat instead of the old label/value transcript', () => {
+  assert.match(discussionViewQml, /DiscussionChat \{/);
+  assert.doesNotMatch(discussionViewQml, /DetailFields/);
+  assert.doesNotMatch(discussionViewQml, /"You"\s*:\s*"Forge"/);
+});
+
+test('DiscussionView keeps the chat, input and send button in top-to-bottom order', () => {
+  const chatIndex = discussionViewQml.indexOf('DiscussionChat {');
+  const inputIndex = discussionViewQml.indexOf('id: messageInput');
+  const sendIndex = discussionViewQml.indexOf('id: sendButton');
+  assert.ok(chatIndex >= 0 && inputIndex >= 0 && sendIndex >= 0);
+  assert.ok(chatIndex < inputIndex, 'chat comes before the message input');
+  assert.ok(inputIndex < sendIndex, 'message input comes before the send button');
+});
+
+test('DiscussionView keeps existing input shortcuts and clipboard wiring', () => {
+  assert.match(discussionViewQml, /event\.key === Qt\.Key_Return \|\| event\.key === Qt\.Key_Enter\)\s*\n\s*&& event\.modifiers === Qt\.NoModifier/);
+  assert.match(discussionViewQml, /Keys\.onEscapePressed: event => \{\s*\n\s*view\.leaveRequested\(\)/);
+  assert.match(discussionViewQml, /Qt\.Key_F1/);
+  assert.match(discussionViewQml, /Quickshell\.clipboardText/);
+});
+
+test('Panel.qml passes the sent message into DiscussionView', () => {
+  assert.match(qml, /sentMessage: root\.discussionSent/);
+});
+
+test('DiscussionChat.qml and DiscussionMessage.qml stay independent of Quickshell and Panel scope', () => {
+  for (const source of [discussionChatQml, discussionMessageQml]) {
+    assert.doesNotMatch(source, /import Quickshell/);
+    assert.doesNotMatch(source, /qs\.Commons/);
+    assert.doesNotMatch(source, /\broot\./);
+  }
 });
 
 test('project switch resets discussion state and the input', () => {

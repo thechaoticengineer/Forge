@@ -2071,6 +2071,7 @@ Item {
           width: parent.width
           entries: root.discussion
           pending: root.discussionPending
+          sentMessage: root.discussionSent
           error: root.discussionError
           canSend: root.discussionCanSend
           canPlan: root.discussionCanPlan
