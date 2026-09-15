@@ -387,8 +387,8 @@ conversation. Use `t` to focus the discussion input; `Enter` sends the message a
 leaves the input, `Escape` leaves without sending, and `Shift+Enter` inserts a newline.
 In expanded view, the conversation appears as a chat that reads top to bottom,
 with the newest message at the bottom just above the message input. Your messages
-are right-aligned with an accent tint, and Forge's replies are left-aligned on the
-background. While a reply is pending, your message and a "Forge is replying…"
+are right-aligned with an accent tint, and Forge's replies are left-aligned in a
+neutral surface color. While a reply is pending, your message and a "Forge is replying…"
 indicator appear at the bottom of the chat. A failed reply shows the error there
 and puts your message back into the input for revision. The chat scrolls to new
 messages when they arrive, unless you have scrolled up to read earlier ones. Each
