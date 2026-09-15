@@ -385,7 +385,16 @@ planner tool about the repository and possible solutions. Type a message in the
 The planner reads the repository read-only and replies in a normal back-and-forth
 conversation. Use `t` to focus the discussion input; `Enter` sends the message and
 leaves the input, `Escape` leaves without sending, and `Shift+Enter` inserts a newline.
-The conversation transcript is shown in expanded view and each new reply includes all
+In expanded view, the conversation appears as a chat that reads top to bottom,
+with the newest message at the bottom just above the message input. Your messages
+are right-aligned with an accent tint, and Forge's replies are left-aligned on the
+background. While a reply is pending, your message and a "Forge is replying…"
+indicator appear at the bottom of the chat. A failed reply shows the error there
+and puts your message back into the input for revision. The chat scrolls to new
+messages when they arrive, unless you have scrolled up to read earlier ones. Each
+message has a Copy button in its header, and you can select and copy the text
+directly. Tab moves focus between messages. When the section is collapsed, a
+one-line status shows pending activity or an error. Each new reply includes all
 prior messages, so the discussion can refine and settle on an approach.
 
 Sending discussion messages never starts plan creation. When you are ready to
