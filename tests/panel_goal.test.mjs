@@ -21,10 +21,12 @@ function fixture() {
     engineState: {project: '/a'}, lastProject: '/a', engineOnline: true, busy: false,
     editingPlan: false, revisePending: false, localError: '', calls: [], goalDrafts: {},
     feedbackField: {text: ''}, questionField: {text: ''}, chatList: {}, goalFlick: {},
+    discussionView: {input: {text: ''}},
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
     historyList, reportList, agentOutput:{liveOutput,historyList,reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
-    cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){}, refreshAgentLog(){} };
+    cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){},
+    syncDiscussion(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
   ctx.enhanceGoalButton = { get enabled() { return vm.runInNewContext(enabled, ctx); } };

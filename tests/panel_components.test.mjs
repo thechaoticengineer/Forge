@@ -13,6 +13,7 @@ const views = [
   'ProjectChooser.qml',
   'CatalogueEditor.qml',
   'DiffView.qml',
+  'DiscussionView.qml',
 ];
 
 test('Panel composes focused views while retaining state and API coordination', () => {

@@ -15,6 +15,7 @@ import "PanelDetails.js" as PanelDetails
 import "ModelRouting.js" as ModelRouting
 import "UsageFormat.js" as UsageFormat
 import "GoalEnhancement.js" as GoalEnhancement
+import "Discussion.js" as Discussion
 import "PlanEdit.js" as PlanEdit
 import "CataloguePresentation.js" as CataloguePresentation
 
@@ -57,6 +58,11 @@ Item {
   property string goalEnhanceUndo: ""
   property string goalEnhanceError: ""
   property bool chatExpanded: false
+  property bool discussionPending: false
+  property int discussionRequest: -1
+  property string discussionSent: ""
+  property string discussionError: ""
+  property bool discussionExpanded: false
   property bool editingPlan: false
   property var editStages: []
   property string editGoal: ""
@@ -128,6 +134,7 @@ Item {
   })
   readonly property var queue: engineState && engineState.queue ? engineState.queue : []
   readonly property var chat: engineState && engineState.chat ? engineState.chat : []
+  readonly property var discussion: engineState && engineState.discussion ? engineState.discussion : []
   readonly property bool queueActive: engineState !== null && engineState.queue_active === true
   readonly property var queueHead: queue.find(function(item) { return item.status !== "done" }) || null
   readonly property bool hasQueuedGoals: queueHead !== null && ["queued", "blocked", "failed", "planning", "awaiting_approval", "running"].includes(queueHead.status)
@@ -151,6 +158,11 @@ Item {
   readonly property string projectName: engineState
     ? engineState.project.split("/").filter(function(p) { return p !== "" }).pop() || "?"
     : "?"
+
+  readonly property bool discussionCanSend: engineOnline && !busy && !queueActive
+    && !editingPlan && !revisePending && !discussionPending
+  readonly property bool discussionCanPlan: discussionCanSend && Discussion.canPlanFromDiscussion(discussion)
+  readonly property bool discussionCanClear: engineOnline && !busy && !queueActive && discussion.length > 0
 
   readonly property var planReview: plan && plan.plan_review ? plan.plan_review : null
   readonly property string planReviewScope: PlanReview.scope(lastProject, projectViewRevision, plan)
@@ -361,7 +373,7 @@ Item {
 
   property bool helpOpen: false
   readonly property bool insertMode: goalField.activeFocus
-    || feedbackField.activeFocus || questionField.activeFocus
+    || feedbackField.activeFocus || questionField.activeFocus || discussionView.input.activeFocus
     || projectChooser.filterField.activeFocus || projectChooser.manualField.activeFocus || catalogueEditorView.editor.activeFocus
     || editFocusedField !== null
 
@@ -419,7 +431,7 @@ Item {
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncCatalogueSuggestion(); syncReviewViews(); return }
+    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncCatalogueSuggestion(); syncReviewViews(); syncDiscussion(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
@@ -446,6 +458,12 @@ Item {
     chatExpanded = false
     chatList.followTail = true
     chatList.readingY = 0
+    discussionPending = false
+    discussionRequest = -1
+    discussionSent = ""
+    discussionError = ""
+    discussionExpanded = false
+    discussionView.input.text = ""
     goalFlick.contentY = 0
     expandedStageId = -1
     selectedStageIndex = -1
@@ -534,7 +552,7 @@ Item {
         // Preserve view models across unchanged polls; replacing ListView and
         // Repeater models can rebuild delegates and reset the reading position.
         if (root.engineState && resp.project === root.engineState.project) {
-          for (const key of ["plan", "architecture", "chat", "reports", "queue", "model_catalogue"]) {
+          for (const key of ["plan", "architecture", "chat", "discussion", "reports", "queue", "model_catalogue"]) {
             if (JSON.stringify(resp[key]) === JSON.stringify(root.engineState[key]))
               resp[key] = root.engineState[key]
           }
@@ -667,6 +685,49 @@ Item {
         root.localError = "Could not ask about the plan. Check the engine connection and try again."
       }
     })
+  }
+
+  function sendDiscussionMessage(text) {
+    if (!discussionCanSend || text.trim() === "") return
+    const revision = projectViewRevision
+    discussionPending = true
+    discussionSent = text
+    discussionError = ""
+    act("/api/discussion/message", { message: text }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.discussionRequest = resp.request_id
+        if (discussionView.input.text === text) discussionView.input.text = ""
+        // act refreshes state first; the reply may already be ready.
+        root.syncDiscussion()
+      } else {
+        root.discussionPending = false
+        root.discussionError = resp && resp.error ? resp.error
+          : "Could not send the message. Check the engine connection and try again."
+      }
+    })
+  }
+
+  function syncDiscussion() {
+    const outcome = Discussion.discussionAction(engineState ? engineState.discussion_activity : null, discussionRequest)
+    if (outcome.action === "none") return
+    // Consume terminal results once; later polls must not repeat them.
+    discussionRequest = -1
+    discussionPending = false
+    if (outcome.action === "error") {
+      discussionError = outcome.error
+      if (discussionView.input.text === "") discussionView.input.text = outcome.message
+    }
+  }
+
+  function planFromDiscussion() {
+    if (!discussionCanPlan) return
+    act("/api/plan", { discussion: true, goal: goalField.text })
+  }
+
+  function clearDiscussion() {
+    if (!discussionCanClear) return
+    act("/api/discussion/reset")
   }
 
   function beginPlanEdit() {
@@ -1329,6 +1390,10 @@ Item {
           } else if (event.key === Qt.Key_E && event.modifiers === Qt.ShiftModifier) {
             root.enhanceGoal()
             event.accepted = true
+          } else if (event.key === Qt.Key_T && event.modifiers === Qt.NoModifier) {
+            discussionView.input.forceActiveFocus()
+            panelScroll.reveal(discussionView)
+            event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
             if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
             event.accepted = true
@@ -1337,6 +1402,9 @@ Item {
             if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier) {
               if (root.reportsVisible) selectReport(root.reports.length - 1)
               else selectStage(stages.length - 1)
+              event.accepted = true
+            } else if (event.key === Qt.Key_P && event.modifiers === Qt.ShiftModifier) {
+              if (root.discussionCanPlan) root.planFromDiscussion()
               event.accepted = true
             } else if (event.modifiers === Qt.ControlModifier
                        && (event.key === Qt.Key_D || event.key === Qt.Key_U)) {
@@ -1998,6 +2066,35 @@ Item {
           }
         }
 
+        DiscussionView {
+          id: discussionView
+          width: parent.width
+          entries: root.discussion
+          pending: root.discussionPending
+          error: root.discussionError
+          canSend: root.discussionCanSend
+          canPlan: root.discussionCanPlan
+          canClear: root.discussionCanClear
+          expanded: root.discussionExpanded
+          foreground: root.foreground
+          mutedForeground: root.mutedForeground
+          background: root.background
+          surface: root.surface
+          accent: root.accent
+          urgent: root.urgent
+          fontFamily: root.fontFamily
+          fontSize11: root.fs(11)
+          fontSize12: root.fs(12)
+          onSendRequested: message => root.sendDiscussionMessage(message)
+          onPlanRequested: root.planFromDiscussion()
+          onClearRequested: root.clearDiscussion()
+          onExpansionRequested: expanded => root.discussionExpanded = expanded
+          onLeaveRequested: keyHandler.forceActiveFocus()
+          onHelpRequested: root.helpOpen = true
+          onDetailRevealed: control => root.revealDetail(control)
+          onDetailInspected: control => root.inspectDetail(control)
+        }
+
         Row {
           width: parent.width
           spacing: Style.space(8)
@@ -2589,6 +2686,8 @@ Item {
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
                     { key: "6", description: "History: Reports (when available)" },
                     { key: "p", description: "Create plan from goal" },
+                    { key: "t", description: "Focus the discussion message input" },
+                    { key: "P", description: "Create plan from discussion" },
                     { key: "E", description: "Enhance the goal description with AI" },
                     { key: "e", description: "Edit plan stages by hand" },
                     { key: "a", description: "Approve draft plan" },
