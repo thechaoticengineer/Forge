@@ -19,6 +19,32 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
 Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
 
+pub(crate) const DISCUSSION_PLANNER_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+Explore this repository, then produce an implementation plan for the goal below.
+
+The user discussed this work with Forge before planning. The transcript is authoritative context.
+Plan what the conversation converged on. Later messages refine or override earlier ones. Do not plan ideas the user rejected, and do not plan only from the first message.
+Set the plan's "goal" field to one clear, self-contained description of the agreed goal that captures the refined decisions from the discussion.
+
+USER NOTE (may be empty):
+{note}
+
+DISCUSSION TRANSCRIPT:
+{transcript}
+
+Write the plan as JSON to the file {plan_path} (create the directory if needed) with exactly this schema:
+{"goal": "...", "status": "draft", "stages": [
+  {"id": 1, "title": "short title",
+   "instructions": "complete, self-contained instructions for an implementing agent that has NOT seen this conversation",
+   "acceptance": "concrete acceptance criteria",
+   "commit": "proposed conventional commit message",
+   "model_proposal": {"risk":"standard","complexity":"standard","task":"functionality","provider":"exact eligible provider","model":"exact eligible registry ID","native_effort":"provider_default","rationale":"stage-specific reasoning"},
+   "status": "pending", "rounds": 0}
+]}
+
+Rules: 2 to 8 stages, each independently committable, ordered by dependency.
+Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
+
 pub(crate) const REFACTOR_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
 Explore this repository and read the code. Identify concrete refactoring opportunities:
 duplication, dead code, overly long functions, unclear naming, and poor module structure.

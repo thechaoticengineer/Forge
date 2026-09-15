@@ -11,7 +11,7 @@ pub(super) enum ScopeResolution {
 }
 use super::{Ctx, FORGE_DIR, PlanMode, WorkerGuard};
 use crate::agent::AgentRequest;
-use crate::prompts::{CHAT_PROMPT, ENHANCE_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
+use crate::prompts::{CHAT_PROMPT, DISCUSSION_PLANNER_PROMPT, ENHANCE_PROMPT, PLANNER_PROMPT, REFACTOR_PROMPT, REVISE_PROMPT, SCOPE_PROMPT};
 use crate::candidate_draft::prepare_candidate_draft;
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{fill_template, json_payload, json_payload_with_keys, unix_timestamp};
@@ -48,6 +48,7 @@ impl Ctx {
     /// The caller owns the session busy claim and its WorkerGuard.
     /// This method must not construct WorkerGuard or release the busy claim.
     pub(super) fn plan_with_busy_claim(&self, goal: &str, mode: &PlanMode) -> bool {
+        let discussion = matches!(mode, PlanMode::Discussion { .. });
         let prompt = match mode {
             PlanMode::Standard => PLANNER_PROMPT
                 .replace("{goal}", goal)
@@ -55,10 +56,21 @@ impl Ctx {
             PlanMode::Refactor { focus } => fill_template(REFACTOR_PROMPT, &[
                 ("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan-candidate.json"),
             ]),
+            PlanMode::Discussion { transcript, note } => fill_template(DISCUSSION_PLANNER_PROMPT, &[
+                ("{note}", note.as_str()), ("{transcript}", transcript.as_str()),
+                ("{plan_path}", ".forge/plan-candidate.json"),
+            ]),
         };
-        match self.generate_plan(&prompt, goal, None)
-            .and_then(|plan| self.finalize_plan(plan, None, "ready"))
-        {
+        let result = self.generate_plan(&prompt, goal, discussion, None)
+            .and_then(|plan| {
+                let final_goal = plan["goal"].as_str().unwrap_or("").to_string();
+                self.finalize_plan(plan, None, "ready")?;
+                if discussion {
+                    self.session.state.lock().unwrap().goal = final_goal;
+                }
+                Ok(())
+            });
+        match result {
             Ok(()) => true,
             Err(e) => {
                 let blocked = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
@@ -79,7 +91,7 @@ impl Ctx {
             ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
             ("{goal}", goal), ("{plan_path}", ".forge/plan-candidate.json"),
         ]);
-        let result = self.generate_plan(&prompt, goal, Some(current_plan))
+        let result = self.generate_plan(&prompt, goal, false, Some(current_plan))
             .and_then(|plan| self.finalize_plan(plan, Some(current_plan), "revised"));
         if let Err(error) = result {
             let architecture_failed = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
@@ -166,7 +178,10 @@ impl Ctx {
         self.log_event(kind, &message);
     }
 
-    fn generate_plan(&self, prompt: &str, goal: &str, previous: Option<&Value>) -> Result<Value, String> {
+    /// For a discussion run the engine has no goal to enforce up front, so the
+    /// candidate's own trimmed `goal` field is validated and used instead of
+    /// the engine-supplied override every other mode keeps applying.
+    fn generate_plan(&self, prompt: &str, goal: &str, discussion: bool, previous: Option<&Value>) -> Result<Value, String> {
         self.ensure_forge_dir();
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         match fs::remove_file(self.forge_path("plan-candidate.json")) {
@@ -179,7 +194,16 @@ impl Ctx {
             let candidate: Value = crate::response::parse_json(json_payload(text))
                 .map_err(|e| format!("invalid candidate: {e}"))?;
             if !candidate["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
-            let (draft, _) = prepare_candidate_draft(candidate, goal, previous)?;
+            let resolved_goal: String = if discussion {
+                let candidate_goal = candidate["goal"].as_str().map(str::trim).unwrap_or("").to_string();
+                if candidate_goal.is_empty() || candidate_goal.chars().count() > 20000 {
+                    return Err("planner did not produce a goal from the discussion".into());
+                }
+                candidate_goal
+            } else {
+                goal.to_string()
+            };
+            let (draft, _) = prepare_candidate_draft(candidate, &resolved_goal, previous)?;
             crate::routing::validate_candidate_proposals(&draft)?;
             Ok(draft)
         })?;

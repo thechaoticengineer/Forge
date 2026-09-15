@@ -17,10 +17,34 @@ pub(super) fn api_plan(ctx: &Ctx, body: &Value) -> ApiResponse {
         },
         _ => return (400, json!({"error": "unknown mode"})),
     };
+    let discussion = match body.get("discussion") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return (400, json!({"error": "discussion must be a boolean"})),
+    };
+    if discussion && matches!(mode, PlanMode::Refactor { .. }) {
+        return (400, json!({"error": "discussion planning requires standard mode"}));
+    }
+    let mode = if discussion {
+        let transcript = ctx.read_discussion();
+        let has_reply = transcript.as_array().unwrap().windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "assistant");
+        if !has_reply {
+            return (400, json!({"error": "no discussion"}));
+        }
+        PlanMode::Discussion {
+            transcript: serde_json::to_string_pretty(&transcript).unwrap(),
+            note: focus.clone(),
+        }
+    } else {
+        mode
+    };
     let goal = match &mode {
-        PlanMode::Standard => focus,
+        PlanMode::Standard => focus.clone(),
         PlanMode::Refactor { focus } if focus.is_empty() => "Refactor the codebase".into(),
         PlanMode::Refactor { focus } => format!("Refactor the codebase — focus: {focus}"),
+        PlanMode::Discussion { note, .. } if note.is_empty() => "Plan from discussion".into(),
+        PlanMode::Discussion { note, .. } => note.clone(),
     };
     if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
         (409, json!({"error": "busy"}))
@@ -33,8 +57,15 @@ pub(super) fn api_plan(ctx: &Ctx, body: &Value) -> ApiResponse {
             s.architect_activity = Value::Null;
             s.role_usage = Value::Null;
         }
-        let short: String = goal.chars().take(300).collect();
-        ctx.log_event("plan", &format!("planning started for goal: {short}"));
+        let log_text = if discussion {
+            let note_short: String = focus.chars().take(300).collect();
+            if note_short.is_empty() { "planning started from discussion".to_string() }
+            else { format!("planning started from discussion: {note_short}") }
+        } else {
+            let short: String = goal.chars().take(300).collect();
+            format!("planning started for goal: {short}")
+        };
+        ctx.log_event("plan", &log_text);
         let ctx2 = ctx.clone();
         std::thread::spawn(move || ctx2.plan_worker(&goal, &mode));
         (200, json!({"ok": true}))

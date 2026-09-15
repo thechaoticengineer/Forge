@@ -1,4 +1,5 @@
 use crate::app::WorkerGuard;
+use crate::prompts::PLANNER_PROMPT;
 use crate::test_support::{QueueTest, api_request, editable_stage, wait_for_worker};
 use serde_json::{Value, json};
 use std::fs;
@@ -354,4 +355,162 @@ fn discussion_targets_project_and_leaves_other_session_alone() {
     assert_eq!(api_request(engine, "POST", "/api/discussion/reset", json!({})),
         (409, json!({"error":"busy"})));
     assert_eq!(*engine.active_project.lock().unwrap(), first.app.project());
+}
+
+fn write_transcript(test: &QueueTest, entries: &[(&str, &str)]) {
+    let bytes: Vec<u8> = entries.iter().enumerate()
+        .flat_map(|(i, (role, text))| format!("{}\n",
+            json!({"role":role,"text":text,"unix":(i + 1) as i64})).into_bytes())
+        .collect();
+    fs::write(test.app.forge_path("discussion.jsonl"), &bytes).unwrap();
+}
+
+#[test]
+fn discussion_plan_uses_planner_goal_from_the_refined_conversation() {
+    let test = QueueTest::new(false);
+    write_transcript(&test, &[
+        ("user", "Add dark mode"),
+        ("assistant", "Sure, a manual toggle or system-based?"),
+        ("user", "Actually let's do a light mode toggle instead"),
+        ("assistant", "Got it, a light mode toggle it is"),
+    ]);
+    let before = fs::read(test.app.forge_path("discussion.jsonl")).unwrap();
+    test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!({
+        "goal": "Add a light mode theme toggle", "status": "draft", "stages": [editable_stage(1)]});
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": true})),
+        (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["phase"], "plan_ready");
+    assert_eq!(state["goal"], "Add a light mode theme toggle");
+    assert_eq!(state["plan"]["goal"], "Add a light mode theme toggle");
+    assert_eq!(test.app.load_plan().unwrap()["goal"], "Add a light mode theme toggle");
+    let settings = test.app.app.settings.lock().unwrap();
+    let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+    assert!(prompt.contains("Add dark mode"));
+    assert!(prompt.contains("Sure, a manual toggle or system-based?"));
+    assert!(prompt.contains("Actually let's do a light mode toggle instead"));
+    assert!(prompt.contains("Got it, a light mode toggle it is"));
+    let schema = PLANNER_PROMPT.split_once("with exactly this schema:\n").unwrap().1
+        .split_once("\n\nRules:").unwrap().0;
+    assert!(prompt.contains(schema));
+    assert!(prompt.contains("The user discussed this work with Forge before planning."));
+    assert!(prompt.contains("Do not plan ideas the user rejected, and do not plan only from the first message."));
+    drop(settings);
+    assert_eq!(fs::read(test.app.forge_path("discussion.jsonl")).unwrap(), before);
+}
+
+#[test]
+fn discussion_plan_includes_note_in_prompt_and_history() {
+    let test = QueueTest::new(false);
+    write_transcript(&test, &[("user", "keep this"), ("assistant", "kept")]);
+    test.app.app.settings.lock().unwrap()["mock_plan_output"] =
+        json!({"goal": "Refined goal", "stages": [editable_stage(1)]});
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan",
+        json!({"discussion": true, "goal": " Please prioritize performance \n"})),
+        (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let settings = test.app.app.settings.lock().unwrap();
+    let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+    assert!(prompt.contains("USER NOTE (may be empty):\nPlease prioritize performance\n"));
+    drop(settings);
+    let history = test.app.read_history();
+    assert!(history.as_array().unwrap().iter().any(|event|
+        event["kind"] == "plan" && event["text"] == "planning started from discussion: Please prioritize performance"));
+}
+
+#[test]
+fn discussion_plan_validates_before_busy_and_invokes_no_agent() {
+    let test = QueueTest::new(false);
+    for discussion in [json!("true"), json!(1), json!(null), json!([])] {
+        assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": discussion})),
+            (400, json!({"error": "discussion must be a boolean"})));
+    }
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan",
+        json!({"discussion": true, "mode": "refactor"})),
+        (400, json!({"error": "discussion planning requires standard mode"})));
+    // No discussion.jsonl at all.
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": true})),
+        (400, json!({"error": "no discussion"})));
+    for entries in [
+        vec![],
+        vec![("user", "hi")],
+        vec![("assistant", "hi")],
+        vec![("assistant", "a"), ("user", "b")],
+    ] {
+        write_transcript(&test, &entries);
+        assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": true})),
+            (400, json!({"error": "no discussion"})));
+    }
+    assert!(!test.app.session.busy.load(Ordering::SeqCst));
+    assert_eq!(test.app.read_history(), json!([]));
+    assert!(test.app.app.settings.lock().unwrap().get("mock_planner_prompt").is_none());
+    assert!(test.app.load_plan().is_none());
+    assert_eq!(test.app.session.state.lock().unwrap().phase, "idle");
+}
+
+#[test]
+fn discussion_plan_respects_busy_and_queue_guards() {
+    let test = QueueTest::new(false);
+    write_transcript(&test, &[("user", "keep this"), ("assistant", "kept")]);
+    for flag in [&test.app.session.busy, &test.app.session.queue_active] {
+        flag.store(true, Ordering::SeqCst);
+        assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": true})),
+            (409, json!({"error": "busy"})));
+        flag.store(false, Ordering::SeqCst);
+    }
+    assert_eq!(test.app.read_history(), json!([]));
+    assert!(test.app.load_plan().is_none());
+}
+
+#[test]
+fn discussion_plan_repairs_blank_planner_goal_before_succeeding() {
+    let test = QueueTest::new(false);
+    write_transcript(&test, &[("user", "keep this"), ("assistant", "kept")]);
+    test.app.app.settings.lock().unwrap()["mock_plan_output"] = json!([
+        {"status": "draft", "stages": [editable_stage(1)]},
+        {"goal": "   ", "stages": [editable_stage(1)]},
+        {"goal": "Recovered goal", "stages": [editable_stage(1)]},
+    ]);
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"discussion": true})),
+        (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["phase"], "plan_ready");
+    assert_eq!(state["goal"], "Recovered goal");
+    assert_eq!(state["plan"]["goal"], "Recovered goal");
+    let history = test.app.read_history();
+    let events: Vec<&str> = history.as_array().unwrap().iter()
+        .filter_map(|event| event["text"].as_str()).collect();
+    assert!(events.iter().any(|text| text.starts_with(
+        "planner rejected: planner did not produce a goal from the discussion; asking for a correction (1/3)")));
+    assert!(events.iter().any(|text| text.starts_with(
+        "planner rejected: planner did not produce a goal from the discussion; asking for a correction (2/3)")));
+    assert!(events.contains(&"plan ready with 1 stages"));
+}
+
+#[test]
+fn standard_plan_ignores_existing_discussion_transcript_and_forces_body_goal() {
+    let test = QueueTest::new(false);
+    write_transcript(&test, &[("user", "keep this"), ("assistant", "kept")]);
+    let before = fs::read(test.app.forge_path("discussion.jsonl")).unwrap();
+    test.app.app.settings.lock().unwrap()["mock_plan_output"] =
+        json!({"goal": "Planner's own goal", "stages": [editable_stage(1)]});
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan", json!({"goal": "Body goal"})),
+        (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let (status, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(state["goal"], "Body goal");
+    assert_eq!(state["plan"]["goal"], "Body goal");
+    let settings = test.app.app.settings.lock().unwrap();
+    let prompt = settings["mock_planner_prompt"].as_str().unwrap();
+    assert!(prompt.starts_with(&PLANNER_PROMPT.replace("{goal}", "Body goal")
+        .replace("{plan_path}", ".forge/plan-candidate.json")));
+    assert!(!prompt.contains("keep this"));
+    assert!(!prompt.contains("\"kept\""));
+    drop(settings);
+    assert_eq!(fs::read(test.app.forge_path("discussion.jsonl")).unwrap(), before);
 }

@@ -26,6 +26,7 @@ pub(crate) const FORGE_DIR: &str = ".forge";
 pub(crate) enum PlanMode {
     Standard,
     Refactor { focus: String },
+    Discussion { transcript: String, note: String },
 }
 
 pub(crate) struct App {
