@@ -360,10 +360,10 @@ Before creating a plan, you can have a multi-turn conversation with the configur
 planner tool about the repository and possible solutions. Type a message in the
 **Discuss before planning** section of the panel, then click **Send** or press `Enter`.
 The planner reads the repository read-only and replies in a normal back-and-forth
-conversation. Use `t` to focus the discussion input and press `Escape` or `Enter`
-to leave and send. The conversation transcript is shown in expanded view and each
-new reply includes all prior messages, so the discussion can refine and settle on
-an approach.
+conversation. Use `t` to focus the discussion input; `Enter` sends the message and
+leaves the input, `Escape` leaves without sending, and `Shift+Enter` inserts a newline.
+The conversation transcript is shown in expanded view and each new reply includes all
+prior messages, so the discussion can refine and settle on an approach.
 
 Sending discussion messages never starts plan creation. When you are ready to
 plan from the conversation, click **Create plan from discussion** (or press `P`)
