@@ -98,7 +98,8 @@ fn run_bounded(fixture: &Cli, provider: &str, prompt: String) -> AgentResult {
         let result = ctx.run_agent(&AgentRequest { prompt: &prompt, ..request(&provider) });
         let _ = send.send(result);
     });
-    match receive.recv_timeout(Duration::from_secs(5)) {
+    // A pipe deadlock never finishes; the bound tolerates a CPU-contended run.
+    match receive.recv_timeout(Duration::from_secs(30)) {
         Ok(result) => {
             task.join().unwrap();
             result.unwrap()
@@ -114,7 +115,7 @@ fn run_bounded(fixture: &Cli, provider: &str, prompt: String) -> AgentResult {
             }
             // Give cleanup a bounded chance to finish, even on a failing test.
             let _ = receive.recv_timeout(Duration::from_secs(2));
-            panic!("fake CLI did not finish within five seconds: {error}");
+            panic!("fake CLI did not finish within thirty seconds: {error}");
         }
     }
 }

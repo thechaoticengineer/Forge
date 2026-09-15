@@ -396,9 +396,10 @@ returns HTTP 200 `{"ok":true,"request_id":n}`. Input is trimmed and limited to
 initially an empty array, then an array of up to 100 recent entries, each with
 `role` ("user" or "assistant"), `text` and `unix` (a Unix timestamp). The
 `discussion_activity` field is initially `null`, then an object with `status`
-(`running`, `ready` or `failed`), `request_id` and `unix`. A `ready` result has
-no additional fields. A `failed` result adds `message` (the original trimmed
-input) and `error`.
+(`running`, `ready` or `failed`), `request_id` and `unix`. A `running` request
+adds `message` (the original trimmed input). A `ready` result has no additional
+fields. A `failed` result adds `message` (the original trimmed input) and
+`error`.
 
 `POST /api/plan` with `{"discussion":true}` (and optional `goal` for a note)
 starts planning from the discussion. Non-boolean `discussion` values return HTTP

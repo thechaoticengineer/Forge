@@ -115,10 +115,12 @@ pub(crate) fn api_request(engine: &Arc<App>, method: &str, path: &str, body: Val
     })
 }
 
+// Queue workers run whole plans with real git commits. Under a parallel
+// `cargo test` they compete for CPU, so this only guards against hangs.
 pub(crate) fn wait_for_worker(ctx: &Ctx) {
     let started = Instant::now();
     while ctx.session.busy.load(Ordering::SeqCst) {
-        assert!(started.elapsed() < Duration::from_secs(5), "worker did not finish");
+        assert!(started.elapsed() < Duration::from_secs(60), "worker did not finish");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
