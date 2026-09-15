@@ -19,6 +19,7 @@ pub(super) fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> ApiR
             "run_started_unix": s.run_started_unix,
             "model_selection": s.model_selection,
             "goal_enhancement": s.goal_enhancement,
+            "discussion_activity": s.discussion_activity,
             "model_policy_suggestion": {
                 "status":s.model_policy_suggestion["status"],
                 "request_id":s.model_policy_suggestion["request_id"],
@@ -128,6 +129,7 @@ pub(super) fn api_state(app: &Arc<App>, ctx: &Ctx, active_project: &str) -> ApiR
     snap["sessions"] = app.session_summaries(active_project);
     snap["history"] = ctx.read_history();
     snap["chat"] = ctx.read_chat();
+    snap["discussion"] = ctx.read_discussion();
     snap["reports"] = ctx.read_reports();
     snap["git_log"] = json!(ctx.git(&["log", "--oneline", "-12"]).unwrap_or_default());
     (200, snap)

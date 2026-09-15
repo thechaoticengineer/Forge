@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 #[path = "http_admin.rs"]
 mod admin;
+#[path = "http_discussion.rs"]
+mod discussion;
 #[path = "http_plan.rs"]
 mod plan;
 #[path = "http_queue.rs"]
@@ -13,6 +15,7 @@ mod queue;
 mod read;
 
 use admin::*;
+use discussion::*;
 use plan::*;
 use queue::*;
 use read::*;
@@ -53,6 +56,8 @@ impl<'a> ApiRequest<'a> {
                 | "/api/plan/revise"
                 | "/api/plan/chat"
                 | "/api/goal/enhance"
+                | "/api/discussion/message"
+                | "/api/discussion/reset"
                 | "/api/models/suggest"
                 | "/api/models/suggestion"
                 | "/api/approve"
@@ -192,6 +197,10 @@ fn dispatch(
         (tiny_http::Method::Post, "/api/plan/revise") => api_plan_revise(ctx, &request.body),
         (tiny_http::Method::Post, "/api/plan/chat") => api_plan_chat(ctx, &request.body),
         (tiny_http::Method::Post, "/api/goal/enhance") => api_goal_enhance(ctx, &request.body),
+        (tiny_http::Method::Post, "/api/discussion/message") => {
+            api_discussion_message(ctx, &request.body)
+        }
+        (tiny_http::Method::Post, "/api/discussion/reset") => api_discussion_reset(ctx),
         (tiny_http::Method::Post, "/api/plan/edit") => api_plan_edit(ctx, &request.body),
         (tiny_http::Method::Post, "/api/approve") => api_approve(ctx),
         (tiny_http::Method::Post, "/api/run") => api_run(ctx),

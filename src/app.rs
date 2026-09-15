@@ -1,5 +1,6 @@
 //! Shared application/session state, metadata scheduling, and repository discovery.
 mod agent_execution;
+mod discussion;
 mod execution;
 mod git;
 mod history;
@@ -81,6 +82,8 @@ pub(crate) struct State {
     pub(crate) goal: String,
     pub(crate) goal_enhancement: Value,
     pub(crate) goal_enhancement_serial: i64,
+    pub(crate) discussion_activity: Value,
+    pub(crate) discussion_serial: i64,
     pub(crate) model_policy_suggestion: Value,
     pub(crate) model_policy_suggestion_serial: i64,
     pub(crate) current_stage: Option<i64>,

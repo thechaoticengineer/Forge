@@ -93,6 +93,10 @@ impl Ctx {
         self.read_jsonl_tail("chat.jsonl", 100)
     }
 
+    pub(crate) fn read_discussion(&self) -> Value {
+        self.read_jsonl_tail("discussion.jsonl", 100)
+    }
+
     pub(crate) fn read_reports(&self) -> Value {
         self.read_jsonl_tail("reports.jsonl", 100)
     }

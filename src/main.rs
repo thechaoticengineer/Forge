@@ -40,6 +40,8 @@ mod test_support;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]
+mod discussion_tests;
+#[cfg(test)]
 mod architecture_integration_tests;
 #[cfg(test)]
 mod http_tests;

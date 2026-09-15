@@ -85,6 +85,22 @@ Write your answer as JSON to the file {answer_path} (create the directory if nee
 
 Do NOT implement anything. Do NOT modify the plan or any other file. Only write {answer_path}."#;
 
+pub(crate) const DISCUSS_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+The user wants to talk about this repository and possible solutions before any plan is made.
+Explore the repository read-only as needed so your answers are about the actual project.
+Build on the prior conversation. Discuss options and trade-offs, and ask clarifying questions when useful.
+
+Here is the prior discussion transcript (may be empty):
+{history}
+
+Here is the user's latest message:
+{message}
+
+Write your reply as JSON to the file {answer_path} (create the directory if needed) with exactly this schema:
+{"answer": "..."}
+
+Do NOT create a plan or split the work into stages. Do NOT implement anything. Do NOT modify any file. Only write {answer_path}."#;
+
 pub(crate) const ENHANCE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
 The user has supplied a rough description of what they want built in this repository. You may read the repository for context.
 Rewrite it into one clear, concrete, self-contained goal description that preserves the user's intent. Add no invented requirements and do not split the work into stages.
