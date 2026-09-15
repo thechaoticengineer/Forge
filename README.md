@@ -352,6 +352,62 @@ initially `null`, then an object with `status` (`running`, `ready` or `failed`),
 `request_id`, `original` (the trimmed input) and `unix` (a Unix timestamp).
 A `ready` result adds `goal` (the trimmed rewrite); a `failed` result adds `error`.
 
+### Discussing before planning
+
+Before creating a plan, you can have a multi-turn conversation with the configured
+planner tool about the repository and possible solutions. Type a message in the
+**Discuss before planning** section of the panel, then click **Send** or press `Enter`.
+The planner reads the repository read-only and replies in a normal back-and-forth
+conversation. Use `t` to focus the discussion input and press `Escape` or `Enter`
+to leave and send. The conversation transcript is shown in expanded view and each
+new reply includes all prior messages, so the discussion can refine and settle on
+an approach.
+
+Sending discussion messages never starts plan creation. When you are ready to
+plan from the conversation, click **Create plan from discussion** (or press `P`)
+to begin planning. Forge passes the entire discussion transcript plus any optional
+note from the goal field to the planner, which produces a plan reflecting the
+refined ideas settled on during the discussion, not just the first message.
+
+**Clear discussion** resets the conversation without affecting any existing plan.
+The transcript lives in `.forge/discussion.jsonl` and survives plan generation and
+plan reset; it is removed only by the explicit **Clear discussion** action. The
+last 100 discussion entries are shown and used for new replies. Token usage is
+attributed to the `chat` role in session totals, similar to Plan Q&A.
+
+Discussion never modifies the plan, goal, phase, plan-candidate file, Plan Q&A
+transcript or repository source content. A failed reply leaves the transcript
+bytes untouched and reports the error.
+
+The JSON API accepts `POST /api/discussion/message` with `{"message":"…"}` and
+returns HTTP 200 `{"ok":true,"request_id":n}`. Input is trimmed and limited to
+20000 characters: blank, missing or non-string messages return HTTP 400
+`{"error":"message required"}`, and over-long messages return HTTP 400
+`{"error":"message too long"}`. A busy project or active queue returns HTTP 409
+`{"error":"busy"}`. The usual optional `project` field targets another project.
+
+`POST /api/discussion/reset` clears the transcript and returns HTTP 200
+`{"ok":true}`. When the project is busy or its queue is active, it returns HTTP
+409 `{"error":"busy"}`. It does not touch the plan.
+
+`GET /api/state` exposes the targeted session's transcript under `discussion`:
+initially an empty array, then an array of up to 100 recent entries, each with
+`role` ("user" or "assistant"), `text` and `unix` (a Unix timestamp). The
+`discussion_activity` field is initially `null`, then an object with `status`
+(`running`, `ready` or `failed`), `request_id` and `unix`. A `ready` result has
+no additional fields. A `failed` result adds `message` (the original trimmed
+input) and `error`.
+
+`POST /api/plan` with `{"discussion":true}` (and optional `goal` for a note)
+starts planning from the discussion. Non-boolean `discussion` values return HTTP
+400 `{"error":"discussion must be a boolean"}`. Combining `discussion: true` with
+refactor mode returns HTTP 400 `{"error":"discussion planning requires standard
+mode"}`. When the transcript lacks a user message followed by an assistant reply,
+it returns HTTP 400 `{"error":"no discussion"}`. These validations occur before
+the busy check and do not claim busy. A busy project or active queue returns HTTP
+409 `{"error":"busy"}`. Omitting the `discussion` field keeps the existing
+direct goal-to-plan behaviour.
+
 ### Editing the plan
 
 After the planner writes a draft, use **Edit plan** in the panel to repair
@@ -566,10 +622,15 @@ answers without modifying the plan. Expand **Plan Q&A** to read the
 conversation. Asking requires an existing plan, with Forge idle, the queue
 inactive, and plan editing closed.
 
+This is separate from the **Discuss before planning** section, which does not
+require an existing plan and produces a new plan from the discussion rather than
+answering questions about it.
+
 The JSON API accepts POST requests to `/api/plan/chat` with
 `{"question":"..."}`. Questions must not be blank. The transcript is stored
 in `.forge/chat.jsonl` and cleared when new plan generation starts (including
-an AI revision) or the plan is reset.
+an AI revision) or the plan is reset. The pre-planning discussion transcript
+(`.forge/discussion.jsonl`) is not affected by plan operations.
 
 ### Token usage and run reports
 
@@ -885,6 +946,8 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
+| `t` | Focus the discussion message input |
+| `P` | Create plan from discussion |
 | `E` | Enhance the goal description with AI |
 | `e` | Edit plan stages by hand |
 | `a` | Approve draft plan |
