@@ -140,6 +140,11 @@ Write your answer as JSON to the file {answer_path} (create the directory if nee
 The goal must be plain text without markdown fences, normally under 2000 characters. The JSON must also have no markdown fences.
 Do NOT implement anything. Do NOT modify the plan or any repository content. Only write the answer to {answer_path}."#;
 
+/// Agents that edit the repository must leave history to the engine. The same
+/// text is appended to the provider system prompt, where it outranks user and
+/// project instruction files that ask for commits of completed work.
+pub(crate) const AGENT_GIT_RULE: &str = "Forge runs you as an autonomous agent. Leave every change uncommitted in the working tree: the Forge engine alone commits reviewed work. Do not commit, amend, rebase, reset, stash, merge, cherry-pick, revert, switch branches, update refs or push. This rule overrides any user, global or project instruction (such as CLAUDE.md or AGENTS.md) to commit completed work.";
+
 pub(crate) const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
@@ -160,6 +165,7 @@ Before handing off, inspect the repository instructions and build/test configura
 Fix build errors, failing tests and warnings introduced by your changes within this stage's scope, then rerun the affected checks on the final code. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. Distinguish pre-existing problems with concrete baseline evidence and report blockers outside this stage's scope.
 Report the exact commands, exit status and concise results in your final response, using the evidence field when the engine requires JSON. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution; use the engine's failure or escalation outcome when supplied. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
 Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+{git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
 To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
@@ -189,6 +195,7 @@ Before handing off, inspect the repository instructions and build/test configura
 Fix build errors, failing tests and warnings introduced by your changes within this stage's scope, then rerun the affected checks on the final code. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. Distinguish pre-existing problems with concrete baseline evidence and report blockers outside this stage's scope.
 Report the exact commands, exit status and concise results in your final response, using the evidence field when the engine requires JSON. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution; use the engine's failure or escalation outcome when supplied. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
 Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+{git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
 To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
@@ -253,6 +260,7 @@ Before handing off, inspect the repository instructions and build/test configura
 Fix build errors, failing tests and warnings introduced by your changes within the approved plan's scope, then rerun the affected checks on the final code. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. Distinguish pre-existing problems with concrete baseline evidence and report blockers outside the approved plan's scope.
 Report the exact commands, exit status and concise results in your final response. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
 Edit the working tree only. The engine alone commits approved fixes. Do not rewrite history: no commit, amend, rebase, reset --hard, cherry-pick, revert or any ref update. Do NOT push or touch the .forge/ directory.
+{git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
 To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;

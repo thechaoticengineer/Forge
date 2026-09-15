@@ -478,6 +478,21 @@ fn reviewers_and_qa_are_always_fresh_and_unknown_effort_is_never_mapped() {
 }
 
 #[test]
+fn editing_agents_are_told_to_leave_history_to_the_engine() {
+    for role in ["implementer", "fixer"] {
+        let req = AgentRequest { role, session: None, ..request("claude") };
+        let args: Vec<_> = command(&req).unwrap().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+        let at = args.iter().position(|a| a == "--append-system-prompt").expect("system prompt flag");
+        assert_eq!(args[at + 1], crate::prompts::AGENT_GIT_RULE);
+    }
+    let req = AgentRequest { role: "chat", session: None, ..request("claude") };
+    assert!(!command(&req).unwrap().get_args().any(|a| a == "--append-system-prompt"));
+    for template in [crate::prompts::IMPLEMENT_PROMPT, crate::prompts::FIX_PROMPT, crate::prompts::PLAN_FIX_PROMPT] {
+        assert!(template.contains("{git_rule}"));
+    }
+}
+
+#[test]
 fn enhancement_and_response_corrections_require_readonly_capabilities() {
     for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "model_policy", "response_correction"].map(|role| (provider, role))) {
         let mut req = AgentRequest {role:"chat",session:None,..request(provider)};

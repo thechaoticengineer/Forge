@@ -110,6 +110,7 @@ impl Ctx {
             ("{instructions}", stage["instructions"].as_str().unwrap_or("")),
             ("{acceptance}", stage["acceptance"].as_str().unwrap_or("")),
             ("{forge_dir}", FORGE_DIR),
+            ("{git_rule}", crate::prompts::AGENT_GIT_RULE),
             ("{verdict_path}", &format!("{FORGE_DIR}/verdict.json")),
             ("{review_context}", &Self::stage_review_context(stage)),
         ]);

@@ -145,6 +145,7 @@ pub(crate) fn command(request: &AgentRequest<'_>) -> Result<std::process::Comman
                 ]);
             } else {
                 c.arg("--dangerously-skip-permissions");
+                c.args(["--append-system-prompt", crate::prompts::AGENT_GIT_RULE]);
             }
             if review { c.args(["--allowedTools", "Read,Glob,Grep,Bash"]); }
             if let Some(id) = session {

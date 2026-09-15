@@ -14,7 +14,9 @@ Rust engine + Quickshell (Omarchy) panel.
    criteria, and a proposed commit message.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
-   - the **implementer** implements the stage,
+   - the **implementer** implements the stage and leaves it uncommitted; commits it
+     makes anyway on top of the stage's base are moved back into staged changes
+     before review, while rewritten history still blocks the stage,
    - the engine classifies the full implementation snapshot,
    - a fresh, adversarial **independent reviewer** verifies the stage and its scope
      when scheduled per stage,

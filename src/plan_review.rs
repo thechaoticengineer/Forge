@@ -219,6 +219,7 @@ impl Ctx {
                     ("{constraints}",&cp["constraints"].to_string()),
                     ("{interfaces}",&cp["completed_interfaces"].to_string()),
                     ("{plan_id}",plan["plan_id"].as_str().unwrap_or("")),
+                    ("{git_rule}",crate::prompts::AGENT_GIT_RULE),
                 ]);
                 let turn = crate::architecture::identity();
                 if !plan["plan_review"]["model_invocations"].is_array() { plan["plan_review"]["model_invocations"] = json!([]); }
@@ -260,6 +261,7 @@ impl Ctx {
                 }
                 self.save_plan(plan)?;
                 if let Ok(output) = &result { self.record_plan_usage(plan,"fixer",&choice.0,output.usage.clone())?; }
+                if let Some(head) = plan["plan_review"]["head"].as_str() { self.undo_agent_commits(head,"fixer")?; }
                 self.plan_fixer_boundary(plan)?;
                 match result {
                     Ok(_) => {

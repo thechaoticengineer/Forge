@@ -578,6 +578,9 @@ impl Ctx {
                     }
                 }
             };
+            if let Some(base) = plan["stages"][idx]["attempt_head"].as_str() {
+                self.undo_agent_commits(base, role)?;
+            }
             let effective = &assignment["effective"];
             let provider = effective["provider"].as_str().unwrap();
             let model = effective["model"].as_str().unwrap();
@@ -849,6 +852,22 @@ impl Ctx {
         self.finish_stage(&mut plan, idx, "committed")?;
         self.log_event("stage", &format!("stage {sid} recovered: exact reviewed commit already exists; completion checkpoint restored"));
         Ok(vec![sid])
+    }
+
+    /// Agents must leave their work uncommitted. Commits stacked on the expected
+    /// base become staged changes again, so review still sees the whole diff and
+    /// the engine makes the only commit. Any other HEAD movement is left for the
+    /// callers' HEAD checks to reject.
+    pub(in crate::app) fn undo_agent_commits(&self, base: &str, role: &str) -> Result<(), String> {
+        let head = self.git(&["rev-parse", "HEAD"])?;
+        if head == base || self.git(&["merge-base", "--is-ancestor", base, &head]).is_err() {
+            return Ok(());
+        }
+        let count = self.git(&["rev-list", "--count", &format!("{base}..{head}")])?;
+        // CAS on the observed HEAD; the index and worktree keep the committed content.
+        self.git(&["update-ref", "-m", &format!("forge: undo {role} commits"), "HEAD", base, &head])?;
+        self.log_event("git", &format!("[{role}] made {count} commit(s); moved them back to uncommitted changes"));
+        Ok(())
     }
 
     pub(in crate::app) fn commit_reviewed(

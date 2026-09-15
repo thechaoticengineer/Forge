@@ -1332,22 +1332,58 @@ fn plan_review_crash_boundaries_distinguish_unstarted_and_completed_fixers() {
 }
 
 #[test]
-fn plan_review_fixer_head_changes_block_without_engine_commit_or_report() {
-    let f = Fixture::new("Implement feature",2);
-    f.two_deferred_stages();
-    f.setting("mock_verdicts",json!([reject("Fix behavior")]));
-    f.setting("mock_fixer_actions",json!([{"git":["commit","--allow-empty","-m","unauthorized fixer commit"]}]));
+fn stage_agent_commits_become_uncommitted_work_before_review() {
+    let f = Fixture::with_ignored_runtime("Implement feature", 0, true);
+    f.setting("mock_implementer_actions", json!([{"commit":"agent commit"}]));
     let p = f.run();
-    assert_eq!(p["plan_review"]["status"],"blocked");
-    assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("HEAD moved"));
-    assert_eq!(p["plan_review"]["rounds"],2);
-    assert!(p["plan_review"]["fix_sha"].is_null());
-    assert_eq!(f.plan_calls().len(),2);
-    assert!(!f.ctx.forge_path("reports.jsonl").exists());
-    let resumed = f.run();
-    assert_eq!(resumed["plan_review"]["rounds"],2);
-    assert_eq!(f.count("fixer"),1);
-    assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+    assert_eq!(p["stages"][0]["status"], "committed", "{p}");
+    assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), "feat: stage");
+    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD^"]).unwrap(), "initial");
+    assert_eq!(f.ctx.git(&["show", "HEAD:mock.txt"]).unwrap(), "work by implementer");
+    let review = &p["stages"][0]["reviews"][0]["identity"]["snapshot"];
+    assert_eq!(review["head"], p["stages"][0]["attempt_head"]);
+    assert!(f.ctx.read_history().to_string().contains("[implementer] made 1 commit(s); moved them back to uncommitted changes"));
+}
+
+#[test]
+fn stage_agent_history_rewrites_still_block() {
+    let f = Fixture::with_ignored_runtime("Implement feature", 0, true);
+    f.setting("mock_implementer_actions", json!([{"git":["commit","--amend","--allow-empty","-qm","rewritten"]}]));
+    let p = f.run();
+    assert_eq!(p["stages"][0]["status"], "blocked");
+    assert_eq!(p["stages"][0]["review_gate"]["error"], "implementer changed HEAD");
+    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), "rewritten");
+}
+
+#[test]
+fn plan_review_fixer_commits_are_undone_but_history_rewrites_block() {
+    for rewrite in [false, true] {
+        let f = Fixture::new("Implement feature",2);
+        f.two_deferred_stages();
+        f.setting("mock_verdicts",json!([reject("Fix behavior")]));
+        let git = if rewrite { json!(["commit","--amend","--allow-empty","-m","rewritten stage commit"]) }
+            else { json!(["commit","--allow-empty","-m","unauthorized fixer commit"]) };
+        f.setting("mock_fixer_actions",json!([{"git":git}]));
+        let p = f.run();
+        assert_eq!(p["plan_review"]["rounds"],2);
+        assert_eq!(f.count("fixer"),1);
+        if rewrite {
+            assert!(p["plan_review"]["fix_sha"].is_null());
+            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+            assert_eq!(p["plan_review"]["status"],"blocked");
+            assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("HEAD moved"));
+            assert_eq!(f.plan_calls().len(),2);
+            assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        } else {
+            assert_eq!(p["status"],"done","{p}");
+            // The fixer's work reaches history only through the engine's reviewed fix commit.
+            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+            assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"fix(review): apply deferred plan review findings");
+            assert_eq!(f.ctx.git(&["rev-parse","HEAD^"]).unwrap(),p["plan_review"]["head"]);
+            assert!(f.ctx.forge_path("reports.jsonl").exists());
+        }
+    }
 }
 
 #[test]

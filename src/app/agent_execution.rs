@@ -236,8 +236,8 @@ impl Ctx {
         }
         self.mock_agent(role)?;
         #[cfg(test)]
-        if role == "fixer" {
-            let action = self.app.settings.lock().unwrap()["mock_fixer_actions"].as_array_mut()
+        if matches!(role, "implementer" | "fixer") {
+            let action = self.app.settings.lock().unwrap()[format!("mock_{role}_actions")].as_array_mut()
                 .filter(|a| !a.is_empty()).map(|a| a.remove(0));
             if let Some(action) = action {
                 for path in action["remove"].as_array().into_iter().flatten() {
@@ -245,6 +245,10 @@ impl Ctx {
                 }
                 if let Some(args) = action["git"].as_array() {
                     self.git(&args.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())?;
+                }
+                if let Some(message) = action["commit"].as_str() {
+                    self.git(&["add", "-A"])?;
+                    self.git(&["commit", "-qm", message])?;
                 }
                 if action["stop"] == true { self.session.stop_requested.store(true, Ordering::SeqCst); }
             }
