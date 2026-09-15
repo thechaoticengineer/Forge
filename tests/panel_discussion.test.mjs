@@ -213,6 +213,116 @@ test('clearDiscussion posts the reset endpoint and is gated like the Clear butto
   assert.equal(ctx.calls[0].path, '/api/discussion/reset');
 });
 
+class Model {
+  rows = []; writes = []; inserts = []; removes = []; moves = [];
+  get count() { return this.rows.length; }
+  get(i) { return this.rows[i]; }
+  insert(i, r) { this.rows.splice(i, 0, {...r}); this.inserts.push(i); }
+  remove(i) { this.rows.splice(i, 1); this.removes.push(i); }
+  move(a, b, n) { this.rows.splice(b, 0, ...this.rows.splice(a, n)); this.moves.push([a, b, n]); }
+  setProperty(i, k, v) { this.rows[i][k] = v; this.writes.push([i, k, v]); }
+}
+
+test('chatMessages: user/assistant transcript keeps order and fields', () => {
+  const d = loadDiscussion();
+  const entries = [{role: 'user', text: 'hi', unix: 1}, {role: 'assistant', text: 'hello', unix: 2}];
+  const rows = plain(d.chatMessages(entries, false, '', ''));
+  assert.deepEqual(rows, [
+    {key: 'entry/["user",1,"hi"]/0', kind: 'user', outgoing: true, author: 'You', status: '', text: 'hi'},
+    {key: 'entry/["assistant",2,"hello"]/0', kind: 'assistant', outgoing: false, author: 'Forge', status: '', text: 'hello'},
+  ]);
+});
+
+test('chatMessages: unknown roles and null entries are skipped; non-array entries are empty', () => {
+  const d = loadDiscussion();
+  const entries = [null, {role: 'system', text: 'x', unix: 1}, {role: 'user', text: 'hi', unix: 2}, undefined];
+  const rows = plain(d.chatMessages(entries, false, '', ''));
+  assert.deepEqual(rows, [{key: 'entry/["user",2,"hi"]/0', kind: 'user', outgoing: true, author: 'You', status: '', text: 'hi'}]);
+  assert.deepEqual(plain(d.chatMessages(null, false, '', '')), []);
+  assert.deepEqual(plain(d.chatMessages(undefined, false, '', '')), []);
+  assert.deepEqual(plain(d.chatMessages('nope', false, '', '')), []);
+});
+
+test('chatMessages: null/undefined text is coerced to an empty string', () => {
+  const d = loadDiscussion();
+  const rows = plain(d.chatMessages([{role: 'user', text: null, unix: 1}], false, '', ''));
+  assert.equal(rows[0].text, '');
+});
+
+test('chatMessages: keys stay stable when the oldest entry is dropped from the rolling window', () => {
+  const d = loadDiscussion();
+  const full = [{role: 'user', text: 'a', unix: 1}, {role: 'assistant', text: 'b', unix: 2},
+    {role: 'user', text: 'c', unix: 3}, {role: 'assistant', text: 'd', unix: 4}];
+  const before = plain(d.chatMessages(full, false, '', '')).map(r => r.key);
+  const rolled = full.slice(1);
+  const after = plain(d.chatMessages(rolled, false, '', '')).map(r => r.key);
+  assert.deepEqual(after, before.slice(1));
+});
+
+test('chatMessages: duplicate identical messages get distinct keys', () => {
+  const d = loadDiscussion();
+  const entries = [{role: 'user', text: 'same', unix: 1}, {role: 'user', text: 'same', unix: 1}];
+  const rows = plain(d.chatMessages(entries, false, '', ''));
+  assert.equal(rows[0].key, 'entry/["user",1,"same"]/0');
+  assert.equal(rows[1].key, 'entry/["user",1,"same"]/1');
+  assert.notEqual(rows[0].key, rows[1].key);
+});
+
+test('chatMessages: pending with a sent message appends a Sending… row and the reply row', () => {
+  const d = loadDiscussion();
+  const rows = plain(d.chatMessages([], true, 'hello there', ''));
+  assert.deepEqual(rows, [
+    {key: 'pending/user', kind: 'user', outgoing: true, author: 'You', status: 'Sending…', text: 'hello there'},
+    {key: 'pending/reply', kind: 'pending', outgoing: false, author: 'Forge', status: '', text: 'Forge is replying…'},
+  ]);
+});
+
+test('chatMessages: pending with a blank sent message gives only the reply row', () => {
+  const d = loadDiscussion();
+  for (const sentMessage of ['', '   ', null, undefined]) {
+    const rows = plain(d.chatMessages([], true, sentMessage, ''));
+    assert.deepEqual(rows, [{key: 'pending/reply', kind: 'pending', outgoing: false, author: 'Forge', status: '', text: 'Forge is replying…'}]);
+  }
+});
+
+test('chatMessages: error rows appear only when not pending and the error is not blank', () => {
+  const d = loadDiscussion();
+  assert.deepEqual(plain(d.chatMessages([], true, '', 'boom')), [
+    {key: 'pending/reply', kind: 'pending', outgoing: false, author: 'Forge', status: '', text: 'Forge is replying…'},
+  ]);
+  for (const error of ['', '   ', null, undefined]) assert.deepEqual(plain(d.chatMessages([], false, '', error)), []);
+  assert.deepEqual(plain(d.chatMessages([], false, '', 'boom')), [
+    {key: 'error', kind: 'error', outgoing: false, author: 'Forge', status: 'Reply failed', text: 'boom'},
+  ]);
+});
+
+test('reconcileChat: an identical second call makes zero writes', () => {
+  const d = loadDiscussion();
+  const model = new Model();
+  const rows = plain(d.chatMessages([{role: 'user', text: 'a', unix: 1}, {role: 'assistant', text: 'b', unix: 2}], false, '', ''));
+  d.reconcileChat(model, rows);
+  assert.equal(model.count, 2);
+  model.writes = []; model.inserts = []; model.removes = []; model.moves = [];
+  d.reconcileChat(model, plain(rows));
+  assert.deepEqual(model.writes, []);
+  assert.deepEqual(model.inserts, []);
+  assert.deepEqual(model.removes, []);
+  assert.deepEqual(model.moves, []);
+});
+
+test('reconcileChat: a pending row is replaced by transcript rows, then entries are cleared', () => {
+  const d = loadDiscussion();
+  const model = new Model();
+  d.reconcileChat(model, plain(d.chatMessages([], true, 'hello', '')));
+  assert.deepEqual(model.rows.map(r => r.key), ['pending/user', 'pending/reply']);
+  const delegate = model.rows[0];
+  d.reconcileChat(model, plain(d.chatMessages([{role: 'user', text: 'hello', unix: 5}, {role: 'assistant', text: 'hi', unix: 6}], false, '', '')));
+  assert.deepEqual(model.rows.map(r => r.key), ['entry/["user",5,"hello"]/0', 'entry/["assistant",6,"hi"]/0']);
+  assert.ok(!model.rows.includes(delegate));
+  d.reconcileChat(model, []);
+  assert.equal(model.count, 0);
+});
+
 test('project switch resets discussion state and the input', () => {
   assert.deepEqual(defaults, {discussionPending: false, discussionRequest: -1,
     discussionSent: '', discussionError: '', discussionExpanded: false});
