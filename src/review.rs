@@ -52,3 +52,6 @@ mod orchestration_tests;
 
 #[path = "plan_review.rs"]
 mod plan_review;
+
+#[path = "history_decision.rs"]
+mod history_decision;

@@ -235,6 +235,15 @@ impl Ctx {
                         "stage {sid} blocked after {duration}: required review gate is not clean after max fix rounds — needs a human"));
                     return Ok(());
                 }
+                "history_blocked" => {
+                    let reason = plan["stages"][idx]["review_gate"]["reason"]
+                        .as_str().unwrap_or("the architect blocked a git history change").to_string();
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked")?);
+                    self.set_phase("blocked");
+                    self.log_event("stage", &format!(
+                        "stage {sid} blocked after {duration}: git history changed and the architect decided to stop: {reason} — needs a human"));
+                    return Ok(());
+                }
                 "scope_blocked" => {
                     let reason = plan["stages"][idx]["review_gate"]["reason"]
                         .as_str().unwrap_or("the stage cannot be built as written").to_string();

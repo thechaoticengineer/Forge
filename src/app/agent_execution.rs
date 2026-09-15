@@ -246,6 +246,13 @@ impl Ctx {
                 if let Some(args) = action["git"].as_array() {
                     self.git(&args.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>())?;
                 }
+                if let Some(files) = action["external"].as_object() {
+                    for (path, content) in files {
+                        fs::write(PathBuf::from(self.project()).join(path), content.as_str().unwrap()).map_err(|e| e.to_string())?;
+                        self.git(&["add", "--", path])?;
+                    }
+                    self.git(&["commit", "-qm", "external change"])?;
+                }
                 if let Some(message) = action["commit"].as_str() {
                     self.git(&["add", "-A"])?;
                     self.git(&["commit", "-qm", message])?;

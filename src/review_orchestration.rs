@@ -578,8 +578,24 @@ impl Ctx {
                     }
                 }
             };
-            if let Some(base) = plan["stages"][idx]["attempt_head"].as_str() {
-                self.undo_agent_commits(base, role)?;
+            // The engine never decides what a history change means; the architect does.
+            if let Some(base) = plan["stages"][idx]["attempt_head"].as_str().map(str::to_owned)
+                && let Some(evidence) = self.history_change(&base)?
+            {
+                let decision = self.decide_history_change(plan, ReviewScope::Stage(idx), role, &evidence)?;
+                match decision["action"].as_str() {
+                    Some("uncommit") => self.undo_agent_commits(&base, role)?,
+                    Some("continue") => {
+                        plan["stages"][idx]["attempt_head"] = evidence["head"].clone();
+                        self.save_plan(plan)?;
+                    }
+                    _ => {
+                        plan["stages"][idx]["review_gate"] = json!({"status":"history_blocked","reason":decision["reason"],
+                            "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
+                        self.save_plan(plan)?;
+                        return Ok("history_blocked");
+                    }
+                }
             }
             let effective = &assignment["effective"];
             let provider = effective["provider"].as_str().unwrap();
@@ -854,10 +870,10 @@ impl Ctx {
         Ok(vec![sid])
     }
 
-    /// Agents must leave their work uncommitted. Commits stacked on the expected
-    /// base become staged changes again, so review still sees the whole diff and
-    /// the engine makes the only commit. Any other HEAD movement is left for the
-    /// callers' HEAD checks to reject.
+    /// Carry out the architect's "uncommit" decision: commits stacked on the
+    /// expected base become staged changes again, so review still sees the whole
+    /// diff and the engine makes the only commit. Any other HEAD movement is left
+    /// for the callers' HEAD checks to reject.
     pub(in crate::app) fn undo_agent_commits(&self, base: &str, role: &str) -> Result<(), String> {
         let head = self.git(&["rev-parse", "HEAD"])?;
         if head == base || self.git(&["merge-base", "--is-ancestor", base, &head]).is_err() {

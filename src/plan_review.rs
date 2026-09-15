@@ -197,7 +197,7 @@ impl Ctx {
         };
         let requirements = self.model_requirements("implementer",None)?.requiring_at_least(minimum);
         self.set_step(None,"fixing plan review findings");
-        self.with_selected_model(&requirements,None, |choice| {
+        let outcome = self.with_selected_model(&requirements,None, |choice| {
             loop {
                 self.plan_fixer_boundary(plan)?;
                 *plan = self.load_plan().ok_or("missing plan before fixer")?;
@@ -261,8 +261,10 @@ impl Ctx {
                 }
                 self.save_plan(plan)?;
                 if let Ok(output) = &result { self.record_plan_usage(plan,"fixer",&choice.0,output.usage.clone())?; }
-                if let Some(head) = plan["plan_review"]["head"].as_str() { self.undo_agent_commits(head,"fixer")?; }
-                self.plan_fixer_boundary(plan)?;
+                // A moved HEAD is resolved by the architect after this selection loop,
+                // so a history change never looks like a retryable fixer failure.
+                let moved = self.git(&["rev-parse","HEAD"])? != plan["plan_review"]["head"].as_str().unwrap_or("");
+                if !moved { self.plan_fixer_boundary(plan)?; }
                 match result {
                     Ok(_) => {
                         if plan["plan_review"]["model_invocations"].as_array().unwrap().last().unwrap()["verification_state"] != "execution_verified" {
@@ -271,13 +273,31 @@ impl Ctx {
                         return Ok(());
                     }
                     Err(error) => {
-                        if self.operational_retry_for_scope(plan,None,&error,"fixer")? { continue; }
+                        if !moved && self.operational_retry_for_scope(plan,None,&error,"fixer")? { continue; }
                         return Err(error);
                     }
                 }
             }
-        })?;
-        Ok(())
+        });
+        self.resolve_plan_fixer_history(plan)?;
+        outcome?;
+        self.plan_fixer_boundary(plan)
+    }
+
+    fn resolve_plan_fixer_history(&self, plan: &mut Value) -> Result<(), String> {
+        if self.session.stop_requested.load(Ordering::SeqCst) { return Ok(()); }
+        let base = plan["plan_review"]["head"].as_str().ok_or("missing plan review HEAD")?.to_string();
+        let Some(evidence) = self.history_change(&base)? else { return Ok(()); };
+        let decision = self.decide_history_change(plan, ReviewScope::Plan, "fixer", &evidence)?;
+        match decision["action"].as_str() {
+            Some("uncommit") => self.undo_agent_commits(&base, "fixer"),
+            Some("continue") => {
+                plan["plan_review"]["head"] = evidence["head"].clone();
+                self.save_plan(plan)
+            }
+            _ => Err(format!("git history changed during the plan fixer and the architect decided to stop: {}",
+                decision["reason"].as_str().unwrap_or(""))),
+        }
     }
 
     fn finalized_plan_snapshot(&self, plan: &Value) -> Result<Value, String> {

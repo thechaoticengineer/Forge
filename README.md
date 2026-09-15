@@ -14,9 +14,9 @@ Rust engine + Quickshell (Omarchy) panel.
    criteria, and a proposed commit message.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
-   - the **implementer** implements the stage and leaves it uncommitted; commits it
-     makes anyway on top of the stage's base are moved back into staged changes
-     before review, while rewritten history still blocks the stage,
+   - the **implementer** implements the stage and leaves it uncommitted. If git
+     history changed meanwhile, the engine changes nothing itself and asks the
+     architect to decide (see [Git history changes during a stage](#git-history-changes-during-a-stage)),
    - the engine classifies the full implementation snapshot,
    - a fresh, adversarial **independent reviewer** verifies the stage and its scope
      when scheduled per stage,
@@ -308,6 +308,29 @@ separately from current pending, deferred, blocked, error, interrupted or
 invalidated gates.
 Legacy note-only approvals keep their historical rendering; incoming notes never
 permit a current clean gate. Full feedback remains in paginated review history.
+
+### Git history changes during a stage
+
+Implementers and fixers must leave their work uncommitted: their prompts and, for
+Claude, the appended system prompt say so and override instruction files that ask
+for commits. When HEAD nevertheless differs from the stage's base after such an
+agent finishes (or from the captured HEAD after a plan review fixer), the engine
+does not touch history. It collects evidence — the new commits, the files they
+change, the uncommitted work, their overlap and whether history was rewritten —
+and asks the persistent architect for exactly one action:
+
+- `uncommit`: the commits hold this work. The engine moves HEAD back to the base,
+  keeps their content staged, and the normal review and engine commit follow.
+- `continue`: the commits are an external change that leaves this work alone.
+  They stay in history and the stage (or plan review) continues on the new HEAD.
+  The engine rejects this unless uncommitted work exists and no file overlaps.
+- `block`: anything else. The stage (or plan review) stops with the architect's
+  reason and history stays as it is.
+
+Rewritten history allows only `block`, and a failed or invalid architect answer
+blocks too. Each outcome is stored in `history_decisions` on the stage or
+`plan_review`, and the architect's choice is recorded as an accepted decision
+in the plan's architecture history.
 
 ### Refactor plans
 

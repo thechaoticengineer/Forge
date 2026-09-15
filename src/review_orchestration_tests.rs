@@ -1331,57 +1331,108 @@ fn plan_review_crash_boundaries_distinguish_unstarted_and_completed_fixers() {
     }
 }
 
+fn history_decisions(f: &Fixture, decisions: Value) {
+    f.setting("mock_history_decisions", decisions);
+}
+
 #[test]
-fn stage_agent_commits_become_uncommitted_work_before_review() {
+fn history_decision_answers_are_limited_to_safe_actions() {
+    use super::history_decision::{continue_rejection, parse_history_decision};
+    let evidence = json!({"rewritten":false});
+    assert_eq!(parse_history_decision(r#"{"action":"uncommit","reason":"stage work"}"#, &evidence).unwrap()["action"], "uncommit");
+    for (text, error) in [(r#"{"action":"reset","reason":"x"}"#, "action must be one of"), (r#"{"action":"block","reason":" "}"#, "reason must be"),
+        (r#"{"action":"block","reason":"x","extra":1}"#, "extra")] {
+        assert!(parse_history_decision(text, &evidence).unwrap_err().contains(error), "{text}");
+    }
+    let rewritten = json!({"rewritten":true});
+    assert!(parse_history_decision(r#"{"action":"continue","reason":"x"}"#, &rewritten).is_err());
+    assert!(parse_history_decision(r#"{"action":"block","reason":"x"}"#, &rewritten).is_ok());
+    assert!(continue_rejection(&json!({"rewritten":false,"uncommitted_files":["a.rs"],"overlap":[]})).is_none());
+    assert!(continue_rejection(&json!({"rewritten":false,"uncommitted_files":[],"overlap":[]})).unwrap().contains("no uncommitted work"));
+    assert!(continue_rejection(&json!({"rewritten":false,"uncommitted_files":["a.rs"],"overlap":["a.rs"]})).unwrap().contains("a.rs"));
+}
+
+#[test]
+fn stage_agent_commit_is_uncommitted_only_when_the_architect_decides_so() {
     let f = Fixture::with_ignored_runtime("Implement feature", 0, true);
     f.setting("mock_implementer_actions", json!([{"commit":"agent commit"}]));
+    history_decisions(&f, json!([{"action":"uncommit","reason":"The commit holds this stage's work."}]));
     let p = f.run();
     assert_eq!(p["stages"][0]["status"], "committed", "{p}");
     assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
     assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), "feat: stage");
-    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD^"]).unwrap(), "initial");
     assert_eq!(f.ctx.git(&["show", "HEAD:mock.txt"]).unwrap(), "work by implementer");
-    let review = &p["stages"][0]["reviews"][0]["identity"]["snapshot"];
-    assert_eq!(review["head"], p["stages"][0]["attempt_head"]);
-    assert!(f.ctx.read_history().to_string().contains("[implementer] made 1 commit(s); moved them back to uncommitted changes"));
+    let decision = &p["stages"][0]["history_decisions"][0];
+    assert_eq!(decision["action"], "uncommit");
+    assert_eq!(decision["evidence"]["commits"][0]["subject"], "agent commit");
+    assert_eq!(decision["evidence"]["committed_files"], json!(["mock.txt"]));
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(cp["recent_decisions"].as_array().unwrap().iter().any(|d| d["id"] == decision["decision_id"]));
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let prompt = settings["mock_history_prompts"][0].as_str().unwrap();
+    for text in ["agent commit", "\"uncommit\"", "\"continue\"", "\"block\"", "Implement feature"] { assert!(prompt.contains(text), "{text}"); }
 }
 
 #[test]
-fn stage_agent_history_rewrites_still_block() {
+fn stage_history_change_blocks_without_touching_history_unless_the_architect_approves() {
+    for (action, decisions, reason, subject) in [
+        (json!({"commit":"agent commit"}), json!([]), "mock architect blocks", "agent commit"),
+        (json!({"commit":"agent commit"}), json!([{"error":"architect unavailable"}]), "could not decide", "agent commit"),
+        (json!({"commit":"agent commit"}), json!([{"action":"continue","reason":"Looks external."}]), "engine rejected continue: there is no uncommitted work", "agent commit"),
+        (json!({"git":["commit","--amend","--allow-empty","-qm","rewritten"]}), json!([{"action":"uncommit","reason":"x"}]), "mock architect blocks", "rewritten"),
+    ] {
+        let f = Fixture::with_ignored_runtime("Implement feature", 0, true);
+        f.setting("mock_implementer_actions", json!([action]));
+        history_decisions(&f, decisions);
+        let p = f.run();
+        let stage = &p["stages"][0];
+        assert_eq!(stage["status"], "blocked", "{p}");
+        assert_eq!(stage["review_gate"]["status"], "history_blocked");
+        assert!(stage["review_gate"]["reason"].as_str().unwrap().contains(reason), "{}", stage["review_gate"]);
+        assert_eq!(stage["history_decisions"][0]["action"], "block");
+        assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), subject);
+        assert_eq!(f.ctx.session.state.lock().unwrap().phase, "blocked");
+        assert!(stage["reviews"].as_array().is_none_or(Vec::is_empty));
+    }
+}
+
+#[test]
+fn external_commit_that_leaves_stage_work_alone_continues_when_the_architect_allows() {
     let f = Fixture::with_ignored_runtime("Implement feature", 0, true);
-    f.setting("mock_implementer_actions", json!([{"git":["commit","--amend","--allow-empty","-qm","rewritten"]}]));
+    f.setting("mock_implementer_actions", json!([{"external":{"other.txt":"external"}}]));
+    history_decisions(&f, json!([{"action":"continue","reason":"An unrelated external change."}]));
     let p = f.run();
-    assert_eq!(p["stages"][0]["status"], "blocked");
-    assert_eq!(p["stages"][0]["review_gate"]["error"], "implementer changed HEAD");
-    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), "rewritten");
+    assert_eq!(p["stages"][0]["status"], "committed", "{p}");
+    assert_eq!(f.ctx.git(&["rev-list", "--count", "HEAD"]).unwrap(), "3");
+    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD"]).unwrap(), "feat: stage");
+    assert_eq!(f.ctx.git(&["show", "-s", "--format=%B", "HEAD^"]).unwrap(), "external change");
+    assert_eq!(p["stages"][0]["attempt_head"], f.ctx.git(&["rev-parse", "HEAD^"]).unwrap());
+    assert_eq!(f.ctx.git(&["diff", "--name-only", "HEAD^", "HEAD"]).unwrap(), "mock.txt");
 }
 
 #[test]
-fn plan_review_fixer_commits_are_undone_but_history_rewrites_block() {
-    for rewrite in [false, true] {
+fn plan_review_fixer_history_change_follows_the_architect_decision() {
+    for action in ["uncommit", "continue", "block"] {
         let f = Fixture::new("Implement feature",2);
         f.two_deferred_stages();
         f.setting("mock_verdicts",json!([reject("Fix behavior")]));
-        let git = if rewrite { json!(["commit","--amend","--allow-empty","-m","rewritten stage commit"]) }
-            else { json!(["commit","--allow-empty","-m","unauthorized fixer commit"]) };
-        f.setting("mock_fixer_actions",json!([{"git":git}]));
+        f.setting("mock_fixer_actions",json!([{"git":["commit","--allow-empty","-m","unauthorized fixer commit"]}]));
+        if action != "block" { history_decisions(&f, json!([{"action":action,"reason":"Architect decision."}])); }
         let p = f.run();
         assert_eq!(p["plan_review"]["rounds"],2);
         assert_eq!(f.count("fixer"),1);
-        if rewrite {
-            assert!(p["plan_review"]["fix_sha"].is_null());
-            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        assert_eq!(p["plan_review"]["history_decisions"][0]["action"],action,"{p}");
+        if action == "block" {
             assert_eq!(p["plan_review"]["status"],"blocked");
-            assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("HEAD moved"));
-            assert_eq!(f.plan_calls().len(),2);
+            assert!(p["plan_review"]["gate"]["error"].as_str().unwrap().contains("architect decided to stop"));
+            assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"unauthorized fixer commit");
             assert!(!f.ctx.forge_path("reports.jsonl").exists());
         } else {
             assert_eq!(p["status"],"done","{p}");
-            // The fixer's work reaches history only through the engine's reviewed fix commit.
-            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
             assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"fix(review): apply deferred plan review findings");
-            assert_eq!(f.ctx.git(&["rev-parse","HEAD^"]).unwrap(),p["plan_review"]["head"]);
-            assert!(f.ctx.forge_path("reports.jsonl").exists());
+            let kept = f.ctx.git(&["log","--format=%s"]).unwrap().contains("unauthorized fixer commit");
+            assert_eq!(kept, action == "continue");
+            assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(), if action == "continue" {"5"} else {"4"});
         }
     }
 }

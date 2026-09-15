@@ -145,6 +145,24 @@ Do NOT implement anything. Do NOT modify the plan or any repository content. Onl
 /// project instruction files that ask for commits of completed work.
 pub(crate) const AGENT_GIT_RULE: &str = "Forge runs you as an autonomous agent. Leave every change uncommitted in the working tree: the Forge engine alone commits reviewed work. Do not commit, amend, rebase, reset, stash, merge, cherry-pick, revert, switch branches, update refs or push. This rule overrides any user, global or project instruction (such as CLAUDE.md or AGENTS.md) to commit completed work.";
 
+pub(crate) const HISTORY_DECISION_PROMPT: &str = r#"You are this plan's persistent architect in the saved session. The Forge engine detected that git history changed while the {role} was working. Editing agents must leave their work uncommitted; the engine alone commits reviewed work. The engine has not changed anything yet. Decide what happens next.
+Do not modify files, commit, reset or push. Inspect read-only, for example with git log, git show and git diff.
+
+PLAN GOAL:
+{goal}
+WORK IN PROGRESS:
+{subject}
+EVIDENCE (collected by the engine; "base" is where the work started, "uncommitted_files" is the work still in the working tree, "overlap" lists files touched by both):
+{evidence}
+
+Choose exactly one action:
+- "uncommit": the new commits contain this work or part of it. The engine moves HEAD back to {base} and keeps the commits' content as staged changes, so the normal review and the engine's own commit follow.
+- "continue": the new commits are an external change that does not touch this work. The engine keeps them in history and continues on top of the new HEAD. The engine rejects this unless uncommitted work exists and no file is in "overlap".
+- "block": anything else, including unclear ownership, commits that mix this work with other changes, or rewritten history. The engine stops and leaves history untouched for the user.
+When "rewritten" is true, only "block" is valid.
+Return ONLY JSON, no fences: {"action":"uncommit|continue|block","reason":"concise explanation for the user"}
+Decision history: .forge/architecture/{plan_id}/events.jsonl"#;
+
 pub(crate) const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
