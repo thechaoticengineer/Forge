@@ -446,6 +446,14 @@ test('Panel derives discussionOpen from the stack and navigates through the page
   assert.ok(viewIndex < catalogueIndex, 'the chat page is declared before the overlays');
   // The instance is pushed, never a Component or a URL, so it survives a pop.
   assert.match(qml, /DiscussionView \{\s*\n\s*id: discussionView/);
+
+  // It starts hidden so nothing draws over panelPage before the first push;
+  // the StackView (not a binding to discussionOpen) owns visible afterwards.
+  const declaration = qml.slice(viewIndex, qml.indexOf('onCloseRequested: root.closeDiscussion()', viewIndex));
+  assert.match(declaration, /^\s*visible: false\s*$/m, 'the page declares a literal hidden start');
+  assert.doesNotMatch(declaration, /visible:\s*(?!false\s*$)\S/m,
+    'visible is never bound to discussionOpen or anything else');
+  assert.doesNotMatch(declaration, /\b(?:anchors\.|width:|height:)/);
 });
 
 test('the panel column keeps a discussion entry point that opens the chat page', () => {

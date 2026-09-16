@@ -2562,10 +2562,15 @@ Item {
 
       // ------------------------------------------- pre-planning discussion
       // A persistent stack page: pushed and popped by open/closeDiscussion, so
-      // it keeps its transcript, reading position and draft. No anchors, size
-      // or visible binding - the StackView owns all three.
+      // it keeps its transcript, reading position and draft. It starts hidden
+      // so nothing draws over panelPage before the first push; the StackView
+      // then shows and sizes it while it is current, and hides it again after
+      // pop. That's a literal starting value, not a binding to discussionOpen
+      // - the StackView owns visibility (and size) once the page is in play.
       DiscussionView {
         id: discussionView
+
+        visible: false
 
         entries: root.discussion
         pending: root.discussionPending

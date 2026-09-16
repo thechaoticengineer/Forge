@@ -8,8 +8,9 @@ import qs.Commons
 // gating booleans enter as properties and render as a chat page; sending a
 // message, planning from the discussion, clearing, closing the page and focus
 // handoff leave as signals. Panel.qml owns HTTP calls, request correlation and
-// transcript persistence. The panel's StackView sizes and shows this page, so
-// the root deliberately declares no size, anchors or visible binding.
+// transcript persistence. Panel.qml declares this page hidden until it is
+// pushed; the StackView then shows and sizes it, so the root deliberately
+// declares no size, anchors or visible binding of its own.
 Rectangle {
   id: view
 
