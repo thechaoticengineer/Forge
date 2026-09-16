@@ -229,7 +229,7 @@ Item {
             const section=named(root,"planReviewSection"), detail=named(section,"planReviewRequests")
             verify(section.visible);compare(root.historyPaths.length,0,"state polling does not load history")
             const status=named(section,"fieldStatus").text
-            for (const value of ["exhausted","round 2 of 2","Architect: changes_requested","Independent: changes_requested","Fix commit: abc123"])
+            for (const value of ["exhausted","round 2 of 2","Architect: changes_requested","Independent: changes_requested","Final fix commit: abc123"])
                 verify(status.indexOf(value)>=0,value)
             const preview=originals.slice(0,8).map(text=>"[architect] "+text.slice(0,240)).join("\n\n")
             function verifyPreview() {
