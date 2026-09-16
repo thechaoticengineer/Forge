@@ -5,6 +5,8 @@ building software — including Forge itself — with almost no ceremony.
 
 Rust engine + Quickshell (Omarchy) panel.
 
+A feature-spec planning workflow is documented in [docs/features/](docs/features/README.md); it is planned and not yet implemented by the engine.
+
 ## The loop
 
 1. Point Forge at a git repository and describe a goal.
