@@ -382,15 +382,21 @@ A `ready` result adds `goal` (the trimmed rewrite); a `failed` result adds `erro
 Before creating a plan, you can have a multi-turn conversation with the configured
 planner tool about the repository and possible solutions. Click the **Discuss before
 planning** entry point in the panel to open a dedicated chat view showing the full
-discussion. Type a message into the composer and click **Send**, or press `Enter`.
+discussion. The chat replaces the visible panel content while it is open: the goal
+field, the plan and stage list, the action buttons, the feedback field, the
+architecture review, the agent output and the keyboard hint are all hidden, and the
+chat view alone fills the window. Type a message into the composer and click
+**Send**, or press `Enter`.
 The planner reads the repository read-only and replies in a normal back-and-forth
 conversation. The chat view shows the conversation in a scrollable transcript that
-reads top to bottom, with the newest message at the bottom. Your messages are
-right-aligned with an accent tint, and Forge's replies are left-aligned in a
-neutral surface color. The view displays a clearly visible **← Back** return control
-at the top; press it, `Escape`, or `q` to close the chat and return to the full panel.
-While the chat is closed, a one-line status beside the entry point shows any pending
-reply or error.
+takes the full height freed by hiding the rest of the panel, reading top to bottom
+with the newest message at the bottom; below it sit the status line, the composer and
+the **Send**, **Create plan from discussion** and **Clear discussion** actions. Your
+messages are right-aligned with an accent tint, and Forge's replies are left-aligned
+in a neutral surface color. The view displays a clearly visible **← Back** return
+control at the top; press it, `Escape`, or `q` to close the chat and restore the full
+panel with its previous state intact. While the chat is closed, a one-line status
+beside the entry point shows any pending reply or error.
 
 While a reply is pending, your message and a "Forge is replying…" indicator appear
 at the bottom of the chat. A failed reply shows the error in the status line and puts
