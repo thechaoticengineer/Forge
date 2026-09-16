@@ -66,4 +66,4 @@ Approvals, plan links and progress are runtime state, stored in `.forge/features
 
 ## See also
 
-The specification of this feature-spec workflow itself is documented in `docs/features/feature-specs/` (to be added).
+The specification of this feature-spec workflow itself is documented in [`docs/features/feature-specs/`](feature-specs/README.md).
