@@ -20,6 +20,15 @@ struct Checkpoint {
     #[serde(default)]
     completed_interfaces: Vec<String>,
 }
+/// An explicit retirement is the only way a saved constraint may disappear. A
+/// revision that reorders stages can make a stage-numbered constraint false, and
+/// without this the architect can neither drop it nor stop reporting the conflict.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retirement {
+    text: String,
+    reason: String,
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Risk {
@@ -64,6 +73,8 @@ struct Turn {
     #[serde(default)]
     resolved_risks: Vec<String>,
     #[serde(default)]
+    retired_constraints: Vec<Retirement>,
+    #[serde(default)]
     model_evaluations: Value,
 }
 fn contract_version() -> u64 { crate::architecture::VERSION }
@@ -106,6 +117,7 @@ fn apply_turn(
         || t.guidance.len() > 64
         || t.unresolved_risks.len() > 64
         || t.resolved_risks.len() > 64
+        || t.retired_constraints.len() > 64
         || t.checkpoint
             .constraints
             .iter()
@@ -114,15 +126,26 @@ fn apply_turn(
     {
         return Err("invalid or oversized architect checkpoint".into());
     }
-    for key in ["constraints", "completed_interfaces"] {
-        let proposed = if key == "constraints" {
-            &t.checkpoint.constraints
-        } else {
-            &t.checkpoint.completed_interfaces
-        };
-        if strings(&cp[key]).iter().any(|s| !proposed.contains(s)) {
-            return Err(format!("architect dropped saved {key}"));
+    // A retirement must name a saved constraint, give a reason, be unique, and
+    // actually remove it: retiring a constraint the turn still proposes would
+    // record a decision that changed nothing.
+    let saved_constraints = strings(&cp["constraints"]);
+    let mut retired = BTreeSet::new();
+    for r in &t.retired_constraints {
+        if !text_ok(&r.text, 1000)
+            || !text_ok(&r.reason, 1000)
+            || !saved_constraints.contains(&r.text)
+            || t.checkpoint.constraints.contains(&r.text)
+            || !retired.insert(r.text.clone())
+        {
+            return Err("invalid retired constraint".into());
         }
+    }
+    if saved_constraints.iter().any(|s| !t.checkpoint.constraints.contains(s) && !retired.contains(s)) {
+        return Err("architect dropped saved constraints without explicit retirement".into());
+    }
+    if strings(&cp["completed_interfaces"]).iter().any(|s| !t.checkpoint.completed_interfaces.contains(s)) {
+        return Err("architect dropped saved completed_interfaces".into());
     }
     let mut seen = BTreeSet::new();
     for r in &t.unresolved_risks {
@@ -224,6 +247,17 @@ fn apply_turn(
     }
     if required.iter().any(|id| !seen.contains(id)) {
         return Err("architect omitted required stage guidance".into());
+    }
+    // Keep the audit trail of what stopped applying and why, bounded like decisions.
+    if !t.retired_constraints.is_empty() {
+        let history = next["retired_constraints"].as_array().cloned().unwrap_or_default();
+        let mut history: Vec<Value> = history;
+        for r in &t.retired_constraints {
+            history.push(json!({"text":r.text,"reason":r.reason,
+                "revision":plan["revision"],"unix":unix_timestamp()}));
+        }
+        if history.len() > 16 { history.drain(..history.len() - 16); }
+        next["retired_constraints"] = json!(history);
     }
     Ok((next, records))
 }
@@ -440,7 +474,7 @@ impl Ctx {
                 "unfinished_diff_preview":self.git(&["diff","HEAD","--",".",":(exclude).forge"]).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>(),
                 "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
             let mut prompt = format!(
-                "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved constraints and completed interfaces exactly; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Use the history_path to retrieve omitted or relevant decision details. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[]}}\nSupply guidance for every required_stage_id. checkpoint.constraints and checkpoint.completed_interfaces are arrays of strings, not objects. resolved_risks is an array of exact existing unresolved-risk IDs from the supplied checkpoint/history, never descriptions or newly invented IDs; use [] when no existing risk can be resolved. New findings belong in unresolved_risks as objects with id and text. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
+                "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved completed interfaces exactly, and preserve every saved constraint unless you explicitly retire it; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Use the history_path to retrieve omitted or relevant decision details. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[],\"retired_constraints\":[]}}\nSupply guidance for every required_stage_id. checkpoint.constraints and checkpoint.completed_interfaces are arrays of strings, not objects. resolved_risks is an array of exact existing unresolved-risk IDs from the supplied checkpoint/history, never descriptions or newly invented IDs; use [] when no existing risk can be resolved. New findings belong in unresolved_risks as objects with id and text. retired_constraints is how a saved constraint stops applying: each entry is {{\"text\":\"the exact saved constraint\",\"reason\":\"why it no longer applies\"}}, the text must be omitted from checkpoint.constraints in the same turn, and it must match a saved constraint exactly. Retire a constraint that a later revision made false, such as one naming a stage number that now holds different work, instead of reporting the contradiction and leaving it in place; use [] when every saved constraint still applies. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
                 candidate["plan_id"], candidate["revision"]
             );
             prompt.push_str(&format!("\n{}\n{}\nEvaluate exactly required_model_stage_ids: {:?}. Include model_evaluations in the complete architect output.", self.stage_selection_prompt(&candidate, &routing_ids)?, crate::routing::EVALUATION_CONTRACT, routing_ids));

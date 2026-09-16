@@ -328,7 +328,7 @@ impl Ctx {
 
     /// Commit the round's fixes so the next review round starts from a clean
     /// worktree. The fixer still only edits files: the engine alone moves HEAD.
-    fn commit_plan_fix_round(&self, plan: &mut Value) -> Result<(), String> {
+    fn commit_plan_fix_round(&self, plan: &mut Value) -> Result<bool, String> {
         self.validate_plan_subject(plan)?;
         if self.session.stop_requested.load(Ordering::SeqCst) {
             return Err("stop before plan fix commit; saved work retained".into());
@@ -343,7 +343,7 @@ impl Ctx {
             return Err("simulated crash after staging plan fixes".into());
         }
         let staged = self.git(&["write-tree"])?;
-        if staged == self.git(&["rev-parse", "HEAD^{tree}"])? { return Ok(()); }
+        if staged == self.git(&["rev-parse", "HEAD^{tree}"])? { return Ok(false); }
         let requests = plan["plan_review"]["outstanding_requests"].clone();
         let message = fix_round_message(round, &requests);
         // Record the intended commit before HEAD moves: a crash between commit-tree
@@ -358,7 +358,33 @@ impl Ctx {
         if self.app.settings.lock().unwrap()["test_plan_commit_crash"] == true {
             return Err("simulated crash after plan fix update-ref".into());
         }
-        self.adopt_plan_fix_commit(plan)
+        self.adopt_plan_fix_commit(plan)?;
+        Ok(true)
+    }
+
+    /// A fix round that changed nothing about requests the previous round already
+    /// failed to change is not going to converge: the requests ask for something
+    /// outside the working tree. Stop there instead of spending the rest of the
+    /// budget re-reviewing identical content.
+    fn plan_review_stalled(&self, plan: &mut Value, committed: bool) -> Result<bool, String> {
+        let requests = plan["plan_review"]["outstanding_requests"].clone();
+        if committed || requests.as_array().is_none_or(|r| r.is_empty()) {
+            plan["plan_review"].as_object_mut().ok_or("invalid plan review")?.remove("stalled_requests");
+            return self.save_plan(plan).map(|()| false);
+        }
+        if plan["plan_review"]["stalled_requests"] != requests {
+            plan["plan_review"]["stalled_requests"] = requests;
+            self.save_plan(plan)?;
+            return Ok(false);
+        }
+        plan["plan_review"]["gate"]["status"] = json!("stalled");
+        plan["plan_review"]["status"] = json!("blocked");
+        plan["plan_review"]["next_action"] = json!("stalled");
+        self.plan_action_checkpoint(plan)?;
+        self.log_event("plan_review", "plan review stalled: two fix rounds changed nothing against \
+            the same requests; resolve them outside the working tree, then edit and approve a \
+            revised plan; commits remain local");
+        Ok(true)
     }
 
     /// Publish a recorded fix commit into the plan, whether it was just made or
@@ -596,6 +622,7 @@ impl Ctx {
             self.validate_plan_subject(plan)?;
             if self.session.stop_requested.load(Ordering::SeqCst) { return Err("plan review stopped; resume to continue".into()); }
             let action = plan["plan_review"]["next_action"].as_str().unwrap_or("reserve_review").to_string();
+            if action == "stalled" { return Ok(false); }
             if matches!(action.as_str(), "reserve_review" | "reserve_fix") {
                 let rounds = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
                 let budget = plan["plan_review"]["budget"].as_u64().ok_or("invalid plan budget")?;
@@ -614,13 +641,14 @@ impl Ctx {
                 self.plan_action_checkpoint(plan)?;
             }
             match plan["plan_review"]["next_action"].as_str().ok_or("missing plan next action")? {
-                "exhausted" => return Ok(false),
+                "exhausted" | "stalled" => return Ok(false),
                 "fix_pending" => {
                     plan["plan_review"]["next_action"] = json!("fixing");
                     plan["plan_review"]["status"] = json!("fixing");
                     self.plan_action_checkpoint(plan)?;
                     self.run_plan_fixer(plan)?;
-                    self.commit_plan_fix_round(plan)?;
+                    let committed = self.commit_plan_fix_round(plan)?;
+                    if self.plan_review_stalled(plan, committed)? { return Ok(false); }
                     plan["plan_review"]["next_action"] = json!("review_pending");
                     self.plan_action_checkpoint(plan)?;
                 }

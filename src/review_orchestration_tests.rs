@@ -1259,6 +1259,35 @@ fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
 }
 
 #[test]
+fn plan_review_stalls_when_two_fix_rounds_change_nothing_for_the_same_requests() {
+    let f = Fixture::new("Implement feature",3);
+    f.two_deferred_stages();
+    // Each fixer round rewrites identical content, so no round can ever commit.
+    f.setting("mock_edits",json!([{"first.rs":"fn first() {}\n"},{"second.rs":"fn second() {}\n"},
+        {"first.rs":"fn first() {}\n"},{"first.rs":"fn first() {}\n"},{"first.rs":"fn first() {}\n"}]));
+    f.setting("mock_verdicts",json!(vec![reject("Resolve the saved constraint conflict");4]));
+    let p = f.run();
+    let r = &p["plan_review"];
+    assert_eq!(r["gate"]["status"],"stalled","{p}");
+    assert_eq!(r["status"],"blocked");
+    assert_eq!(r["next_action"],"stalled");
+    // The captured budget would have allowed four rounds; the stall stops at three.
+    assert_eq!(r["rounds"],3);
+    assert_eq!(r["budget"],3);
+    assert_eq!(f.count("fixer"),2);
+    assert!(r["fixes"].as_array().is_none_or(|fixes| fixes.is_empty()));
+    assert_eq!(r["outstanding_requests"],json!(["[reviewer] Resolve the saved constraint conflict"]));
+    assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+    assert!(!f.ctx.forge_path("reports.jsonl").exists());
+    assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked");
+    // A stalled attempt never reserves another round on resume.
+    let mut resumed = f.plan();
+    assert!(!f.ctx.run_plan_review(&mut resumed).unwrap());
+    assert_eq!(resumed["plan_review"]["rounds"],3);
+    assert_eq!(f.count("fixer"),2);
+}
+
+#[test]
 fn plan_review_interrupted_fixer_consumes_reserved_cycle() {
     for budget in [1,2] {
         let f = Fixture::new("Implement feature",budget);

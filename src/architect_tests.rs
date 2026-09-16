@@ -409,10 +409,43 @@ fn architect_turn_validation_preserves_constraints_and_requires_risk_resolution(
     let mut bad = base.clone();
     bad["checkpoint"]["summary"] = json!("x".repeat(8001));
     assert!(apply_turn(&p, &cp, &bad.to_string(), &BTreeMap::new(), &[1]).is_err());
-    let mut resolved = base;
+    let mut resolved = base.clone();
     resolved["unresolved_risks"] = json!([]);
     resolved["resolved_risks"] = json!(["risk-1"]);
     assert!(apply_turn(&p, &cp, &resolved.to_string(), &BTreeMap::new(), &[1]).is_ok());
+
+    // A saved constraint may disappear only through an explicit, exact retirement.
+    let retire = |value: Value| {
+        let mut turn = base.clone();
+        turn["checkpoint"]["constraints"] = json!([]);
+        turn["retired_constraints"] = value;
+        apply_turn(&p, &cp, &turn.to_string(), &BTreeMap::new(), &[1])
+    };
+    let good = retire(json!([{"text":"unresolved compatibility constraint",
+        "reason":"revision 2 reordered the stages it names"}]));
+    let (next, _) = good.expect("explicit retirement rejected");
+    assert_eq!(next["constraints"], json!([]));
+    assert_eq!(next["retired_constraints"][0]["text"], "unresolved compatibility constraint");
+    assert_eq!(next["retired_constraints"][0]["reason"], "revision 2 reordered the stages it names");
+    assert_eq!(next["retired_constraints"][0]["revision"], p["revision"]);
+    for bad in [json!([]),
+        json!([{"text":"never saved","reason":"invented"}]),
+        json!([{"text":"unresolved compatibility constraint","reason":"  "}]),
+        json!([{"text":"unresolved compatibility constraint","reason":"a"},
+               {"text":"unresolved compatibility constraint","reason":"b"}])] {
+        assert!(retire(bad.clone()).is_err(), "{bad}");
+    }
+    // Retiring a constraint the same turn still proposes changes nothing.
+    let mut contradictory = base.clone();
+    contradictory["retired_constraints"] = json!([{"text":"unresolved compatibility constraint","reason":"stale"}]);
+    assert!(apply_turn(&p, &cp, &contradictory.to_string(), &BTreeMap::new(), &[1]).is_err());
+    // Completed interfaces stay strictly append-only.
+    let mut interfaces = base;
+    interfaces["checkpoint"]["completed_interfaces"] = json!([]);
+    interfaces["retired_constraints"] = json!([]);
+    let mut with_interface = cp.clone();
+    with_interface["completed_interfaces"] = json!(["saved interface"]);
+    assert!(apply_turn(&p, &with_interface, &interfaces.to_string(), &BTreeMap::new(), &[1]).is_err());
 }
 
 #[test]

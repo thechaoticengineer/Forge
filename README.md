@@ -148,7 +148,7 @@ correction budget covers the following checks before their results are used:
 | --- | --- |
 | Plan generation and revision | Valid stages and dependencies, proposal fields, and the minimum capability tier for the proposed work |
 | Routing selection | Exact proposal/evaluation IDs, complete fields, planning capability floor, and consistent explicit agreement |
-| Architect guidance | Plan/revision identity, required guidance, retained constraints/interfaces, valid decisions and explicit risk resolution |
+| Architect guidance | Plan/revision identity, required guidance, retained interfaces, constraints retained or explicitly retired, valid decisions and explicit risk resolution |
 | Scope response | Exactly one revision or refusal, valid revision fields, and an actual change or a concrete clarification |
 | Review | Review identity, consistent approval, acceptance/check evidence, and actionable rejection details |
 | Implementer/fixer outcome | Non-empty response, structured outcome identity/status/evidence, and a request consistent with its status |
@@ -279,6 +279,13 @@ tree, and `plan_review.fixes` records every round's commit, addressed requests a
 files. A round that changes nothing makes no commit. Because the engine commits
 each round, a review may never ask an agent to commit; uncommitted content it sees
 is content no fix round has committed yet.
+
+A fix round that commits nothing while the outstanding requests are unchanged from
+the previous such round stalls the review: the gate becomes `stalled`, the phase
+blocks and the remaining budget is not spent re-reviewing identical content. That
+signals requests that no working-tree edit can satisfy, such as a saved
+architectural constraint to reconcile; resolve them outside the working tree, then
+edit and approve a revised plan.
 
 Only a clean evidenced plan gate can authorize the remaining
 `fix(review): apply deferred plan review findings` commit of the approved tree,
@@ -1449,7 +1456,15 @@ bounded recent checkpoint preview. The full plan retains all committed stages.
 Stored and expanded checkpoints are capped at 4 MiB, and individual architect
 responses at 48 KiB.
 Saved constraints and completed interfaces cannot be silently dropped; unresolved
-risks require explicit resolution by ID. Recent decision details remain bounded,
+risks require explicit resolution by ID. Completed interfaces are strictly
+append-only. A saved constraint may stop applying only through an explicit
+`retired_constraints` entry naming the exact saved text and a reason, and the same
+turn must omit that text from `checkpoint.constraints`; retiring unsaved text,
+retiring the same constraint twice or retiring one the turn still proposes is
+rejected. This is how a constraint that a later revision made false, such as one
+naming a stage number that now holds different work, is removed instead of being
+reported as a contradiction forever. The last sixteen retirements are retained
+with their reason and revision. Recent decision details remain bounded,
 while the append-only history retains full rationale, alternatives and
 supersessions. Subsequent prompts include the saved checkpoint, at most 24 KiB of
 active decision details and the history path for further retrieval. Capacity or
