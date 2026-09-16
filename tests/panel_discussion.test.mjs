@@ -12,7 +12,7 @@ const slice = (start, end) => qml.slice(qml.indexOf(start), qml.indexOf(end));
 const discussionCallbacks = slice('  function sendDiscussionMessage(', '  function beginPlanEdit(');
 const stateHandler = slice('  onEngineStateChanged: {', '  onBusyChanged: {')
   .replace('onEngineStateChanged: {', 'function engineStateChanged() {');
-const defaults = Object.fromEntries([...qml.matchAll(/property (?:bool|int|string) (discussion(?:Pending|Request|Sent|Error|Expanded)): (.+)/g)]
+const defaults = Object.fromEntries([...qml.matchAll(/property (?:bool|int|string) (discussion(?:Pending|Request|Sent|Error)): (.+)/g)]
   .map(([, key, value]) => [key, JSON.parse(value)]));
 const state = ctx => Object.fromEntries(Object.keys(defaults).map(key => [key, ctx[key]]));
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -40,14 +40,20 @@ function fixture() {
     editingPlan: false, revisePending: false, localError: '', calls: [], goalDrafts: {},
     feedbackField: {text: ''}, questionField: {text: ''}, chatList: {}, goalFlick: {},
     discussion: [], discussionView: {input: {text: ''}},
+    panelPage: {}, StackView: {Immediate: 0},
+    keyHandler: {pendingKey: '', forceActiveFocus(){}},
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
     historyList, reportList, agentOutput: {liveOutput, historyList, reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
     cancelPlanEdit(){}, syncHistory(){}, syncGoalEnhancement(){}, syncCatalogueSuggestion(){},
     syncReviewViews(){}, refreshAgentLog(){} };
   ctx.root = ctx;
+  ctx.panelStack = {currentItem: ctx.discussionView, pushed: null, poppedTo: null,
+    push(item) { this.pushed = item; this.currentItem = item; },
+    pop(target) { this.poppedTo = target; this.currentItem = target; }};
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
   ctx.Discussion = loadDiscussion();
+  Object.defineProperty(ctx, 'discussionOpen', { get() { return ctx.panelStack.currentItem === ctx.discussionView; } });
   Object.defineProperty(ctx, 'discussionCanSend', { get() { return vm.runInNewContext(canSendExpr, ctx); } });
   Object.defineProperty(ctx, 'discussionCanPlan', { get() { return vm.runInNewContext(canPlanExpr, ctx); } });
   Object.defineProperty(ctx, 'discussionCanClear', { get() { return vm.runInNewContext(canClearExpr, ctx); } });
@@ -360,19 +366,101 @@ test('DiscussionChat.qml and DiscussionMessage.qml stay independent of Quickshel
   }
 });
 
-test('project switch resets discussion state and the input', () => {
+test('project switch closes the chat page and resets discussion state and the input', () => {
   assert.deepEqual(defaults, {discussionPending: false, discussionRequest: -1,
-    discussionSent: '', discussionError: '', discussionExpanded: false});
+    discussionSent: '', discussionError: ''});
   const ctx = fixture();
   ctx.discussionPending = true;
   ctx.discussionRequest = 3;
   ctx.discussionSent = 'x';
   ctx.discussionError = 'err';
-  ctx.discussionExpanded = true;
+  ctx.panelStack.currentItem = ctx.discussionView;
+  assert.equal(ctx.discussionOpen, true);
   ctx.discussionView.input.text = 'typed but unsent';
   ctx.engineState = {project: '/b', discussion: [], discussion_activity: null};
   ctx.engineStateChanged();
   assert.deepEqual(state(ctx), defaults);
+  assert.equal(ctx.panelStack.poppedTo, ctx.panelPage);
+  assert.equal(ctx.discussionOpen, false);
   assert.equal(ctx.discussionView.input.text, '');
   assert.equal(ctx.lastProject, '/b');
+});
+
+test('openDiscussion pushes the chat page once and focuses the composer', () => {
+  const ctx = fixture();
+  ctx.panelStack.currentItem = ctx.panelPage;
+  let focused = 0;
+  ctx.discussionView.input.forceActiveFocus = () => focused++;
+  ctx.keyHandler.pendingKey = 'g';
+  ctx.openDiscussion();
+  assert.equal(ctx.panelStack.pushed, ctx.discussionView);
+  assert.equal(ctx.discussionOpen, true);
+  assert.equal(ctx.keyHandler.pendingKey, '');
+  assert.equal(focused, 1);
+  ctx.panelStack.pushed = null;
+  ctx.openDiscussion();
+  assert.equal(ctx.panelStack.pushed, null, 'an open page is never pushed twice');
+  assert.equal(focused, 2);
+});
+
+test('closeDiscussion pops to the panel page and hands focus back', () => {
+  const ctx = fixture();
+  let focused = 0;
+  ctx.keyHandler.forceActiveFocus = () => focused++;
+  ctx.keyHandler.pendingKey = 'g';
+  ctx.closeDiscussion();
+  assert.equal(ctx.panelStack.poppedTo, ctx.panelPage);
+  assert.equal(ctx.keyHandler.pendingKey, '');
+  assert.equal(focused, 1);
+  ctx.panelStack.poppedTo = null;
+  ctx.closeDiscussion();
+  assert.equal(ctx.panelStack.poppedTo, null, 'a closed page is never popped again');
+  assert.equal(focused, 2);
+});
+
+test('DiscussionView is a stack page: a close signal, no expansion and no root geometry', () => {
+  assert.match(discussionViewQml, /signal closeRequested/);
+  assert.doesNotMatch(discussionViewQml, /expanded/);
+  assert.doesNotMatch(discussionViewQml, /expansionRequested/);
+  assert.doesNotMatch(discussionViewQml, /property bool open\b/);
+  // StackView assigns visible imperatively; a binding here would break push/pop.
+  const root = discussionViewQml.slice(discussionViewQml.indexOf('Rectangle {'),
+    discussionViewQml.indexOf('Item {'));
+  assert.doesNotMatch(root, /\bvisible:/);
+  assert.doesNotMatch(root, /\b(?:width|height|anchors)\s*[.:]/);
+  assert.match(discussionViewQml, /objectName: "discussionBackButton"/);
+});
+
+test('Panel derives discussionOpen from the stack and navigates through the page instance', () => {
+  assert.match(qml, /readonly property bool discussionOpen: panelStack\.currentItem === discussionView/);
+  assert.match(qml, /function openDiscussion\(\) \{\s*\n\s*if \(!discussionOpen\) panelStack\.push\(discussionView, StackView\.Immediate\)/);
+  assert.match(qml, /function closeDiscussion\(\) \{\s*\n\s*if \(discussionOpen\) panelStack\.pop\(panelPage, StackView\.Immediate\)/);
+  assert.match(qml, /onCloseRequested: root\.closeDiscussion\(\)/);
+  assert.doesNotMatch(qml, /discussionExpanded/);
+
+  const pageIndex = qml.indexOf('id: panelPage');
+  const viewIndex = qml.indexOf('DiscussionView {');
+  const catalogueIndex = qml.indexOf('CatalogueEditor {');
+  assert.ok(pageIndex >= 0 && viewIndex >= 0 && catalogueIndex >= 0);
+  assert.ok(pageIndex < viewIndex, 'the chat page is declared after the panel page');
+  assert.ok(viewIndex < catalogueIndex, 'the chat page is declared before the overlays');
+  // The instance is pushed, never a Component or a URL, so it survives a pop.
+  assert.match(qml, /DiscussionView \{\s*\n\s*id: discussionView/);
+});
+
+test('the panel column keeps a discussion entry point that opens the chat page', () => {
+  const columnIndex = qml.indexOf('id: panelColumn');
+  const buttonIndex = qml.indexOf('id: discussionButton');
+  const hintIndex = qml.indexOf('id: keyboardHint');
+  assert.ok(columnIndex < buttonIndex && buttonIndex < hintIndex,
+    'the entry point sits inside the panel column');
+  assert.match(qml, /id: discussionButton[\s\S]*?onClicked: root\.openDiscussion\(\)/);
+});
+
+test('the t shortcut opens the chat page instead of revealing an inline section', () => {
+  const branch = qml.slice(qml.indexOf('event.key === Qt.Key_T'));
+  const body = branch.slice(0, branch.indexOf('event.accepted = true'));
+  assert.match(body, /root\.openDiscussion\(\)/);
+  assert.doesNotMatch(body, /panelScroll\.reveal/);
+  assert.doesNotMatch(qml, /panelScroll\.reveal\(discussionView\)/);
 });

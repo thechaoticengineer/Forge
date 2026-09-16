@@ -62,7 +62,8 @@ Item {
   property int discussionRequest: -1
   property string discussionSent: ""
   property string discussionError: ""
-  property bool discussionExpanded: false
+  // The chat page being current is the single source of truth for "open".
+  readonly property bool discussionOpen: panelStack.currentItem === discussionView
   property bool editingPlan: false
   property var editStages: []
   property string editGoal: ""
@@ -462,7 +463,7 @@ Item {
     discussionRequest = -1
     discussionSent = ""
     discussionError = ""
-    discussionExpanded = false
+    closeDiscussion()
     discussionView.input.text = ""
     goalFlick.contentY = 0
     expandedStageId = -1
@@ -728,6 +729,18 @@ Item {
   function clearDiscussion() {
     if (!discussionCanClear) return
     act("/api/discussion/reset")
+  }
+
+  function openDiscussion() {
+    if (!discussionOpen) panelStack.push(discussionView, StackView.Immediate)
+    keyHandler.pendingKey = ""
+    discussionView.input.forceActiveFocus()
+  }
+
+  function closeDiscussion() {
+    if (discussionOpen) panelStack.pop(panelPage, StackView.Immediate)
+    keyHandler.pendingKey = ""
+    keyHandler.forceActiveFocus()
   }
 
   function beginPlanEdit() {
@@ -1391,8 +1404,7 @@ Item {
             root.enhanceGoal()
             event.accepted = true
           } else if (event.key === Qt.Key_T && event.modifiers === Qt.NoModifier) {
-            discussionView.input.forceActiveFocus()
-            panelScroll.reveal(discussionView)
+            root.openDiscussion()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
             if (root.editingPlan && !root.editPending) root.cancelPlanEdit()
@@ -2082,34 +2094,27 @@ Item {
               }
             }
 
-            DiscussionView {
-              id: discussionView
+            // Entry point for the discussion; the chat itself is a stack page.
+            Row {
               width: parent.width
-              entries: root.discussion
-              pending: root.discussionPending
-              sentMessage: root.discussionSent
-              error: root.discussionError
-              canSend: root.discussionCanSend
-              canPlan: root.discussionCanPlan
-              canClear: root.discussionCanClear
-              expanded: root.discussionExpanded
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              fontFamily: root.fontFamily
-              fontSize11: root.fs(11)
-              fontSize12: root.fs(12)
-              onSendRequested: message => root.sendDiscussionMessage(message)
-              onPlanRequested: root.planFromDiscussion()
-              onClearRequested: root.clearDiscussion()
-              onExpansionRequested: expanded => root.discussionExpanded = expanded
-              onLeaveRequested: keyHandler.forceActiveFocus()
-              onHelpRequested: root.helpOpen = true
-              onDetailRevealed: control => root.revealDetail(control)
-              onDetailInspected: control => root.inspectDetail(control)
+              spacing: Style.space(8)
+              PanelButton {
+                id: discussionButton
+                label: "Discuss before planning"
+                  + (root.discussion.length > 0 ? " (" + root.discussion.length + ")" : "")
+                onClicked: root.openDiscussion()
+              }
+              Text {
+                width: Math.max(0, parent.width - discussionButton.width - parent.spacing)
+                anchors.verticalCenter: discussionButton.verticalCenter
+                visible: text !== ""
+                text: root.discussionPending ? "Forge is replying…" : root.discussionError
+                textFormat: Text.PlainText
+                color: root.discussionError !== "" ? root.urgent : root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
             }
 
             Row {
@@ -2530,6 +2535,39 @@ Item {
             }
           }
         }
+      }
+
+      // ------------------------------------------- pre-planning discussion
+      // A persistent stack page: pushed and popped by open/closeDiscussion, so
+      // it keeps its transcript, reading position and draft. No anchors, size
+      // or visible binding - the StackView owns all three.
+      DiscussionView {
+        id: discussionView
+
+        entries: root.discussion
+        pending: root.discussionPending
+        sentMessage: root.discussionSent
+        error: root.discussionError
+        canSend: root.discussionCanSend
+        canPlan: root.discussionCanPlan
+        canClear: root.discussionCanClear
+        foreground: root.foreground
+        mutedForeground: root.mutedForeground
+        background: root.background
+        surface: root.surface
+        accent: root.accent
+        urgent: root.urgent
+        fontFamily: root.fontFamily
+        fontSize11: root.fs(11)
+        fontSize12: root.fs(12)
+        onSendRequested: message => root.sendDiscussionMessage(message)
+        onPlanRequested: root.planFromDiscussion()
+        onClearRequested: root.clearDiscussion()
+        onCloseRequested: root.closeDiscussion()
+        onLeaveRequested: keyHandler.forceActiveFocus()
+        onHelpRequested: root.helpOpen = true
+        onDetailRevealed: control => root.revealDetail(control)
+        onDetailInspected: control => root.inspectDetail(control)
       }
 
       // ------------------------------------------- model policy and options

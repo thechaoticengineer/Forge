@@ -204,6 +204,7 @@ test('leaving and revisiting a project resets both lists and strands the earlier
     feedbackField: {text: ''}, questionField: {text: ''}, goalDrafts: {},
     discussionView: {input: {text: ''}},
     cancelPlanEdit(){}, syncCatalogueSuggestion(){}, syncReviewViews(){}, syncDiscussion(){},
+    closeDiscussion(){},
     calls: [], Qt: {callLater(){}},
     logFeed: view.newFeed(), logError: '', lastProject: '/a', projectViewRevision: 1,
     agentSession: 'agent', busy: false, historyFilter: 'errors', engineState: null };

@@ -26,7 +26,7 @@ function fixture() {
     historyList, reportList, agentOutput:{liveOutput,historyList,reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
     cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){},
-    syncDiscussion(){}, refreshAgentLog(){} };
+    syncDiscussion(){}, closeDiscussion(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
   ctx.enhanceGoalButton = { get enabled() { return vm.runInNewContext(enabled, ctx); } };
