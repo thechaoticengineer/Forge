@@ -430,7 +430,13 @@ impl Ctx {
             } else {
                 None
             };
-            if required.is_empty() && routing_ids.is_empty() && cp["context_status"] == "ready" && recovery.is_none() {
+            // A revision is the one event that can falsify plan-wide saved context,
+            // such as a constraint naming a stage number the reorder moved. Take a
+            // turn for it even when no stage needs guidance, so the architect can
+            // retire what no longer applies instead of reporting it forever.
+            let revised = previous.is_some_and(|p| p["revision"] != candidate["revision"]);
+            if required.is_empty() && routing_ids.is_empty() && cp["context_status"] == "ready"
+                && recovery.is_none() && !revised {
                 if previous == Some(&candidate) {
                     return Ok(candidate);
                 }

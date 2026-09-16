@@ -449,6 +449,27 @@ fn architect_turn_validation_preserves_constraints_and_requires_risk_resolution(
 }
 
 #[test]
+fn a_revision_takes_an_architect_turn_even_when_every_stage_is_committed() {
+    let f = Fixture::new();
+    let mut published = f.initial();
+    for stage in published["stages"].as_array_mut().unwrap() {
+        stage["status"] = json!("committed");
+    }
+    published = f.ctx.architect_publish(published, None, "commit").unwrap();
+    // Nothing needs guidance any more, so an unchanged revision reuses the boundary.
+    let before = f.requests().len();
+    let reused = f.ctx.architect_publish(published.clone(), Some(&published), "approval").unwrap();
+    assert_eq!(f.requests().len(), before, "committed plan took an unnecessary turn");
+    assert_eq!(reused["revision"], published["revision"]);
+    // A revision can falsify plan-wide saved context, so it must take a turn.
+    let revised = f.revision(&reused);
+    assert_ne!(revised["revision"], reused["revision"]);
+    let published = f.ctx.architect_publish(revised, Some(&reused), "approval").unwrap();
+    assert_eq!(f.requests().len(), before + 1, "revision skipped the architect turn");
+    assert!(f.cp(&published)["constraints"].is_array());
+}
+
+#[test]
 fn strong_bootstraps_are_separate_configured_and_availability_unverified() {
     let f = Fixture::new();
     {

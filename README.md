@@ -1464,7 +1464,11 @@ retiring the same constraint twice or retiring one the turn still proposes is
 rejected. This is how a constraint that a later revision made false, such as one
 naming a stage number that now holds different work, is removed instead of being
 reported as a contradiction forever. The last sixteen retirements are retained
-with their reason and revision. Recent decision details remain bounded,
+with their reason and revision. A publication that needs no stage guidance,
+routing or recovery reuses the architect boundary without a turn, except when the
+plan revision changed: a revision is the one event that can falsify plan-wide
+saved context, so it always takes a turn and gives the architect the chance to
+retire what no longer applies. Recent decision details remain bounded,
 while the append-only history retains full rationale, alternatives and
 supersessions. Subsequent prompts include the saved checkpoint, at most 24 KiB of
 active decision details and the history path for further retrieval. Capacity or
