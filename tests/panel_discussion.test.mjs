@@ -464,3 +464,34 @@ test('the t shortcut opens the chat page instead of revealing an inline section'
   assert.doesNotMatch(body, /panelScroll\.reveal/);
   assert.doesNotMatch(qml, /panelScroll\.reveal\(discussionView\)/);
 });
+
+test('the discussion modal branch routes keys like the other full views', () => {
+  const chooserIndex = qml.indexOf('} else if (root.chooserOpen) {');
+  const discussionIndex = qml.indexOf('} else if (root.discussionOpen) {');
+  const questionIndex = qml.indexOf('} else if (question) {');
+  assert.ok(chooserIndex >= 0 && discussionIndex >= 0 && questionIndex >= 0);
+  assert.ok(chooserIndex < discussionIndex, 'the discussion branch comes after chooser');
+  assert.ok(discussionIndex < questionIndex, 'the discussion branch comes before the question branch');
+
+  const branch = qml.slice(discussionIndex, questionIndex);
+  assert.match(branch, /^\} else if \(root\.discussionOpen\) \{\s*\n\s*event\.accepted = true\s*\n/,
+    'every event is accepted unconditionally');
+  assert.match(branch, /if \(question\) \{\s*\n\s*root\.helpOpen = true/);
+  assert.match(branch,
+    /event\.key === Qt\.Key_Escape[\s\S]*?event\.key === Qt\.Key_Q && event\.modifiers === Qt\.NoModifier[\s\S]*?\) \{\s*\n\s*root\.closeDiscussion\(\)/);
+  assert.match(branch,
+    /event\.key === Qt\.Key_I && event\.modifiers === Qt\.NoModifier\) \{\s*\n\s*discussionView\.input\.forceActiveFocus\(\)/);
+  assert.doesNotMatch(branch, /root\.discussionOpen\s*=[^=]/,
+    'the branch never assigns to the read-only discussionOpen');
+});
+
+test('the keyboard help overlay documents the discussion chat', () => {
+  const headingIndex = qml.indexOf('{ key: "", description: "Discussion chat" }');
+  const keyboardHelpIndex = qml.indexOf('{ key: "", description: "Keyboard help" }');
+  assert.ok(headingIndex >= 0 && keyboardHelpIndex >= 0 && headingIndex < keyboardHelpIndex);
+  const section = qml.slice(headingIndex, keyboardHelpIndex);
+  assert.match(section, /\{ key: "i", description: "Edit the message \(insert mode\)" \}/);
+  assert.match(section, /\{ key: "Enter \/ Shift\+Enter", description: "Send the message \/ insert a newline" \}/);
+  assert.match(section, /\{ key: "q \/ Escape", description: "Close the chat \(Escape leaves the message field first\)" \}/);
+  assert.match(qml, /\{ key: "t", description: "Open the discussion chat" \}/);
+});

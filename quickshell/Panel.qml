@@ -1389,6 +1389,16 @@ Item {
               else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
                 projectChooser.filterField.forceActiveFocus()
             }
+          } else if (root.discussionOpen) {
+            event.accepted = true
+            if (question) {
+              root.helpOpen = true
+            } else if (event.key === Qt.Key_Escape
+                || (event.key === Qt.Key_Q && event.modifiers === Qt.NoModifier)) {
+              root.closeDiscussion()
+            } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
+              discussionView.input.forceActiveFocus()
+            }
           } else if (question) {
             root.helpOpen = true
             event.accepted = true
@@ -2743,7 +2753,7 @@ Item {
                     { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
                     { key: "6", description: "History: Reports (when available)" },
                     { key: "p", description: "Create plan from goal" },
-                    { key: "t", description: "Focus the discussion message input" },
+                    { key: "t", description: "Open the discussion chat" },
                     { key: "P", description: "Create plan from discussion" },
                     { key: "E", description: "Enhance the goal description with AI" },
                     { key: "e", description: "Edit plan stages by hand" },
@@ -2764,6 +2774,10 @@ Item {
                     { key: "Enter", description: "Open selection; in filter, open first match; in path field, set path" },
                     { key: "/ / i", description: "Edit project filter (insert mode)" },
                     { key: "q / Escape", description: "Close chooser (Escape leaves a text field first)" },
+                    { key: "", description: "Discussion chat" },
+                    { key: "i", description: "Edit the message (insert mode)" },
+                    { key: "Enter / Shift+Enter", description: "Send the message / insert a newline" },
+                    { key: "q / Escape", description: "Close the chat (Escape leaves the message field first)" },
                     { key: "", description: "Keyboard help" },
                     { key: "? (Shift+/) / F1 / q / Escape", description: "Close help before any other overlay" }
                   ]
