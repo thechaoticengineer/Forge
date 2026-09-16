@@ -53,3 +53,22 @@ test('root and extracted views share one button implementation', () => {
   assert.match(button, /property bool enabled: true/);
   assert.match(button, /enabled: button\.enabled/);
 });
+
+test('Panel hosts its content on a StackView page', () => {
+  assert.match(panel, /StackView\s*\{/);
+  assert.match(panel, /id:\s*panelStack/);
+  assert.match(panel, /anchors\.fill:\s*parent\s*\n\s*initialItem:\s*panelPage/);
+  assert.match(panel, /Item\s*\{\s*\n\s*id:\s*panelPage/);
+
+  const stackIndex = panel.indexOf('StackView {');
+  const pageIndex = panel.indexOf('id: panelPage');
+  const scrollIndex = panel.indexOf('id: panelScroll');
+  const hintIndex = panel.indexOf('id: keyboardHint');
+  const catalogueIndex = panel.indexOf('CatalogueEditor {');
+  assert.ok(stackIndex >= 0 && pageIndex >= 0 && scrollIndex >= 0
+    && hintIndex >= 0 && catalogueIndex >= 0);
+  assert.ok(stackIndex < pageIndex, 'panelStack comes before panelPage');
+  assert.ok(pageIndex < scrollIndex, 'panelPage comes before panelScroll');
+  assert.ok(scrollIndex < hintIndex, 'panelScroll comes before keyboardHint');
+  assert.ok(hintIndex < catalogueIndex, 'keyboardHint comes before the overlays');
+});

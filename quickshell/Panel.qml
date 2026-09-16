@@ -1489,1028 +1489,1046 @@ Item {
             }
           }
         }
-      }
 
-      Flickable {
-        id: panelScroll
-        anchors.fill: parent
-        anchors.margins: Style.space(16)
-        anchors.bottomMargin: Style.space(16) + keyboardHint.height + Style.space(10)
-        clip: true
-        contentWidth: width
-        contentHeight: panelColumn.implicitHeight
-        flickableDirection: Flickable.VerticalFlick
-        boundsBehavior: Flickable.StopAtBounds
-        readonly property real maximumY: Math.max(0, contentHeight - height)
-        function scrollPage(direction) {
-          cancelFlick()
-          contentY = Math.max(0, Math.min(maximumY, contentY + direction * height * 0.8))
-        }
-        function reveal(item) {
-          const top = item.mapToItem(contentItem, 0, 0).y
-          if (top < contentY || top + item.height > contentY + height)
-            contentY = Math.max(0, Math.min(maximumY, top))
-        }
-        ScrollBar.vertical: ScrollBar {
-          policy: ScrollBar.AsNeeded
+        StackView {
+          id: panelStack
+
+          anchors.fill: parent
+          initialItem: panelPage
+          // Instant page swaps: the panel is a navigation stack, not an animated app.
+          pushEnter: Transition {}
+          pushExit: Transition {}
+          popEnter: Transition {}
+          popExit: Transition {}
+          replaceEnter: Transition {}
+          replaceExit: Transition {}
         }
 
-      Column {
-        id: panelColumn
-        width: panelScroll.width - Style.space(16)
-        spacing: Style.space(10)
+        Item {
+          id: panelPage
 
-        // ---------------------------------------------------- header
-        Row {
-          width: parent.width
-          spacing: Style.space(10)
-
-          Text {
-            id: forgeTitle
-            text: "FORGE"
-            color: root.accent
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(18)
-            font.bold: true
-          }
-          Text {
-            id: projectActivity
-            visible: root.backgroundBusy
-            text: root.activeProjectCount + " project"
-              + (root.activeProjectCount === 1 ? "" : "s") + " active"
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(10)
-            anchors.verticalCenter: parent.verticalCenter
-          }
-          Rectangle {
-            id: phaseBadge
-            width: phaseText.implicitWidth + Style.space(16)
-            height: phaseText.implicitHeight + Style.space(6)
-            radius: height / 2
-            color: "transparent"
-            border.width: 1
-            border.color: root.phase === "failed" || root.phase === "blocked"
-              ? root.urgent
-              : root.busy ? root.working
-              : root.phase === "done" ? root.success
-              : root.mutedForeground
-            Text {
-              id: phaseText
-              anchors.centerIn: parent
-              text: root.engineOnline ? root.phase : "engine offline"
-              color: root.phase === "failed" || root.phase === "blocked"
-                ? root.urgent
-                : root.busy ? root.working
-                : root.phase === "done" ? root.success
-                : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
-            }
-          }
-          Text {
-            visible: root.engineState !== null && root.engineState.current_step !== ""
-            width: Math.max(0, parent.width - forgeTitle.width - phaseBadge.width
-              - (projectActivity.visible ? projectActivity.width + parent.spacing : 0)
-              - helpButton.width - parent.spacing
-              - 2 * parent.spacing)
-            elide: Text.ElideRight
-            text: root.engineState && root.engineState.current_stage !== null
-              ? "stage " + root.engineState.current_stage + ": "
-                + (root.currentActivity || root.engineState.current_step)
-              : (root.engineState ? root.engineState.current_step : "")
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-            anchors.verticalCenter: parent.verticalCenter
-          }
-          PanelButton {
-            id: helpButton
-            label: "? Help"
-            onClicked: root.helpOpen = true
-          }
-        }
-
-        // ------------------------------------------------ now working
-        Rectangle {
-          id: agentCard
-          readonly property var stages: root.plan && root.plan.stages ? root.plan.stages : []
-          readonly property var currentStage: stages.find(function(stage) {
-            return root.engineState && stage.id === root.engineState.current_stage
-          })
-          readonly property int committedStages: stages.filter(function(stage) {
-            return stage.status === "committed"
-          }).length
-          readonly property int runSeconds: root.engineState && root.engineState.run_started_unix > 0
-            ? Math.max(0, Math.floor(root.agentNow - root.engineState.run_started_unix)) : 0
-
-          visible: root.busy
-          width: parent.width
-          height: visible ? workingSummary.implicitHeight + Style.space(16) : 0
-          color: root.surface
-          radius: 4
-
-          Column {
-            id: workingSummary
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.margins: Style.space(8)
-            spacing: Style.space(4)
-            PanelDetail {
-              width: parent.width
-              originalText: root.engineState ? root.engineState.goal : ""
-              metadata: "Goal"
-            }
-            Row {
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                width: parent.width - (workingStep.visible ? workingStep.width + parent.spacing : 0)
-                text: root.phase === "planning" ? "planning…"
-                  : root.engineState && root.engineState.current_stage !== null
-                    ? "stage " + root.engineState.current_stage
-                      + (agentCard.currentStage ? " · " + agentCard.currentStage.title : "")
-                    : "now working"
-                textFormat: Text.PlainText
-                color: root.working
-                elide: Text.ElideRight
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-              Text {
-                id: workingStep
-                visible: root.phase !== "planning" && text !== ""
-                width: Math.min(implicitWidth, parent.width * 0.4)
-                text: root.currentActivity || (root.engineState ? root.engineState.current_step : "")
-                textFormat: Text.PlainText
-                color: root.working
-                elide: Text.ElideRight
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-            }
-            Text {
-              readonly property string planUsage: UsageFormat.usageSummary(root.plan ? root.plan.usage : null)
-              visible: root.phase !== "planning"
-                || (root.engineState !== null && root.engineState.run_started_unix > 0)
-              width: parent.width
-              text: (root.phase !== "planning"
-                  ? agentCard.committedStages + "/" + agentCard.stages.length + " stages committed" : "")
-                + (root.engineState && root.engineState.run_started_unix > 0
-                  ? (root.phase !== "planning" ? " · " : "")
-                    + "run " + Math.floor(agentCard.runSeconds / 60) + "m "
-                    + (agentCard.runSeconds % 60) + "s" : "")
-                + (planUsage ? " · " + planUsage : "")
-              textFormat: Text.PlainText
-              color: root.mutedForeground
-              wrapMode: planUsage ? Text.Wrap : Text.NoWrap
-              elide: planUsage ? Text.ElideNone : Text.ElideRight
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
-            }
-            Row {
-              visible: root.agentActive
-              width: parent.width
-              spacing: Style.space(10)
-              Text {
-                id: agentSummary
-                width: Math.max(0, parent.width - agentTime.width - parent.spacing)
-                text: root.agentActive ? root.agent.role + " · " + root.agent.tool
-                  + (root.agent.model ? " · " + root.agent.model : "") : ""
-                textFormat: Text.PlainText
-                color: root.working
-                elide: Text.ElideRight
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-              Text {
-                id: agentTime
-                text: root.agentActive ? root.agentElapsed() + " · " + root.agent.lines + " lines" : ""
-                textFormat: Text.PlainText
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-            }
-            PanelDetail {
-              // The state heartbeat's last_line is bounded to 200 characters.
-              // Full-text actions must use the complete retained feed instead.
-              visible: root.agentActive && liveEntries.count > 0
-              scope: JSON.stringify([root.lastProject, root.projectViewRevision, root.agentSession])
-              width: parent.width
-              originalText: liveEntries.count > 0 ? liveEntries.get(liveEntries.count - 1).originalText : ""
-              metadata: "Latest retained output"
-              error: liveEntries.count > 0 && (liveEntries.get(liveEntries.count - 1).kind === "error"
-                || liveEntries.get(liveEntries.count - 1).stream === "stderr")
-            }
-          }
-        }
-
-        // ----------------------------------------------- project tabs
-        Flow {
-          id: projectTabs
-          visible: root.sessions.length > 1
-          width: parent.width
-          spacing: Style.space(8)
-          Repeater {
-            model: root.sessions
-            delegate: PanelButton {
-              required property var modelData
-              readonly property bool needsAttention: modelData.phase === "blocked"
-                || modelData.phase === "failed"
-              label: modelData.name + " "
-                + (modelData.busy || modelData.queue_active ? "●" : needsAttention ? "!"
-                  : modelData.phase === "done" ? "✓" : "·")
-                + (modelData.queued > 0 ? " +" + modelData.queued : "")
-              width: Math.min(implicitWidth, projectTabs.width)
-              primary: modelData.project === root.activeProject
-              labelColor: !primary && needsAttention ? root.urgent
-                : primary && enabled ? root.background : root.foreground
-              enabled: root.engineOnline
-              onClicked: root.act("/api/project/select", { path: modelData.project })
-            }
-          }
-        }
-
-        // -------------------------------------------- project + tools
-        Row {
-          width: parent.width
-          spacing: Style.space(10)
-
-          Column {
-            width: parent.width - changeProjectButton.width - parent.spacing
-            Text {
-              text: root.projectName
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(13)
-              font.bold: true
-            }
-            Text {
-              width: parent.width
-              text: root.engineState ? root.engineState.project : ""
-              color: root.mutedForeground
-              elide: Text.ElideMiddle
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(10)
-            }
-          }
-          PanelButton {
-            id: changeProjectButton
-            label: "Change project"
-            enabled: root.engineOnline
-            onClicked: root.openChooser()
-          }
-        }
-
-        Flow {
-          width: parent.width
-          spacing: Style.space(8)
-          PanelButton {
-            label: "planner: "
-              + (root.engineState ? root.engineState.settings.planner : "…")
-            onClicked: root.cycleTool("planner")
-          }
-          PanelButton {
-            label: "architect: "
-              + (root.engineState ? (root.engineState.settings.architect || "codex") : "…")
-            onClicked: root.cycleTool("architect")
-          }
-          PanelButton {
-            label: "automatic routing: " + (root.engineState && root.engineState.settings.automatic_routing !== false ? "yes" : "no")
-            onClicked: root.act("/api/settings", { automatic_routing: !(root.engineState && root.engineState.settings.automatic_routing !== false) })
-          }
-          PanelButton {
-            label: "implementer: "
-              + (root.engineState ? root.engineState.settings.implementer : "…")
-            onClicked: root.cycleTool("implementer")
-          }
-          PanelButton {
-            label: root.reviewerLabel()
-            onClicked: root.cycleReviewer()
-          }
-          CadenceButton { role: "architect" }
-          CadenceButton { role: "reviewer" }
-          PanelButton {
-            label: "push at end: "
-              + (root.engineState && root.engineState.settings.auto_push ? "yes" : "no")
-            onClicked: root.act("/api/settings", {
-              auto_push: !(root.engineState && root.engineState.settings.auto_push) })
-          }
-          PanelButton {
-            label: "auto-approve: "
-              + (root.engineState && root.engineState.settings.queue_auto_approve ? "yes" : "no")
-            enabled: root.engineOnline
-            onClicked: root.act("/api/settings", {
-              queue_auto_approve: !(root.engineState && root.engineState.settings.queue_auto_approve) })
-          }
-        }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-          Flow {
-            width: parent.width
-            spacing: Style.space(8)
-            PanelButton {
-              label: root.catalogue && root.catalogue.refreshing ? "Models: refreshing…" : "Refresh models"
-              enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
-              onClicked: root.act("/api/models/refresh", {})
-            }
-            PanelButton {
-              label: "Cancel refresh"
-              visible: !!root.catalogue && root.catalogue.refreshing
-              onClicked: root.act("/api/models/cancel", {})
-            }
-            PanelButton {
-              label: root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing
-                ? "Limits: checking…" : "Refresh Claude limits"
-              enabled: root.engineOnline && !(root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing)
-              onClicked: root.act("/api/quota/refresh", {})
-            }
-            PanelButton {
-              label: root.catalogueOpen ? "Close model settings" : "Model settings & options"
-              onClicked: { if (root.catalogueOpen) root.catalogueOpen = false; else root.openCatalogue() }
-            }
-          }
-          Text {
-            width: parent.width
-            text: UsageFormat.quotaSummary(root.engineState && root.engineState.claude_quota
-              ? Object.assign({}, root.engineState.claude_quota, {error: ""}) : null)
-            textFormat: Text.PlainText
-            color: root.foreground
-            wrapMode: Text.Wrap
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(12)
-          }
-          PanelDetail {
-            width: parent.width
-            visible: originalText !== ""
-            metadata: "Quota error"
-            error: true
-            originalText: root.engineState && root.engineState.claude_quota ? root.engineState.claude_quota.error || "" : ""
-          }
-          Text {
-            width: parent.width
-            text: root.catalogue ? "Model tiers: configured user policy · revision " + root.catalogue.policy_revision
-              + " · " + root.catalogue.configured_count + " explicit entries" : "Model catalogue pending"
-            color: root.mutedForeground
-            wrapMode: Text.Wrap
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(11)
-          }
-          PanelDetail {
-            width: parent.width
-            visible: !!root.catalogue && !!root.catalogue.policy_error
-            originalText: root.catalogue && root.catalogue.policy_error ? root.catalogue.policy_error : ""
-            metadata: "Model policy error"
-            error: true
-          }
-          Text {
-            width: parent.width
-            visible: !!root.engineState && !!root.engineState.model_selection
-            text: visible ? "Last model: " + root.engineState.model_selection.provider + "/"
-              + (root.engineState.model_selection.model || "provider default") + " · "
-              + root.engineState.model_selection.availability : ""
-            color: root.mutedForeground
-            wrapMode: Text.Wrap
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(11)
-          }
-          PanelFields {
-            objectName: "providerDetails"
-            width: parent.width
-            entries: PanelDetails.providers(root.catalogue ? root.catalogue.providers : [])
-          }
-          Text {
-            width: parent.width
-            visible: !!root.catalogue
-            text: CataloguePresentation.catalogueMetadataSummaryText(root.catalogue && root.catalogue.metadata
-              ? Object.assign({}, root.catalogue.metadata, {store_error: ""}) : null)
-            color: root.catalogue && root.catalogue.metadata
-              && (root.catalogue.metadata.source_errors || root.catalogue.metadata.store_error)
-              ? root.urgent : root.mutedForeground
-            wrapMode: Text.Wrap
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(11)
-          }
-
-          PanelDetail {
-            width: parent.width
-            visible: originalText !== ""
-            metadata: "Metadata store error"
-            error: true
-            originalText: root.catalogue && root.catalogue.metadata ? root.catalogue.metadata.store_error || "" : ""
-          }
-        }
-
-        // ---------------------------------------------------- goal
-        Rectangle {
-          width: parent.width
-          height: Math.min(Math.max(Style.space(52),
-            goalField.contentHeight + Style.space(16)), Style.space(140))
-          color: root.surface
-          radius: 4
-          border.width: 1
-          border.color: goalField.activeFocus
-            ? root.accent : Qt.darker(root.foreground, 3)
           Flickable {
-            id: goalFlick
+            id: panelScroll
             anchors.fill: parent
-            anchors.margins: Style.space(6)
+            anchors.margins: Style.space(16)
+            anchors.bottomMargin: Style.space(16) + keyboardHint.height + Style.space(10)
             clip: true
-            contentWidth: goalField.width
-            contentHeight: goalField.height
+            contentWidth: width
+            contentHeight: panelColumn.implicitHeight
             flickableDirection: Flickable.VerticalFlick
             boundsBehavior: Flickable.StopAtBounds
-
-            function ensureCursorVisible() {
-              const cursor = goalField.cursorRectangle
-              if (contentY > cursor.y)
-                contentY = cursor.y
-              else if (contentY + height < cursor.y + cursor.height)
-                contentY = cursor.y + cursor.height - height
-              contentY = Math.max(0, Math.min(contentY, contentHeight - height))
+            readonly property real maximumY: Math.max(0, contentHeight - height)
+            function scrollPage(direction) {
+              cancelFlick()
+              contentY = Math.max(0, Math.min(maximumY, contentY + direction * height * 0.8))
+            }
+            function reveal(item) {
+              const top = item.mapToItem(contentItem, 0, 0).y
+              if (top < contentY || top + item.height > contentY + height)
+                contentY = Math.max(0, Math.min(maximumY, top))
+            }
+            ScrollBar.vertical: ScrollBar {
+              policy: ScrollBar.AsNeeded
             }
 
-            onHeightChanged: Qt.callLater(ensureCursorVisible)
-            onContentHeightChanged: Qt.callLater(ensureCursorVisible)
+          Column {
+            id: panelColumn
+            width: panelScroll.width - Style.space(16)
+            spacing: Style.space(10)
 
-            TextEdit {
-              id: goalField
-              Keys.onPressed: event => {
-                if (event.key === Qt.Key_F1) {
-                  root.helpOpen = true
-                  keyHandler.forceActiveFocus()
-                  event.accepted = true
+            // ---------------------------------------------------- header
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Text {
+                id: forgeTitle
+                text: "FORGE"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(18)
+                font.bold: true
+              }
+              Text {
+                id: projectActivity
+                visible: root.backgroundBusy
+                text: root.activeProjectCount + " project"
+                  + (root.activeProjectCount === 1 ? "" : "s") + " active"
+                color: root.mutedForeground
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(10)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Rectangle {
+                id: phaseBadge
+                width: phaseText.implicitWidth + Style.space(16)
+                height: phaseText.implicitHeight + Style.space(6)
+                radius: height / 2
+                color: "transparent"
+                border.width: 1
+                border.color: root.phase === "failed" || root.phase === "blocked"
+                  ? root.urgent
+                  : root.busy ? root.working
+                  : root.phase === "done" ? root.success
+                  : root.mutedForeground
+                Text {
+                  id: phaseText
+                  anchors.centerIn: parent
+                  text: root.engineOnline ? root.phase : "engine offline"
+                  color: root.phase === "failed" || root.phase === "blocked"
+                    ? root.urgent
+                    : root.busy ? root.working
+                    : root.phase === "done" ? root.success
+                    : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
                 }
               }
-              Keys.onEscapePressed: event => {
-                keyHandler.forceActiveFocus()
-                event.accepted = true
-              }
-              width: goalFlick.width
-              height: Math.max(contentHeight, goalFlick.height)
-              wrapMode: TextEdit.Wrap
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              onCursorRectangleChanged: goalFlick.ensureCursorVisible()
               Text {
-                visible: goalField.text === "" && !goalField.activeFocus
-                text: "Describe a goal, or leave empty and press Refactor plan for suggestions"
+                visible: root.engineState !== null && root.engineState.current_step !== ""
+                width: Math.max(0, parent.width - forgeTitle.width - phaseBadge.width
+                  - (projectActivity.visible ? projectActivity.width + parent.spacing : 0)
+                  - helpButton.width - parent.spacing
+                  - 2 * parent.spacing)
+                elide: Text.ElideRight
+                text: root.engineState && root.engineState.current_stage !== null
+                  ? "stage " + root.engineState.current_stage + ": "
+                    + (root.currentActivity || root.engineState.current_step)
+                  : (root.engineState ? root.engineState.current_step : "")
                 color: root.mutedForeground
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(12)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              PanelButton {
+                id: helpButton
+                label: "? Help"
+                onClicked: root.helpOpen = true
               }
             }
-          }
-        }
 
-        Text {
-          width: parent.width
-          visible: text !== ""
-          text: root.goalEnhancePending ? "enhancing the description…"
-            : root.goalEnhanceError !== "" ? root.goalEnhanceError
-            : root.goalEnhanceReady !== "" ? "AI rewrite ready — press Apply AI description" : ""
-          textFormat: Text.PlainText
-          color: root.goalEnhanceError !== "" ? root.urgent : root.mutedForeground
-          wrapMode: Text.Wrap
-          font.family: root.fontFamily
-          font.pixelSize: root.fs(11)
-        }
-
-        Flow {
-          width: parent.width
-          spacing: Style.space(8)
-          PanelButton {
-            id: createPlanButton
-            label: "Create plan"
-            primary: true
-            enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
-            onClicked: root.act("/api/plan", { goal: goalField.text })
-          }
-          PanelButton {
-            id: enhanceGoalButton
-            label: "Enhance with AI"
-            enabled: root.engineOnline && !root.busy && !root.editingPlan && !root.revisePending
-              && !root.goalEnhancePending && goalField.text.trim() !== ""
-            onClicked: root.enhanceGoal()
-          }
-          PanelButton {
-            label: "Apply AI description"
-            visible: root.goalEnhanceReady !== ""
-            onClicked: root.applyGoalEnhancement()
-          }
-          PanelButton {
-            label: "Undo enhance"
-            visible: root.goalEnhanceUndo !== ""
-            onClicked: root.undoGoalEnhancement()
-          }
-          PanelButton {
-            label: "Refactor plan"
-            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.engineOnline
-            onClicked: root.act("/api/plan", { mode: "refactor", goal: goalField.text })
-          }
-          PanelButton {
-            label: "Add to queue"
-            enabled: root.engineOnline && goalField.text.trim() !== ""
-            onClicked: {
-              root.act("/api/queue/add", { goal: goalField.text })
-              goalField.text = ""
-            }
-          }
-          PanelButton {
-            id: approvePlanButton
-            label: "Plan is OK — approve"
-            enabled: !root.editingPlan && !root.revisePending && !root.busy
-              && root.plan !== null && root.plan.status === "draft"
-            onClicked: root.act("/api/approve")
-          }
-          PanelButton {
-            id: runPlanButton
-            label: "Start implementing"
-            primary: true
-            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
-              && (root.plan.status === "approved" || root.plan.status === "done")
-            onClicked: root.act("/api/run")
-          }
-          PanelButton {
-            label: "Stop"
-            enabled: root.phase === "running" || root.queueActive
-            onClicked: root.act("/api/stop")
-          }
-          PanelButton {
-            id: editPlanButton
-            label: "Edit plan"
-            visible: !root.editingPlan
-            enabled: !root.editingPlan && !root.revisePending && root.engineOnline && !root.busy && !root.queueActive
-              && root.plan !== null && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
-            onClicked: root.beginPlanEdit()
-          }
-          PanelButton {
-            label: "Discard plan"
-            enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
-            onClicked: root.act("/api/reset_plan")
-          }
-          PanelButton {
-            label: "View diff"
-            enabled: root.engineOnline
-            onClicked: root.openDiff()
-          }
-          PanelButton {
-            label: "Update Forge"
-            enabled: root.engineOnline && !root.busy
-            onClicked: root.act("/api/self_update")
-          }
-        }
-
-        DiscussionView {
-          id: discussionView
-          width: parent.width
-          entries: root.discussion
-          pending: root.discussionPending
-          sentMessage: root.discussionSent
-          error: root.discussionError
-          canSend: root.discussionCanSend
-          canPlan: root.discussionCanPlan
-          canClear: root.discussionCanClear
-          expanded: root.discussionExpanded
-          foreground: root.foreground
-          mutedForeground: root.mutedForeground
-          background: root.background
-          surface: root.surface
-          accent: root.accent
-          urgent: root.urgent
-          fontFamily: root.fontFamily
-          fontSize11: root.fs(11)
-          fontSize12: root.fs(12)
-          onSendRequested: message => root.sendDiscussionMessage(message)
-          onPlanRequested: root.planFromDiscussion()
-          onClearRequested: root.clearDiscussion()
-          onExpansionRequested: expanded => root.discussionExpanded = expanded
-          onLeaveRequested: keyHandler.forceActiveFocus()
-          onHelpRequested: root.helpOpen = true
-          onDetailRevealed: control => root.revealDetail(control)
-          onDetailInspected: control => root.inspectDetail(control)
-        }
-
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
-          Rectangle {
-            width: parent.width - improvePlanButton.width - parent.spacing
-            height: improvePlanButton.height
-            color: root.surface
-            radius: 4
-            border.width: 1
-            border.color: feedbackField.activeFocus
-              ? root.accent : Qt.darker(root.foreground, 3)
-            TextInput {
-              id: feedbackField
-              anchors.fill: parent
-              anchors.margins: Style.space(6)
-              verticalAlignment: TextInput.AlignVCenter
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              selectByMouse: true
-              clip: true
-              onAccepted: root.revisePlan()
-              Keys.onPressed: event => {
-                if (event.key === Qt.Key_F1) {
-                  root.helpOpen = true
-                  keyHandler.forceActiveFocus()
-                  event.accepted = true
-                }
-              }
-              Keys.onEscapePressed: event => {
-                keyHandler.forceActiveFocus()
-                event.accepted = true
-              }
-              Text {
-                visible: feedbackField.text === "" && !feedbackField.activeFocus
-                text: "what should be improved…"
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-              }
-            }
-          }
-          PanelButton {
-            id: improvePlanButton
-            label: "Improve with AI"
-            enabled: root.engineOnline && !root.busy && !root.queueActive
-              && !root.editingPlan && !root.revisePending && root.plan !== null
-              && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
-              && feedbackField.text.trim() !== ""
-            onClicked: root.revisePlan()
-          }
-        }
-
-        ArchitectureReviewView {
-          width: parent.width
-          engineState: root.engineState
-          plan: root.plan
-          architecture: root.architecture
-          planReview: root.planReview
-          planReviewView: root.planReviewView
-          planReviewVersion: root.planReviewVersion
-          planReviewScope: root.planReviewScope
-          planReviewExpanded: root.planReviewExpanded
-          detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-          planReviewStatusText: root.planReviewStatusText
-          foreground: root.foreground
-          mutedForeground: root.mutedForeground
-          background: root.background
-          surface: root.surface
-          accent: root.accent
-          urgent: root.urgent
-          fontFamily: root.fontFamily
-          fontSize11: root.fs(11)
-          fontSize12: root.fs(12)
-          onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
-          onPlanReviewLoadRequested: root.loadPlanReviewRequests()
-          onLeaveRequested: keyHandler.forceActiveFocus()
-          onDetailRevealed: control => root.revealDetail(control)
-          onDetailInspected: control => root.inspectDetail(control)
-        }
-
-        // ------------------------------------------------ plan Q&A
-        Column {
-          id: chatSection
-          visible: root.plan !== null
-          width: parent.width
-          spacing: Style.space(6)
-
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-            PanelButton {
-              id: chatToggle
-              label: (root.chatExpanded ? "▾" : "▸") + " Plan Q&A"
-                + (root.chat.length > 0 ? " (" + root.chat.length + ")" : "")
-              onClicked: root.chatExpanded = !root.chatExpanded
-            }
+            // ------------------------------------------------ now working
             Rectangle {
-              width: Math.max(0, parent.width - chatToggle.width - askPlanButton.width
-                - parent.spacing * 2)
-              height: askPlanButton.height
+              id: agentCard
+              readonly property var stages: root.plan && root.plan.stages ? root.plan.stages : []
+              readonly property var currentStage: stages.find(function(stage) {
+                return root.engineState && stage.id === root.engineState.current_stage
+              })
+              readonly property int committedStages: stages.filter(function(stage) {
+                return stage.status === "committed"
+              }).length
+              readonly property int runSeconds: root.engineState && root.engineState.run_started_unix > 0
+                ? Math.max(0, Math.floor(root.agentNow - root.engineState.run_started_unix)) : 0
+
+              visible: root.busy
+              width: parent.width
+              height: visible ? workingSummary.implicitHeight + Style.space(16) : 0
+              color: root.surface
+              radius: 4
+
+              Column {
+                id: workingSummary
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(8)
+                spacing: Style.space(4)
+                PanelDetail {
+                  width: parent.width
+                  originalText: root.engineState ? root.engineState.goal : ""
+                  metadata: "Goal"
+                }
+                Row {
+                  width: parent.width
+                  spacing: Style.space(8)
+                  Text {
+                    width: parent.width - (workingStep.visible ? workingStep.width + parent.spacing : 0)
+                    text: root.phase === "planning" ? "planning…"
+                      : root.engineState && root.engineState.current_stage !== null
+                        ? "stage " + root.engineState.current_stage
+                          + (agentCard.currentStage ? " · " + agentCard.currentStage.title : "")
+                        : "now working"
+                    textFormat: Text.PlainText
+                    color: root.working
+                    elide: Text.ElideRight
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Text {
+                    id: workingStep
+                    visible: root.phase !== "planning" && text !== ""
+                    width: Math.min(implicitWidth, parent.width * 0.4)
+                    text: root.currentActivity || (root.engineState ? root.engineState.current_step : "")
+                    textFormat: Text.PlainText
+                    color: root.working
+                    elide: Text.ElideRight
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                }
+                Text {
+                  readonly property string planUsage: UsageFormat.usageSummary(root.plan ? root.plan.usage : null)
+                  visible: root.phase !== "planning"
+                    || (root.engineState !== null && root.engineState.run_started_unix > 0)
+                  width: parent.width
+                  text: (root.phase !== "planning"
+                      ? agentCard.committedStages + "/" + agentCard.stages.length + " stages committed" : "")
+                    + (root.engineState && root.engineState.run_started_unix > 0
+                      ? (root.phase !== "planning" ? " · " : "")
+                        + "run " + Math.floor(agentCard.runSeconds / 60) + "m "
+                        + (agentCard.runSeconds % 60) + "s" : "")
+                    + (planUsage ? " · " + planUsage : "")
+                  textFormat: Text.PlainText
+                  color: root.mutedForeground
+                  wrapMode: planUsage ? Text.Wrap : Text.NoWrap
+                  elide: planUsage ? Text.ElideNone : Text.ElideRight
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(11)
+                }
+                Row {
+                  visible: root.agentActive
+                  width: parent.width
+                  spacing: Style.space(10)
+                  Text {
+                    id: agentSummary
+                    width: Math.max(0, parent.width - agentTime.width - parent.spacing)
+                    text: root.agentActive ? root.agent.role + " · " + root.agent.tool
+                      + (root.agent.model ? " · " + root.agent.model : "") : ""
+                    textFormat: Text.PlainText
+                    color: root.working
+                    elide: Text.ElideRight
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                  Text {
+                    id: agentTime
+                    text: root.agentActive ? root.agentElapsed() + " · " + root.agent.lines + " lines" : ""
+                    textFormat: Text.PlainText
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(11)
+                  }
+                }
+                PanelDetail {
+                  // The state heartbeat's last_line is bounded to 200 characters.
+                  // Full-text actions must use the complete retained feed instead.
+                  visible: root.agentActive && liveEntries.count > 0
+                  scope: JSON.stringify([root.lastProject, root.projectViewRevision, root.agentSession])
+                  width: parent.width
+                  originalText: liveEntries.count > 0 ? liveEntries.get(liveEntries.count - 1).originalText : ""
+                  metadata: "Latest retained output"
+                  error: liveEntries.count > 0 && (liveEntries.get(liveEntries.count - 1).kind === "error"
+                    || liveEntries.get(liveEntries.count - 1).stream === "stderr")
+                }
+              }
+            }
+
+            // ----------------------------------------------- project tabs
+            Flow {
+              id: projectTabs
+              visible: root.sessions.length > 1
+              width: parent.width
+              spacing: Style.space(8)
+              Repeater {
+                model: root.sessions
+                delegate: PanelButton {
+                  required property var modelData
+                  readonly property bool needsAttention: modelData.phase === "blocked"
+                    || modelData.phase === "failed"
+                  label: modelData.name + " "
+                    + (modelData.busy || modelData.queue_active ? "●" : needsAttention ? "!"
+                      : modelData.phase === "done" ? "✓" : "·")
+                    + (modelData.queued > 0 ? " +" + modelData.queued : "")
+                  width: Math.min(implicitWidth, projectTabs.width)
+                  primary: modelData.project === root.activeProject
+                  labelColor: !primary && needsAttention ? root.urgent
+                    : primary && enabled ? root.background : root.foreground
+                  enabled: root.engineOnline
+                  onClicked: root.act("/api/project/select", { path: modelData.project })
+                }
+              }
+            }
+
+            // -------------------------------------------- project + tools
+            Row {
+              width: parent.width
+              spacing: Style.space(10)
+
+              Column {
+                width: parent.width - changeProjectButton.width - parent.spacing
+                Text {
+                  text: root.projectName
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(13)
+                  font.bold: true
+                }
+                Text {
+                  width: parent.width
+                  text: root.engineState ? root.engineState.project : ""
+                  color: root.mutedForeground
+                  elide: Text.ElideMiddle
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(10)
+                }
+              }
+              PanelButton {
+                id: changeProjectButton
+                label: "Change project"
+                enabled: root.engineOnline
+                onClicked: root.openChooser()
+              }
+            }
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(8)
+              PanelButton {
+                label: "planner: "
+                  + (root.engineState ? root.engineState.settings.planner : "…")
+                onClicked: root.cycleTool("planner")
+              }
+              PanelButton {
+                label: "architect: "
+                  + (root.engineState ? (root.engineState.settings.architect || "codex") : "…")
+                onClicked: root.cycleTool("architect")
+              }
+              PanelButton {
+                label: "automatic routing: " + (root.engineState && root.engineState.settings.automatic_routing !== false ? "yes" : "no")
+                onClicked: root.act("/api/settings", { automatic_routing: !(root.engineState && root.engineState.settings.automatic_routing !== false) })
+              }
+              PanelButton {
+                label: "implementer: "
+                  + (root.engineState ? root.engineState.settings.implementer : "…")
+                onClicked: root.cycleTool("implementer")
+              }
+              PanelButton {
+                label: root.reviewerLabel()
+                onClicked: root.cycleReviewer()
+              }
+              CadenceButton { role: "architect" }
+              CadenceButton { role: "reviewer" }
+              PanelButton {
+                label: "push at end: "
+                  + (root.engineState && root.engineState.settings.auto_push ? "yes" : "no")
+                onClicked: root.act("/api/settings", {
+                  auto_push: !(root.engineState && root.engineState.settings.auto_push) })
+              }
+              PanelButton {
+                label: "auto-approve: "
+                  + (root.engineState && root.engineState.settings.queue_auto_approve ? "yes" : "no")
+                enabled: root.engineOnline
+                onClicked: root.act("/api/settings", {
+                  queue_auto_approve: !(root.engineState && root.engineState.settings.queue_auto_approve) })
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              Flow {
+                width: parent.width
+                spacing: Style.space(8)
+                PanelButton {
+                  label: root.catalogue && root.catalogue.refreshing ? "Models: refreshing…" : "Refresh models"
+                  enabled: root.engineOnline && !(root.catalogue && root.catalogue.refreshing)
+                  onClicked: root.act("/api/models/refresh", {})
+                }
+                PanelButton {
+                  label: "Cancel refresh"
+                  visible: !!root.catalogue && root.catalogue.refreshing
+                  onClicked: root.act("/api/models/cancel", {})
+                }
+                PanelButton {
+                  label: root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing
+                    ? "Limits: checking…" : "Refresh Claude limits"
+                  enabled: root.engineOnline && !(root.engineState && root.engineState.claude_quota && root.engineState.claude_quota.refreshing)
+                  onClicked: root.act("/api/quota/refresh", {})
+                }
+                PanelButton {
+                  label: root.catalogueOpen ? "Close model settings" : "Model settings & options"
+                  onClicked: { if (root.catalogueOpen) root.catalogueOpen = false; else root.openCatalogue() }
+                }
+              }
+              Text {
+                width: parent.width
+                text: UsageFormat.quotaSummary(root.engineState && root.engineState.claude_quota
+                  ? Object.assign({}, root.engineState.claude_quota, {error: ""}) : null)
+                textFormat: Text.PlainText
+                color: root.foreground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(12)
+              }
+              PanelDetail {
+                width: parent.width
+                visible: originalText !== ""
+                metadata: "Quota error"
+                error: true
+                originalText: root.engineState && root.engineState.claude_quota ? root.engineState.claude_quota.error || "" : ""
+              }
+              Text {
+                width: parent.width
+                text: root.catalogue ? "Model tiers: configured user policy · revision " + root.catalogue.policy_revision
+                  + " · " + root.catalogue.configured_count + " explicit entries" : "Model catalogue pending"
+                color: root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              PanelDetail {
+                width: parent.width
+                visible: !!root.catalogue && !!root.catalogue.policy_error
+                originalText: root.catalogue && root.catalogue.policy_error ? root.catalogue.policy_error : ""
+                metadata: "Model policy error"
+                error: true
+              }
+              Text {
+                width: parent.width
+                visible: !!root.engineState && !!root.engineState.model_selection
+                text: visible ? "Last model: " + root.engineState.model_selection.provider + "/"
+                  + (root.engineState.model_selection.model || "provider default") + " · "
+                  + root.engineState.model_selection.availability : ""
+                color: root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+              PanelFields {
+                objectName: "providerDetails"
+                width: parent.width
+                entries: PanelDetails.providers(root.catalogue ? root.catalogue.providers : [])
+              }
+              Text {
+                width: parent.width
+                visible: !!root.catalogue
+                text: CataloguePresentation.catalogueMetadataSummaryText(root.catalogue && root.catalogue.metadata
+                  ? Object.assign({}, root.catalogue.metadata, {store_error: ""}) : null)
+                color: root.catalogue && root.catalogue.metadata
+                  && (root.catalogue.metadata.source_errors || root.catalogue.metadata.store_error)
+                  ? root.urgent : root.mutedForeground
+                wrapMode: Text.Wrap
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(11)
+              }
+
+              PanelDetail {
+                width: parent.width
+                visible: originalText !== ""
+                metadata: "Metadata store error"
+                error: true
+                originalText: root.catalogue && root.catalogue.metadata ? root.catalogue.metadata.store_error || "" : ""
+              }
+            }
+
+            // ---------------------------------------------------- goal
+            Rectangle {
+              width: parent.width
+              height: Math.min(Math.max(Style.space(52),
+                goalField.contentHeight + Style.space(16)), Style.space(140))
               color: root.surface
               radius: 4
               border.width: 1
-              border.color: questionField.activeFocus
+              border.color: goalField.activeFocus
                 ? root.accent : Qt.darker(root.foreground, 3)
-              TextInput {
-                id: questionField
+              Flickable {
+                id: goalFlick
                 anchors.fill: parent
                 anchors.margins: Style.space(6)
-                verticalAlignment: TextInput.AlignVCenter
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-                selectByMouse: true
                 clip: true
-                onAccepted: root.askPlanQuestion()
-                Keys.onPressed: event => {
-                  if (event.key === Qt.Key_F1) {
-                    root.helpOpen = true
+                contentWidth: goalField.width
+                contentHeight: goalField.height
+                flickableDirection: Flickable.VerticalFlick
+                boundsBehavior: Flickable.StopAtBounds
+
+                function ensureCursorVisible() {
+                  const cursor = goalField.cursorRectangle
+                  if (contentY > cursor.y)
+                    contentY = cursor.y
+                  else if (contentY + height < cursor.y + cursor.height)
+                    contentY = cursor.y + cursor.height - height
+                  contentY = Math.max(0, Math.min(contentY, contentHeight - height))
+                }
+
+                onHeightChanged: Qt.callLater(ensureCursorVisible)
+                onContentHeightChanged: Qt.callLater(ensureCursorVisible)
+
+                TextEdit {
+                  id: goalField
+                  Keys.onPressed: event => {
+                    if (event.key === Qt.Key_F1) {
+                      root.helpOpen = true
+                      keyHandler.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
+                  Keys.onEscapePressed: event => {
                     keyHandler.forceActiveFocus()
                     event.accepted = true
                   }
-                }
-                Keys.onEscapePressed: event => {
-                  keyHandler.forceActiveFocus()
-                  event.accepted = true
-                }
-                Text {
-                  visible: questionField.text === "" && !questionField.activeFocus
-                  text: "ask about this plan…"
-                  color: root.mutedForeground
+                  width: goalFlick.width
+                  height: Math.max(contentHeight, goalFlick.height)
+                  wrapMode: TextEdit.Wrap
+                  color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: root.fs(12)
+                  onCursorRectangleChanged: goalFlick.ensureCursorVisible()
+                  Text {
+                    visible: goalField.text === "" && !goalField.activeFocus
+                    text: "Describe a goal, or leave empty and press Refactor plan for suggestions"
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                  }
                 }
               }
             }
-            PanelButton {
-              id: askPlanButton
-              label: root.chatPending ? "Asking…" : "Ask"
-              enabled: root.engineOnline && !root.busy && !root.queueActive
-                && !root.editingPlan && !root.revisePending && !root.chatPending
-                && root.plan !== null && questionField.text.trim() !== ""
-              onClicked: root.askPlanQuestion()
-            }
-          }
 
-          Rectangle {
-            visible: root.chatExpanded && root.chat.length > 0
-            width: parent.width
-            height: Math.min(chatList.contentHeight, Style.space(96)) + Style.space(16)
-            color: root.surface
-            radius: 4
-            Flickable {
-              id: chatList
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              contentHeight: chatDetails.height
-              property bool followTail: true
-              property real readingY: 0
-              function scrollToTail() { if (followTail && !moving) contentY = Math.max(0, contentHeight - height) }
-              function restoreReadingPosition() {
-                if (!followTail && !moving) contentY = Math.max(0, Math.min(readingY, Math.max(0, contentHeight - height)))
-              }
-              onContentYChanged: if (moving) { followTail = atYEnd; readingY = contentY }
-              onMovementEnded: { followTail = atYEnd; readingY = contentY }
-              onContentHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
-              onHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
-              onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
-              PanelFields {
-                id: chatDetails
-                objectName: "chatDetails"
-                width: chatList.width
-                entries: root.chat.map(function(message, i) {
-                  // Chat has no durable IDs. Scope by plan, position and the
-                  // entire original record, keeping identical adjacent messages distinct.
-                  return PanelDetails.field(JSON.stringify([i, message]),
-                    message.role === "user" ? "You" : "Forge", message.text)
-                })
-                onInspecting: { chatList.followTail = false; chatList.readingY = chatList.contentY }
-              }
-            }
-          }
-        }
-        PanelDetail {
-          objectName: "localErrorDetail"
-          width: parent.width
-          visible: root.localError !== ""
-          originalText: root.localError
-          metadata: "Error"
-          error: true
-        }
-
-        // -------------------------------------------------- queue
-        Rectangle {
-          id: queueSection
-          visible: root.queue.length > 0
-          width: parent.width
-          height: queueHeader.height + queueList.height + Style.space(24)
-          color: root.surface
-          radius: 4
-
-          Row {
-            id: queueHeader
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.margins: Style.space(8)
-            spacing: Style.space(8)
             Text {
-              width: parent.width - startQueueButton.width - parent.spacing
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Queue (" + root.queue.length + ")"
-              color: root.foreground
+              width: parent.width
+              visible: text !== ""
+              text: root.goalEnhancePending ? "enhancing the description…"
+                : root.goalEnhanceError !== "" ? root.goalEnhanceError
+                : root.goalEnhanceReady !== "" ? "AI rewrite ready — press Apply AI description" : ""
+              textFormat: Text.PlainText
+              color: root.goalEnhanceError !== "" ? root.urgent : root.mutedForeground
+              wrapMode: Text.Wrap
               font.family: root.fontFamily
-              font.pixelSize: root.fs(12)
-              font.bold: true
+              font.pixelSize: root.fs(11)
             }
-            PanelButton {
-              id: startQueueButton
-              label: "Start queue"
-              primary: true
-              enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
-              onClicked: root.act("/api/queue/start")
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(8)
+              PanelButton {
+                id: createPlanButton
+                label: "Create plan"
+                primary: true
+                enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
+                onClicked: root.act("/api/plan", { goal: goalField.text })
+              }
+              PanelButton {
+                id: enhanceGoalButton
+                label: "Enhance with AI"
+                enabled: root.engineOnline && !root.busy && !root.editingPlan && !root.revisePending
+                  && !root.goalEnhancePending && goalField.text.trim() !== ""
+                onClicked: root.enhanceGoal()
+              }
+              PanelButton {
+                label: "Apply AI description"
+                visible: root.goalEnhanceReady !== ""
+                onClicked: root.applyGoalEnhancement()
+              }
+              PanelButton {
+                label: "Undo enhance"
+                visible: root.goalEnhanceUndo !== ""
+                onClicked: root.undoGoalEnhancement()
+              }
+              PanelButton {
+                label: "Refactor plan"
+                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.engineOnline
+                onClicked: root.act("/api/plan", { mode: "refactor", goal: goalField.text })
+              }
+              PanelButton {
+                label: "Add to queue"
+                enabled: root.engineOnline && goalField.text.trim() !== ""
+                onClicked: {
+                  root.act("/api/queue/add", { goal: goalField.text })
+                  goalField.text = ""
+                }
+              }
+              PanelButton {
+                id: approvePlanButton
+                label: "Plan is OK — approve"
+                enabled: !root.editingPlan && !root.revisePending && !root.busy
+                  && root.plan !== null && root.plan.status === "draft"
+                onClicked: root.act("/api/approve")
+              }
+              PanelButton {
+                id: runPlanButton
+                label: "Start implementing"
+                primary: true
+                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
+                  && (root.plan.status === "approved" || root.plan.status === "done")
+                onClicked: root.act("/api/run")
+              }
+              PanelButton {
+                label: "Stop"
+                enabled: root.phase === "running" || root.queueActive
+                onClicked: root.act("/api/stop")
+              }
+              PanelButton {
+                id: editPlanButton
+                label: "Edit plan"
+                visible: !root.editingPlan
+                enabled: !root.editingPlan && !root.revisePending && root.engineOnline && !root.busy && !root.queueActive
+                  && root.plan !== null && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
+                onClicked: root.beginPlanEdit()
+              }
+              PanelButton {
+                label: "Discard plan"
+                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
+                onClicked: root.act("/api/reset_plan")
+              }
+              PanelButton {
+                label: "View diff"
+                enabled: root.engineOnline
+                onClicked: root.openDiff()
+              }
+              PanelButton {
+                label: "Update Forge"
+                enabled: root.engineOnline && !root.busy
+                onClicked: root.act("/api/self_update")
+              }
+            }
+
+            DiscussionView {
+              id: discussionView
+              width: parent.width
+              entries: root.discussion
+              pending: root.discussionPending
+              sentMessage: root.discussionSent
+              error: root.discussionError
+              canSend: root.discussionCanSend
+              canPlan: root.discussionCanPlan
+              canClear: root.discussionCanClear
+              expanded: root.discussionExpanded
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              fontFamily: root.fontFamily
+              fontSize11: root.fs(11)
+              fontSize12: root.fs(12)
+              onSendRequested: message => root.sendDiscussionMessage(message)
+              onPlanRequested: root.planFromDiscussion()
+              onClearRequested: root.clearDiscussion()
+              onExpansionRequested: expanded => root.discussionExpanded = expanded
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onHelpRequested: root.helpOpen = true
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              Rectangle {
+                width: parent.width - improvePlanButton.width - parent.spacing
+                height: improvePlanButton.height
+                color: root.surface
+                radius: 4
+                border.width: 1
+                border.color: feedbackField.activeFocus
+                  ? root.accent : Qt.darker(root.foreground, 3)
+                TextInput {
+                  id: feedbackField
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  verticalAlignment: TextInput.AlignVCenter
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(12)
+                  selectByMouse: true
+                  clip: true
+                  onAccepted: root.revisePlan()
+                  Keys.onPressed: event => {
+                    if (event.key === Qt.Key_F1) {
+                      root.helpOpen = true
+                      keyHandler.forceActiveFocus()
+                      event.accepted = true
+                    }
+                  }
+                  Keys.onEscapePressed: event => {
+                    keyHandler.forceActiveFocus()
+                    event.accepted = true
+                  }
+                  Text {
+                    visible: feedbackField.text === "" && !feedbackField.activeFocus
+                    text: "what should be improved…"
+                    color: root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                  }
+                }
+              }
+              PanelButton {
+                id: improvePlanButton
+                label: "Improve with AI"
+                enabled: root.engineOnline && !root.busy && !root.queueActive
+                  && !root.editingPlan && !root.revisePending && root.plan !== null
+                  && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
+                  && feedbackField.text.trim() !== ""
+                onClicked: root.revisePlan()
+              }
+            }
+
+            ArchitectureReviewView {
+              width: parent.width
+              engineState: root.engineState
+              plan: root.plan
+              architecture: root.architecture
+              planReview: root.planReview
+              planReviewView: root.planReviewView
+              planReviewVersion: root.planReviewVersion
+              planReviewScope: root.planReviewScope
+              planReviewExpanded: root.planReviewExpanded
+              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+              planReviewStatusText: root.planReviewStatusText
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              fontFamily: root.fontFamily
+              fontSize11: root.fs(11)
+              fontSize12: root.fs(12)
+              onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
+              onPlanReviewLoadRequested: root.loadPlanReviewRequests()
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
+
+            // ------------------------------------------------ plan Q&A
+            Column {
+              id: chatSection
+              visible: root.plan !== null
+              width: parent.width
+              spacing: Style.space(6)
+
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+                PanelButton {
+                  id: chatToggle
+                  label: (root.chatExpanded ? "▾" : "▸") + " Plan Q&A"
+                    + (root.chat.length > 0 ? " (" + root.chat.length + ")" : "")
+                  onClicked: root.chatExpanded = !root.chatExpanded
+                }
+                Rectangle {
+                  width: Math.max(0, parent.width - chatToggle.width - askPlanButton.width
+                    - parent.spacing * 2)
+                  height: askPlanButton.height
+                  color: root.surface
+                  radius: 4
+                  border.width: 1
+                  border.color: questionField.activeFocus
+                    ? root.accent : Qt.darker(root.foreground, 3)
+                  TextInput {
+                    id: questionField
+                    anchors.fill: parent
+                    anchors.margins: Style.space(6)
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                    selectByMouse: true
+                    clip: true
+                    onAccepted: root.askPlanQuestion()
+                    Keys.onPressed: event => {
+                      if (event.key === Qt.Key_F1) {
+                        root.helpOpen = true
+                        keyHandler.forceActiveFocus()
+                        event.accepted = true
+                      }
+                    }
+                    Keys.onEscapePressed: event => {
+                      keyHandler.forceActiveFocus()
+                      event.accepted = true
+                    }
+                    Text {
+                      visible: questionField.text === "" && !questionField.activeFocus
+                      text: "ask about this plan…"
+                      color: root.mutedForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: root.fs(12)
+                    }
+                  }
+                }
+                PanelButton {
+                  id: askPlanButton
+                  label: root.chatPending ? "Asking…" : "Ask"
+                  enabled: root.engineOnline && !root.busy && !root.queueActive
+                    && !root.editingPlan && !root.revisePending && !root.chatPending
+                    && root.plan !== null && questionField.text.trim() !== ""
+                  onClicked: root.askPlanQuestion()
+                }
+              }
+
+              Rectangle {
+                visible: root.chatExpanded && root.chat.length > 0
+                width: parent.width
+                height: Math.min(chatList.contentHeight, Style.space(96)) + Style.space(16)
+                color: root.surface
+                radius: 4
+                Flickable {
+                  id: chatList
+                  anchors.fill: parent
+                  anchors.margins: Style.space(8)
+                  clip: true
+                  boundsBehavior: Flickable.StopAtBounds
+                  contentHeight: chatDetails.height
+                  property bool followTail: true
+                  property real readingY: 0
+                  function scrollToTail() { if (followTail && !moving) contentY = Math.max(0, contentHeight - height) }
+                  function restoreReadingPosition() {
+                    if (!followTail && !moving) contentY = Math.max(0, Math.min(readingY, Math.max(0, contentHeight - height)))
+                  }
+                  onContentYChanged: if (moving) { followTail = atYEnd; readingY = contentY }
+                  onMovementEnded: { followTail = atYEnd; readingY = contentY }
+                  onContentHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
+                  onHeightChanged: Qt.callLater(function() { restoreReadingPosition(); scrollToTail() })
+                  onVisibleChanged: if (visible) Qt.callLater(scrollToTail)
+                  PanelFields {
+                    id: chatDetails
+                    objectName: "chatDetails"
+                    width: chatList.width
+                    entries: root.chat.map(function(message, i) {
+                      // Chat has no durable IDs. Scope by plan, position and the
+                      // entire original record, keeping identical adjacent messages distinct.
+                      return PanelDetails.field(JSON.stringify([i, message]),
+                        message.role === "user" ? "You" : "Forge", message.text)
+                    })
+                    onInspecting: { chatList.followTail = false; chatList.readingY = chatList.contentY }
+                  }
+                }
+              }
+            }
+            PanelDetail {
+              objectName: "localErrorDetail"
+              width: parent.width
+              visible: root.localError !== ""
+              originalText: root.localError
+              metadata: "Error"
+              error: true
+            }
+
+            // -------------------------------------------------- queue
+            Rectangle {
+              id: queueSection
+              visible: root.queue.length > 0
+              width: parent.width
+              height: queueHeader.height + queueList.height + Style.space(24)
+              color: root.surface
+              radius: 4
+
+              Row {
+                id: queueHeader
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(8)
+                spacing: Style.space(8)
+                Text {
+                  width: parent.width - startQueueButton.width - parent.spacing
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Queue (" + root.queue.length + ")"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: root.fs(12)
+                  font.bold: true
+                }
+                PanelButton {
+                  id: startQueueButton
+                  label: "Start queue"
+                  primary: true
+                  enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
+                  onClicked: root.act("/api/queue/start")
+                }
+              }
+
+              ListView {
+                id: queueList
+                anchors.top: queueHeader.bottom
+                anchors.topMargin: Style.space(8)
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Style.space(8)
+                height: Math.min(contentHeight, Style.space(96))
+                clip: true
+                spacing: Style.space(4)
+                model: root.queue
+                delegate: Row {
+                  id: queueRow
+                  required property var modelData
+                  required property int index
+                  readonly property bool active: modelData.status === "planning"
+                    || modelData.status === "awaiting_approval" || modelData.status === "running"
+                  width: queueList.width
+                  height: Math.max(queueGoal.implicitHeight, queueControls.implicitHeight)
+                  spacing: Style.space(8)
+                  Text {
+                    id: queueGlyph
+                    width: root.fs(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: queueRow.active ? "●" : queueRow.modelData.status === "done" ? "✓"
+                      : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
+                        ? "!" : "·"
+                    color: queueRow.active ? root.accent
+                      : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
+                        ? root.urgent : root.mutedForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: root.fs(12)
+                    font.bold: true
+                  }
+                  PanelDetail {
+                    id: queueGoal
+                    width: Math.max(0, parent.width - queueGlyph.width - parent.spacing
+                      - (queueControls.visible ? queueControls.width + parent.spacing : 0))
+                    metadata: "Goal"
+                    originalText: queueRow.modelData.goal
+                  }
+                  Row {
+                    id: queueControls
+                    visible: queueRow.modelData.status === "queued"
+                      || queueRow.modelData.status === "failed" || queueRow.modelData.status === "blocked"
+                    spacing: Style.space(4)
+                    PanelButton {
+                      label: "↑"
+                      visible: queueRow.modelData.status === "queued"
+                      enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, -1)
+                      onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
+                    }
+                    PanelButton {
+                      label: "↓"
+                      visible: queueRow.modelData.status === "queued"
+                      enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, 1)
+                      onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
+                    }
+                    PanelButton {
+                      label: "×"
+                      enabled: root.engineOnline
+                      onClicked: root.act("/api/queue/remove", { id: queueRow.modelData.id })
+                    }
+                  }
+                }
+              }
+            }
+
+            PlanEditorView {
+              id: planEditor
+
+              width: parent.width
+              editingPlan: root.editingPlan
+              editPending: root.editPending
+              editValid: root.editValid
+              queueActive: root.queueActive
+              engineOnline: root.engineOnline
+              busy: root.busy
+              displayedStages: root.displayedStages
+              editStages: root.editStages
+              plan: root.plan
+              stageSnapshot: root.stageSnapshot
+              expandedStageId: root.expandedStageId
+              selectedStageIndex: root.selectedStageIndex
+              stageRoutingExpanded: root.stageRoutingExpanded
+              stageReviewBlocks: root.stageReviewBlocks
+              agentNow: root.agentNow
+              panelHeight: panelScroll.height
+              editFocusedField: root.editFocusedField
+              fs: root.fs
+              stageActivity: root.stageActivity
+              stageDetailScope: root.stageDetailScope
+              reviewView: root.reviewView
+              reviewGateText: root.reviewGateText
+              reviewDecision: root.reviewDecision
+              reviewFields: root.reviewFields
+              reviewRoundLabel: root.reviewRoundLabel
+              reviewTimestamp: root.reviewTimestamp
+              stageReviewIncompleteRange: root.stageReviewIncompleteRange
+              stageReviewHasHeldPreview: root.stageReviewHasHeldPreview
+              ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
+              reconcileStageReviewPresentation: root.reconcileStageReviewPresentation
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              success: root.success
+              working: root.working
+              fontFamily: root.fontFamily
+              onSavePlanEdit: root.savePlanEdit()
+              onCancelPlanEdit: root.cancelPlanEdit()
+              onAddEditStage: root.addEditStage()
+              onMoveEditStage: (index, direction) => root.moveEditStage(index, direction)
+              onDeleteEditStage: index => root.deleteEditStage(index)
+              onChangeStageField: (index, field, value) => root.changeStageField(index, field, value)
+              onChangeModelConstraint: (index, key, value) => root.changeModelConstraint(index, key, value)
+              onLoadStageReviews: (stageId, cursor, end) => root.loadStageReviews(stageId, cursor, end)
+              onRetryStageReviews: stage => root.retryStageReviews(stage)
+              onExpandedStageRequested: stageId => root.expandedStageId = stageId
+              onStageRoutingExpandedRequested: expanded => root.stageRoutingExpanded = expanded
+              onEditFocusChanged: field => root.editFocusedField = field
+              onHelpRequested: root.helpOpen = true
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => panelScroll.reveal(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
+
+            AgentOutputView {
+              id: agentOutput
+
+              width: parent.width
+              liveTab: root.liveTab
+              historyFilter: root.historyFilter
+              hasReports: root.hasReports
+              reportsVisible: root.reportsVisible
+              logError: root.logError
+              liveModel: liveEntries
+              historyModel: historyEntries
+              reportIndex: root.reportIndex
+              projectViewRevision: root.projectViewRevision
+              selectedReportKey: root.selectedReportKey
+              expandedReportKey: root.expandedReportKey
+              now: root.agentNow
+              panelHeight: panelScroll.height
+              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              success: root.success
+              working: root.working
+              fontFamily: root.fontFamily
+              fontSize10: root.fs(10)
+              fontSize11: root.fs(11)
+              onLiveTabRequested: live => root.liveTab = live
+              onHistoryFilterRequested: filter => root.historyFilter = filter
+              onReportSelected: key => root.selectedReportKey = key
+              onReportExpansionRequested: key => root.expandedReportKey = key
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
             }
           }
+          }
 
-          ListView {
-            id: queueList
-            anchors.top: queueHeader.bottom
-            anchors.topMargin: Style.space(8)
+          Text {
+            id: keyboardHint
             anchors.left: parent.left
             anchors.right: parent.right
-            anchors.margins: Style.space(8)
-            height: Math.min(contentHeight, Style.space(96))
-            clip: true
-            spacing: Style.space(4)
-            model: root.queue
-            delegate: Row {
-              id: queueRow
-              required property var modelData
-              required property int index
-              readonly property bool active: modelData.status === "planning"
-                || modelData.status === "awaiting_approval" || modelData.status === "running"
-              width: queueList.width
-              height: Math.max(queueGoal.implicitHeight, queueControls.implicitHeight)
-              spacing: Style.space(8)
-              Text {
-                id: queueGlyph
-                width: root.fs(12)
-                anchors.verticalCenter: parent.verticalCenter
-                text: queueRow.active ? "●" : queueRow.modelData.status === "done" ? "✓"
-                  : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
-                    ? "!" : "·"
-                color: queueRow.active ? root.accent
-                  : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
-                    ? root.urgent : root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-                font.bold: true
-              }
-              PanelDetail {
-                id: queueGoal
-                width: Math.max(0, parent.width - queueGlyph.width - parent.spacing
-                  - (queueControls.visible ? queueControls.width + parent.spacing : 0))
-                metadata: "Goal"
-                originalText: queueRow.modelData.goal
-              }
-              Row {
-                id: queueControls
-                visible: queueRow.modelData.status === "queued"
-                  || queueRow.modelData.status === "failed" || queueRow.modelData.status === "blocked"
-                spacing: Style.space(4)
-                PanelButton {
-                  label: "↑"
-                  visible: queueRow.modelData.status === "queued"
-                  enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, -1)
-                  onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
-                }
-                PanelButton {
-                  label: "↓"
-                  visible: queueRow.modelData.status === "queued"
-                  enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, 1)
-                  onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
-                }
-                PanelButton {
-                  label: "×"
-                  enabled: root.engineOnline
-                  onClicked: root.act("/api/queue/remove", { id: queueRow.modelData.id })
-                }
-              }
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(16)
+            text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - click here or press ? (Shift+/) or F1 for keyboard help"
+            color: root.mutedForeground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(10)
+            font.underline: !root.insertMode && keyboardHintMouseArea.containsMouse
+            MouseArea {
+              id: keyboardHintMouseArea
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: if (!root.helpOpen) root.helpOpen = true
             }
           }
-        }
-
-        PlanEditorView {
-          id: planEditor
-
-          width: parent.width
-          editingPlan: root.editingPlan
-          editPending: root.editPending
-          editValid: root.editValid
-          queueActive: root.queueActive
-          engineOnline: root.engineOnline
-          busy: root.busy
-          displayedStages: root.displayedStages
-          editStages: root.editStages
-          plan: root.plan
-          stageSnapshot: root.stageSnapshot
-          expandedStageId: root.expandedStageId
-          selectedStageIndex: root.selectedStageIndex
-          stageRoutingExpanded: root.stageRoutingExpanded
-          stageReviewBlocks: root.stageReviewBlocks
-          agentNow: root.agentNow
-          panelHeight: panelScroll.height
-          editFocusedField: root.editFocusedField
-          fs: root.fs
-          stageActivity: root.stageActivity
-          stageDetailScope: root.stageDetailScope
-          reviewView: root.reviewView
-          reviewGateText: root.reviewGateText
-          reviewDecision: root.reviewDecision
-          reviewFields: root.reviewFields
-          reviewRoundLabel: root.reviewRoundLabel
-          reviewTimestamp: root.reviewTimestamp
-          stageReviewIncompleteRange: root.stageReviewIncompleteRange
-          stageReviewHasHeldPreview: root.stageReviewHasHeldPreview
-          ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
-          reconcileStageReviewPresentation: root.reconcileStageReviewPresentation
-          foreground: root.foreground
-          mutedForeground: root.mutedForeground
-          background: root.background
-          surface: root.surface
-          accent: root.accent
-          urgent: root.urgent
-          success: root.success
-          working: root.working
-          fontFamily: root.fontFamily
-          onSavePlanEdit: root.savePlanEdit()
-          onCancelPlanEdit: root.cancelPlanEdit()
-          onAddEditStage: root.addEditStage()
-          onMoveEditStage: (index, direction) => root.moveEditStage(index, direction)
-          onDeleteEditStage: index => root.deleteEditStage(index)
-          onChangeStageField: (index, field, value) => root.changeStageField(index, field, value)
-          onChangeModelConstraint: (index, key, value) => root.changeModelConstraint(index, key, value)
-          onLoadStageReviews: (stageId, cursor, end) => root.loadStageReviews(stageId, cursor, end)
-          onRetryStageReviews: stage => root.retryStageReviews(stage)
-          onExpandedStageRequested: stageId => root.expandedStageId = stageId
-          onStageRoutingExpandedRequested: expanded => root.stageRoutingExpanded = expanded
-          onEditFocusChanged: field => root.editFocusedField = field
-          onHelpRequested: root.helpOpen = true
-          onLeaveRequested: keyHandler.forceActiveFocus()
-          onDetailRevealed: control => panelScroll.reveal(control)
-          onDetailInspected: control => root.inspectDetail(control)
-        }
-
-        AgentOutputView {
-          id: agentOutput
-
-          width: parent.width
-          liveTab: root.liveTab
-          historyFilter: root.historyFilter
-          hasReports: root.hasReports
-          reportsVisible: root.reportsVisible
-          logError: root.logError
-          liveModel: liveEntries
-          historyModel: historyEntries
-          reportIndex: root.reportIndex
-          projectViewRevision: root.projectViewRevision
-          selectedReportKey: root.selectedReportKey
-          expandedReportKey: root.expandedReportKey
-          now: root.agentNow
-          panelHeight: panelScroll.height
-          detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-          foreground: root.foreground
-          mutedForeground: root.mutedForeground
-          background: root.background
-          surface: root.surface
-          accent: root.accent
-          urgent: root.urgent
-          success: root.success
-          working: root.working
-          fontFamily: root.fontFamily
-          fontSize10: root.fs(10)
-          fontSize11: root.fs(11)
-          onLiveTabRequested: live => root.liveTab = live
-          onHistoryFilterRequested: filter => root.historyFilter = filter
-          onReportSelected: key => root.selectedReportKey = key
-          onReportExpansionRequested: key => root.expandedReportKey = key
-          onLeaveRequested: keyHandler.forceActiveFocus()
-          onDetailRevealed: control => root.revealDetail(control)
-          onDetailInspected: control => root.inspectDetail(control)
-        }
-      }
-      }
-
-      Text {
-        id: keyboardHint
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
-        anchors.margins: Style.space(16)
-        text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - click here or press ? (Shift+/) or F1 for keyboard help"
-        color: root.mutedForeground
-        font.family: root.fontFamily
-        font.pixelSize: root.fs(10)
-        font.underline: !root.insertMode && keyboardHintMouseArea.containsMouse
-        MouseArea {
-          id: keyboardHintMouseArea
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onClicked: if (!root.helpOpen) root.helpOpen = true
         }
       }
 
