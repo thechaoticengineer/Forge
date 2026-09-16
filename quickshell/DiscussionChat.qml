@@ -14,7 +14,6 @@ Item {
   required property bool pending
   required property string sentMessage
   required property string error
-  property real maximumHeight: 320
   required property color foreground
   required property color mutedForeground
   required property color background
@@ -32,8 +31,7 @@ Item {
   signal focusRevealed(var control)
   signal inspecting()
 
-  implicitHeight: Math.min(Math.max(list.contentHeight, rows.count === 0 ? placeholder.implicitHeight : 0),
-    chat.maximumHeight) + chat.contentPadding * 2
+  implicitHeight: Math.max(list.contentHeight, rows.count === 0 ? placeholder.implicitHeight : 0) + chat.contentPadding * 2
 
   ListModel { id: rows }
 

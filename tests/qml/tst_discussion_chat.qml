@@ -14,7 +14,7 @@ Item {
     DiscussionChat {
         id: chat
         width: 480
-        maximumHeight: 150
+        height: 150
         entries: []
         pending: false
         sentMessage: ""
@@ -67,7 +67,7 @@ Item {
             chat.pending = false
             chat.sentMessage = ""
             chat.error = ""
-            chat.maximumHeight = 150
+            chat.height = 150
             chat.width = 480
             fixture.copied = ""
             fixture.leftRequested = false

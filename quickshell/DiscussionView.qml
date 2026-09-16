@@ -64,7 +64,7 @@ Column {
   Rectangle {
     visible: view.expanded
     width: parent.width
-    height: discussionChat.height
+    height: Math.min(discussionChat.implicitHeight, Style.space(320))
     color: view.surface
     radius: 4
     DiscussionChat {
@@ -75,7 +75,6 @@ Column {
       pending: view.pending
       sentMessage: view.sentMessage
       error: view.error
-      maximumHeight: Style.space(320)
       foreground: view.foreground
       mutedForeground: view.mutedForeground
       background: view.background
