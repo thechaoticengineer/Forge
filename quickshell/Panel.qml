@@ -205,6 +205,18 @@ Item {
     act("/api/settings", {review_cadence: cadence})
   }
 
+  function fixCommitsText(review) {
+    const fixes = review && Array.isArray(review.fixes) ? review.fixes : []
+    if (fixes.length === 0) return ""
+    const lines = fixes.map(function(fix) {
+      const subject = typeof fix.message === "string" ? fix.message.split("\n")[0] : ""
+      return "  round " + fix.round + " · " + (fix.sha || "—") + (subject ? " · " + subject : "")
+    })
+    const total = typeof review.fix_count === "number" ? review.fix_count : fixes.length
+    return "\nFix commits (" + total + "):\n" + lines.join("\n")
+      + (review.fixes_truncated ? "\n  …" : "")
+  }
+
   function planReviewStatusText(review) {
     if (!review) return ""
     const gate = review.gate || {}, roles = gate.roles || {}
@@ -219,7 +231,8 @@ Item {
       + " · round " + round + " of " + maximum
       + "\nCurrent gate: " + (gate.status || "unavailable")
       + "\nArchitect: " + outcome("architect") + " · Independent: " + outcome("reviewer")
-      + (review.fix_sha ? "\nFix commit: " + review.fix_sha : "")
+      + fixCommitsText(review)
+      + (review.fix_sha ? "\nFinal fix commit: " + review.fix_sha : "")
   }
 
   property bool chooserOpen: false

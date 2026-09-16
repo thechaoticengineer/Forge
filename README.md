@@ -271,16 +271,25 @@ Plan fixes receive the goal, frozen stage text, commit range, role-tagged
 requests and architectural guidance/constraints. The fixer edits only the
 working tree, without committing or rewriting history. Its model uses the shared
 resolver, capability requirements, invocation accounting, operational retries
-and quota fallback. Every corrective tree is reviewed again by all required
-plan roles. Only a clean evidenced plan gate can authorize a single
-`fix(review): apply deferred plan review findings` commit of the approved tree;
-if that tree already equals HEAD's tree, there is no extra commit. Rejected or
-exhausted review leaves fixes uncommitted and prevents push and run-report
-publication. Stops retain work and return to `plan_ready`; other phase failures
-block. Successful finalization is saved and validated before `auto_push` or the
-completed-run report. Recovery after a fix ref update requires the exact approved
-tree/content, parent and deterministic message, so it cannot create a duplicate
-fix commit or approve new work.
+and quota fallback. When a fix round changes the tree, the engine commits it as
+`fix(review): apply round <n> plan review findings`, with the addressed
+role-tagged requests in the message body, and advances the anchored HEAD. Each
+round is therefore reviewed again by all required plan roles from a clean working
+tree, and `plan_review.fixes` records every round's commit, addressed requests and
+files. A round that changes nothing makes no commit. Because the engine commits
+each round, a review may never ask an agent to commit; uncommitted content it sees
+is content no fix round has committed yet.
+
+Only a clean evidenced plan gate can authorize the remaining
+`fix(review): apply deferred plan review findings` commit of the approved tree,
+which covers content the review saw that no fix round committed; if that tree
+already equals HEAD's tree, there is no extra commit. Rejected or exhausted review
+keeps the fix commits already made but prevents push and run-report publication.
+Stops retain work and return to `plan_ready`; other phase failures block.
+Successful finalization is saved and validated before `auto_push` or the
+completed-run report. Both commit paths record their intended parent, tree and
+deterministic message before moving HEAD, so recovery adopts exactly the commit
+that landed and can never create a duplicate or approve new work.
 
 Stage commit validation checks current stage-required verdicts, identity, policy
 and the unchanged snapshot. After staging, the actual index tree must equal the
@@ -612,7 +621,10 @@ When the phase exists, `GET /api/state` exposes `plan.plan_review` as a bounded
 projection with status, attempt ID, base and anchored HEAD, `rounds`, captured
 `budget`, `required_roles`, optional `fix_sha`, usage and the gate's status, per-role
 outcomes, role-tagged requests and identity. It includes at most eight recent
-review previews with `review_count` and `reviews_truncated`; individual previews
+fix-round previews with `fix_count` and `fixes_truncated`, each keeping its round,
+SHA and message subject while bounding the addressed requests and file list. It
+includes at most eight recent review previews with `review_count` and
+`reviews_truncated`; individual previews
 are explicitly shortened even for small verdicts. Auxiliary fields and strings
 are bounded too, with flags such as `requests_truncated` and
 `identity_truncated` on the gate. Polling uses stored projections without reading
@@ -741,10 +753,11 @@ has `stage_id`, `attempt_id`, `revision` (the attempt revision) and `cadence`
 completed stage attempts. An older stage with no capture has `cadence: null`;
 live settings are never substituted, and wholly legacy plans omit the field.
 If plan review exists, `plan_review` records final gate `status`, `rounds` used,
-per-role `roles`, `base`, `fix_sha` (null when no fix commit was needed), and its
-`usage` and `role_usage` contribution when present. That contribution is already
-included in plan totals. The existing `commits` and `stage_outcomes` remain stage
-lists; the extra fix commit is identified by `plan_review.fix_sha`. Reports
+per-role `roles`, `base`, `fix_sha` (null when no extra finalization commit was
+needed), `fixes` (each round's `round` and `sha`), and its `usage` and `role_usage`
+contribution when present. That contribution is already included in plan totals.
+The existing `commits` and `stage_outcomes` remain stage lists; review fix commits
+are identified by `plan_review.fixes` and `plan_review.fix_sha`. Reports
 without plan review omit that object, and older reports remain readable.
 
 Report appends are synced before a queue goal is marked complete. A storage
@@ -848,7 +861,8 @@ distinguishes **awaiting commit under a deferred review policy** from
 **committed under a deferred review policy**, without presenting either as an
 approval. Plan review appears separately beside the architecture area, outside
 the stage cards, with phase status, current gate, round `n of budget + 1`,
-architect/independent outcomes and any fix commit SHA. Its role-tagged requests
+architect/independent outcomes, each fix round's commit SHA and subject, and any
+final fix commit SHA. Its role-tagged requests
 expand to complete, wrapping, selectable plain text with **Copy full text**.
 If state shortened the requests, opening the detail retrieves bounded pages of
 architecture history and matches the exact plan, attempt, round, policy,

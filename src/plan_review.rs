@@ -4,6 +4,32 @@ use std::collections::BTreeSet;
 
 const FIX_MESSAGE: &str = "fix(review): apply deferred plan review findings";
 
+/// Each fix round becomes its own commit, so the round after it reviews a clean
+/// worktree and the plan records where every correction landed. The message is a
+/// pure function of persisted round state, which lets recovery recognize a commit
+/// that landed just before a crash instead of rejecting the moved HEAD.
+fn fix_round_message(round: u64, requests: &Value) -> String {
+    let mut message = format!("fix(review): apply round {round} plan review findings");
+    let addressed = requests
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|request| request.as_str())
+        .map(|request| {
+            let request = request.split_whitespace().collect::<Vec<_>>().join(" ");
+            match request.char_indices().nth(200) {
+                Some((cut, _)) => format!("{}...", &request[..cut]),
+                None => request,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !addressed.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(&addressed.join("\n"));
+    }
+    message
+}
+
 const INDEPENDENCE: &str = "independent plan review requires a provider no stage implementer used; set the reviewer review cadence to per stage for a revised plan or pin the implementer provider; existing commits remain local";
 
 fn subject(plan: &Value) -> Result<Value, String> {
@@ -300,6 +326,77 @@ impl Ctx {
         }
     }
 
+    /// Commit the round's fixes so the next review round starts from a clean
+    /// worktree. The fixer still only edits files: the engine alone moves HEAD.
+    fn commit_plan_fix_round(&self, plan: &mut Value) -> Result<(), String> {
+        self.validate_plan_subject(plan)?;
+        if self.session.stop_requested.load(Ordering::SeqCst) {
+            return Err("stop before plan fix commit; saved work retained".into());
+        }
+        let round = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
+        let parent = plan["plan_review"]["head"].as_str().ok_or("missing plan review HEAD")?.to_string();
+        // Match the finalization staging: git add rejects an explicitly excluded ignored path.
+        self.git(&["add", "-A"])?;
+        self.git(&["reset", "-q", "HEAD", "--", ".forge"])?;
+        #[cfg(test)]
+        if self.app.settings.lock().unwrap()["test_plan_staging_crash"] == true {
+            return Err("simulated crash after staging plan fixes".into());
+        }
+        let staged = self.git(&["write-tree"])?;
+        if staged == self.git(&["rev-parse", "HEAD^{tree}"])? { return Ok(()); }
+        let requests = plan["plan_review"]["outstanding_requests"].clone();
+        let message = fix_round_message(round, &requests);
+        // Record the intended commit before HEAD moves: a crash between commit-tree
+        // and the saved head must resolve to this commit, not to "subject changed".
+        plan["plan_review"]["fix_commit"] =
+            json!({"round":round,"parent":parent,"tree":staged,"message":message,"requests":requests});
+        self.plan_action_checkpoint(plan)?;
+        let sha = self.git(&["commit-tree", &staged, "-p", &parent, "-m", &message])?;
+        // CAS on the recorded parent rejects any concurrent HEAD movement.
+        self.git(&["update-ref", "-m", &message, "HEAD", &sha, &parent])?;
+        #[cfg(test)]
+        if self.app.settings.lock().unwrap()["test_plan_commit_crash"] == true {
+            return Err("simulated crash after plan fix update-ref".into());
+        }
+        self.adopt_plan_fix_commit(plan)
+    }
+
+    /// Publish a recorded fix commit into the plan, whether it was just made or
+    /// found again after a crash. Recovery never creates a second commit.
+    fn adopt_plan_fix_commit(&self, plan: &mut Value) -> Result<(), String> {
+        let pending = plan["plan_review"]["fix_commit"].clone();
+        if !pending.is_object() { return Ok(()); }
+        let parent = pending["parent"].as_str().ok_or("missing recorded plan fix parent")?;
+        let head = self.git(&["rev-parse", "HEAD"])?;
+        if head == parent {
+            // The crash preceded update-ref; the round's work is still uncommitted.
+            plan["plan_review"].as_object_mut().ok_or("invalid plan review")?.remove("fix_commit");
+            return self.save_plan(plan);
+        }
+        let parents = self.git(&["rev-list", "--parents", "-n", "1", "HEAD"])?;
+        let parents: Vec<_> = parents.split_whitespace().collect();
+        if parents.len() != 2 || parents[1] != parent
+            || self.git(&["rev-parse", "HEAD^{tree}"])? != pending["tree"]
+            || self.git(&["show", "-s", "--format=%B", "HEAD"])? != pending["message"] {
+            return Err("HEAD is not the recorded plan fix commit; restore the plan branch before retrying".into());
+        }
+        let short = self.git(&["rev-parse", "--short", "HEAD"])?;
+        let files: Vec<Value> = self.git(&["show", "--name-only", "--format=", "HEAD"])?
+            .lines().filter(|l| !l.is_empty()).map(|l| json!(l)).collect();
+        let entry = json!({"round":pending["round"],"sha":short,"head":head,
+            "message":pending["message"],"requests":pending["requests"],
+            "files":files,"unix":crate::util::unix_timestamp()});
+        let review = plan["plan_review"].as_object_mut().ok_or("invalid plan review")?;
+        review.remove("fix_commit");
+        review.insert("head".into(), json!(head));
+        review.entry("fixes").or_insert_with(|| json!([]))
+            .as_array_mut().ok_or("invalid recorded plan fixes")?.push(entry);
+        self.save_plan(plan)?;
+        self.log_event("git", &format!("committed {short}: {}",
+            pending["message"].as_str().unwrap_or("").lines().next().unwrap_or("")));
+        Ok(())
+    }
+
     fn finalized_plan_snapshot(&self, plan: &Value) -> Result<Value, String> {
         self.validate_plan_evidence(plan)?;
         let expected = &plan["plan_review"]["gate"]["identity"]["snapshot"];
@@ -458,6 +555,7 @@ impl Ctx {
                 "rounds":0,"status":"pending","gate":{"status":"pending"},"reviews":reviews,
                 "next_action":"reserve_review","outstanding_requests":[],
                 "model_invocations":plan["plan_review"]["model_invocations"].as_array().cloned().unwrap_or_default(),
+                "fixes":plan["plan_review"]["fixes"].as_array().cloned().unwrap_or_default(),
                 "minimum_tier":plan["stages"].as_array().unwrap().iter().map(|s|
                     s["model_agreement"]["policy_inputs"]["minimum_tier"].as_u64().unwrap_or(3)).max().unwrap_or(3),
                 "retries":{"operational_retries":0,"history":[],"limits":self.app.settings.lock().unwrap()["reassessment_limits"]},
@@ -471,6 +569,7 @@ impl Ctx {
             self.save_plan(&next)?;
             *plan = next;
         }
+        self.adopt_plan_fix_commit(plan)?;
         if matches!(plan["plan_review"]["next_action"].as_str(), Some("finalize" | "complete"))
             || plan["plan_review"]["status"] == "approved" {
             self.commit_plan_reviewed(plan)?;
@@ -521,6 +620,7 @@ impl Ctx {
                     plan["plan_review"]["status"] = json!("fixing");
                     self.plan_action_checkpoint(plan)?;
                     self.run_plan_fixer(plan)?;
+                    self.commit_plan_fix_round(plan)?;
                     plan["plan_review"]["next_action"] = json!("review_pending");
                     self.plan_action_checkpoint(plan)?;
                 }

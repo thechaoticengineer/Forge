@@ -19,6 +19,8 @@ fn completed_plan_review_report_preserves_captured_cadences_and_phase_usage() {
         "usage":{"mock":{"total_tokens":100,"calls":4}},
         "plan_review":{"status":"approved","rounds":2,"base":"base","fix_sha":"fix",
             "gate":{"status":"approved","roles":{"architect":"approved","reviewer":"approved"}},
+            "fixes":[{"round":2,"sha":"abc1234","message":"fix(review): apply round 2 plan review findings",
+                "requests":["[reviewer] Fix behavior"],"files":["first.rs"]}],
             "reviews":[]}});
     test.app.save_plan(&plan).unwrap();
     let mut plan = test.app.load_plan().unwrap();
@@ -34,8 +36,10 @@ fn completed_plan_review_report_preserves_captured_cadences_and_phase_usage() {
         {"stage_id":1,"attempt_id":"first","revision":1,"cadence":first},
         {"stage_id":2,"attempt_id":"second","revision":2,"cadence":second},
         {"stage_id":3,"attempt_id":null,"revision":null,"cadence":null}]}));
+    // The report keeps each fix round's commit, not its prompt-sized detail.
     assert_eq!(report["plan_review"],json!({"status":"approved","rounds":2,
         "roles":{"architect":"approved","reviewer":"approved"},"base":"base","fix_sha":"fix",
+        "fixes":[{"round":2,"sha":"abc1234"}],
         "usage":plan["plan_review"]["usage"],"role_usage":plan["plan_review"]["role_usage"]}));
     assert_eq!(report["usage"]["mock"]["total_tokens"],115);
     assert_eq!(report["usage"]["mock"]["calls"],7);

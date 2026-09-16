@@ -50,6 +50,34 @@ fn plan_preview(record: &Value) -> Value {
         "summary": record["summary"].as_str().unwrap_or("").chars().take(240).collect::<String>()})
 }
 
+/// Keep every fix commit identifiable in the panel: the round, its sha and the
+/// message subject survive intact, while unbounded detail stays in git.
+fn fix_preview(record: &Value) -> Value {
+    let mut result = json!({});
+    for key in ["round", "sha", "head", "unix"] {
+        if let Some(value) = record.get(key).filter(|v| !v.is_null()) {
+            result[key] = limited(value, &mut 256, 1);
+        }
+    }
+    let message = record["message"].as_str().unwrap_or("");
+    let subject: String = message.lines().next().unwrap_or("").chars().take(240).collect();
+    result["message"] = json!(subject);
+    if subject != message || record["message_truncated"] == true {
+        result["message_truncated"] = json!(true);
+    }
+    // Re-bounding an already bounded record must reproduce it exactly, so a flag
+    // set by an earlier pass survives even when the shrunken value now fits.
+    for key in ["requests", "files"] {
+        if let Some(value) = record.get(key) {
+            result[key] = limited(value, &mut 1024, 3);
+            if result[key] != *value || record[format!("{key}_truncated")] == true {
+                result[format!("{key}_truncated")] = json!(true);
+            }
+        }
+    }
+    result
+}
+
 pub(crate) fn bounded(plan: &mut Value) {
     for stage in plan["stages"].as_array_mut().into_iter().flatten() {
         if let Some(reviews) = stage["reviews"].as_array() {
@@ -141,11 +169,16 @@ fn bounded_plan_review(review: &Value) -> Value {
         }
     }
     for (key, count_key, flag) in [("reviews", "review_count", "reviews_truncated"),
-        ("model_invocations", "model_invocation_count", "model_invocations_truncated")] {
+        ("model_invocations", "model_invocation_count", "model_invocations_truncated"),
+        ("fixes", "fix_count", "fixes_truncated")] {
         if let Some(records) = review[key].as_array() {
             let total = (records.len() as u64).max(review[count_key].as_u64().unwrap_or(0));
             let recent: Vec<_> = records.iter().skip(records.len().saturating_sub(PREVIEW_COUNT))
-                .map(|r| if key == "reviews" { plan_preview(r) } else { bounded_field(r) }).collect();
+                .map(|r| match key {
+                    "reviews" => plan_preview(r),
+                    "fixes" => fix_preview(r),
+                    _ => bounded_field(r),
+                }).collect();
             let truncated = review[flag] == true || total > recent.len() as u64
                 || records.iter().rev().zip(recent.iter().rev()).any(|(a,b)| a != b)
                 || recent.iter().any(|r| r["truncated"] == true);

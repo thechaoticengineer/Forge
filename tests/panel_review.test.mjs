@@ -64,6 +64,8 @@ function planFixture() {
     approved:false,issues:originals,notes:[originals[0],'legacy note']}));
   const plan = {plan_id:'plan',revision:2,plan_review:{attempt_id:'attempt',status:'exhausted',rounds:2,budget:1,
     fix_sha:'abc123',required_roles:['architect','reviewer'],reviews:[{truncated:true,issues:[originals[0].slice(0,100)]}],
+    fix_count:3,fixes_truncated:true,
+    fixes:[{round:2,sha:'aaa111',message:'fix(review): apply round 2 plan review findings\n\n[architect] detail'}],
     gate:{identity,status:'exhausted',roles:{architect:'changes_requested',reviewer:'changes_requested'},
       requests_truncated:true,requests:originals.slice(0,8).map(text=>({role:'architect',text:text.slice(0,240)}))}}};
   const event = record => ({id:'event-'+record.role,plan_id:'plan',payload:{kind:'plan_review',reviews:[record]}});
@@ -73,7 +75,12 @@ test('plan review status, B+1 rounds, outcomes and fix commit are independent of
   const {plan} = planFixture();
   const text = planHelpers.planReviewStatusText(plan.plan_review);
   for (const value of ['Plan review: exhausted','round 2 of 2','Current gate: exhausted',
-    'Architect: changes_requested','Independent: changes_requested','Fix commit: abc123']) assert.ok(text.includes(value),value);
+    'Architect: changes_requested','Independent: changes_requested','Final fix commit: abc123',
+    'Fix commits (3):','round 2 · aaa111 · fix(review): apply round 2 plan review findings']) assert.ok(text.includes(value),value);
+  // The per-round subject stands alone: the request detail stays out of the summary.
+  assert.ok(!text.includes('[architect] detail'));
+  assert.ok(text.includes('…'));
+  assert.ok(!planHelpers.planReviewStatusText({status:'pending',rounds:0,budget:0}).includes('Fix commits'));
   assert.match(planHelpers.planReviewStatusText({status:'pending',rounds:0,budget:0}),/round 0 of 1/);
   assert.match(planHelpers.planReviewStatusText({}),/round — of —/);
   assert.equal(planHelpers.planReviewStatusText(null),'');

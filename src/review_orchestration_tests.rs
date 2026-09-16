@@ -1175,11 +1175,20 @@ fn plan_review_fixes_are_reviewed_then_committed_once() {
         assert_eq!(r["rounds"],2);
         assert_eq!(r["budget"],1);
         assert_eq!(r["next_action"],"complete");
-        assert_eq!(r["fix_sha"],f.ctx.git(&["rev-parse","--short","HEAD"]).unwrap());
+        // The round committed the fixes, so finalization has nothing left to commit.
+        assert!(r["fix_sha"].is_null());
         assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
-        assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"fix(review): apply deferred plan review findings");
+        assert_eq!(f.ctx.git(&["show","-s","--format=%s"]).unwrap(),"fix(review): apply round 2 plan review findings");
         assert_eq!(f.ctx.git(&["rev-parse","HEAD^{tree}"]).unwrap(),r["gate"]["identity"]["snapshot"]["tree"]);
-        assert_eq!(f.ctx.git(&["rev-parse","HEAD^"]).unwrap(),r["head"]);
+        assert_eq!(f.ctx.git(&["rev-parse","HEAD"]).unwrap(),r["head"]);
+        let fixes = r["fixes"].as_array().unwrap();
+        assert_eq!(fixes.len(),1,"{r}");
+        assert_eq!(fixes[0]["round"],2);
+        assert_eq!(fixes[0]["head"],f.ctx.git(&["rev-parse","HEAD"]).unwrap());
+        assert_eq!(fixes[0]["sha"],f.ctx.git(&["rev-parse","--short","HEAD"]).unwrap());
+        assert_eq!(fixes[0]["requests"],json!(["[architect] Fix integration","[reviewer] Fix feature behavior"]));
+        assert!(fixes[0]["files"].as_array().unwrap().contains(&json!("first.rs")),"{}",fixes[0]);
+        assert!(fixes[0]["message"].as_str().unwrap().contains("[reviewer] Fix feature behavior"));
         assert_eq!(f.plan_calls().len(),4);
         assert_eq!(r["reviews"].as_array().unwrap().len(),4);
         assert_ne!(r["reviews"][0]["identity"]["snapshot"],r["reviews"][2]["identity"]["snapshot"]);
@@ -1230,7 +1239,9 @@ fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
         assert_eq!(p["plan_review"]["status"],"blocked");
         assert_eq!(p["plan_review"]["outstanding_requests"],json!(["[reviewer] Fix behavior"]));
         assert_eq!(f.count("fixer"),budget as usize);
-        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
+        // Every fix round commits, so exhaustion keeps the corrections it produced.
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),(3+budget).to_string());
+        assert_eq!(p["plan_review"]["fixes"].as_array().unwrap().len(),budget as usize);
         assert!(p["plan_review"]["fix_sha"].is_null());
         assert!(!f.ctx.forge_path("reports.jsonl").exists());
         assert!(f.ctx.git(&["ls-remote","origin"]).unwrap().is_empty());
@@ -1274,37 +1285,49 @@ fn plan_review_interrupted_fixer_consumes_reserved_cycle() {
 
 #[test]
 fn plan_review_recovers_only_exact_fix_commit_after_update_ref_crash() {
-    for change in ["none","delete","message","content","subject","evidence"] {
-        let f = Fixture::new("Implement feature",1);
+    for change in ["none","message","tree","reset"] {
+        let f = Fixture::new("Implement feature",2);
         f.two_deferred_stages();
-        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
-        if change == "delete" { f.setting("mock_fixer_actions",json!([{"remove":["second.rs"]}])); }
+        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean(),clean()]));
         f.setting("test_plan_commit_crash",json!(true));
         let p = f.run();
-        assert_eq!(p["plan_review"]["next_action"],"finalize");
-        assert_eq!(p["plan_review"]["gate"]["status"],"approved");
-        assert!(p["plan_review"]["fix_sha"].is_null());
-        assert!(!f.ctx.forge_path("reports.jsonl").exists());
+        let review = &p["plan_review"];
+        assert_eq!(review["next_action"],"fixing");
+        assert_eq!(review["fix_commit"]["round"],2);
+        assert!(review["fixes"].as_array().is_none_or(|fixes| fixes.is_empty()),"{review}");
         assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
+        assert!(!f.ctx.forge_path("reports.jsonl").exists());
         let head = f.ctx.git(&["rev-parse","HEAD"]).unwrap();
         match change {
-            "message" => { f.ctx.git(&["commit","--amend","-m","wrong message"]).unwrap(); }
-            "content" => { fs::write(f.root.join("first.rs"),"external change").unwrap(); }
-            "subject" => { let mut changed = p.clone(); changed["stages"][0]["acceptance"] = json!("Different criteria"); f.ctx.save_plan(&changed).unwrap(); }
-            "evidence" => { let mut changed = p.clone(); changed["plan_review"]["reviews"][2]["criteria"] = json!([]); f.ctx.save_plan(&changed).unwrap(); }
+            "message" => { f.ctx.git(&["commit","--amend","-qm","wrong message"]).unwrap(); }
+            "tree" => {
+                fs::write(f.root.join("first.rs"),"external change").unwrap();
+                f.ctx.git(&["commit","--amend","-qa","--no-edit"]).unwrap();
+            }
+            "reset" => { f.ctx.git(&["reset","--hard","-q","HEAD~1"]).unwrap(); }
             _ => {}
         }
         f.setting("test_plan_commit_crash",json!(false));
         let resumed = f.run();
-        let recovered = matches!(change,"none"|"delete");
-        assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),recovered,"{change}: {resumed}");
-        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"4");
-        if recovered {
-            assert_eq!(f.ctx.git(&["rev-parse","HEAD"]).unwrap(),head);
-            assert!(resumed["plan_review"]["fix_sha"].is_string());
-            assert_eq!(resumed["plan_review"]["next_action"],"complete");
-        } else { assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked"); }
-        assert_eq!(f.plan_calls().len(),4);
+        if matches!(change,"message"|"tree") {
+            // Only the exact recorded commit may be adopted; anything else stops.
+            assert_eq!(f.ctx.session.state.lock().unwrap().phase,"blocked");
+            assert_eq!(resumed["plan_review"]["status"],"blocked");
+            assert!(resumed["plan_review"]["gate"]["error"].as_str().unwrap()
+                .contains("not the recorded plan fix commit"),"{}",resumed["plan_review"]["gate"]);
+            assert!(!f.ctx.forge_path("reports.jsonl").exists());
+            continue;
+        }
+        assert_eq!(resumed["status"],"done","{change}: {resumed}");
+        assert!(resumed["plan_review"]["fix_commit"].is_null());
+        let fixes = resumed["plan_review"]["fixes"].as_array().unwrap();
+        // "none" adopts the crashed commit and still owes its interrupted cycle a
+        // fresh fix round; "reset" lost the commit, so one round rebuilds it.
+        assert_eq!(fixes.len(),if change == "none" {2} else {1},"{change}: {resumed}");
+        assert_eq!(fixes[0]["head"] == json!(head),change == "none");
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),
+            if change == "none" {"5"} else {"4"});
+        assert_eq!(f.ctx.git(&["rev-parse","HEAD"]).unwrap(),resumed["plan_review"]["head"]);
     }
 }
 
@@ -1327,7 +1350,8 @@ fn plan_review_crash_boundaries_distinguish_unstarted_and_completed_fixers() {
         assert_eq!(resumed["plan_review"]["rounds"],2);
         assert_eq!(resumed["plan_review"]["attempt_id"],p["plan_review"]["attempt_id"]);
         assert_eq!(f.count("fixer"),usize::from(action != "fixing"));
-        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if completes {"4"} else {"3"});
+        // Only a fixer that never ran leaves the history at the stage commits.
+        assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if action == "fixing" {"3"} else {"4"});
     }
 }
 
@@ -1429,7 +1453,7 @@ fn plan_review_fixer_history_change_follows_the_architect_decision() {
             assert!(!f.ctx.forge_path("reports.jsonl").exists());
         } else {
             assert_eq!(p["status"],"done","{p}");
-            assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),"fix(review): apply deferred plan review findings");
+            assert_eq!(f.ctx.git(&["show","-s","--format=%s"]).unwrap(),"fix(review): apply round 2 plan review findings");
             let kept = f.ctx.git(&["log","--format=%s"]).unwrap().contains("unauthorized fixer commit");
             assert_eq!(kept, action == "continue");
             assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(), if action == "continue" {"5"} else {"4"});
@@ -1492,11 +1516,13 @@ fn plan_review_fixer_uses_shared_capability_retry_fallback_and_provenance() {
 fn plan_review_recovers_staging_crash_but_rejects_new_content_or_index() {
     for change in ["none","content","index"] {
         let f = Fixture::new("Implement feature",1);
-        f.two_deferred_stages();
-        f.setting("mock_verdicts",json!([reject("Fix behavior"),clean()]));
+        f.pending_plan_review();
+        // Work already in the tree when plan review opens belongs to no fix round,
+        // so the approved gate is finalized by the plan review commit path.
+        fs::write(f.root.join("notes.md"),"pre-existing work\n").unwrap();
         f.setting("test_plan_staging_crash",json!(true));
         let p = f.run();
-        assert_eq!(p["plan_review"]["gate"]["status"],"approved");
+        assert_eq!(p["plan_review"]["gate"]["status"],"approved","{p}");
         assert_eq!(p["plan_review"]["commit_state"],"staging");
         assert_eq!(f.ctx.git(&["write-tree"]).unwrap(),p["plan_review"]["gate"]["identity"]["snapshot"]["tree"]);
         assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),"3");
@@ -1506,7 +1532,11 @@ fn plan_review_recovers_staging_crash_but_rejects_new_content_or_index() {
         let resumed = f.run();
         assert_eq!(f.ctx.forge_path("reports.jsonl").exists(),change == "none","{change}: {}",resumed["plan_review"]["gate"]);
         assert_eq!(f.ctx.git(&["rev-list","--count","HEAD"]).unwrap(),if change == "none" {"4"} else {"3"});
-        assert_eq!(f.plan_calls().len(),4);
+        if change == "none" {
+            assert_eq!(f.ctx.git(&["show","-s","--format=%B","HEAD"]).unwrap(),
+                "fix(review): apply deferred plan review findings");
+            assert!(resumed["plan_review"]["fix_sha"].is_string());
+        }
     }
 }
 

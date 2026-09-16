@@ -26,6 +26,8 @@ fn state_plan_review_is_bounded_and_never_loads_verdict_payloads() {
             "gate":{"status":"blocked","roles":{"architect":"blocked","reviewer":"blocked"},
                 "identity":identity,"requests":vec![json!({"role":"architect","text":long});20]},
             "model_invocations":vec![json!({"role":"fixer","requested":{"model":long},"failure":long});20],
+            "fixes":(0..20).map(|round| json!({"round":round,"sha":format!("sha{round}"),
+                "message":long,"requests":vec![long.clone();20],"files":vec![long.clone();20]})).collect::<Vec<_>>(),
             "subject":{"large":long},"acceptance":long,"retries":{"history":vec![long.clone();20]},
             "outstanding_requests":vec![format!("[reviewer] {long}");20],"unknown":long}});
     let mut plan = plan;
@@ -60,6 +62,12 @@ fn state_plan_review_is_bounded_and_never_loads_verdict_payloads() {
     assert_eq!(review["model_invocation_count"],20);
     assert_eq!(review["model_invocations_truncated"],true);
     assert_eq!(review["model_invocations"].as_array().unwrap().len(),8);
+    assert_eq!(review["fix_count"],20);
+    assert_eq!(review["fixes_truncated"],true);
+    assert_eq!(review["fixes"].as_array().unwrap().len(),crate::review_history::PREVIEW_COUNT);
+    assert_eq!(review["fixes"][0]["round"],12);
+    assert_eq!(review["fixes"][0]["sha"],"sha12");
+    assert!(review["fixes"].as_array().unwrap().iter().all(|f| f.to_string().len() <= 4096));
     for key in ["subject","acceptance","retries","unknown"] { assert!(review.get(key).is_none()); }
     assert!(review.to_string().len() < 100 * 1024);
     let mut twice = state["plan"].clone();

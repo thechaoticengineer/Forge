@@ -78,7 +78,10 @@ pub(crate) fn completed_run_report(
     if let Some(review) = plan.get("plan_review").filter(|r| r.is_object()) {
         report["plan_review"] = json!({"status":review["gate"]["status"],
             "rounds":review["rounds"], "roles":review["gate"]["roles"],
-            "base":review["base"], "fix_sha":review["fix_sha"]});
+            "base":review["base"], "fix_sha":review["fix_sha"],
+            // Each fix round commits, so the report keeps its own commit trail.
+            "fixes":review["fixes"].as_array().into_iter().flatten()
+                .map(|fix| json!({"round":fix["round"], "sha":fix["sha"]})).collect::<Vec<_>>()});
         for key in ["usage", "role_usage"] {
             if let Some(value) = review.get(key) { report["plan_review"][key] = value.clone(); }
         }
