@@ -380,22 +380,27 @@ A `ready` result adds `goal` (the trimmed rewrite); a `failed` result adds `erro
 ### Discussing before planning
 
 Before creating a plan, you can have a multi-turn conversation with the configured
-planner tool about the repository and possible solutions. Type a message in the
-**Discuss before planning** section of the panel, then click **Send** or press `Enter`.
+planner tool about the repository and possible solutions. Click the **Discuss before
+planning** entry point in the panel to open a dedicated chat view showing the full
+discussion. Type a message into the composer and click **Send**, or press `Enter`.
 The planner reads the repository read-only and replies in a normal back-and-forth
-conversation. Use `t` to focus the discussion input; `Enter` sends the message and
-leaves the input, `Escape` leaves without sending, and `Shift+Enter` inserts a newline.
-In expanded view, the conversation appears as a chat that reads top to bottom,
-with the newest message at the bottom just above the message input. Your messages
-are right-aligned with an accent tint, and Forge's replies are left-aligned in a
-neutral surface color. While a reply is pending, your message and a "Forge is replying…"
-indicator appear at the bottom of the chat. A failed reply shows the error there
-and puts your message back into the input for revision. The chat scrolls to new
-messages when they arrive, unless you have scrolled up to read earlier ones. Each
-message has a Copy button in its header, and you can select and copy the text
-directly. Tab moves focus between messages. When the section is collapsed, a
-one-line status shows pending activity or an error. Each new reply includes all
-prior messages, so the discussion can refine and settle on an approach.
+conversation. The chat view shows the conversation in a scrollable transcript that
+reads top to bottom, with the newest message at the bottom. Your messages are
+right-aligned with an accent tint, and Forge's replies are left-aligned in a
+neutral surface color. The view displays a clearly visible **← Back** return control
+at the top; press it, `Escape`, or `q` to close the chat and return to the full panel.
+While the chat is closed, a one-line status beside the entry point shows any pending
+reply or error.
+
+While a reply is pending, your message and a "Forge is replying…" indicator appear
+at the bottom of the chat. A failed reply shows the error in the status line and puts
+your message back into the composer for revision. The chat scrolls to new messages
+when they arrive, unless you have scrolled up to read earlier ones. Each message has
+a Copy button in its header, and you can select and copy the text directly. Tab moves
+focus between messages. In the composer, `Enter` sends the message and `Shift+Enter`
+inserts a newline; `Escape` leaves the field (a second `Escape` closes the chat).
+Press `i` to return focus to the composer after leaving it. Each new reply includes
+all prior messages, so the discussion can refine and settle on an approach.
 
 Sending discussion messages never starts plan creation. When you are ready to
 plan from the conversation, click **Create plan from discussion** (or press `P`)
@@ -657,7 +662,7 @@ answers without modifying the plan. Expand **Plan Q&A** to read the
 conversation. Asking requires an existing plan, with Forge idle, the queue
 inactive, and plan editing closed.
 
-This is separate from the **Discuss before planning** section, which does not
+This is separate from the **Discuss before planning** chat, which does not
 require an existing plan and produces a new plan from the discussion rather than
 answering questions about it.
 
@@ -981,7 +986,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
-| `t` | Focus the discussion message input |
+| `t` | Open the discussion chat |
 | `P` | Create plan from discussion |
 | `E` | Enhance the goal description with AI |
 | `e` | Edit plan stages by hand |
@@ -1012,6 +1017,14 @@ These shortcuts apply in normal mode, with text-field behavior noted below.
 | `Enter` | Open selection; in filter, open first match; in path field, set path |
 | `/` / `i` | Edit project filter (insert mode) |
 | `q` / `Escape` | Close chooser (Escape leaves a text field first) |
+
+#### Discussion chat
+
+| Key | Action |
+| --- | --- |
+| `i` | Edit the message (insert mode) |
+| `Enter` / `Shift+Enter` | Send the message / insert a newline |
+| `q` / `Escape` | Close the chat (Escape leaves the message field first) |
 
 #### Keyboard help
 
