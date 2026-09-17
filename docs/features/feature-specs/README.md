@@ -1,6 +1,6 @@
 # Feature specs (self-specification)
 
-**Status: M1 (format and discovery) and M4 (pen.dev integration) are implemented.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). M1 enables the engine to discover and validate feature folders and expose them via an API and panel list. M4 integrates pen.dev for headless design editing and PNG export (see scenarios S20-S26 and business tests in src/pen_dev_tests.rs). Milestones M2 (spec phase), M3 (feature to plans), and M5 (panel viewer) remain planned, and the existing goal, discussion, planning, execution and queue workflows are unchanged.
+**Status: M1 (format and discovery), M2 (spec phase) and M4 (pen.dev integration) are implemented.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). M1 enables the engine to discover and validate feature folders and expose them via an API and panel list. M2 adds feature creation from the template, a read-only co-authoring agent, an architect spec review, and spec and scenario approvals bound to a Git commit and a content hash (see scenarios S10-S19 and business tests in src/feature_spec_m2_tests.rs and tests/panel_feature_spec.test.mjs). M4 integrates pen.dev for headless design editing and PNG export (see scenarios S20-S26 and business tests in src/pen_dev_tests.rs). Milestones M3 (feature to plans) and M5 (panel viewer) remain planned, and the existing goal, discussion, planning, execution and queue workflows are unchanged.
 
 ## Goal
 
@@ -54,7 +54,7 @@ See `docs/features/README.md` for the full folder format and flow description, a
 ## Open questions
 
 - Which Mermaid rendering option (pre-rendered SVG via `mmdc`, or showing source) will the panel viewer use?
-- What is the exact schema of `.forge/features/<slug>.json`? (M2 fixes its content: status, architect reviews, and approvals bound to a commit and content hash — see D10; field names are decided during implementation.)
+- ~~What is the exact schema of `.forge/features/<slug>.json`?~~ Decided in M2: see [Feature runtime state](../../../README.md#feature-runtime-state) in the top-level README and `src/feature_state.rs`.
 - How do scenario IDs (S1, S2, ...) map to generated test names?
 - ~~How are spec co-authoring writes restricted to a single feature folder?~~ Decided in D8.
 - ~~What does "architect spec review" require beyond the existing plan-review mechanics?~~ Decided in D9.

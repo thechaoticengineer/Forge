@@ -1,8 +1,8 @@
 # Scenarios
 
-**Status: M1 scenarios (S1-S9) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation.**
+**Status: M1 scenarios (S1-S9), M2 scenarios (S10-S19) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation.**
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery) and M4 (pen.dev integration); scenarios for M2, M3, and M5 are to be written before those milestones are planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery), M2 (spec phase) and M4 (pen.dev integration); scenarios for M3 and M5 are to be written before those milestones are planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M2 scenarios are verified by business tests in src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
 
 ## S1: A valid feature folder is discovered
 

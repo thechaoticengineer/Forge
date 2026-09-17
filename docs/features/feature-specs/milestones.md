@@ -1,8 +1,8 @@
 # Milestones
 
-**Status: M1 and M4 are implemented; M2, M3, and M5 are planned.**
+**Status: M1, M2 and M4 are implemented; M3 and M5 are planned.**
 
-The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9) and M4's scenarios (S20-S26) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
+The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9), M2's scenarios (S10-S19) and M4's scenarios (S20-S26) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
 
 ## M1: Format and discovery
 
@@ -14,9 +14,11 @@ Business tests: src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.t
 
 ## M2: Spec phase
 
-Not yet implemented. Creating a feature from the template; a co-authoring agent whose writes are restricted to a single feature folder; an architect spec review of the draft; spec and scenario approvals, with the spec committed on approval and approvals recorded in runtime state.
+**Implemented.** Creating a feature from the template; a co-authoring agent whose writes are restricted to a single feature folder; an architect spec review of the draft; spec and scenario approvals, with the spec committed on approval and approvals recorded in runtime state.
 
 Covers: S10, S11, S12, S13, S14, S15, S16, S17, S18, S19
+
+Business tests: src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18)
 
 ## M3: Feature to plans
 

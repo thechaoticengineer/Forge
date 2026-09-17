@@ -1,6 +1,6 @@
 # Feature specs
 
-**Status: M1 (format and discovery) and M4 (pen.dev integration) are implemented.** The Forge engine discovers `docs/features/<slug>/` folders, validates required files and scenario structure, and exposes them via a read-only `GET /api/features` endpoint. Agents edit pen.dev `.pen` files headlessly via the shell with the bundled skill, and the engine exports PNGs after each editing turn before review and commit. Milestones M2 (spec phase), M3 (feature to plans), and M5 (panel viewer) remain planned. Runtime state storage (`.forge/features/<slug>.json`) and the existing goal, discussion, planning, execution and queue workflows remain unchanged.
+**Status: M1 (format and discovery), M2 (spec phase) and M4 (pen.dev integration) are implemented.** The Forge engine discovers `docs/features/<slug>/` folders, validates required files and scenario structure, and exposes them via a read-only `GET /api/features` endpoint. It also lets a feature be created from the template, co-authored by a read-only agent whose proposed writes it validates and applies, reviewed by the persistent architect, and approved (spec, then scenarios) with each approval bound to a Git commit and a content hash. Agents edit pen.dev `.pen` files headlessly via the shell with the bundled skill, and the engine exports PNGs after each editing turn before review and commit. Milestones M3 (feature to plans) and M5 (panel viewer) remain planned. The existing goal, discussion, planning, execution and queue workflows remain unchanged.
 
 ## Purpose
 
@@ -54,9 +54,9 @@ Empty templates of these files are available in `docs/features/_template/` to co
 
 The feature specification flow proceeds in order:
 
-1. **Draft** — the spec folder is created and written with README, design sketches, scenarios and initial decisions.
-2. **Architect spec review** — the architect reviews the proposed goal, scope, scenarios and decisions for consistency and feasibility.
-3. **Scenario approval** — scenarios are reviewed and approved as acceptance criteria.
+1. **Draft** — the spec folder is created (from the panel's "New feature" action, which copies `docs/features/_template/`) and written with README, design sketches, scenarios and initial decisions, edited by hand or through the panel's read-only co-authoring chat.
+2. **Architect spec review** — requested from the panel, the architect reviews the proposed goal, scope, scenarios and decisions for consistency and feasibility and returns a structured verdict.
+3. **Scenario approval** — once the architect has approved the spec, the panel's approval actions record the spec approval and then the scenario approval, each bound to a Git commit and a content hash of the folder.
 4. **Milestones** — the feature is split into successive milestones, each covering a subset of the scenarios.
 5. **One Forge plan per milestone** — for each milestone:
    - The first stage of the plan turns that milestone's scenarios into executable tests that fail before implementation.
@@ -74,7 +74,9 @@ The executable tests generated from scenarios are the project's business tests. 
 
 ## Runtime state
 
-Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it. This file is not yet produced; it will be created starting with milestone M2, which introduces approvals committed to runtime state.
+Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it.
+
+This file is produced starting with milestone M2. A missing file means the defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[], "architect_session":null}`. `reviews` holds append-only architect spec review records (verdict, issues, questions, content hash, provider/model/session); `approvals` holds append-only spec and scenario approval records, each bound to a Git commit and a content hash of the folder; `chat` holds the co-authoring transcript; `architect_session` remembers the feature's own architect session when no plan session was resumed. A feature's status (draft, spec approved, or scenarios approved) is derived from this state and the folder's current content hash on every read, never stored: changing any file in the folder after an approval returns the status to draft while the earlier reviews and approvals remain as history. See [the feature-spec API in the top-level README](../../README.md#feature-specs) for the exact schema and the endpoints that read and write it.
 
 ## See also
 

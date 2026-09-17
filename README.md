@@ -5,7 +5,7 @@ building software — including Forge itself — with almost no ceremony.
 
 Rust engine + Quickshell (Omarchy) panel.
 
-A feature-spec planning workflow is documented in [docs/features/](docs/features/README.md); it is planned and not yet implemented by the engine.
+A feature-spec planning workflow is documented in [docs/features/](docs/features/README.md); milestones M1, M2 and M4 are implemented by the engine, and M3 and M5 remain planned.
 
 ## The loop
 
@@ -839,31 +839,163 @@ the queue and whether it is active.
 The feature-spec workflow ([documented in `docs/features/`](docs/features/README.md)) organizes
 specifications, scenarios and milestones for a feature before it is planned. Milestone M1 lets the
 engine discover and validate feature folders and expose them through a read-only API and a panel list.
-Milestone M4 adds pen.dev integration for UI mockups in feature specifications.
+Milestone M2 adds the spec phase: creating a feature from the template, a read-only co-authoring agent
+whose proposed file changes the engine validates and writes, an architect spec review, and spec and
+scenario approvals bound to a Git commit and a content hash. Milestone M4 adds pen.dev integration for
+UI mockups in feature specifications. Milestones M3 (feature to plans) and M5 (panel viewer) remain
+planned.
 
 ```
 GET /api/features[?project=<path>]
 ```
 
-Returns `{"project": "/path/to/project", "features": [{"slug", "title", "path", "status", "reasons"}, ...]}`,
-sorted by slug. `slug` is the folder name under `docs/features/` (names starting with `_`, like
-`_template`, are excluded). `title` is the feature's first `# ` heading in `README.md` (outside
-fenced code blocks), or the slug if there is none. `path` is the feature folder's absolute path.
-`status` is `"valid"` or `"invalid"`; `reasons` lists validation errors (missing or unreadable
-required files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines) and
-is empty when valid. The endpoint is read-only: it never creates, modifies or removes files.
-`?project=<URL-encoded-path>` targets another project without switching the active one. When
-`docs/features/` is absent or empty, `features` is `[]`.
+Returns `{"project": "/path/to/project", "features": [...], "activity"}`, features sorted by slug.
+Each feature keeps its M1 fields — `slug` (the folder name under `docs/features/`; names starting with
+`_`, like `_template`, are excluded), `title` (the feature's first `# ` heading in `README.md` outside
+fenced code blocks, or the slug if there is none), `path` (the feature folder's absolute path),
+`status` (`"valid"` or `"invalid"`) and `reasons` (validation errors — missing or unreadable required
+files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines — empty when
+valid) — and adds the M2 spec-phase fields:
+
+- `spec_status`: `"draft"`, `"spec approved"` or `"scenarios approved"`, derived on every read from the
+  feature's approvals and the folder's current content hash; it is never stored as authoritative state.
+  A feature whose runtime state file exists but cannot be read or parsed reports `spec_status: "error"`
+  with a `state_error` reason instead of being silently treated as `"draft"`.
+- `content_hash`: a lowercase sha256 hex digest of the feature folder's file paths and contents
+  (symlinks are hashed by their target text and never followed).
+- `latest_review`: the feature's most recent architect spec review record (see below), or `null`.
+- `review_current`: `true` when `latest_review`'s content hash equals the current `content_hash`.
+
+The top-level `activity` is `null`, or the most recent feature chat or architect-review request:
+`{"kind": "chat"|"review", "slug", "request_id", "status": "running"|"ready"|"failed", "error"?}`. The
+endpoint remains read-only: it never creates, modifies or removes files. `?project=<URL-encoded-path>`
+targets another project without switching the active one. When `docs/features/` is absent or empty,
+`features` is `[]`.
 
 ```bash
 curl http://127.0.0.1:8734/api/features
 curl http://127.0.0.1:8734/api/features?project=%2Fpath%2Fto%2Fproject
 ```
 
-The panel lists discovered features with their title, slug and validation status (with reasons for
-invalid ones), opened with the **Features** button or the `f` key; see [Feature list](#feature-list)
-below for its overlay controls. Opening a feature runs `omarchy-launch-editor <folder>` to edit it
-in nvim. The panel fetches features only when the overlay opens or refreshes; it does not poll.
+```
+GET /api/features/state?slug=<slug>[&project=<path>]
+```
+
+Returns one feature's full picture: `{"project", "slug", "valid", "reasons", "spec_status",
+"content_hash", "latest_review", "review_current", "state", "activity"}`, where `state` is that
+feature's complete runtime state record (see [Feature runtime state](#feature-runtime-state) below).
+HTTP 400 for an invalid slug; 404 when discovery does not list the slug; 500 `{"error"}` when the
+runtime state file exists but cannot be read or parsed, rather than a silent reset.
+
+```
+POST /api/features/create {"project"?, "slug", "title"}
+```
+
+Creates `docs/features/<slug>/` from `docs/features/_template/`, replacing the first `# ` heading
+(outside fenced code) of the copied `README.md` with `<title>`. Nothing is staged or committed; approval
+owns the folder's first commit (see approve_spec below). Returns 200 `{"ok": true, "slug"}`. HTTP 400
+for an invalid slug (`^[a-z0-9]+(-[a-z0-9]+)*$`, at most 64 bytes) or title (trimmed, non-empty, at most
+200 characters, a single line); 409 when the folder already exists, or when `docs/features/_template/`
+is missing (there is no engine-bundled fallback template); 409 `{"error":"busy"}` while the engine is
+busy or the queue is active.
+
+```
+POST /api/features/chat {"project"?, "slug", "message"}
+```
+
+Sends one message to the read-only co-authoring agent for the feature. Returns 200
+`{"ok": true, "request_id"}` and runs the turn in the background; poll `GET /api/features` or
+`GET /api/features/state` and watch `activity` for its outcome. HTTP 400 for an invalid slug, an empty
+message, or a message over 20000 characters; 404 for an unknown feature; 409 `{"error":"busy"}` while
+the engine is busy or the queue is active.
+
+The agent never writes files itself: it returns a reply and a list of proposed `{"path", "content"}`
+files as JSON, and the engine alone validates every path against `docs/features/<slug>/` and then
+writes the whole set, or nothing. A path that is not strictly inside that folder — absolute, containing
+a `.` or `..` component, a prefix trick such as `docs/features/<slug>-x/`, or passing through a symlink
+anywhere along it — is rejected and sent back to the agent through the shared response-correction
+budget (see [Shared response correction](#shared-response-correction)); every destination is checked
+again immediately before writing. On success, the user's message and the agent's reply are appended to
+the feature's `chat` history; on any failure (an exhausted correction budget, a provider error, or a
+stopped run) nothing is written, `chat` is unchanged, and `activity.status` becomes `"failed"` with an
+`error`.
+
+```
+POST /api/features/review {"project"?, "slug"}
+```
+
+Requests a structured architect spec review of the feature's current content. Returns 200
+`{"ok": true, "request_id"}` and runs the turn in the background. HTTP 400 for an invalid slug; 404 for
+an unknown feature; 409 `{"error": "feature is invalid: <reasons joined by '; '>", "reasons": [...]}`
+when the feature fails M1 validation — checked, and refused, before any agent starts; 409
+`{"error":"busy"}` while the engine is busy or the queue is active.
+
+The review is a read-only turn of the persistent architect: no stage, snapshot or project-check
+requirements, validated through the same shared response-correction policy used for stage and plan
+reviews. When the plan's architect session is ready and uses the same provider, the review resumes that
+session and the turn is recorded in the plan's architecture history; otherwise the feature keeps its own
+architect session in its runtime state and resumes it on the next review. On success, a review record
+`{"id", "approved", "summary", "issues", "questions", "content_hash", "provider", "model", "session",
+"unix"}` is appended to the feature's `reviews` history; on any failure nothing is recorded and
+`activity.status` becomes `"failed"` with an `error`.
+
+```
+POST /api/features/approve_spec {"project"?, "slug"}
+```
+
+Approves the spec of a feature whose latest architect review approved its current content. Synchronous:
+commits only `docs/features/<slug>/` — a path-scoped `git add` followed by a path-scoped `git commit`,
+so other staged or unstaged changes are left exactly as they were — as `docs(features): approve <slug>
+spec`, appends `{"kind":"spec", "commit", "content_hash", "unix"}` to the feature's `approvals`, and
+returns 200 `{"ok": true, "commit", "content_hash", "spec_status": "spec approved"}`. A folder that
+already matches HEAD produces no new commit; the recorded commit is HEAD either way, which makes a
+retry after a failed state write safe. HTTP 400 for an invalid slug; 404 for an unknown feature; 409
+`{"error":"busy"}` while the engine is busy or the queue is active; 409 with a reason and no commit when
+the feature fails M1 validation, has no architect review, its latest review requested changes, or its
+latest review's content hash no longer matches the folder.
+
+```
+POST /api/features/approve_scenarios {"project"?, "slug"}
+```
+
+Approves the scenarios of a feature whose spec approval still matches the current content. Appends
+`{"kind":"scenarios", "scenario_ids", "commit", "content_hash", "unix"}` — `scenario_ids` are the IDs
+from `scenarios.md` in document order, and `commit`/`content_hash` are copied from the spec approval, so
+this endpoint creates no commit of its own — and returns 200 `{"ok": true, "scenario_ids", "commit",
+"content_hash", "spec_status": "scenarios approved"}`. HTTP 400/404/409 busy as above; 409 when the
+feature is invalid, has no spec approval, or its spec approval no longer matches the current content.
+
+#### Feature runtime state
+
+Reviews, approvals and the co-authoring chat transcript are runtime state, stored at
+`.forge/features/<slug>.json` inside the project, never under `docs/features/`. A missing file means the
+defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[], "architect_session":null}`.
+Reviews and approvals are append-only: a later review or approval never removes an earlier one, so the
+full history survives every later change. The file is written through the engine's durable-publish
+protocol (temp file, fsync, rename), so an interrupted write never leaves invalid JSON and a stray temp
+file next to it is ignored on read; a file that exists but is unreadable or structurally wrong is
+reported as an error rather than silently reset, since resetting it would discard approval history.
+
+`spec_status` is derived from this state and the folder's current content hash, never stored: it is
+`"scenarios approved"` when the latest `spec` and `scenarios` approvals both carry the current content
+hash, `"spec approved"` when only the latest `spec` approval does, and `"draft"` otherwise. Changing any
+file in `docs/features/<slug>/` afterwards — through co-authoring or by hand — therefore returns the
+status to `draft` on the next read, while every earlier review and approval remains in the history; a
+new approving review and a new spec approval are required before approving again.
+
+The panel lists discovered features with their title, slug, validation status and spec-phase status
+(with reasons for invalid ones), opened with the **Features** button or the `f` key; see
+[Feature list](#feature-list) below for its overlay controls. Opening a feature runs
+`omarchy-launch-editor <folder>` to edit it in nvim. The panel fetches features when the overlay opens or
+refreshes; while a chat or review request it started is still running, it also polls `GET /api/features`
+(and the selected feature's state) once a second until that activity is ready or failed.
+
+From the feature list you can create a feature (slug and title), select one to see its detail — the
+latest architect review's verdict (approved or changes requested, with its summary, issues and
+questions) and the co-authoring chat transcript — send a message to the co-authoring agent, request an
+architect spec review, and approve the spec and then the scenarios once each becomes allowed. Engine
+refusals (invalid slug or title, an unapproved or stale review, a busy engine, and so on) are shown
+inline in the list.
 
 #### pen.dev integration (M4)
 
@@ -1104,10 +1236,18 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 
 #### Feature list
 
+Typing in the new-feature or chat-message fields is handled by the field itself, like other panel
+text fields; the shortcuts below apply in normal mode.
+
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select next / previous feature |
 | `Enter` / `o` | Open the selected feature folder in nvim (via `omarchy-launch-editor`) |
+| `n` | Open the new-feature form (slug and title) |
+| `c` | Select the feature and focus the co-authoring chat message field |
+| `v` | Request an architect spec review of the selected feature |
+| `a` | Approve the selected feature's spec |
+| `A` | Approve the selected feature's scenarios |
 | `R` | Refresh the feature list |
 | `q` / `Escape` | Close the feature list |
 
