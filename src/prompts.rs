@@ -395,3 +395,30 @@ Rules for "files":
 - Every path must be repository-relative and inside {folder}/; no absolute path, no "..", no "." and no symlink.
 - "content" is the complete new text of the file, not a patch; at most {max_files} files and at most {max_kib} KiB per file.
 - The engine validates every path and writes the files for you. A rejected response comes back to you for correction."#;
+
+/// Architect spec review of one feature folder (M2, S13, decision D9).
+/// Read-only, no project checks: a spec is documentation, so builds and tests
+/// add nothing. The identity is echoed so a verdict can never be attributed to
+/// another feature or to content the architect did not see.
+pub(crate) const FEATURE_REVIEW_PROMPT: &str = r#"You are this project's persistent architect, reviewing one feature specification. The feature is {slug} and its folder is {folder}.
+{plan_context}
+A feature folder holds README.md (goal, scope, behaviour), scenarios.md (acceptance scenarios with stable IDs S1, S2, ...), decisions.md (decisions with stable IDs D1, D2, ...) and milestones.md (milestones with stable IDs M1, M2, ... covering scenario IDs).
+
+Here are the current contents of {folder} (possibly truncated):
+{folder_text}
+
+Judge this specification on:
+- internal consistency (scope, scenarios, decisions and milestones agree; every scenario is covered),
+- feasibility (the behaviour can be built as specified),
+- conflicts with the existing architecture and with decisions already taken in this repository.
+
+You run READ-ONLY: do NOT create, modify or remove any file, do NOT run git, and do NOT implement anything. No build and no test run is required or expected; this is a documentation review.
+Return ONLY one JSON object, with no prose and no markdown fences, with exactly this schema:
+{"slug": "{slug}", "content_hash": "{content_hash}", "approved": true, "summary": "one paragraph", "issues": [], "questions": []}
+
+Rules:
+- Echo "slug" and "content_hash" exactly as given above; they identify the reviewed content.
+- "approved" is true only when you have no issue and no question; then "issues" and "questions" must both be empty.
+- "approved" is false when the spec needs changes; then give at least one entry in "issues" (a required change) or "questions" (something you need answered).
+- "summary" is a non-empty string; every entry of "issues" and "questions" is a non-empty string, at most {max_entries} entries each.
+- The engine validates this verdict and returns it to you for correction if it is malformed."#;

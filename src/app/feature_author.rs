@@ -211,7 +211,7 @@ fn ensure_dirs(project: &Path, path: &str) -> Result<(), String> {
 /// The folder's current text, bounded per file and in total, with every
 /// truncation or omission noted so the agent never treats a cut file as
 /// complete. Symlinks are listed but never followed.
-fn folder_text(dir: &Path, folder: &str) -> Result<String, String> {
+pub(crate) fn folder_text(dir: &Path, folder: &str) -> Result<String, String> {
     let mut entries = Vec::new();
     collect(dir, Path::new(""), &mut entries)?;
     entries.sort();

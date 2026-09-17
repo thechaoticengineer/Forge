@@ -53,6 +53,8 @@ mod feature_state_tests;
 #[cfg(test)]
 mod feature_author_tests;
 #[cfg(test)]
+mod feature_review_tests;
+#[cfg(test)]
 mod pen_dev_tests;
 #[cfg(test)]
 mod architecture_integration_tests;

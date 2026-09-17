@@ -698,7 +698,7 @@ impl Ctx {
 
 /// Formats an identity as a UUID-shaped mock session id. Identities have
 /// variable-length hex parts, so pad (and truncate) to 32 digits before slicing.
-fn mock_session_uuid(identity: &str) -> String {
+pub(crate) fn mock_session_uuid(identity: &str) -> String {
     let raw: String = format!("{:0<32}", identity.replace('-', "")).chars().take(32).collect();
     format!("{}-{}-{}-{}-{}", &raw[..8], &raw[8..12], &raw[12..16], &raw[16..20], &raw[20..32])
 }

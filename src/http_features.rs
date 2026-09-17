@@ -106,3 +106,48 @@ pub(super) fn api_feature_chat(ctx: &Ctx, body: &Value) -> ApiResponse {
     std::thread::spawn(move || worker.feature_chat_worker(&worker_slug, &message, request_id));
     (200, json!({"ok": true, "request_id": request_id}))
 }
+
+/// Admission of one architect spec review (S13/S14).
+///
+/// An invalid feature is refused with its validation reasons *before* the
+/// engine takes the busy claim or starts any agent, so a refusal never blocks
+/// other work and never reaches a provider (S14).
+pub(super) fn api_feature_review(ctx: &Ctx, body: &Value) -> ApiResponse {
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+    let slug = body["slug"].as_str().unwrap_or("").to_string();
+    if let Err(error) = feature_state::validate_slug(&slug) {
+        return (400, json!({"error": error}));
+    }
+    let Some(feature) = crate::features::discover(Path::new(ctx.project()))
+        .into_iter()
+        .find(|feature| feature.slug == slug)
+    else {
+        return (404, json!({"error": format!("unknown feature: {slug}")}));
+    };
+    if !feature.reasons.is_empty() {
+        return (
+            409,
+            json!({
+                "error": format!("feature is invalid: {}", feature.reasons.join("; ")),
+                "reasons": feature.reasons,
+            }),
+        );
+    }
+    if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+        return (409, json!({"error": "busy"}));
+    }
+    ctx.session.stop_requested.store(false, Ordering::SeqCst);
+    let request_id = {
+        let mut state = ctx.session.state.lock().unwrap();
+        state.feature_serial += 1;
+        let request_id = state.feature_serial;
+        state.feature_activity = json!({"kind":"review","slug":slug,"request_id":request_id,
+            "status":"running","unix":crate::util::unix_timestamp()});
+        request_id
+    };
+    ctx.log_event("features", &format!("architect spec review of {slug}"));
+    let worker = ctx.clone();
+    let worker_slug = slug.clone();
+    std::thread::spawn(move || worker.feature_review_worker(&worker_slug, request_id));
+    (200, json!({"ok": true, "request_id": request_id}))
+}

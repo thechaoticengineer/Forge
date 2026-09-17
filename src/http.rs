@@ -53,6 +53,7 @@ impl<'a> ApiRequest<'a> {
                 | "/api/features/state"
                 | "/api/features/create"
                 | "/api/features/chat"
+                | "/api/features/review"
                 | "/api/architecture/history"
                 | "/api/architecture/reviews"
                 | "/api/agent_log"
@@ -194,6 +195,7 @@ fn dispatch(
             api_feature_create(ctx, &request.body)
         }
         (tiny_http::Method::Post, "/api/features/chat") => api_feature_chat(ctx, &request.body),
+        (tiny_http::Method::Post, "/api/features/review") => api_feature_review(ctx, &request.body),
         (tiny_http::Method::Get, "/api/agent_records") => api_agent_records(ctx, request.query),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(ctx, request.query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(ctx),

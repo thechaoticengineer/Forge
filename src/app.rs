@@ -5,6 +5,9 @@ mod execution;
 /// Co-authoring writes are engine-owned, so its validators are unit-tested
 /// directly (see src/feature_author_tests.rs).
 pub(crate) mod feature_author;
+/// The spec review reuses the persistent-architect invariants; its verdict
+/// validator is unit-tested directly (see src/feature_review_tests.rs).
+pub(crate) mod feature_review;
 mod git;
 mod history;
 mod persistence;
