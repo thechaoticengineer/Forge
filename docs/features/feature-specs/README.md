@@ -54,7 +54,7 @@ See `docs/features/README.md` for the full folder format and flow description, a
 ## Open questions
 
 - Which Mermaid rendering option (pre-rendered SVG via `mmdc`, or showing source) will the panel viewer use?
-- What is the exact schema of `.forge/features/<slug>.json`?
+- What is the exact schema of `.forge/features/<slug>.json`? (M2 fixes its content: status, architect reviews, and approvals bound to a commit and content hash — see D10; field names are decided during implementation.)
 - How do scenario IDs (S1, S2, ...) map to generated test names?
-- How are spec co-authoring writes restricted to a single feature folder?
-- What does "architect spec review" require beyond the existing plan-review mechanics?
+- ~~How are spec co-authoring writes restricted to a single feature folder?~~ Decided in D8.
+- ~~What does "architect spec review" require beyond the existing plan-review mechanics?~~ Decided in D9.

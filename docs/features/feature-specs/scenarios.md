@@ -57,3 +57,63 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: `docs/features/` is absent from the repository, or present but empty
 - When: the user drives the existing goal, optional discussion, planning, staged execution and queue flow
 - Then: that flow behaves exactly as it does today, with no change caused by the absence or emptiness of `docs/features/`
+
+## S10: A new feature is created from the template
+
+- Given: no folder `docs/features/<slug>/` exists for a valid new slug
+- When: the user creates a feature with that slug and a title from the panel
+- Then: the folder is created from `docs/features/_template/` with the title as the README heading, the feature appears in the list with status `draft`, and nothing is committed yet
+
+## S11: The co-authoring agent edits only its feature folder
+
+- Given: a draft feature is open for co-authoring
+- When: the user sends a message asking for changes to the spec
+- Then: the agent replies and its proposed file changes are applied only to files inside `docs/features/<slug>/`
+
+## S12: Co-authoring writes outside the feature folder are rejected
+
+- Given: the co-authoring agent proposes a change to a path outside `docs/features/<slug>/` (including `..` or symlink escapes)
+- When: the engine validates the agent's response
+- Then: no file is written, and the rejection is returned to the agent through the shared response-correction budget
+
+## S13: The architect reviews the spec
+
+- Given: a draft feature that passes M1 validation
+- When: the user requests an architect spec review
+- Then: the persistent architect returns a structured verdict (approved, issues, questions) about consistency, feasibility and conflicts with the existing architecture, and the verdict is stored in the feature's runtime state and shown in the panel
+
+## S14: An invalid feature cannot be sent to spec review
+
+- Given: a feature that fails M1 validation
+- When: the user requests an architect spec review
+- Then: the request is refused with the validation reasons, and no agent is started
+
+## S15: Approving the spec commits the feature folder
+
+- Given: a feature whose latest architect spec review approved the current content
+- When: the user approves the spec
+- Then: the engine commits only `docs/features/<slug>/` as `docs(features): approve <slug> spec`, and records the commit and a content hash of the folder in `.forge/features/<slug>.json`
+
+## S16: The spec cannot be approved without an approving review of the current content
+
+- Given: a feature with no architect review, a rejecting review, or files changed since the approving review
+- When: the user approves the spec
+- Then: approval is refused with the reason, and nothing is committed
+
+## S17: Approving scenarios records their IDs
+
+- Given: a feature whose spec is approved and unchanged since approval
+- When: the user approves the scenarios
+- Then: the approved scenario IDs, commit and content hash are recorded in `.forge/features/<slug>.json`, and the feature status becomes `scenarios approved`
+
+## S18: Changing an approved spec reopens it
+
+- Given: a feature with an approved spec or approved scenarios
+- When: any file in `docs/features/<slug>/` changes afterwards (by co-authoring or manual editing)
+- Then: the feature status returns to `draft`, previous approvals are kept as history, and a new architect review and approval are required
+
+## S19: Runtime state is outside the repository
+
+- Given: any feature with reviews or approvals
+- When: its runtime state is saved
+- Then: it is written to `.forge/features/<slug>.json`, never to `docs/features/`, and the file stays valid JSON after an interrupted write

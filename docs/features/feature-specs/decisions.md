@@ -41,3 +41,21 @@ Reason: Keeps the committed spec folder as pure documentation, and matches how o
 Decision: After every plan, all business tests generated from approved scenarios, across all features, must pass. A business test may be changed or removed only after its scenario is deliberately changed or removed in the feature spec and that change is approved. Agents escalate conflicts with approved scenarios to the architect instead of adjusting the tests.
 
 Reason: Business tests are the executable form of the business documentation. If they could drift or be edited to fit an implementation, the documentation would stop describing what the product actually does.
+
+## D8: The engine, not the sandbox, restricts co-authoring writes
+
+Decision: The co-authoring agent runs read-only and returns proposed file contents as structured JSON. The engine validates every path against `docs/features/<slug>/` and writes the files itself.
+
+Reason: Path validation in the engine works the same for every provider and follows the existing pattern where agents return JSON and the engine alone applies effects.
+
+## D9: Architect spec review is a structured verdict of the persistent architect
+
+Decision: Spec review uses the plan's persistent architect session and returns `approved`, `issues` and `questions`, validated through the shared response-correction policy. It reuses existing verdict mechanics but has no stage, snapshot or project-check requirements.
+
+Reason: The architect already holds the project's architectural context; a spec is documentation, so running builds and tests adds nothing.
+
+## D10: Approvals are bound to content
+
+Decision: `.forge/features/<slug>.json` records, for each approval, the commit and a content hash of `docs/features/<slug>/`. Any later change to the folder returns the feature to `draft`; earlier approvals remain as history.
+
+Reason: An approval must always refer to exactly the content that was reviewed.

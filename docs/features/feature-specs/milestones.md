@@ -14,9 +14,9 @@ Business tests: src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.t
 
 ## M2: Spec phase
 
-Not yet implemented. A co-authoring agent whose writes are restricted to a single feature folder; an architect spec review of the draft; approvals committed to runtime state.
+Not yet implemented. Creating a feature from the template; a co-authoring agent whose writes are restricted to a single feature folder; an architect spec review of the draft; spec and scenario approvals, with the spec committed on approval and approvals recorded in runtime state.
 
-Covers: none yet
+Covers: S10, S11, S12, S13, S14, S15, S16, S17, S18, S19
 
 ## M3: Feature to plans
 
