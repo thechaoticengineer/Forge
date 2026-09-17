@@ -16,9 +16,11 @@ A feature-spec planning workflow is documented in [docs/features/](docs/features
    criteria, and a proposed commit message.
 3. You mark the plan OK in the panel.
 4. Forge runs each stage automatically:
-   - the **implementer** implements the stage and leaves it uncommitted. If git
-     history changed meanwhile, the engine changes nothing itself and asks the
-     architect to decide (see [Git history changes during a stage](#git-history-changes-during-a-stage)),
+   - the **implementer** implements the stage and leaves it uncommitted. The
+     implementer must fix every build error and failing test before handing off,
+     regardless of which change caused it; such failures are never out of scope.
+     If git history changed meanwhile, the engine changes nothing itself and asks
+     the architect to decide (see [Git history changes during a stage](#git-history-changes-during-a-stage)),
    - the engine classifies the full implementation snapshot,
    - a fresh, adversarial **independent reviewer** verifies the stage and its scope
      when scheduled per stage,
@@ -27,7 +29,9 @@ A feature-spec planning workflow is documented in [docs/features/](docs/features
    - requested edits return to the implementer, followed by the stage-required reviews again,
    - the engine commits the exact gated tree locally under an approved or deferred gate.
 5. After the last stage, Forge runs any deferred reviews over the plan's commit
-   range and fixes their findings. Only after that gate is clean and any approved
+   range and fixes their findings. The plan fixer must fix every build error and
+   failing test found by review, regardless of which change caused it; such
+   failures are never out of scope. Only after that gate is clean and any approved
    fixes are committed does it attempt a push to `origin` when `auto_push` is
    enabled and append the completed-run report. Plans without deferred roles
    skip this phase. Push failures are logged; report-storage failures are returned
@@ -1725,6 +1729,16 @@ under the same requirements blocks without repeating the planner dialogue.
 Malformed routing proposal fields are returned to the planner with the validation
 error for up to three corrections. The full proposal batch must validate before any
 stage receives a replacement proposal; unknown fields are never silently ignored.
+
+Agents must not disable tests, weaken assertions or suppress warnings merely to
+pass; intentional exceptions require repository-supported justification. When a
+test cannot pass because a stage or plan's intended behavior legitimately changes
+what the test expects, the agent must not delete, skip or weaken that test on its
+own. Stage implementers and fixers escalate through the engine outcome channel
+with status `escalation` and request kind `scope`, naming the test, the behavior
+change and the concrete evidence; the plan fixer surfaces it as an architectural
+context gap in the final response with the same details. The architect decides
+whether the test is updated or removed.
 
 A stop preserves the worktree, unresolved requests and last committed architect
 checkpoint. Restart retains spent fix rounds, retry/evaluation counts and trigger
