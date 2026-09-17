@@ -159,8 +159,8 @@ def _interactive(rest):
             for child in children:
                 sys.stdout.write("forge-frame " + str(child["id"]) + " " + str(child["name"]) + "\n")
             sys.stdout.flush()
-        elif line.startswith("Export("):
-            m = _EXPORT_RE.match(line)
+        elif "Export(" in line:
+            m = _EXPORT_RE.search(line)
             if not m:
                 sys.stdout.write("Error: cannot parse export call\n")
                 sys.stdout.flush()
@@ -710,7 +710,6 @@ fn s22_png_exported_for_every_changed_pen_file() {
 }
 
 #[test]
-#[ignore = "M4 pending: S23 not implemented yet"]
 fn s23_export_names_follow_top_level_frames() {
     // S23: Export file names follow the design's top-level frames
     assert_eq!(crate::pen::frame_slug("Main Screen"), "main-screen");
@@ -920,4 +919,290 @@ fn s26_reviewers_review_designs_through_pngs() {
         assert!(plan_review.contains(text), "plan reviewer prompt missing {text:?}: {plan_review}");
     }
     assert!(!plan_review.contains("pen interactive --in"), "reviewers must not get editing instructions: {plan_review}");
+}
+
+// ------------------------------------------------------ pen module units
+// Focused unit tests for src/pen.rs; not scenario tests.
+
+use crate::pen::ExportError;
+
+/// A temporary git repository with one initial commit, removed on Drop.
+struct Repo {
+    root: PathBuf,
+}
+
+impl Repo {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let root = std::env::temp_dir().join(format!("forge-pen-repo-{}", crate::architecture::identity()));
+        fs::create_dir_all(&root).unwrap();
+        let repo = Self { root };
+        repo.git(&["init", "-q"]);
+        repo.git(&["config", "user.name", "Fixture"]);
+        repo.git(&["config", "user.email", "fixture@example.invalid"]);
+        repo.git(&["config", "commit.gpgsign", "false"]);
+        fs::write(repo.root.join("README.md"), "demo\n").unwrap();
+        for (path, content) in files {
+            repo.write(path, content);
+        }
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-qm", "initial"]);
+        repo
+    }
+
+    fn write(&self, path: &str, content: &str) {
+        let full = self.root.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, content).unwrap();
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").args(args).current_dir(&self.root).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
+}
+
+impl Drop for Repo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn empty_search_dir() -> (PathBuf, OsString) {
+    let dir = std::env::temp_dir().join(format!("forge-pen-empty-{}", crate::architecture::identity()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = OsString::from(&dir);
+    (dir, path)
+}
+
+#[test]
+fn pen_references_designs_matches_pen_files_and_design_folders() {
+    for text in ["x.pen", "see design/screen.pen.", "docs/features/a/design/", "design/ first", "(ui.pen)"] {
+        assert!(crate::pen::references_designs(text), "{text}");
+    }
+    for text in ["open file", "redesign/ the API", "pending", "notes.pens", "my_design/ folder", "design folder"] {
+        assert!(!crate::pen::references_designs(text), "{text}");
+    }
+    assert!(crate::pen::stage_references_designs(&json!({"instructions": "Tidy up.", "acceptance": "screen.pen exported"})));
+    assert!(crate::pen::stage_references_designs(&json!({"instructions": "Add docs/features/x/design/ mockups"})));
+    assert!(!crate::pen::stage_references_designs(&json!({"instructions": "Tidy up.", "acceptance": "Done"})));
+}
+
+#[test]
+fn pen_frame_slug_replaces_each_non_alphanumeric_character() {
+    assert_eq!(crate::pen::frame_slug("Main  Screen"), "main--screen");
+    assert_eq!(crate::pen::frame_slug("A1_b"), "a1-b");
+    assert_eq!(crate::pen::frame_slug("Café!"), "caf--");
+    assert_eq!(crate::pen::frame_slug(""), "");
+}
+
+#[test]
+fn pen_find_pen_uses_only_the_explicit_search_path() {
+    let (dir, empty) = empty_search_dir();
+    assert_eq!(crate::pen::find_pen(&empty), None);
+    fs::write(dir.join("pen"), "not executable").unwrap();
+    assert_eq!(crate::pen::find_pen(&empty), None, "a non-executable file is not pen");
+
+    let cli = PenCli::new();
+    let joined = std::env::join_paths([dir.clone(), PathBuf::from(cli.direct_search_path())]).unwrap();
+    assert_eq!(crate::pen::find_pen(&joined), Some(PathBuf::from(cli.direct_search_path()).join("pen")));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_resolve_skill_follows_direct_symlink_without_running_pen() {
+    let cli = PenCli::new();
+    let skill = crate::pen::resolve_skill(&cli.direct_search_path());
+    assert_eq!(skill, Some(fs::canonicalize(cli.skill_path()).unwrap()));
+    assert!(cli.calls().is_empty(), "pen must not run: {:?}", cli.calls());
+}
+
+#[test]
+fn pen_resolve_skill_follows_mise_shim_without_running_pen() {
+    let cli = PenCli::new();
+    let skill = crate::pen::resolve_skill(&cli.mise_search_path());
+    assert_eq!(skill, Some(fs::canonicalize(cli.skill_path()).unwrap()));
+    assert!(cli.calls().is_empty(), "pen must not run: {:?}", cli.calls());
+}
+
+#[test]
+fn pen_resolve_skill_returns_none_without_skill_file() {
+    let cli = PenCli::new();
+    fs::remove_file(cli.skill_path()).unwrap();
+    assert_eq!(crate::pen::resolve_skill(&cli.direct_search_path()), None);
+    assert_eq!(crate::pen::resolve_skill(&cli.mise_search_path()), None);
+    let (dir, empty) = empty_search_dir();
+    assert_eq!(crate::pen::resolve_skill(&empty), None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_resolve_skill_falls_back_to_package_root() {
+    // An entry point nested below dist/ finds the skill via package.json.
+    let root = std::env::temp_dir().join(format!("forge-pen-pkg-{}", crate::architecture::identity()));
+    let pkg = root.join("lib/@pen.dev/cli");
+    fs::create_dir_all(pkg.join("dist/bin")).unwrap();
+    fs::create_dir_all(pkg.join("dist/out/skills/pen-dev")).unwrap();
+    fs::write(pkg.join("package.json"), r#"{"name": "@pen.dev/cli"}"#).unwrap();
+    fs::write(pkg.join("dist/out/skills/pen-dev/SKILL.md"), "skill").unwrap();
+    let entry = pkg.join("dist/bin/index.mjs");
+    fs::write(&entry, "#!/bin/false\n").unwrap();
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    std::os::unix::fs::symlink(&entry, root.join("bin/pen")).unwrap();
+
+    let skill = crate::pen::resolve_skill(root.join("bin").as_os_str());
+    assert_eq!(skill, Some(fs::canonicalize(pkg.join("dist/out/skills/pen-dev/SKILL.md")).unwrap()));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pen_changed_pen_files_lists_modified_added_and_untracked_designs() {
+    let repo = Repo::new(&[("a.pen", "{}"), ("b.pen", "{}"), ("c.pen", "{}"), ("old.pen", "{}")]);
+    let base = repo.head();
+    repo.write("a.pen", "{\"changed\": true}");
+    fs::remove_file(repo.root.join("b.pen")).unwrap();
+    repo.write("design/d.pen", "{}");
+    repo.write("e.pen", "{}");
+    repo.git(&["add", "e.pen"]);
+    repo.git(&["mv", "old.pen", "new.pen"]);
+    repo.write(".forge/state.pen", "{}");
+    repo.write("README.md", "changed\n");
+    repo.write("notes.pen.txt", "x");
+
+    let files = crate::pen::changed_pen_files(&repo.root, &base).unwrap();
+    assert_eq!(files, vec!["a.pen", "design/d.pen", "e.pen", "new.pen"]);
+
+    // A committed change relative to an older base is still listed.
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-qm", "next"]);
+    let files = crate::pen::changed_pen_files(&repo.root, &base).unwrap();
+    assert_eq!(files, vec!["a.pen", "design/d.pen", "e.pen", "new.pen"]);
+    assert!(crate::pen::changed_pen_files(&repo.root, "HEAD").unwrap().is_empty());
+    assert!(crate::pen::changed_pen_files(&repo.root, "not-a-commit").is_err());
+}
+
+#[test]
+fn pen_export_changed_without_pen_changes_spawns_nothing() {
+    let cli = PenCli::new();
+    let repo = Repo::new(&[("design/screen.pen", &design_json(&[("f1", "Main")]))]);
+    repo.write("README.md", "changed\n");
+    let out = crate::pen::export_changed(&repo.root, &repo.head(), &cli.direct_search_path()).unwrap();
+    assert!(out.is_empty());
+    assert!(cli.calls().is_empty(), "no process may run: {:?}", cli.calls());
+    let (dir, empty) = empty_search_dir();
+    assert!(crate::pen::export_changed(&repo.root, &repo.head(), &empty).unwrap().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_export_changed_reports_unavailable_pen_actionably() {
+    let repo = Repo::new(&[]);
+    let base = repo.head();
+    repo.write("design/screen.pen", &design_json(&[("f1", "Main")]));
+
+    let (dir, empty) = empty_search_dir();
+    match crate::pen::export_changed(&repo.root, &base, &empty) {
+        Err(ExportError::Unavailable(message)) => assert!(message.contains("npm install -g @pen.dev/cli"), "{message}"),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    let _ = fs::remove_dir_all(&dir);
+
+    for mode in ["exit1", "logged-out"] {
+        let cli = PenCli::new();
+        cli.set_status_mode(mode);
+        match crate::pen::export_changed(&repo.root, &base, &cli.direct_search_path()) {
+            Err(ExportError::Unavailable(message)) => assert!(message.contains("pen login"), "{mode}: {message}"),
+            other => panic!("{mode}: expected Unavailable, got {other:?}"),
+        }
+        assert_eq!(cli.calls(), vec![json!(["status"])], "{mode}: only pen status may run");
+    }
+    assert!(!repo.root.join("design/screen.png").exists());
+}
+
+#[test]
+fn pen_export_changed_fails_for_unreadable_design_naming_the_file() {
+    let cli = PenCli::new();
+    let repo = Repo::new(&[]);
+    let base = repo.head();
+    repo.write("design/broken.pen", "not valid pen json");
+    repo.write("design/good.pen", &design_json(&[("f1", "Main")]));
+    match crate::pen::export_changed(&repo.root, &base, &cli.direct_search_path()) {
+        Err(ExportError::Failed(message)) => {
+            assert!(message.contains("design/broken.pen"), "{message}");
+            assert!(message.contains("cannot open"), "{message}");
+            assert!(!message.contains("design/good.pen"), "{message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(repo.root.join("design/broken.pen")).unwrap(), "not valid pen json");
+    assert!(!repo.root.join("design/broken.png").exists());
+}
+
+#[test]
+fn pen_export_design_rejects_missing_or_unusable_frames() {
+    let cli = PenCli::new();
+    let repo = Repo::new(&[]);
+    let search_path = cli.direct_search_path();
+    for (frames, expected) in [
+        (vec![], "no top-level frames"),
+        (vec![("a/b", "Main")], "invalid frame id"),
+        (vec![("f1", "A B"), ("f2", "A-B")], "same file"),
+        (vec![("f1", "Main"), ("f1", "Other")], "duplicate frame id"),
+    ] {
+        repo.write("design/screen.pen", &design_json(&frames));
+        match crate::pen::export_design(&repo.root, "design/screen.pen", &search_path) {
+            Err(ExportError::Failed(message)) => {
+                assert!(message.contains("design/screen.pen"), "{message}");
+                assert!(message.contains(expected), "{expected}: {message}");
+            }
+            other => panic!("{expected}: expected Failed, got {other:?}"),
+        }
+    }
+    assert!(fs::read_dir(repo.root.join("design")).unwrap().all(|e| {
+        !e.unwrap().file_name().to_string_lossy().ends_with(".png")
+    }));
+}
+
+#[test]
+fn pen_export_design_removes_only_its_own_stale_pngs() {
+    let cli = PenCli::new();
+    let pen_json = design_json(&[("f1", "Main Screen"), ("f2", "Settings")]);
+    let repo = Repo::new(&[]);
+    repo.write("design/screen.pen", &pen_json);
+    for (name, content) in [
+        ("screen.png", "stale single"),
+        ("screen.old-frame.png", "stale frame"),
+        ("screen.extra.png", "other design"),
+        ("screen.extra.pen", "{}"),
+        ("screen.Upper.png", "not an export name"),
+        ("screen.png.bak", "backup"),
+        ("other.png", "unrelated"),
+        ("screens.png", "different stem"),
+    ] {
+        repo.write(&format!("design/{name}"), content);
+    }
+
+    let mut out = crate::pen::export_design(&repo.root, "design/screen.pen", &cli.direct_search_path()).unwrap();
+    out.sort();
+    assert_eq!(out, vec!["design/screen.main-screen.png", "design/screen.settings.png"]);
+    assert_eq!(fs::read_to_string(repo.root.join("design/screen.pen")).unwrap(), pen_json, "source must be untouched");
+    assert_eq!(fs::read(repo.root.join("design/screen.settings.png")).unwrap(), expected_png(pen_json.as_bytes(), "f2"));
+
+    let mut remaining: Vec<String> = fs::read_dir(repo.root.join("design")).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    remaining.sort();
+    assert_eq!(remaining, vec![
+        "other.png", "screen.Upper.png", "screen.extra.pen", "screen.extra.png", "screen.main-screen.png",
+        "screen.pen", "screen.png.bak", "screen.settings.png", "screens.png",
+    ]);
+    let interactive: Vec<_> = cli.calls().into_iter().filter(|c| c[0] == "interactive").collect();
+    assert_eq!(interactive.len(), 2, "one listing and one export session");
+    for call in interactive {
+        assert_ne!(call[4], json!(repo.root.join("design/screen.pen").to_string_lossy()), "--out must not be the source");
+    }
 }
