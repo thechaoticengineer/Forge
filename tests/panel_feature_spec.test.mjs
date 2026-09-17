@@ -8,6 +8,11 @@ import vm from 'node:vm';
 // here does not exist. Tests fail with a clear assertion message naming the
 // missing function or helper, following the pattern in panel_features.test.mjs.
 
+// Values produced inside vm.runInNewContext() carry that realm's prototypes,
+// so assert/strict deep equality rejects them against literals written here.
+// Round-tripping through JSON normalizes the realm, as panel_features.test.mjs does.
+const plain = value => JSON.parse(JSON.stringify(value));
+
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const featuresJsSource = readFileSync(new URL('../quickshell/Features.js', import.meta.url), 'utf8');
 
@@ -70,7 +75,7 @@ test('S10: createFeature POSTs /api/features/create with project, slug and title
   const create = ctx.calls[0];
   assert.equal(create.method, 'POST');
   assert.equal(create.path, '/api/features/create');
-  assert.deepEqual(create.body, { project: ctx.lastProject, slug: 'new-feature', title: 'New Feature' });
+  assert.deepEqual(plain(create.body), { project: ctx.lastProject, slug: 'new-feature', title: 'New Feature' });
 });
 
 test('S10: createFeature refreshes the feature list on success', () => {
@@ -130,7 +135,7 @@ test('S11: sendFeatureChat POSTs /api/features/chat with project, slug and messa
   assert.equal(ctx.calls.length, 1, 'sendFeatureChat must call api() exactly once');
   assert.equal(ctx.calls[0].method, 'POST');
   assert.equal(ctx.calls[0].path, '/api/features/chat');
-  assert.deepEqual(ctx.calls[0].body, { project: ctx.lastProject, slug: 'draft-feature', message: 'please add a section' });
+  assert.deepEqual(plain(ctx.calls[0].body), { project: ctx.lastProject, slug: 'draft-feature', message: 'please add a section' });
 });
 
 test('S13: requestFeatureReview POSTs /api/features/review with project and slug', () => {
@@ -143,7 +148,7 @@ test('S13: requestFeatureReview POSTs /api/features/review with project and slug
   assert.equal(ctx.calls.length, 1, 'requestFeatureReview must call api() exactly once');
   assert.equal(ctx.calls[0].method, 'POST');
   assert.equal(ctx.calls[0].path, '/api/features/review');
-  assert.deepEqual(ctx.calls[0].body, { project: ctx.lastProject, slug: 'reviewed-feature' });
+  assert.deepEqual(plain(ctx.calls[0].body), { project: ctx.lastProject, slug: 'reviewed-feature' });
 });
 
 test('S13: Features.reviewSummary summarizes the latest review', () => {
@@ -185,7 +190,7 @@ test('S15/S16: approveFeatureSpec POSTs /api/features/approve_spec with project 
   assert.equal(ctx.calls.length, 1, 'approveFeatureSpec must call api() exactly once');
   assert.equal(ctx.calls[0].method, 'POST');
   assert.equal(ctx.calls[0].path, '/api/features/approve_spec');
-  assert.deepEqual(ctx.calls[0].body, { project: ctx.lastProject, slug: 'approve-feature' });
+  assert.deepEqual(plain(ctx.calls[0].body), { project: ctx.lastProject, slug: 'approve-feature' });
 });
 
 test('S15/S16: Features.canApproveSpec requires a current approving review on a draft', () => {
@@ -211,7 +216,7 @@ test('S17: approveFeatureScenarios POSTs /api/features/approve_scenarios with pr
   assert.equal(ctx.calls.length, 1, 'approveFeatureScenarios must call api() exactly once');
   assert.equal(ctx.calls[0].method, 'POST');
   assert.equal(ctx.calls[0].path, '/api/features/approve_scenarios');
-  assert.deepEqual(ctx.calls[0].body, { project: ctx.lastProject, slug: 'scenario-approval' });
+  assert.deepEqual(plain(ctx.calls[0].body), { project: ctx.lastProject, slug: 'scenario-approval' });
 });
 
 test('S17: Features.canApproveScenarios requires an approved spec', () => {

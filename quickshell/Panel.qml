@@ -249,6 +249,10 @@ Item {
   property var featureList: []
   property bool featuresPending: false
   property string featuresError: ""
+  property var featureSpecs: ({})
+  property var featureActivity: null
+  property string selectedFeatureSlug: ""
+  property var featureDetailState: null
 
   property var catalogueDetails: null
   property bool catalogueOpen: false
@@ -395,6 +399,8 @@ Item {
   readonly property bool insertMode: goalField.activeFocus
     || feedbackField.activeFocus || questionField.activeFocus || discussionView.input.activeFocus
     || projectChooser.filterField.activeFocus || projectChooser.manualField.activeFocus || catalogueEditorView.editor.activeFocus
+    || featuresView.newSlugField.activeFocus || featuresView.newTitleField.activeFocus
+    || featuresView.chatMessageField.activeFocus
     || editFocusedField !== null
 
   onHelpOpenChanged: {
@@ -495,6 +501,10 @@ Item {
     featureList = []
     featuresPending = false
     featuresError = ""
+    featureSpecs = ({})
+    featureActivity = null
+    selectedFeatureSlug = ""
+    featureDetailState = null
     localError = ""
     DetailView.invalidate(logFeed)
     logFeed = DetailView.newFeed()
@@ -878,6 +888,8 @@ Item {
       root.featuresPending = false
       if (resp && Array.isArray(resp.features)) {
         root.featureList = Features.featureRows(resp)
+        root.featureSpecs = Features.featureSpecsBySlug(resp)
+        root.featureActivity = resp.activity || null
         root.featuresError = ""
       } else {
         root.featuresError = "Unable to load feature specs"
@@ -888,10 +900,130 @@ Item {
 
   function closeFeatures() {
     featuresOpen = false
+    selectedFeatureSlug = ""
+    featureDetailState = null
   }
 
   function openFeatureInEditor(feature) {
     Quickshell.execDetached(Features.editorCommand(feature))
+  }
+
+  function selectFeature(feature) {
+    if (!feature || root.selectedFeatureSlug === feature.slug) return
+    root.selectedFeatureSlug = feature.slug
+    root.featureDetailState = null
+    root.loadFeatureState(feature.slug)
+  }
+
+  function loadFeatureState(slug) {
+    const revision = projectViewRevision
+    api("GET", "/api/features/state?project=" + encodeURIComponent(root.lastProject)
+      + "&slug=" + encodeURIComponent(slug), null, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (root.selectedFeatureSlug !== slug) return
+      if (status === 200) {
+        root.featureDetailState = resp
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  // Re-fetches the feature list and, while its activity is still running,
+  // the selected feature's detail state; only called by the polling Timer.
+  function pollFeatureActivity() {
+    const revision = projectViewRevision
+    api("GET", "/api/features?project=" + encodeURIComponent(root.lastProject), null, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200 && resp && Array.isArray(resp.features)) {
+        root.featureList = Features.featureRows(resp)
+        root.featureSpecs = Features.featureSpecsBySlug(resp)
+        root.featureActivity = resp.activity || null
+        if (root.featureActivity && root.featureActivity.status === "failed")
+          root.featuresError = root.featureActivity.error || "Feature activity failed"
+      }
+      if (root.selectedFeatureSlug !== "") root.loadFeatureState(root.selectedFeatureSlug)
+    }, true)
+  }
+
+  function createFeature(slug, title) {
+    const revision = projectViewRevision
+    api("POST", "/api/features/create", { project: root.lastProject, slug: slug, title: title }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        // Inlined rather than delegated to openFeatures(): keeps this
+        // function self-contained for isolated testing and reuse.
+        api("GET", "/api/features?project=" + encodeURIComponent(root.lastProject), null, function(resp2, status2) {
+          if (revision !== root.projectViewRevision) return
+          if (resp2 && Array.isArray(resp2.features)) {
+            root.featureList = Features.featureRows(resp2)
+            root.featureSpecs = Features.featureSpecsBySlug(resp2)
+            root.featureActivity = resp2.activity || null
+            root.featuresError = ""
+          }
+          root.featuresOpen = true
+        }, true)
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  function sendFeatureChat(feature, message) {
+    const revision = projectViewRevision
+    api("POST", "/api/features/chat", { project: root.lastProject, slug: feature.slug, message: message }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        root.openFeatures()
+        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  function requestFeatureReview(feature) {
+    const revision = projectViewRevision
+    api("POST", "/api/features/review", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        root.openFeatures()
+        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  function approveFeatureSpec(feature) {
+    const revision = projectViewRevision
+    api("POST", "/api/features/approve_spec", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        root.openFeatures()
+        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  function approveFeatureScenarios(feature) {
+    const revision = projectViewRevision
+    api("POST", "/api/features/approve_scenarios", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        root.openFeatures()
+        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
   }
 
   property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
@@ -1293,6 +1425,14 @@ Item {
   Timer {
     interval: 1000
     repeat: true
+    running: window.visible && root.featuresOpen && root.featureActivity !== null
+      && root.featureActivity.status === "running"
+    onTriggered: root.pollFeatureActivity()
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
     // Poll through idle as well: the terminal page can arrive after busy clears.
     running: window.visible
     triggeredOnStart: true
@@ -1439,16 +1579,24 @@ Item {
             }
           } else if (root.featuresOpen) {
             event.accepted = true
+            const featureRow = featuresView.currentRow()
             if (event.key === Qt.Key_Escape) {
               root.closeFeatures()
             } else if (event.modifiers === Qt.ShiftModifier) {
               if (event.key === Qt.Key_R && !root.featuresPending) root.openFeatures()
+              else if (event.key === Qt.Key_A && featureRow) root.approveFeatureScenarios(featureRow)
             } else if (event.modifiers === Qt.NoModifier) {
               if (event.key === Qt.Key_Q) root.closeFeatures()
               else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
                 featuresView.listView.moveSelection(event.key === Qt.Key_J ? 1 : -1)
               else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
                 featuresView.listView.activateSelection()
+              else if (event.key === Qt.Key_N) featuresView.openNewFeatureForm()
+              else if (event.key === Qt.Key_C && featureRow) {
+                root.selectFeature(featureRow)
+                featuresView.focusChatInput()
+              } else if (event.key === Qt.Key_V && featureRow) root.requestFeatureReview(featureRow)
+              else if (event.key === Qt.Key_A && featureRow) root.approveFeatureSpec(featureRow)
             }
           } else if (root.discussionOpen) {
             event.accepted = true
@@ -2727,6 +2875,10 @@ Item {
         pending: root.featuresPending
         errorText: root.featuresError
         rows: root.featureList
+        specs: root.featureSpecs
+        activity: root.featureActivity
+        selectedSlug: root.selectedFeatureSlug
+        detailState: root.featureDetailState
         foreground: root.foreground
         mutedForeground: root.mutedForeground
         background: root.background
@@ -2740,6 +2892,12 @@ Item {
         onCloseRequested: root.closeFeatures()
         onRefreshRequested: root.openFeatures()
         onOpenRequested: feature => root.openFeatureInEditor(feature)
+        onCreateRequested: (slug, title) => root.createFeature(slug, title)
+        onChatRequested: (feature, message) => root.sendFeatureChat(feature, message)
+        onReviewRequested: feature => root.requestFeatureReview(feature)
+        onApproveSpecRequested: feature => root.approveFeatureSpec(feature)
+        onApproveScenariosRequested: feature => root.approveFeatureScenarios(feature)
+        onFeatureSelected: feature => root.selectFeature(feature)
         onLeaveRequested: keyHandler.forceActiveFocus()
       }
 
@@ -2873,6 +3031,10 @@ Item {
                     { key: "j / k", description: "Select next / previous feature" },
                     { key: "Enter / o", description: "Open the selected feature in nvim" },
                     { key: "R", description: "Refresh the feature list" },
+                    { key: "n", description: "New feature (slug and title form)" },
+                    { key: "c", description: "Chat with the co-authoring agent about the selected feature" },
+                    { key: "v", description: "Request an architect spec review of the selected feature" },
+                    { key: "a / A", description: "Approve the selected feature's spec / scenarios" },
                     { key: "q / Escape", description: "Close the feature list" },
                     { key: "", description: "Project chooser · normal mode" },
                     { key: "j / k", description: "Select next / previous project" },
