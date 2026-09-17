@@ -1,10 +1,12 @@
-//! Discovery and validation of `docs/features/<slug>/` folders (M1 stub).
+//! Discovery and validation of `docs/features/<slug>/` folders (M1).
 //!
-//! This module currently only defines the interface later stages implement:
-//! discovery, validation and the read-only API and panel depend on the
-//! shape here, not on any behavior yet.
+//! Purely read-only: only `fs::read_dir`, `fs::metadata` and `fs::read_to_string`
+//! are used, never a write, rename or delete. See docs/features/README.md and
+//! docs/features/feature-specs/scenarios.md for the rules implemented here.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 pub(crate) struct Feature {
@@ -21,7 +23,167 @@ impl Feature {
     }
 }
 
+const REQUIRED_FILES: [&str; 4] = ["README.md", "scenarios.md", "decisions.md", "milestones.md"];
+
+/// Lines of `text` outside ``` / ~~~ fenced code blocks; fence delimiter
+/// lines themselves are dropped since they are never headings or `Covers:`.
+fn lines_outside_fences(text: &str) -> impl Iterator<Item = &str> {
+    let mut in_fence = false;
+    text.lines().filter(move |line| {
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence
+    })
+}
+
+fn is_valid_scenario_id(id: &str) -> bool {
+    match id.strip_prefix('S') {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// First non-fenced `# ` heading's trimmed remainder, or `None` when there
+/// is no such heading or the remainder is empty.
+fn extract_title(readme: &str) -> Option<String> {
+    for line in lines_outside_fences(readme) {
+        if let Some(rest) = line.strip_prefix("# ") {
+            let title = rest.trim();
+            return if title.is_empty() { None } else { Some(title.to_string()) };
+        }
+    }
+    None
+}
+
+/// Scenario IDs defined by `## ` headings, and reasons for malformed or
+/// duplicate IDs.
+fn analyze_scenarios(content: &str) -> (HashSet<String>, Vec<String>) {
+    let mut ids = HashSet::new();
+    let mut duplicates_reported = HashSet::new();
+    let mut reasons = Vec::new();
+    for line in lines_outside_fences(content) {
+        let Some(rest) = line.strip_prefix("## ") else { continue };
+        let Some(token) = rest.split_whitespace().next() else { continue };
+        let id = token.strip_suffix(':').unwrap_or(token);
+        if is_valid_scenario_id(id) {
+            if !ids.insert(id.to_string()) && duplicates_reported.insert(id.to_string()) {
+                reasons.push(format!("duplicate scenario ID: {id}"));
+            }
+        } else {
+            reasons.push(format!("malformed scenario ID: {id}"));
+        }
+    }
+    (ids, reasons)
+}
+
+/// Reasons for malformed or unknown `Covers:` entries in `milestones.md`.
+/// Unknown-reference checks are skipped when `scenarios_readable` is false.
+fn analyze_milestones(content: &str, known_ids: &HashSet<String>, scenarios_readable: bool) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut milestone = String::new();
+    for line in lines_outside_fences(content) {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let token = rest.split_whitespace().next().unwrap_or("");
+            milestone = token.strip_suffix(':').unwrap_or(token).to_string();
+            continue;
+        }
+        let Some(rest) = line.trim().strip_prefix("Covers:") else { continue };
+        let rest = rest.trim();
+        if rest == "none yet" {
+            continue;
+        }
+        for entry in rest.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() || !is_valid_scenario_id(entry) {
+                reasons.push(format!("malformed Covers entry in {milestone}: {entry}"));
+            } else if scenarios_readable && !known_ids.contains(entry) {
+                reasons.push(format!("milestone {milestone} references unknown scenario ID: {entry}"));
+            }
+        }
+    }
+    reasons
+}
+
+fn build_feature(slug: String, path: PathBuf) -> Feature {
+    let mut reasons = Vec::new();
+    let mut contents: Vec<(&str, Option<String>)> = Vec::new();
+    for name in REQUIRED_FILES {
+        let file_path = path.join(name);
+        let content = match fs::metadata(&file_path) {
+            Ok(meta) if meta.is_file() => match fs::read_to_string(&file_path) {
+                Ok(content) => Some(content),
+                Err(_) => {
+                    reasons.push(format!("unreadable file: {name}"));
+                    None
+                }
+            },
+            _ => {
+                reasons.push(format!("missing required file: {name}"));
+                None
+            }
+        };
+        contents.push((name, content));
+    }
+    let get = |name: &str| contents.iter().find(|(n, _)| *n == name).and_then(|(_, c)| c.as_deref());
+
+    let title = get("README.md").and_then(extract_title).unwrap_or_else(|| slug.clone());
+
+    let scenarios_content = get("scenarios.md");
+    let (known_ids, scenario_reasons) = match scenarios_content {
+        Some(content) => analyze_scenarios(content),
+        None => (HashSet::new(), Vec::new()),
+    };
+    reasons.extend(scenario_reasons);
+
+    if let Some(content) = get("milestones.md") {
+        reasons.extend(analyze_milestones(content, &known_ids, scenarios_content.is_some()));
+    }
+
+    Feature { slug, title, path, reasons }
+}
+
+/// Discovers and validates every feature folder under `<project_root>/docs/features`.
+/// Read-only: never creates, modifies, renames or deletes anything.
 #[allow(dead_code)]
-pub(crate) fn discover(_project_root: &std::path::Path) -> Vec<Feature> {
-    Vec::new()
+pub(crate) fn discover(project_root: &Path) -> Vec<Feature> {
+    let root = project_root.join("docs/features");
+    let Ok(entries) = fs::read_dir(&root) else { return Vec::new() };
+
+    let mut features = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Some(slug) = entry.file_name().to_str().map(str::to_string) else { continue };
+        if slug.starts_with('_') {
+            continue;
+        }
+        let path = root.join(&slug);
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        features.push(build_feature(slug, path));
+    }
+    features.sort_by(|a, b| a.slug.cmp(&b.slug));
+    features
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discover;
+    use std::path::Path;
+
+    #[test]
+    fn discovers_forge_repository_feature_specs() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let found = discover(repo_root);
+        let feature_specs = found
+            .iter()
+            .find(|f| f.slug == "feature-specs")
+            .expect("this repository's own docs/features/feature-specs should be discovered");
+        assert_eq!(feature_specs.title, "Feature specs (self-specification)");
+        assert_eq!(feature_specs.status(), "valid", "reasons: {:?}", feature_specs.reasons);
+        assert!(!found.iter().any(|f| f.slug == "_template"));
+    }
 }
