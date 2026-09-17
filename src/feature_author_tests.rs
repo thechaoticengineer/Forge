@@ -331,6 +331,17 @@ fn a_failed_transcript_takes_the_published_files_back() {
     write_feature(&test.path, slug);
     let folder = test.path.join("docs/features").join(slug);
     let before = folder_bytes(&folder);
+    // An earlier exchange, so the transcript that must survive is a real
+    // publication on disk rather than a state file that never existed.
+    crate::feature_state::update(&test.app, slug, |state| {
+        let chat = state["chat"].as_array_mut().unwrap();
+        chat.push(json!({"role": "user", "text": "earlier", "unix": 1}));
+        chat.push(json!({"role": "assistant", "text": "earlier reply", "files": [], "unix": 1}));
+        Ok(())
+    })
+    .unwrap();
+    let state_path = crate::feature_state::state_path(&test.app, slug);
+    let state_before = fs::read(&state_path).unwrap();
 
     test.app.app.settings.lock().unwrap()["mock_chat_output"] = json!({
         "reply": "Added a decision and a note.",
@@ -344,13 +355,26 @@ fn a_failed_transcript_takes_the_published_files_back() {
         .app
         .run_feature_chat_at(slug, "add a decision", "record")
         .expect_err("a failed transcript publication must fail the chat");
-    assert!(error.contains("injected feature state publication failure"), "got {error:?}");
+    assert!(error.contains("could not save feature state"), "got {error:?}");
+    assert!(error.contains("injected publication sync error"), "got {error:?}");
     assert!(!error.contains("rollback failed"), "the rollback itself must succeed, got {error:?}");
+    assert!(!error.contains("uncertain"), "the state file must be restored, got {error:?}");
 
     assert_eq!(folder_bytes(&folder), before, "a failed chat must restore every feature file");
     assert!(!folder.join("design").exists(), "including a directory created for the write set");
+    // The state file is back to the previous publication, byte for byte, and
+    // no recovery record of the failed one is left beside it.
+    assert_eq!(fs::read(&state_path).unwrap(), state_before, "the state file must be restored");
+    let names: Vec<String> = fs::read_dir(state_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec![format!("{slug}.json")], "no temp or rollback file may be left behind");
     let state = crate::feature_state::snapshot(&test.app, slug).unwrap();
-    assert!(state.state["chat"].as_array().unwrap().is_empty(), "and record no transcript entry");
+    let chat = state.state["chat"].as_array().unwrap();
+    assert_eq!(chat.len(), 2, "only the earlier exchange may remain, chat was {chat:?}");
+    assert_eq!(chat[0]["text"], "earlier");
+    assert_eq!(chat[1]["text"], "earlier reply");
 }
 
 /// A feature folder that discovery lists, with the four required documents.

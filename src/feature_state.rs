@@ -197,8 +197,14 @@ pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
 
 /// Durable publication (temp file, fsync, rename): an interrupted write never
 /// leaves an invalid state file, and stray temp files are ignored on read.
-fn save(ctx: &Ctx, slug: &str, state: &Value) -> Result<(), String> {
-    crate::durable_json::publish_pretty(&state_path(ctx, slug), state)
+///
+/// `fail_save` is the failure seam the transaction tests use: it takes the
+/// checked publisher's post-rename failure path, which restores the previous
+/// state file before reporting the error, so a caller that has to undo its own
+/// work sees exactly what a real publication failure gives it. Production
+/// passes `false`.
+fn save(ctx: &Ctx, slug: &str, state: &Value, fail_save: bool) -> Result<(), String> {
+    crate::durable_json::publish_pretty_checked(&state_path(ctx, slug), state, fail_save)
         .map_err(|e| format!("could not save feature state for {slug}: {e}"))
 }
 
@@ -209,8 +215,21 @@ pub(crate) fn update<T>(
     slug: &str,
     change: impl FnOnce(&mut Value) -> Result<T, String>,
 ) -> Result<T, String> {
+    update_at(ctx, slug, false, change)
+}
+
+/// `update` with the publication failure seam, so a caller whose own work has
+/// to be undone when the record cannot be persisted can be tested against a
+/// genuinely failed save rather than a simulated one. Production calls
+/// `update`; `fail_save` is documented on [`save`].
+pub(crate) fn update_at<T>(
+    ctx: &Ctx,
+    slug: &str,
+    fail_save: bool,
+    change: impl FnOnce(&mut Value) -> Result<T, String>,
+) -> Result<T, String> {
     let _guard = ctx.session.feature_lock.lock().unwrap();
-    update_locked(ctx, slug, change)
+    update_locked_at(ctx, slug, fail_save, change)
 }
 
 /// Load-modify-publish for a caller that already holds `feature_lock`, so a
@@ -225,9 +244,19 @@ pub(crate) fn update_locked<T>(
     slug: &str,
     change: impl FnOnce(&mut Value) -> Result<T, String>,
 ) -> Result<T, String> {
+    update_locked_at(ctx, slug, false, change)
+}
+
+/// `update_locked` with the publication failure seam; see [`update_at`].
+fn update_locked_at<T>(
+    ctx: &Ctx,
+    slug: &str,
+    fail_save: bool,
+    change: impl FnOnce(&mut Value) -> Result<T, String>,
+) -> Result<T, String> {
     let mut state = load(ctx, slug)?;
     let result = change(&mut state)?;
-    save(ctx, slug, &state)?;
+    save(ctx, slug, &state, fail_save)?;
     Ok(result)
 }
 

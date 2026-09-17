@@ -429,9 +429,11 @@ impl Ctx {
     }
 
     /// `run_feature_chat` with the failure seam the tests use. `stop` is passed
-    /// to [`publish_at`], and `stop == "record"` fails exactly where a state
-    /// publication failure lands: after the files are on disk, so the rollback
-    /// that restores them is the production one.
+    /// to [`publish`], and `stop == "record"` makes the transcript's own
+    /// publication fail inside [`feature_state::update_at`]: the files are on
+    /// disk and the state file has already been rewritten and rolled back by
+    /// the durable publisher, so both rollbacks a test observes are the
+    /// production ones.
     pub(crate) fn run_feature_chat_at(
         &self,
         slug: &str,
@@ -470,21 +472,17 @@ impl Ctx {
         // The files and the transcript entry are one exchange: a transcript
         // that cannot be published takes the files back with it, so a failed
         // chat never leaves a modified folder behind an unchanged history.
-        let stored = if stop == "record" {
-            Err("injected feature state publication failure".to_string())
-        } else {
-            feature_state::update(self, slug, |state| {
-                let chat = state["chat"]
-                    .as_array_mut()
-                    .ok_or("feature state chat is not an array")?;
-                chat.push(json!({"role":"user","text":message,"unix":unix}));
-                chat.push(json!({"role":"assistant","text":reply,"files":recorded,"unix":unix}));
-                if chat.len() > MAX_CHAT_ENTRIES {
-                    chat.drain(..chat.len() - MAX_CHAT_ENTRIES);
-                }
-                Ok(())
-            })
-        };
+        let stored = feature_state::update_at(self, slug, stop == "record", |state| {
+            let chat = state["chat"]
+                .as_array_mut()
+                .ok_or("feature state chat is not an array")?;
+            chat.push(json!({"role":"user","text":message,"unix":unix}));
+            chat.push(json!({"role":"assistant","text":reply,"files":recorded,"unix":unix}));
+            if chat.len() > MAX_CHAT_ENTRIES {
+                chat.drain(..chat.len() - MAX_CHAT_ENTRIES);
+            }
+            Ok(())
+        });
         match stored {
             Ok(()) => {
                 publication.commit();
