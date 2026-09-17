@@ -46,6 +46,8 @@ mod discussion_tests;
 #[cfg(test)]
 mod feature_spec_tests;
 #[cfg(test)]
+mod feature_spec_m2_tests;
+#[cfg(test)]
 mod pen_dev_tests;
 #[cfg(test)]
 mod architecture_integration_tests;
