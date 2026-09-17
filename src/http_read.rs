@@ -197,16 +197,33 @@ pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
     let features: Vec<Value> = crate::features::discover(std::path::Path::new(ctx.project()))
         .into_iter()
         .map(|f| {
-            json!({
+            // M1 keys stay exactly as they were; M2 adds the spec-phase view,
+            // derived from the folder's current content hash on every read.
+            let mut entry = json!({
                 "slug": f.slug,
                 "title": f.title,
                 "path": f.path.display().to_string(),
                 "status": f.status(),
                 "reasons": f.reasons,
-            })
+            });
+            for (key, value) in crate::feature_state::listing_fields(ctx, &f.slug)
+                .as_object()
+                .expect("listing fields are an object")
+                .clone()
+            {
+                entry[key] = value;
+            }
+            entry
         })
         .collect();
-    (200, json!({"project": ctx.project(), "features": features}))
+    (
+        200,
+        json!({
+            "project": ctx.project(),
+            "features": features,
+            "activity": crate::feature_state::activity(ctx),
+        }),
+    )
 }
 
 pub(super) fn api_diff(ctx: &Ctx) -> ApiResponse {

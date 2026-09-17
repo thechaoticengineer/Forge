@@ -125,6 +125,8 @@ fn capture_stream(input: &str, claude: bool) -> (String, String, State) {
         agent_model: String::new(),
         model_selection: Value::Null,
         architect_activity: Value::Null,
+        feature_activity: Value::Null,
+        feature_serial: 0,
         role_usage: Value::Null,
         agent_started_unix: 0,
         agent_lines: 0,

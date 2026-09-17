@@ -13,6 +13,7 @@ mod engine_settings;
 mod catalogue_process;
 mod metadata;
 mod features;
+mod feature_state;
 mod agent;
 mod agent_log;
 mod durable_json;
@@ -47,6 +48,8 @@ mod discussion_tests;
 mod feature_spec_tests;
 #[cfg(test)]
 mod feature_spec_m2_tests;
+#[cfg(test)]
+mod feature_state_tests;
 #[cfg(test)]
 mod pen_dev_tests;
 #[cfg(test)]

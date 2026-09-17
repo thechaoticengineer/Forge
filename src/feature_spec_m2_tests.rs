@@ -115,6 +115,9 @@ fn s10_create_feature_from_template() {
     let test = QueueTest::new(false);
     let features_dir = test.path.join("docs/features");
     fs::create_dir_all(&features_dir).unwrap();
+    // The scenario creates the feature "from docs/features/_template/", so the
+    // project needs this repository's template just like every other fixture.
+    copy_dir_all(&template_root(), &features_dir.join("_template"));
     let project = test.path.display().to_string();
 
     let before_head = test.app.git(&["rev-parse", "HEAD"]).unwrap();

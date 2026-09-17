@@ -7,6 +7,8 @@ use std::sync::Arc;
 mod admin;
 #[path = "http_discussion.rs"]
 mod discussion;
+#[path = "http_features.rs"]
+mod features;
 #[path = "http_plan.rs"]
 mod plan;
 #[path = "http_queue.rs"]
@@ -16,6 +18,7 @@ mod read;
 
 use admin::*;
 use discussion::*;
+use features::*;
 use plan::*;
 use queue::*;
 use read::*;
@@ -47,6 +50,8 @@ impl<'a> ApiRequest<'a> {
             self.path,
             "/api/state"
                 | "/api/features"
+                | "/api/features/state"
+                | "/api/features/create"
                 | "/api/architecture/history"
                 | "/api/architecture/reviews"
                 | "/api/agent_log"
@@ -183,6 +188,10 @@ fn dispatch(
         (tiny_http::Method::Post, "/api/models/metadata/refresh") => api_metadata_refresh(app),
         (tiny_http::Method::Get, "/api/state") => api_state(app, ctx, active_project),
         (tiny_http::Method::Get, "/api/features") => api_features(ctx),
+        (tiny_http::Method::Get, "/api/features/state") => api_feature_state(ctx, request.query),
+        (tiny_http::Method::Post, "/api/features/create") => {
+            api_feature_create(ctx, &request.body)
+        }
         (tiny_http::Method::Get, "/api/agent_records") => api_agent_records(ctx, request.query),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(ctx, request.query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(ctx),

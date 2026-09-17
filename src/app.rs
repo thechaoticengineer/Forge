@@ -48,6 +48,9 @@ pub(crate) struct Session {
     pub(crate) queue_lock: Mutex<()>,
     pub(crate) persistence_lock: Mutex<()>,
     pub(crate) architect_lock: Mutex<()>,
+    /// Guards every load-modify-publish of `.forge/features/<slug>.json`, so
+    /// concurrent chat, review and approval updates never lose a record.
+    pub(crate) feature_lock: Mutex<()>,
     pub(crate) persistence_error: Mutex<Option<String>>,
     pub(crate) legacy_state_cache: Mutex<Option<(String, Value)>>,
     pub(crate) stop_requested: AtomicBool,
@@ -95,6 +98,15 @@ pub(crate) struct State {
     pub(crate) agent_model: String,
     pub(crate) model_selection: Value,
     pub(crate) architect_activity: Value,
+    /// Latest feature chat/review activity: null or
+    /// {"kind","slug","request_id","status","error"?}. Served by
+    /// /api/features, never by /api/state, whose shape the existing flow
+    /// depends on (M1 S9).
+    pub(crate) feature_activity: Value,
+    /// Request-id counter for `feature_activity`, assigned by the co-authoring
+    /// and spec-review workers added in the following stages.
+    #[allow(dead_code)]
+    pub(crate) feature_serial: i64,
     pub(crate) role_usage: Value,
     pub(crate) agent_started_unix: i64,
     pub(crate) agent_lines: i64,
@@ -202,6 +214,7 @@ impl App {
             queue_lock: Mutex::new(()),
             persistence_lock: Mutex::new(()),
             architect_lock: Mutex::new(()),
+            feature_lock: Mutex::new(()),
             persistence_error: Mutex::new(persistence_error),
             legacy_state_cache: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
