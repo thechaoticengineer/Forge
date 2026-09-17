@@ -12,6 +12,7 @@ mod catalogue;
 mod engine_settings;
 mod catalogue_process;
 mod metadata;
+mod features;
 mod agent;
 mod agent_log;
 mod durable_json;
@@ -41,6 +42,8 @@ mod test_support;
 mod plan_tests;
 #[cfg(test)]
 mod discussion_tests;
+#[cfg(test)]
+mod feature_spec_tests;
 #[cfg(test)]
 mod architecture_integration_tests;
 #[cfg(test)]
