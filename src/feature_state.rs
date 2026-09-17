@@ -210,6 +210,21 @@ pub(crate) fn update<T>(
     change: impl FnOnce(&mut Value) -> Result<T, String>,
 ) -> Result<T, String> {
     let _guard = ctx.session.feature_lock.lock().unwrap();
+    update_locked(ctx, slug, change)
+}
+
+/// Load-modify-publish for a caller that already holds `feature_lock`, so a
+/// decision and the record it produces can share one critical section. An
+/// approval uses this to read the folder, derive its record and publish it
+/// without ever releasing the lock in between (D10).
+///
+/// The caller must hold `feature_lock`; `update` is the entry point for
+/// everyone else.
+pub(crate) fn update_locked<T>(
+    ctx: &Ctx,
+    slug: &str,
+    change: impl FnOnce(&mut Value) -> Result<T, String>,
+) -> Result<T, String> {
     let mut state = load(ctx, slug)?;
     let result = change(&mut state)?;
     save(ctx, slug, &state)?;

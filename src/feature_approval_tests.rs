@@ -1,7 +1,9 @@
-//! Unit tests for spec and scenario approvals (M2, D10): the Git discipline
-//! of a path-scoped approval commit, the immutability of a refused approval,
-//! and the idempotency of a retry after a published commit. The scenarios
-//! themselves are covered by the business tests in src/feature_spec_m2_tests.rs.
+//! Unit tests for spec and scenario approvals (M2, D10): the Git discipline of
+//! a path-scoped approval commit, the immutability of a refused approval, that
+//! a scenario approval never binds scenario IDs to a hash of different
+//! content, and the idempotency of a retry after a published commit. The
+//! scenarios themselves are covered by the business tests in
+//! src/feature_spec_m2_tests.rs.
 
 use crate::features::scenario_ids;
 use crate::test_support::{QueueTest, api_request, wait_for_worker};
@@ -158,6 +160,64 @@ fn scenario_approval_refuses_a_spec_approval_of_older_content() {
     assert_eq!(code, 409, "response was {resp}");
     assert_eq!(resp["error"], "feature changed since spec approval", "response was {resp}");
     assert_eq!(test.app.git(&["rev-parse", "HEAD"]).unwrap(), head, "a refusal must not commit");
+}
+
+#[test]
+fn scenario_approval_refuses_an_edit_that_lands_while_it_reads_scenarios() {
+    // The recorded scenario IDs and the recorded content hash must describe
+    // one folder snapshot. Nothing outside the engine takes the feature lock,
+    // so the injected edit stands for a user or editor writing scenarios.md
+    // between the parse and the append.
+    let test = QueueTest::new(false);
+    let features_dir = test.path.join("docs/features");
+    let slug = "scenario-race";
+    write_feature(&features_dir, slug);
+    reviewed(&test, slug);
+    let (code, resp) = post(&test, "/api/features/approve_spec", slug);
+    assert_eq!(code, 200, "response was {resp}");
+    let head = test.app.git(&["rev-parse", "HEAD"]).unwrap();
+
+    let refusal = test
+        .app
+        .approve_feature_scenarios_at(slug, "concurrent_edit")
+        .expect_err("an edit during the approval must refuse it");
+    assert_eq!(refusal.status, 409);
+    assert_eq!(refusal.message, "feature changed during approval");
+    let approvals = state_of(&test, slug)["approvals"].as_array().unwrap().clone();
+    assert_eq!(approvals.len(), 1, "no scenario approval may be appended: {approvals:?}");
+    assert_eq!(approvals[0]["kind"], "spec");
+    assert_eq!(test.app.git(&["rev-parse", "HEAD"]).unwrap(), head, "a refusal must not commit");
+
+    // The edit itself stays on disk, so the feature is simply back in draft
+    // and a new review and spec approval are what unlock it again (S18).
+    let snapshot = crate::feature_state::snapshot(&test.app, slug).unwrap();
+    assert_eq!(snapshot.spec_status, "draft");
+    let (code, resp) = post(&test, "/api/features/approve_scenarios", slug);
+    assert_eq!(code, 409, "response was {resp}");
+    assert_eq!(resp["error"], "feature changed since spec approval", "response was {resp}");
+}
+
+#[test]
+fn scenario_approval_records_the_ids_of_the_hashed_content() {
+    let test = QueueTest::new(false);
+    let features_dir = test.path.join("docs/features");
+    let slug = "scenario-ids";
+    write_feature(&features_dir, slug);
+    reviewed(&test, slug);
+    let (code, resp) = post(&test, "/api/features/approve_spec", slug);
+    assert_eq!(code, 200, "response was {resp}");
+    let hash = resp["content_hash"].as_str().unwrap().to_string();
+
+    let (code, resp) = post(&test, "/api/features/approve_scenarios", slug);
+    assert_eq!(code, 200, "response was {resp}");
+    assert_eq!(resp["content_hash"], json!(&hash), "response was {resp}");
+    let expected =
+        scenario_ids(&fs::read_to_string(features_dir.join(slug).join("scenarios.md")).unwrap());
+    assert_eq!(resp["scenario_ids"], json!(expected), "response was {resp}");
+    assert_eq!(resp["spec_status"], "scenarios approved", "response was {resp}");
+    let recorded = state_of(&test, slug)["approvals"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(recorded["scenario_ids"], json!(expected), "recorded {recorded}");
+    assert_eq!(recorded["content_hash"], json!(&hash), "recorded {recorded}");
 }
 
 #[test]

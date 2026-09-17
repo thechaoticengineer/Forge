@@ -1,6 +1,7 @@
 //! Unit tests for the engine-owned co-authoring write path (M2, S11/S12,
 //! decision D8): what the path validator accepts, every escape it refuses,
-//! and that a refusal or a late change publishes nothing.
+//! that a refusal or a late change publishes nothing, and that a failure after
+//! the first file is on disk restores the folder and the transcript.
 //! The end-to-end scenarios themselves are covered by the business tests in
 //! src/feature_spec_m2_tests.rs.
 
@@ -231,7 +232,7 @@ fn publication_creates_missing_directories_and_leaves_no_temp_file() {
         ("docs/features/spec-one/README.md".to_string(), "# Spec One\n\nNew.\n".to_string()),
         ("docs/features/spec-one/design/notes.md".to_string(), "notes\n".to_string()),
     ];
-    publish(project, "spec-one", &files).expect("a validated set publishes");
+    publish(project, "spec-one", &files, "").expect("a validated set publishes").commit();
     assert_eq!(
         fs::read_to_string(project.join("docs/features/spec-one/README.md")).unwrap(),
         "# Spec One\n\nNew.\n"
@@ -262,13 +263,94 @@ fn publication_writes_nothing_when_a_late_check_fails() {
     // of the folder before the write, as a racing agent or user could do.
     std::os::unix::fs::symlink(&outside, project.join("docs/features/spec-one/second.md")).unwrap();
 
-    let error = publish(project, "spec-one", &files).expect_err("a late symlink must refuse the write set");
+    let error =
+        publish(project, "spec-one", &files, "").expect_err("a late symlink must refuse the write set");
     assert!(error.contains("symlink"), "got {error:?}");
     assert!(
         !project.join("docs/features/spec-one/first.md").exists(),
         "no part of a refused write set may be published"
     );
     assert_eq!(fs::read_to_string(&outside).unwrap(), "original\n");
+}
+
+/// Every regular file under `dir`, as `relative path -> bytes`, so a folder can
+/// be compared byte for byte before and after a failure.
+fn folder_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        for entry in fs::read_dir(dir.join(&rel)).unwrap() {
+            let entry = entry.unwrap();
+            let child = rel.join(entry.file_name());
+            let meta = fs::symlink_metadata(dir.join(&child)).unwrap();
+            if meta.is_dir() {
+                stack.push(child);
+            } else if meta.is_file() {
+                out.push((child.display().to_string(), fs::read(dir.join(&child)).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn publication_rolls_back_a_partly_renamed_write_set() {
+    // The write set is a transaction: POSIX renames one file at a time, so a
+    // failure in the middle of the set must put the folder back rather than
+    // leave the earlier files published.
+    let temp = Temp::new("rollback");
+    let project = temp.project();
+    let folder = project.join("docs/features/spec-one");
+    fs::write(folder.join("scenarios.md"), "original scenarios\n").unwrap();
+    let before = folder_bytes(&folder);
+
+    let files = vec![
+        // An overwrite, a new file and a new file in a new directory, so the
+        // rollback has to undo all three kinds of change.
+        ("docs/features/spec-one/README.md".to_string(), "# Replaced\n".to_string()),
+        ("docs/features/spec-one/scenarios.md".to_string(), "replaced scenarios\n".to_string()),
+        ("docs/features/spec-one/design/notes.md".to_string(), "notes\n".to_string()),
+    ];
+    let error = publish(project, "spec-one", &files, "rename")
+        .expect_err("an injected late rename failure must refuse the write set");
+    assert!(error.contains("injected publication rename failure"), "got {error:?}");
+    assert!(!error.contains("rollback failed"), "the rollback itself must succeed, got {error:?}");
+
+    assert_eq!(folder_bytes(&folder), before, "a failed write set must restore the folder");
+    assert!(!folder.join("design").exists(), "a directory created for the set must be removed again");
+}
+
+#[test]
+fn a_failed_transcript_takes_the_published_files_back() {
+    // The files and the transcript entry are one exchange. If the transcript
+    // cannot be published, reporting the chat as failed while the folder keeps
+    // the agent's edit would leave the two permanently out of step.
+    let test = crate::test_support::QueueTest::new(false);
+    let slug = "chat-rollback";
+    write_feature(&test.path, slug);
+    let folder = test.path.join("docs/features").join(slug);
+    let before = folder_bytes(&folder);
+
+    test.app.app.settings.lock().unwrap()["mock_chat_output"] = json!({
+        "reply": "Added a decision and a note.",
+        "files": [
+            {"path": format!("docs/features/{slug}/decisions.md"),
+                "content": "# Decisions\n\n## D1: First\n\nDecision.\n\n## D2: Second\n\nDecision.\n"},
+            {"path": format!("docs/features/{slug}/design/notes.md"), "content": "notes\n"},
+        ],
+    });
+    let error = test
+        .app
+        .run_feature_chat_at(slug, "add a decision", "record")
+        .expect_err("a failed transcript publication must fail the chat");
+    assert!(error.contains("injected feature state publication failure"), "got {error:?}");
+    assert!(!error.contains("rollback failed"), "the rollback itself must succeed, got {error:?}");
+
+    assert_eq!(folder_bytes(&folder), before, "a failed chat must restore every feature file");
+    assert!(!folder.join("design").exists(), "including a directory created for the write set");
+    let state = crate::feature_state::snapshot(&test.app, slug).unwrap();
+    assert!(state.state["chat"].as_array().unwrap().is_empty(), "and record no transcript entry");
 }
 
 /// A feature folder that discovery lists, with the four required documents.

@@ -6,9 +6,12 @@
 //! validation covers the whole set before anything is mutated, and every
 //! destination is checked again immediately before the write, so a symlink or
 //! directory that appears in between cannot let a write escape the folder
-//! (M2-ARCH-002). Every rejection travels the shared correction budget in
-//! `crate::response`, so the agent gets the reason and one bounded chance to
-//! fix it.
+//! (M2-ARCH-002). The write set is also a transaction: a failure part-way
+//! through the publication, or a transcript entry that cannot be persisted,
+//! restores every file and directory it touched, so a failed chat leaves the
+//! folder and the history exactly as it found them. Every rejection travels
+//! the shared correction budget in `crate::response`, so the agent gets the
+//! reason and one bounded chance to fix it.
 use super::{Ctx, WorkerGuard};
 use crate::feature_state;
 use crate::prompts::FEATURE_CHAT_PROMPT;
@@ -143,22 +146,109 @@ pub(crate) fn validate_response(project: &Path, slug: &str, text: &str) -> Resul
 
 // ---------------------------------------------------------------- publication
 
+/// A published write set that can still be undone in full.
+///
+/// A write set is not atomic by itself: POSIX renames one file at a time, so
+/// the transaction is what makes the whole set all-or-nothing. It carries a
+/// hard-linked backup of every target that already existed, the targets this
+/// publication created, and the directories it created, so `rollback` can put
+/// the folder back byte for byte. `commit` keeps the published files and drops
+/// the backups. Dropping without either keeps the files and still removes the
+/// backups, so no rollback record is ever left under `docs/features/`.
+#[derive(Debug, Default)]
+pub(crate) struct Publication {
+    /// `(target, hard-linked backup of its previous content)`.
+    backups: Vec<(PathBuf, PathBuf)>,
+    /// Targets that did not exist before this publication.
+    created_files: Vec<PathBuf>,
+    /// Directories this publication created, outermost first.
+    created_dirs: Vec<PathBuf>,
+}
+
+impl Publication {
+    /// Keeps the published files; the backups are discarded on drop.
+    pub(crate) fn commit(self) {}
+
+    /// Restores every file and directory the publication touched: new files
+    /// are removed, overwritten files are restored from their backup, and
+    /// directories created on the way are removed again when they are empty.
+    pub(crate) fn rollback(self) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        for target in &self.created_files {
+            match fs::remove_file(target) {
+                Ok(()) => {},
+                Err(e) if e.kind() == ErrorKind::NotFound => {},
+                Err(e) => errors.push(format!("could not remove {}: {e}", target.display())),
+            }
+        }
+        for (target, backup) in &self.backups {
+            if let Err(e) = fs::rename(backup, target) {
+                errors.push(format!("could not restore {}: {e}", target.display()));
+            }
+        }
+        // Deepest first. A directory that is not empty belongs to someone
+        // else's content by now and is left alone.
+        for dir in self.created_dirs.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+        let touched = self.created_files.iter().chain(self.backups.iter().map(|(target, _)| target));
+        for dir in touched.filter_map(|target| target.parent()) {
+            let _ = crate::durable_json::sync_dir(dir);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        for (_, backup) in &self.backups {
+            let _ = fs::remove_file(backup);
+        }
+    }
+}
+
 /// Publishes a validated write set, or nothing at all.
 ///
 /// Every destination is re-checked before the first mutation, each file is
 /// then staged as a temporary file in its own destination directory, and only
-/// a fully staged set is renamed into place. A failure at any point leaves no
-/// published file and no temporary file behind.
-pub(crate) fn publish(project: &Path, slug: &str, files: &[(String, String)]) -> Result<(), String> {
+/// a fully staged set is renamed into place. A failure at any point - during
+/// staging or part-way through the renames - restores the folder through
+/// [`Publication::rollback`], so no partial write set is ever observable and
+/// no temporary file is left behind.
+///
+/// `stop` is the failure seam the tests use: `stop == "rename"` fails the last
+/// rename of the set, the one case that cannot be provoked from outside
+/// because the engine holds no lock a test could take. Production passes `""`.
+pub(crate) fn publish(
+    project: &Path,
+    slug: &str,
+    files: &[(String, String)],
+    stop: &str,
+) -> Result<Publication, String> {
     let mut targets = Vec::new();
     for (path, content) in files {
         targets.push((path.as_str(), check_path(project, slug, path)?, content));
     }
+    let mut publication = Publication::default();
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let result = (|| -> Result<(), String> {
         for (path, target, content) in &targets {
-            ensure_dirs(project, path)?;
+            ensure_dirs(project, path, &mut publication.created_dirs)?;
             let dir = target.parent().ok_or_else(|| format!("{path:?} has no parent directory"))?;
+            // A hard link captures exactly the bytes that are there now, so a
+            // rollback is an atomic rename rather than a second copy.
+            if fs::symlink_metadata(target).is_ok() {
+                let backup = dir.join(format!(".{}.rollback", crate::durable_json::identity()));
+                fs::hard_link(target, &backup)
+                    .map_err(|e| format!("could not back up {}: {e}", target.display()))?;
+                publication.backups.push((target.clone(), backup));
+            } else {
+                publication.created_files.push(target.clone());
+            }
             let tmp = dir.join(format!(".{}.tmp", crate::durable_json::identity()));
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -170,7 +260,10 @@ pub(crate) fn publish(project: &Path, slug: &str, files: &[(String, String)]) ->
                 .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
             staged.push((tmp, target.clone()));
         }
-        for (tmp, target) in &staged {
+        for (index, (tmp, target)) in staged.iter().enumerate() {
+            if stop == "rename" && index + 1 == staged.len() {
+                return Err("injected publication rename failure".into());
+            }
             fs::rename(tmp, target)
                 .map_err(|e| format!("could not publish {}: {e}", target.display()))?;
             crate::durable_json::sync_dir(target.parent().unwrap())?;
@@ -182,18 +275,33 @@ pub(crate) fn publish(project: &Path, slug: &str, files: &[(String, String)]) ->
     for (tmp, _) in &staged {
         let _ = fs::remove_file(tmp);
     }
-    result
+    match result {
+        Ok(()) => Ok(publication),
+        Err(error) => Err(undo(publication, error)),
+    }
+}
+
+/// Rolls a publication back and reports what the caller should show: the
+/// original failure, plus the rollback's own failure when the folder could not
+/// be restored, because that is the only case a human has to look at.
+pub(crate) fn undo(publication: Publication, error: String) -> String {
+    match publication.rollback() {
+        Ok(()) => error,
+        Err(undone) => format!("{error}; rollback failed: {undone}"),
+    }
 }
 
 /// Creates the missing directories of one destination, one component at a
 /// time, re-checking each one so an existing entry is always a real directory.
-fn ensure_dirs(project: &Path, path: &str) -> Result<(), String> {
+/// Every directory it creates is appended to `created`, outermost first and
+/// also on the failing path, so a rollback removes exactly those again.
+fn ensure_dirs(project: &Path, path: &str, created: &mut Vec<PathBuf>) -> Result<(), String> {
     let parts: Vec<&str> = path.split('/').collect();
     let mut current = project.to_path_buf();
     for part in &parts[..parts.len() - 1] {
         current.push(part);
         match fs::create_dir(&current) {
-            Ok(()) => {},
+            Ok(()) => created.push(current.clone()),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {},
             Err(e) => return Err(format!("could not create {}: {e}", current.display())),
         }
@@ -317,6 +425,19 @@ impl Ctx {
     /// The published relative paths on success. Nothing here commits or stages
     /// anything: approval owns the feature folder's history (S15).
     fn run_feature_chat(&self, slug: &str, message: &str) -> Result<Vec<String>, String> {
+        self.run_feature_chat_at(slug, message, "")
+    }
+
+    /// `run_feature_chat` with the failure seam the tests use. `stop` is passed
+    /// to [`publish_at`], and `stop == "record"` fails exactly where a state
+    /// publication failure lands: after the files are on disk, so the rollback
+    /// that restores them is the production one.
+    pub(crate) fn run_feature_chat_at(
+        &self,
+        slug: &str,
+        message: &str,
+        stop: &str,
+    ) -> Result<Vec<String>, String> {
         self.ensure_forge_dir();
         match fs::remove_file(self.forge_path("answer.json")) {
             Ok(()) => {},
@@ -342,21 +463,34 @@ impl Ctx {
             validate_response(&project, slug, text)
         })?;
         let Proposal { reply, files } = reply.value;
-        publish(&project, slug, &files)?;
+        let publication = publish(&project, slug, &files, stop)?;
         let paths: Vec<String> = files.iter().map(|(path, _)| path.clone()).collect();
         let recorded = paths.clone();
         let unix = unix_timestamp();
-        feature_state::update(self, slug, |state| {
-            let chat = state["chat"]
-                .as_array_mut()
-                .ok_or("feature state chat is not an array")?;
-            chat.push(json!({"role":"user","text":message,"unix":unix}));
-            chat.push(json!({"role":"assistant","text":reply,"files":recorded,"unix":unix}));
-            if chat.len() > MAX_CHAT_ENTRIES {
-                chat.drain(..chat.len() - MAX_CHAT_ENTRIES);
-            }
-            Ok(())
-        })?;
-        Ok(paths)
+        // The files and the transcript entry are one exchange: a transcript
+        // that cannot be published takes the files back with it, so a failed
+        // chat never leaves a modified folder behind an unchanged history.
+        let stored = if stop == "record" {
+            Err("injected feature state publication failure".to_string())
+        } else {
+            feature_state::update(self, slug, |state| {
+                let chat = state["chat"]
+                    .as_array_mut()
+                    .ok_or("feature state chat is not an array")?;
+                chat.push(json!({"role":"user","text":message,"unix":unix}));
+                chat.push(json!({"role":"assistant","text":reply,"files":recorded,"unix":unix}));
+                if chat.len() > MAX_CHAT_ENTRIES {
+                    chat.drain(..chat.len() - MAX_CHAT_ENTRIES);
+                }
+                Ok(())
+            })
+        };
+        match stored {
+            Ok(()) => {
+                publication.commit();
+                Ok(paths)
+            },
+            Err(error) => Err(undo(publication, error)),
+        }
     }
 }

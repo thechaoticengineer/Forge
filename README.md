@@ -916,9 +916,11 @@ a `.` or `..` component, a prefix trick such as `docs/features/<slug>-x/`, or pa
 anywhere along it — is rejected and sent back to the agent through the shared response-correction
 budget (see [Shared response correction](#shared-response-correction)); every destination is checked
 again immediately before writing. On success, the user's message and the agent's reply are appended to
-the feature's `chat` history; on any failure (an exhausted correction budget, a provider error, or a
-stopped run) nothing is written, `chat` is unchanged, and `activity.status` becomes `"failed"` with an
-`error`.
+the feature's `chat` history; on any failure (an exhausted correction budget, a provider error, a
+stopped run, or a transcript that could not be persisted) the folder is left exactly as it was, `chat`
+is unchanged, and `activity.status` becomes `"failed"` with an `error`. The write set is a
+transaction: a failure part-way through it, or after it, restores every file and directory it had
+touched, so the published files and the recorded transcript never disagree.
 
 ```
 POST /api/features/review {"project"?, "slug"}
@@ -964,6 +966,9 @@ from `scenarios.md` in document order, and `commit`/`content_hash` are copied fr
 this endpoint creates no commit of its own — and returns 200 `{"ok": true, "scenario_ids", "commit",
 "content_hash", "spec_status": "scenarios approved"}`. HTTP 400/404/409 busy as above; 409 when the
 feature is invalid, has no spec approval, or its spec approval no longer matches the current content.
+The folder is hashed again after `scenarios.md` is read and before the approval is appended, so an edit
+that lands while the endpoint runs is refused with `feature changed during approval` rather than
+recorded: the stored `scenario_ids` and `content_hash` always describe the same content.
 
 #### Feature runtime state
 

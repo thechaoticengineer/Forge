@@ -19,7 +19,10 @@
 //!
 //! Lock order: `queue_lock` (held by the synchronous endpoint) -> `busy`
 //! (claimed by the endpoint, released by `BusyGuard`) -> `feature_lock`,
-//! which stays innermost and is never held across a Git invocation.
+//! which stays innermost and is never held across a Git invocation. Both
+//! endpoints hold `feature_lock` from the final content check through the
+//! append, so what an approval records always describes the folder snapshot it
+//! was decided on.
 use super::{Ctx, Session};
 use crate::feature_state::{self, Refusal};
 use crate::util::unix_timestamp;
@@ -61,9 +64,10 @@ fn latest_approval<'a>(state: &'a Value, kind: &str) -> Option<&'a Value> {
 
 /// Appends one approval and returns the status derived from the updated
 /// state, so the answer always reflects the recorded history rather than an
-/// assumption about it.
+/// assumption about it. The caller holds `feature_lock`, so the check that
+/// admitted the approval and this append share one critical section.
 fn record(ctx: &Ctx, slug: &str, approval: Value, hash: &str) -> Result<&'static str, Refusal> {
-    feature_state::update(ctx, slug, |state| {
+    feature_state::update_locked(ctx, slug, |state| {
         state["approvals"]
             .as_array_mut()
             .ok_or("feature state approvals is not an array")?
@@ -113,11 +117,11 @@ impl Ctx {
         let commit = self.git(&["rev-parse", "HEAD"]).map_err(failed)?;
 
         // The commit holds exactly the content that was hashed above; a folder
-        // changed in between is never recorded as approved.
-        let current = {
-            let _guard = self.session.feature_lock.lock().unwrap();
-            feature_state::content_hash(&dir).map_err(failed)?
-        };
+        // changed in between is never recorded as approved. The check and the
+        // append share the lock, so nothing this engine does can slip between
+        // them.
+        let _guard = self.session.feature_lock.lock().unwrap();
+        let current = feature_state::content_hash(&dir).map_err(failed)?;
         if current != reviewed_hash {
             return Err(refuse("feature changed during approval"));
         }
@@ -141,24 +145,52 @@ impl Ctx {
     /// the current content. Creates no commit of its own: it records the
     /// commit of that spec approval (S17).
     pub(crate) fn approve_feature_scenarios(&self, slug: &str) -> Result<Value, Refusal> {
+        self.approve_feature_scenarios_at(slug, "")
+    }
+
+    /// `approve_feature_scenarios` with the failure seam the tests use:
+    /// `stop == "concurrent_edit"` rewrites `scenarios.md` right after it was
+    /// parsed, which is the one moment an edit could otherwise pair recorded
+    /// scenario IDs with a hash of different content.
+    pub(crate) fn approve_feature_scenarios_at(
+        &self,
+        slug: &str,
+        stop: &str,
+    ) -> Result<Value, Refusal> {
         let dir = feature_state::feature_dir(self, slug);
-        let (commit, hash) = {
-            let _guard = self.session.feature_lock.lock().unwrap();
-            let state = feature_state::load(self, slug).map_err(failed)?;
-            let hash = feature_state::content_hash(&dir).map_err(failed)?;
-            let Some(approval) = latest_approval(&state, "spec") else {
-                return Err(refuse("spec is not approved"));
-            };
-            if approval["content_hash"] != json!(&hash) {
-                return Err(refuse("feature changed since spec approval"));
-            }
-            (approval["commit"].as_str().unwrap_or_default().to_string(), hash)
+        // One critical section for the whole approval: the hash that admits
+        // it, the scenarios.md the IDs are read from, the re-check below and
+        // the append all belong to the same folder snapshot. No Git command
+        // runs here, so the lock is never held across one.
+        let _guard = self.session.feature_lock.lock().unwrap();
+        let state = feature_state::load(self, slug).map_err(failed)?;
+        let hash = feature_state::content_hash(&dir).map_err(failed)?;
+        let Some(approval) = latest_approval(&state, "spec") else {
+            return Err(refuse("spec is not approved"));
         };
+        if approval["content_hash"] != json!(&hash) {
+            return Err(refuse("feature changed since spec approval"));
+        }
+        let commit = approval["commit"].as_str().unwrap_or_default().to_string();
 
         let path = dir.join("scenarios.md");
         let scenarios = fs::read_to_string(&path)
             .map_err(|e| failed(format!("could not read {}: {e}", path.display())))?;
         let scenario_ids = crate::features::scenario_ids(&scenarios);
+        if stop == "concurrent_edit" {
+            fs::write(&path, format!("{scenarios}\n## S99: Injected\n"))
+                .map_err(|e| failed(format!("could not inject an edit: {e}")))?;
+        }
+
+        // The lock serializes this engine's own work, but an editor or a user
+        // writing into the folder takes no lock at all. So the IDs just parsed
+        // are checked against the folder once more before they are recorded:
+        // an edit that landed while scenarios.md was being read refuses the
+        // approval instead of binding those IDs to a hash of other content.
+        let current = feature_state::content_hash(&dir).map_err(failed)?;
+        if current != hash {
+            return Err(refuse("feature changed during approval"));
+        }
 
         let approval = json!({
             "kind": "scenarios",
