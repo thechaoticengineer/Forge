@@ -259,6 +259,16 @@ impl Ctx {
                         "stage {sid} blocked after {duration}: git history changed and the architect decided to stop: {reason} — needs a human"));
                     return Ok(());
                 }
+                // The agent's design work stays in the worktree; resuming retries the export.
+                "design_blocked" => {
+                    let reason = plan["stages"][idx]["review_gate"]["reason"]
+                        .as_str().unwrap_or("pen.dev export is unavailable").to_string();
+                    let duration = fmt_duration(self.finish_stage(&mut plan, idx, "blocked")?);
+                    self.set_phase("blocked");
+                    self.log_event("stage", &format!(
+                        "stage {sid} blocked after {duration}: {reason} — needs a human"));
+                    return Ok(());
+                }
                 "scope_blocked" => {
                     let reason = plan["stages"][idx]["review_gate"]["reason"]
                         .as_str().unwrap_or("the stage cannot be built as written").to_string();

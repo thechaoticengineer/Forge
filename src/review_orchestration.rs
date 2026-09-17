@@ -17,6 +17,9 @@ use std::sync::atomic::Ordering;
 #[derive(Clone, Copy)]
 pub(super) enum ReviewScope { Stage(usize), Plan }
 
+/// Where a round goes after the engine exports its changed designs.
+pub(super) enum DesignExport { Ready, Blocked, Failed }
+
 impl Ctx {
     pub(super) fn review_with_retry(&self, plan: &mut Value, idx: usize, base: &Value, role: &str, provider: &str, model: &str) -> Result<Value,String> {
         let mut current = (provider.to_string(), model.to_string());
@@ -479,7 +482,17 @@ impl Ctx {
         if plan["stages"][idx]["attempt_head"] != head {
             return Err("HEAD changed during stage attempt".into());
         }
-        let start = plan["stages"][idx]["rounds"].as_u64().unwrap_or(0);
+        // Invariant: a `blocked` design export belongs to the round the agent
+        // already finished. Resuming it at the same attempt, round and HEAD
+        // re-enters that round at the export step: no new turn, no new round.
+        let rounds = plan["stages"][idx]["rounds"].as_u64().unwrap_or(0);
+        let export = &plan["stages"][idx]["design_export"];
+        let resume_export = rounds > 0
+            && export["status"] == "blocked"
+            && export["attempt_id"] == plan["stages"][idx]["attempt_id"]
+            && export["round"] == rounds
+            && export["attempt_head"] == head;
+        let start = if resume_export { rounds - 1 } else { rounds };
         if start > budget {
             let architect =
                 if plan["stages"][idx]["review_policy"]["scope"] == "ordinary_documentation" {
@@ -501,176 +514,189 @@ impl Ctx {
             if self.session.stop_requested.load(Ordering::SeqCst) {
                 return Ok("stopped");
             }
+            let resuming = resume_export && round == start;
             let mut assignment = self.assignment_boundary(plan, idx).map_err(|e| format!("model routing blocked: {e}"))?;
             let reviewer_runs = crate::plan::review_cadence(&plan["stages"][idx], "reviewer") == "per_stage";
             let mut reviewer_config = if reviewer_runs {
                 Some(self.reviewer_config(assignment["effective"]["provider"].as_str().ok_or("missing agreed provider")?)
                     .map_err(|e| format!("model routing blocked: {e}"))?)
             } else { None };
-            let clarifying = plan["stages"][idx]["scope_clarification"]["pending"] == true
-                && plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx);
-            // Reserve clarification delivery with the round, before invocation.
-            // Neither a restart nor repeated escalation refunds this follow-up.
-            if clarifying {
-                plan["stages"][idx]["scope_clarification"]["pending"] = json!(false);
-                plan["stages"][idx]["scope_clarification"]["delivered_round"] = json!(round + 1);
-            }
-            // Reserve the round before any invocation; errors/restarts cannot replenish it.
-            plan["stages"][idx]["rounds"] = json!(round + 1);
-            plan["stages"][idx]["review_gate"] =
-                json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
-            for role in ["architect", "reviewer"] {
-                if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan" {
-                    plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
+            // A resumed design block retries only the export: the turn that produced
+            // these edits already ran and its round is already reserved.
+            if !resuming {
+                let clarifying = plan["stages"][idx]["scope_clarification"]["pending"] == true
+                    && plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx);
+                // Reserve clarification delivery with the round, before invocation.
+                // Neither a restart nor repeated escalation refunds this follow-up.
+                if clarifying {
+                    plan["stages"][idx]["scope_clarification"]["pending"] = json!(false);
+                    plan["stages"][idx]["scope_clarification"]["delivered_round"] = json!(round + 1);
                 }
-            }
-            plan["stages"][idx]["last_verdict_valid"] = json!(false);
-            self.save_plan(plan)?;
-            let template = if round == 0 || clarifying {
-                IMPLEMENT_PROMPT
-            } else {
-                FIX_PROMPT
-            };
-            self.set_step(
-                Some(sid),
-                if round == 0 || clarifying { "implementing" } else { "fixing" },
-            );
-            let mut stage = plan["stages"][idx].clone();
-            if round > 0 {
-                stage["last_verdict"] = stage["previous_requests"].clone();
-                stage["last_verdict_valid"] = json!(true);
-            }
-            let role = if round == 0 || clarifying { "implementer" } else { "fixer" };
-            let (output, turn) = loop {
-                if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
-                let turn = crate::architecture::identity();
-                stage = plan["stages"][idx].clone();
-                if round > 0 { stage["last_verdict"] = stage["previous_requests"].clone(); stage["last_verdict_valid"] = json!(true); }
-                let prompt = self.stage_prompt(template, plan, &stage)? + &self.outcome_prompt(plan, idx, &turn);
-                let effective = &assignment["effective"];
-                let implementer = effective["provider"].as_str().ok_or("missing agreed provider")?;
-                let model = effective["model"].as_str().ok_or("missing agreed model")?;
-                let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
-                plan["stages"][idx]["implementer_provider"] = json!(implementer);
-                let invocation = json!({"turn_id":turn,"agreement_id":assignment["agreement_id"],"selection_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
-                if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
-                plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
-                self.save_plan(plan)?;
-                let result = self.run_agent(&crate::agent::AgentRequest { role, provider:implementer, model, effort, session:None, prompt:&prompt });
-                let record = plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().last_mut().unwrap();
-                match &result {
-                    Ok(output) => {
-                        record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
-                        record["model_reported"] = json!(output.model_reported);
-                        record["unexpected_substitution"] = json!((!output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model)));
-                        record["status"] = json!("completed");
-                        record["usage"] = output.usage.as_ref().map(|u| json!({"input":u.input_tokens,"output":u.output_tokens,"total":u.total_tokens})).unwrap_or(Value::Null);
-                        record["verification_state"] = json!(if output.model_reported && crate::agent::same_model(implementer, model, &output.effective_model) { "execution_verified" } else { "unexpected_substitution" });
+                // Reserve the round before any invocation; errors/restarts cannot replenish it.
+                plan["stages"][idx]["rounds"] = json!(round + 1);
+                plan["stages"][idx]["review_gate"] =
+                    json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
+                for role in ["architect", "reviewer"] {
+                    if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan" {
+                        plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
                     }
-                    Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); record["failure_kind"] = json!(super::super::reassessment::failure_kind(error)); }
                 }
+                plan["stages"][idx]["last_verdict_valid"] = json!(false);
                 self.save_plan(plan)?;
-                if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
-                match result {
-                    Ok(output) => {
-                        self.record_stage_usage(plan, idx, role, implementer, output.usage.clone())?;
-                        if !output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model) {
-                            let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
-                            plan["stages"][idx]["model_block"] = json!(error);
+                let template = if round == 0 || clarifying {
+                    IMPLEMENT_PROMPT
+                } else {
+                    FIX_PROMPT
+                };
+                self.set_step(
+                    Some(sid),
+                    if round == 0 || clarifying { "implementing" } else { "fixing" },
+                );
+                let mut stage = plan["stages"][idx].clone();
+                if round > 0 {
+                    stage["last_verdict"] = stage["previous_requests"].clone();
+                    stage["last_verdict_valid"] = json!(true);
+                }
+                let role = if round == 0 || clarifying { "implementer" } else { "fixer" };
+                let (output, turn) = loop {
+                    if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
+                    let turn = crate::architecture::identity();
+                    stage = plan["stages"][idx].clone();
+                    if round > 0 { stage["last_verdict"] = stage["previous_requests"].clone(); stage["last_verdict_valid"] = json!(true); }
+                    let prompt = self.stage_prompt(template, plan, &stage)? + &self.outcome_prompt(plan, idx, &turn);
+                    let effective = &assignment["effective"];
+                    let implementer = effective["provider"].as_str().ok_or("missing agreed provider")?;
+                    let model = effective["model"].as_str().ok_or("missing agreed model")?;
+                    let effort = effective["native_effort"].as_str().ok_or("missing agreed effort")?;
+                    plan["stages"][idx]["implementer_provider"] = json!(implementer);
+                    let invocation = json!({"turn_id":turn,"agreement_id":assignment["agreement_id"],"selection_id":assignment["id"],"role":role,"proposed":assignment["validated_proposal"],"requested":effective,"unix":crate::util::unix_timestamp(),"status":"launching"});
+                    if !plan["stages"][idx]["model_invocations"].is_array() { plan["stages"][idx]["model_invocations"] = json!([]); }
+                    plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().push(invocation);
+                    self.save_plan(plan)?;
+                    let result = self.run_agent(&crate::agent::AgentRequest { role, provider:implementer, model, effort, session:None, prompt:&prompt });
+                    let record = plan["stages"][idx]["model_invocations"].as_array_mut().unwrap().last_mut().unwrap();
+                    match &result {
+                        Ok(output) => {
+                            record["effective"] = json!({"provider":implementer,"model":output.effective_model,"native_effort":effort});
+                            record["model_reported"] = json!(output.model_reported);
+                            record["unexpected_substitution"] = json!((!output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model)));
+                            record["status"] = json!("completed");
+                            record["usage"] = output.usage.as_ref().map(|u| json!({"input":u.input_tokens,"output":u.output_tokens,"total":u.total_tokens})).unwrap_or(Value::Null);
+                            record["verification_state"] = json!(if output.model_reported && crate::agent::same_model(implementer, model, &output.effective_model) { "execution_verified" } else { "unexpected_substitution" });
+                        }
+                        Err(error) => { record["status"] = json!("failed"); record["error"] = json!(error); record["failure_kind"] = json!(super::super::reassessment::failure_kind(error)); }
+                    }
+                    self.save_plan(plan)?;
+                    if self.session.stop_requested.load(Ordering::SeqCst) { return Ok("stopped"); }
+                    match result {
+                        Ok(output) => {
+                            self.record_stage_usage(plan, idx, role, implementer, output.usage.clone())?;
+                            if !output.model_reported || !crate::agent::same_model(implementer, model, &output.effective_model) {
+                                let error = "model routing blocked: unexpected provider model substitution; saved work retained. Correct the stage/global model constraint and reconcile before retrying";
+                                plan["stages"][idx]["model_block"] = json!(error);
+                                self.save_plan(plan)?;
+                                return Err(error.into());
+                            }
+                            plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
                             self.save_plan(plan)?;
-                            return Err(error.into());
+                            break (output, turn);
                         }
-                        plan["stages"][idx]["reassessment"]["status"] = json!("reusing");
-                        self.save_plan(plan)?;
-                        break (output, turn);
+                        Err(error) => {
+                            if self.operational_retry(plan, idx, &error,role)? { continue; }
+                            self.reassess(plan, idx, "provider_operational_failure", json!({"failure_kind":super::super::reassessment::failure_kind(&error),"error":crate::util::last_chars(&error,2000),"provider":implementer}))?;
+                            assignment = self.assignment_boundary(plan, idx)?;
+                            if reviewer_runs {
+                                reviewer_config = Some(self.reviewer_config(assignment["effective"]["provider"].as_str().unwrap())?);
+                            }
+                        }
                     }
-                    Err(error) => {
-                        if self.operational_retry(plan, idx, &error,role)? { continue; }
-                        self.reassess(plan, idx, "provider_operational_failure", json!({"failure_kind":super::super::reassessment::failure_kind(&error),"error":crate::util::last_chars(&error,2000),"provider":implementer}))?;
-                        assignment = self.assignment_boundary(plan, idx)?;
-                        if reviewer_runs {
-                            reviewer_config = Some(self.reviewer_config(assignment["effective"]["provider"].as_str().unwrap())?);
+                };
+                // The engine never decides what a history change means; the architect does.
+                if let Some(base) = plan["stages"][idx]["attempt_head"].as_str().map(str::to_owned)
+                    && let Some(evidence) = self.history_change(&base)?
+                {
+                    let decision = self.decide_history_change(plan, ReviewScope::Stage(idx), role, &evidence)?;
+                    match decision["action"].as_str() {
+                        Some("uncommit") => self.undo_agent_commits(&base, role)?,
+                        Some("continue") => {
+                            plan["stages"][idx]["attempt_head"] = evidence["head"].clone();
+                            self.save_plan(plan)?;
+                        }
+                        _ => {
+                            plan["stages"][idx]["review_gate"] = json!({"status":"history_blocked","reason":decision["reason"],
+                                "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
+                            self.save_plan(plan)?;
+                            return Ok("history_blocked");
                         }
                     }
                 }
-            };
-            // The engine never decides what a history change means; the architect does.
-            if let Some(base) = plan["stages"][idx]["attempt_head"].as_str().map(str::to_owned)
-                && let Some(evidence) = self.history_change(&base)?
-            {
-                let decision = self.decide_history_change(plan, ReviewScope::Stage(idx), role, &evidence)?;
-                match decision["action"].as_str() {
-                    Some("uncommit") => self.undo_agent_commits(&base, role)?,
-                    Some("continue") => {
-                        plan["stages"][idx]["attempt_head"] = evidence["head"].clone();
-                        self.save_plan(plan)?;
-                    }
-                    _ => {
-                        plan["stages"][idx]["review_gate"] = json!({"status":"history_blocked","reason":decision["reason"],
+                let effective = &assignment["effective"];
+                let provider = effective["provider"].as_str().unwrap();
+                let model = effective["model"].as_str().unwrap();
+                let effort = effective["native_effort"].as_str().unwrap();
+                let mut original_snapshot = None;
+                let outcome_context = self.outcome_prompt(plan, idx, &turn);
+                let structured = super::super::reassessment::structured_outcome(&output.output);
+                let mut correction_usage = Vec::new();
+                let (output, ()) = self.repair_response("implementer outcome", output,
+                    |response| {
+                        if structured && !super::super::reassessment::structured_outcome(&response.output) {
+                            return Err("a corrected structured outcome must remain JSON".into());
+                        }
+                        self.validate_implementer_response(plan, idx, &turn, &response.output)
+                    },
+                    |response, error| {
+                        if original_snapshot.is_none() { original_snapshot = Some(review_snapshot(self.project())?); }
+                        let correction = crate::response::correction_prompt(&outcome_context, &response.output, error);
+                        let result = self.run_agent(&AgentRequest { role:"response_correction", provider, model, effort,
+                            session:None, prompt:&correction })?;
+                        if Some(review_snapshot(self.project())?) != original_snapshot {
+                            return Err("implementation or HEAD changed during outcome correction".into());
+                        }
+                        if !result.completed || !result.model_reported || !crate::agent::same_model(provider, model, &result.effective_model) {
+                            return Err("outcome correction model changed or did not complete".into());
+                        }
+                        if let Some(usage) = &result.usage { correction_usage.push(usage.clone()); }
+                        Ok(result)
+                    })?;
+                for usage in correction_usage { self.record_stage_usage(plan, idx, role, provider, Some(usage))?; }
+                let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
+                if let Some((kind,evidence)) = trigger {
+                    // A scope escalation says this stage cannot be built as written.
+                    // Re-running it against the same words only spends the remaining
+                    // fix rounds, so the planner that owns the text decides instead.
+                    if kind == "material_scope_change" {
+                        let message = match self.renegotiate_scope(plan, idx, &evidence)? {
+                            super::super::planning::ScopeResolution::Revised(_) => return Ok("renegotiated"),
+                            super::super::planning::ScopeResolution::Clarified(_) => {
+                                if round < budget { continue; }
+                                return Ok("exhausted");
+                            }
+                            super::super::planning::ScopeResolution::Blocked(message) => message,
+                        };
+                        plan["stages"][idx]["review_gate"] = json!({"status":"scope_blocked","reason":message,
                             "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
                         self.save_plan(plan)?;
-                        return Ok("history_blocked");
+                        return Ok("scope_blocked");
                     }
+                    if round < budget { self.reassess(plan, idx, &kind, evidence)?; continue; }
+                    return Ok("exhausted");
+                }
+                if output.usage.as_ref().is_some_and(|u| {
+                    let limit = assignment["policy_inputs"]["limits"]["context_window"].as_u64().unwrap_or(0);
+                    let percent = plan["stages"][idx]["reassessment"]["limits"]["context_percent"].as_u64().unwrap_or(85);
+                    limit > 0 && u.input_tokens.max(0) as u64 >= limit.saturating_mul(percent) / 100
+                }) && round < budget {
+                    self.reassess(plan, idx, "context_pressure", json!({"measured_input_tokens":output.usage.as_ref().unwrap().input_tokens,"context_window":assignment["policy_inputs"]["limits"]["context_window"]}))?;
                 }
             }
-            let effective = &assignment["effective"];
-            let provider = effective["provider"].as_str().unwrap();
-            let model = effective["model"].as_str().unwrap();
-            let effort = effective["native_effort"].as_str().unwrap();
-            let mut original_snapshot = None;
-            let outcome_context = self.outcome_prompt(plan, idx, &turn);
-            let structured = super::super::reassessment::structured_outcome(&output.output);
-            let mut correction_usage = Vec::new();
-            let (output, ()) = self.repair_response("implementer outcome", output,
-                |response| {
-                    if structured && !super::super::reassessment::structured_outcome(&response.output) {
-                        return Err("a corrected structured outcome must remain JSON".into());
-                    }
-                    self.validate_implementer_response(plan, idx, &turn, &response.output)
-                },
-                |response, error| {
-                    if original_snapshot.is_none() { original_snapshot = Some(review_snapshot(self.project())?); }
-                    let correction = crate::response::correction_prompt(&outcome_context, &response.output, error);
-                    let result = self.run_agent(&AgentRequest { role:"response_correction", provider, model, effort,
-                        session:None, prompt:&correction })?;
-                    if Some(review_snapshot(self.project())?) != original_snapshot {
-                        return Err("implementation or HEAD changed during outcome correction".into());
-                    }
-                    if !result.completed || !result.model_reported || !crate::agent::same_model(provider, model, &result.effective_model) {
-                        return Err("outcome correction model changed or did not complete".into());
-                    }
-                    if let Some(usage) = &result.usage { correction_usage.push(usage.clone()); }
-                    Ok(result)
-                })?;
-            for usage in correction_usage { self.record_stage_usage(plan, idx, role, provider, Some(usage))?; }
-            let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
-            if let Some((kind,evidence)) = trigger {
-                // A scope escalation says this stage cannot be built as written.
-                // Re-running it against the same words only spends the remaining
-                // fix rounds, so the planner that owns the text decides instead.
-                if kind == "material_scope_change" {
-                    let message = match self.renegotiate_scope(plan, idx, &evidence)? {
-                        super::super::planning::ScopeResolution::Revised(_) => return Ok("renegotiated"),
-                        super::super::planning::ScopeResolution::Clarified(_) => {
-                            if round < budget { continue; }
-                            return Ok("exhausted");
-                        }
-                        super::super::planning::ScopeResolution::Blocked(message) => message,
-                    };
-                    plan["stages"][idx]["review_gate"] = json!({"status":"scope_blocked","reason":message,
-                        "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
-                    self.save_plan(plan)?;
-                    return Ok("scope_blocked");
+            match self.export_stage_designs(plan, idx, round + 1)? {
+                DesignExport::Ready => {}
+                DesignExport::Blocked => return Ok("design_blocked"),
+                DesignExport::Failed => {
+                    if round < budget { continue; }
+                    return Ok("exhausted");
                 }
-                if round < budget { self.reassess(plan, idx, &kind, evidence)?; continue; }
-                return Ok("exhausted");
-            }
-            if output.usage.as_ref().is_some_and(|u| {
-                let limit = assignment["policy_inputs"]["limits"]["context_window"].as_u64().unwrap_or(0);
-                let percent = plan["stages"][idx]["reassessment"]["limits"]["context_percent"].as_u64().unwrap_or(85);
-                limit > 0 && u.input_tokens.max(0) as u64 >= limit.saturating_mul(percent) / 100
-            }) && round < budget {
-                self.reassess(plan, idx, "context_pressure", json!({"measured_input_tokens":output.usage.as_ref().unwrap().input_tokens,"context_window":assignment["policy_inputs"]["limits"]["context_window"]}))?;
             }
             let snap = review_snapshot(self.project())?;
             if snap["head"] != plan["stages"][idx]["attempt_head"] {
@@ -782,6 +808,80 @@ impl Ctx {
         Ok("exhausted")
     }
 
+    /// Export PNGs for `.pen` files changed in this attempt before anything
+    /// reviews or commits the snapshot, and persist the outcome on the stage.
+    fn export_stage_designs(&self, plan: &mut Value, idx: usize, round: u64) -> Result<DesignExport, String> {
+        let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
+        let base = plan["stages"][idx]["attempt_head"].as_str().ok_or("missing attempt head for design export")?.to_string();
+        let root = Path::new(self.project());
+        let files = crate::pen::changed_pen_files(root, &base)?;
+        if files.is_empty() {
+            if let Some(stage) = plan["stages"][idx].as_object_mut()
+                && stage.remove("design_export").is_some() {
+                self.save_plan(plan)?;
+            }
+            return Ok(DesignExport::Ready);
+        }
+        self.set_step(Some(sid), "exporting designs");
+        let mut record = json!({"round":round,"attempt_id":plan["stages"][idx]["attempt_id"],
+            "attempt_head":base,"files":files,"unix":unix_timestamp()});
+        let outcome = match crate::pen::export_changed(root, &base, &self.pen_search_path()) {
+            Ok(pngs) => {
+                record["status"] = json!("exported");
+                record["pngs"] = json!(pngs);
+                self.log_event("design", &format!("stage {sid}: exported {} PNG(s) for {} changed design(s)", pngs.len(), files.len()));
+                DesignExport::Ready
+            }
+            Err(crate::pen::ExportError::Unavailable(reason)) => {
+                record["status"] = json!("blocked");
+                record["reason"] = json!(reason);
+                plan["stages"][idx]["review_gate"] = json!({"status":"design_blocked","reason":reason,
+                    "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"}});
+                self.log_event("design", &format!("stage {sid}: {reason}"));
+                DesignExport::Blocked
+            }
+            Err(crate::pen::ExportError::Failed(reason)) => {
+                let request = format!("[engine] pen.dev export failed: {reason}; repair the design so it opens and exports headlessly");
+                // Keep every unresolved request; a newer export failure supersedes older ones.
+                let previous = &plan["stages"][idx]["previous_requests"];
+                let mut issues: Vec<String> = Self::review_requests(previous).into_iter()
+                    .filter(|r| !r.starts_with("[engine] pen.dev export failed:")).collect();
+                issues.push(request.clone());
+                let summary = previous["summary"].as_str()
+                    .unwrap_or("Engine design export failed; prior unresolved findings retain authority").to_string();
+                plan["stages"][idx]["previous_requests"] = json!({"approved":false,"summary":summary,"issues":issues,"notes":[],"checks":previous["checks"].as_array().cloned().unwrap_or_default()});
+                plan["stages"][idx]["review_gate"] = json!({"status":"blocked","reason":reason,
+                    "roles":{"architect":"no_current_verdict","reviewer":"no_current_verdict"},
+                    "requests":[{"role":"engine","text":request}]});
+                record["status"] = json!("failed");
+                record["reason"] = json!(reason);
+                self.log_event("design", &format!("stage {sid}: {reason}; returned to the stage's fixer"));
+                DesignExport::Failed
+            }
+        };
+        plan["stages"][idx]["design_export"] = record;
+        plan["stages"][idx]["last_verdict_valid"] = json!(false);
+        self.save_plan(plan)?;
+        Ok(outcome)
+    }
+
+    /// Changed designs may only commit with this attempt and round's successful export.
+    pub(crate) fn validate_design_export(&self, stage: &Value) -> Result<(), String> {
+        let Some(base) = stage["attempt_head"].as_str() else { return Ok(()); };
+        let files = crate::pen::changed_pen_files(Path::new(self.project()), base)?;
+        let export = &stage["design_export"];
+        if !files.is_empty()
+            && (export["status"] != "exported"
+                || export["attempt_id"] != stage["attempt_id"]
+                || export["round"] != stage["rounds"]
+                || export["attempt_head"] != base
+                || export["files"] != json!(files))
+        {
+            return Err("changed .pen designs have no current successful pen.dev export".into());
+        }
+        Ok(())
+    }
+
     fn validate_commit_approval(&self, plan: &Value, idx: usize) -> Result<(), String> {
         let stage = &plan["stages"][idx];
         let gate = &stage["review_gate"];
@@ -799,12 +899,13 @@ impl Ctx {
         if persisted["plan_id"] != plan["plan_id"]
             || persisted["revision"] != plan["revision"]
             || persisted["stages"][idx]["review_gate"] != *gate
-            || ["attempt_id", "attempt_revision", "rounds", "review_cadence", "review_policy", "reviews"]
+            || ["attempt_id", "attempt_revision", "rounds", "review_cadence", "review_policy", "reviews", "design_export"]
                 .iter().any(|field| persisted["stages"][idx][*field] != stage[*field])
             || crate::plan::stage_inputs(&persisted, idx) != crate::plan::stage_inputs(plan, idx)
         {
             return Err("plan changed after review".into());
         }
+        self.validate_design_export(stage)?;
         let policy = &gate["policy"];
         let required = match policy["scope"].as_str() {
             Some("ordinary_documentation") => json!(["reviewer"]),

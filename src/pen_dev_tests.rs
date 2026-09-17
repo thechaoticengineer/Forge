@@ -670,7 +670,6 @@ fn s21_stages_without_designs_are_unchanged() {
 }
 
 #[test]
-#[ignore = "M4 pending: S22 not implemented yet"]
 fn s22_png_exported_for_every_changed_pen_file() {
     // S22: A PNG is exported for every changed .pen file
     let cli = PenCli::new();
@@ -757,7 +756,6 @@ fn s23_export_names_follow_top_level_frames() {
 }
 
 #[test]
-#[ignore = "M4 pending: S24 not implemented yet"]
 fn s24_missing_or_unauthenticated_pen_blocks_run() {
     // S24: A missing or unauthenticated pen CLI blocks with an actionable message
     struct Case {
@@ -814,7 +812,6 @@ fn s24_missing_or_unauthenticated_pen_blocks_run() {
 }
 
 #[test]
-#[ignore = "M4 pending: S25 not implemented yet"]
 fn s25_failed_export_returns_to_agent() {
     // S25: A failed export goes back to the agent
     let cli = PenCli::new();
@@ -930,6 +927,175 @@ fn s26_reviewers_review_designs_through_pngs() {
         assert!(plan_review.contains(text), "plan reviewer prompt missing {text:?}: {plan_review}");
     }
     assert!(!plan_review.contains("pen interactive --in"), "reviewers must not get editing instructions: {plan_review}");
+}
+
+// ------------------------------------------------- export lifecycle units
+// Regression tests for the engine-owned export lifecycle; not scenario tests.
+
+fn design_stage_fixture(search_path: &OsString) -> Fixture {
+    let f = Fixture::new();
+    f.set("test_pen_search_path", json!(search_path.to_string_lossy()));
+    f.set("mock_routing_planner_outputs", json!([{"proposals": [Fixture::proposal(1, "claude", "other")]}]));
+    f.publish_ready("Add a screen mockup", vec![Fixture::stage(1, "Add screen mockup",
+        "Create docs/features/demo/design/screen.pen using pen interactive.",
+        "docs/features/demo/design/screen.pen exists and its PNG matches")]);
+    f
+}
+
+#[test]
+fn pen_blocked_export_resumes_without_a_new_turn_or_round() {
+    let (dir, empty) = empty_search_dir();
+    let f = design_stage_fixture(&empty);
+    f.set("mock_edits", json!([{"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])}]));
+    f.ctx.run_worker();
+    let blocked = f.plan();
+    assert_eq!(blocked["stages"][0]["status"], "blocked", "{}", f.ctx.read_history());
+    assert_eq!(blocked["stages"][0]["review_gate"]["status"], "design_blocked");
+    assert_eq!(blocked["stages"][0]["design_export"]["status"], "blocked");
+    assert_eq!(blocked["stages"][0]["rounds"], 1);
+    assert!(f.ctx.read_history().to_string().contains("stage 1 blocked"));
+
+    // Install pen and resume: only the export is retried, then review commits.
+    let cli = PenCli::new();
+    f.set("test_pen_search_path", json!(cli.direct_search_path().to_string_lossy()));
+    f.ctx.run_worker();
+    let plan = f.plan();
+    assert_eq!(plan["stages"][0]["status"], "committed", "{}", f.ctx.read_history());
+    assert_eq!(plan["stages"][0]["rounds"], 1, "resume must not reserve another round");
+    assert_eq!(plan["stages"][0]["attempt_id"], blocked["stages"][0]["attempt_id"]);
+    assert_eq!(f.implementer_prompts().len(), 1, "resume must not invoke the implementer again");
+    assert!(f.fixer_prompts().is_empty());
+    assert_eq!(plan["stages"][0]["design_export"]["status"], "exported");
+    let sha = plan["stages"][0]["sha"].as_str().unwrap().to_string();
+    let changed = f.ctx.git(&["show", "--name-only", "--pretty=format:", &sha]).unwrap();
+    assert!(changed.contains("docs/features/demo/design/screen.png"), "{changed}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_failed_export_skips_review_and_keeps_unresolved_requests() {
+    let cli = PenCli::new();
+    let f = design_stage_fixture(&cli.direct_search_path());
+    f.set("mock_edits", json!([
+        {"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])},
+        {"docs/features/demo/design/screen.pen": "broken"},
+        {"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main Fixed")])},
+    ]));
+    f.set("mock_verdicts", json!([Fixture::verdict(false)]));
+    f.ctx.run_worker();
+    let plan = f.plan();
+    assert_eq!(plan["stages"][0]["status"], "committed", "{}", f.ctx.read_history());
+    assert_eq!(plan["stages"][0]["rounds"], 3);
+    // Round 1 reviewed and rejected, round 2 failed export (no review), round 3 approved.
+    assert_eq!(f.reviewer_prompts().len(), 2, "no reviewer may run for a failed export round");
+    let fixers = f.fixer_prompts();
+    assert_eq!(fixers.len(), 2);
+    let last = &fixers[1];
+    assert!(last.contains("[engine] pen.dev export failed:") && last.contains("cannot open"), "{last}");
+    assert!(last.contains("Address the outstanding request"), "unresolved review requests must be kept: {last}");
+    assert_eq!(last.matches("[engine] pen.dev export failed:").count(), 2, "one request, repeated in the findings section: {last}");
+    let sha = plan["stages"][0]["sha"].as_str().unwrap().to_string();
+    let pen = f.ctx.git(&["show", &format!("{sha}:docs/features/demo/design/screen.pen")]).unwrap();
+    let png = f.ctx.git(&["show", &format!("{sha}:docs/features/demo/design/screen.png")]).unwrap();
+    assert_eq!(png.into_bytes(), expected_png(pen.as_bytes(), "f1"));
+}
+
+#[test]
+fn pen_commit_guard_requires_current_successful_export() {
+    let f = Fixture::new();
+    let head = f.ctx.git(&["rev-parse", "HEAD"]).unwrap();
+    let stage = |export: Value| json!({"attempt_head": head, "attempt_id": "a1", "rounds": 2, "design_export": export});
+    let good = json!({"status": "exported", "attempt_id": "a1", "round": 2, "attempt_head": head,
+        "files": ["docs/features/demo/design/screen.pen"]});
+    assert!(f.ctx.validate_design_export(&stage(Value::Null)).is_ok(), "no changed design needs no export");
+
+    fs::write(f.root.join("docs/features/demo/design/screen.pen"), design_json(&[("f1", "Main")])).unwrap();
+    assert!(f.ctx.validate_design_export(&stage(good.clone())).is_ok());
+    let mut stale = vec![Value::Null];
+    for (field, value) in [("status", json!("failed")), ("status", json!("blocked")), ("attempt_id", json!("a0")),
+        ("round", json!(1)), ("attempt_head", json!("0000")), ("files", json!([]))] {
+        let mut export = good.clone();
+        export[field] = value;
+        stale.push(export);
+    }
+    for export in stale {
+        assert!(f.ctx.validate_design_export(&stage(export.clone())).is_err(), "must reject {export}");
+    }
+    // A design added after the export is not covered by it.
+    fs::write(f.root.join("docs/features/demo/design/other.pen"), design_json(&[("f1", "Main")])).unwrap();
+    assert!(f.ctx.validate_design_export(&stage(good)).is_err());
+}
+
+fn plan_fix_fixture(search_path: &OsString) -> Fixture {
+    let f = Fixture::new();
+    f.set("review_cadence", json!({"architect": "per_stage", "reviewer": "per_plan"}));
+    // A configured reviewer keeps plan-review independence regardless of the fixer's provider.
+    f.set("reviewer_provider_mode", json!("configured"));
+    f.set("test_pen_search_path", json!(search_path.to_string_lossy()));
+    f.set("mock_routing_planner_outputs", json!([{"proposals": [Fixture::proposal(1, "claude", "other")]}]));
+    f.publish_ready("Improve greeting", vec![Fixture::stage(1, "Fix greeting",
+        "Append a friendly line to README.md.", "README.md has the friendly line")]);
+    f
+}
+
+#[test]
+fn pen_plan_fixer_export_blocks_then_resumes_without_rerunning_the_fixer() {
+    let (dir, empty) = empty_search_dir();
+    let f = plan_fix_fixture(&empty);
+    f.set("mock_edits", json!([
+        {"README.md": "Hello, friendly world!\n"},
+        {"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])},
+    ]));
+    f.set("mock_verdicts", json!([Fixture::verdict(false)]));
+    f.ctx.run_worker();
+    let plan = f.plan();
+    let review = &plan["plan_review"];
+    assert_eq!(review["status"], "blocked", "{}", f.ctx.read_history());
+    assert_eq!(review["gate"]["status"], "design_blocked", "{review}");
+    assert_eq!(review["next_action"], "export_pending");
+    assert_eq!(review["design_export"]["status"], "blocked");
+    assert_eq!(f.ctx.session.state.lock().unwrap().phase, "blocked");
+    assert!(f.ctx.read_history().to_string().contains("@pen.dev/cli"), "{}", f.ctx.read_history());
+    assert_eq!(review["head"], f.ctx.git(&["rev-parse", "HEAD"]).unwrap(), "nothing may commit");
+    assert!(f.ctx.git(&["status", "--porcelain"]).unwrap().contains("screen.pen"), "fix work stays in the worktree");
+    assert_eq!(f.fixer_prompts().len(), 1);
+
+    let cli = PenCli::new();
+    f.set("test_pen_search_path", json!(cli.direct_search_path().to_string_lossy()));
+    f.ctx.run_worker();
+    let plan = f.plan();
+    assert_eq!(plan["status"], "done", "{}", f.ctx.read_history());
+    assert_eq!(f.fixer_prompts().len(), 1, "resume must not rerun the plan fixer");
+    let fixes = plan["plan_review"]["fixes"].as_array().unwrap();
+    assert_eq!(fixes.len(), 1);
+    assert!(fixes[0]["files"].as_array().unwrap().contains(&json!("docs/features/demo/design/screen.png")), "{fixes:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_plan_fixer_failed_export_returns_to_the_next_fix_round() {
+    let cli = PenCli::new();
+    let f = plan_fix_fixture(&cli.direct_search_path());
+    f.set("mock_edits", json!([
+        {"README.md": "Hello, friendly world!\n"},
+        {"docs/features/demo/design/screen.pen": "broken"},
+        {"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])},
+    ]));
+    f.set("mock_verdicts", json!([Fixture::verdict(false)]));
+    f.ctx.run_worker();
+    let plan = f.plan();
+    assert_eq!(plan["status"], "done", "{}", f.ctx.read_history());
+    let fixers = f.fixer_prompts();
+    assert_eq!(fixers.len(), 2);
+    assert!(fixers[1].contains("[engine] pen.dev export failed:") && fixers[1].contains("cannot open"), "{}", fixers[1]);
+    assert!(fixers[1].contains("Address the outstanding request"), "unresolved review requests must be kept: {}", fixers[1]);
+    // The failed round neither committed nor went to review.
+    let fixes = plan["plan_review"]["fixes"].as_array().unwrap();
+    assert_eq!(fixes.len(), 1, "{fixes:?}");
+    assert!(fixes[0]["files"].as_array().unwrap().contains(&json!("docs/features/demo/design/screen.png")), "{fixes:?}");
+    assert_eq!(f.reviewer_prompts().iter().filter(|p| p.contains("COMMIT RANGE")).count(), 2);
+    let pen = fs::read(f.root.join("docs/features/demo/design/screen.pen")).unwrap();
+    assert_eq!(fs::read(f.root.join("docs/features/demo/design/screen.png")).unwrap(), expected_png(&pen, "f1"));
 }
 
 // ------------------------------------------------------ pen module units

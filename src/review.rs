@@ -20,7 +20,7 @@ use verdict::{
 
 #[path = "review_orchestration.rs"]
 mod orchestration;
-use orchestration::ReviewScope;
+use orchestration::{DesignExport, ReviewScope};
 
 #[cfg(test)]
 use crate::model_selection::claude_model_limit;

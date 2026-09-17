@@ -236,6 +236,8 @@ Column {
                       ? "committed — locked" : stageRow.modelData.status === "blocked"
                       ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "scope_blocked"
                          ? "blocked · stage cannot be built as written"
+                         : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "design_blocked"
+                         ? "blocked · pen.dev export unavailable"
                          : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
                          ? "blocked · fix rounds exhausted" : "blocked") : stageRow.modelData.status)
                       + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")

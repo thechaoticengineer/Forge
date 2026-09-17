@@ -339,6 +339,79 @@ impl Ctx {
         }
     }
 
+    /// Export the fix turn's designs, then commit the round and move on to review.
+    /// A failed export skips the commit and review and reserves another fix round.
+    /// Returns false when the plan review must stop (blocked export or stall).
+    fn finish_plan_fix_round(&self, plan: &mut Value) -> Result<bool, String> {
+        match self.export_plan_fix_designs(plan)? {
+            DesignExport::Ready => {}
+            DesignExport::Blocked => {
+                plan["plan_review"]["next_action"] = json!("export_pending");
+                self.plan_action_checkpoint(plan)?;
+                return Ok(false);
+            }
+            DesignExport::Failed => {
+                if self.plan_review_stalled(plan, false)? { return Ok(false); }
+                plan["plan_review"]["next_action"] = json!("reserve_fix");
+                self.plan_action_checkpoint(plan)?;
+                return Ok(true);
+            }
+        }
+        let committed = self.commit_plan_fix_round(plan)?;
+        if self.plan_review_stalled(plan, committed)? { return Ok(false); }
+        plan["plan_review"]["next_action"] = json!("review_pending");
+        self.plan_action_checkpoint(plan)?;
+        Ok(true)
+    }
+
+    /// Export `.pen` files the plan fixer changed since the plan review HEAD
+    /// before the round commits, and persist the outcome on the plan review.
+    fn export_plan_fix_designs(&self, plan: &mut Value) -> Result<DesignExport, String> {
+        let head = plan["plan_review"]["head"].as_str().ok_or("missing plan review HEAD")?.to_string();
+        let root = std::path::Path::new(self.project());
+        let files = crate::pen::changed_pen_files(root, &head)?;
+        if files.is_empty() {
+            if let Some(review) = plan["plan_review"].as_object_mut()
+                && review.remove("design_export").is_some() {
+                self.save_plan(plan)?;
+            }
+            return Ok(DesignExport::Ready);
+        }
+        self.set_step(None, "exporting designs");
+        let mut record = json!({"round":plan["plan_review"]["rounds"],"attempt_id":plan["plan_review"]["attempt_id"],
+            "head":head,"files":files,"unix":crate::util::unix_timestamp()});
+        let outcome = match crate::pen::export_changed(root, &head, &self.pen_search_path()) {
+            Ok(pngs) => {
+                record["status"] = json!("exported");
+                record["pngs"] = json!(pngs);
+                self.log_event("design", &format!("plan fixer: exported {} PNG(s) for {} changed design(s)", pngs.len(), files.len()));
+                DesignExport::Ready
+            }
+            Err(crate::pen::ExportError::Unavailable(reason)) => {
+                record["status"] = json!("blocked");
+                record["reason"] = json!(reason);
+                plan["plan_review"]["status"] = json!("blocked");
+                plan["plan_review"]["gate"] = json!({"status":"design_blocked","reason":reason});
+                self.log_event("plan_review", &format!("plan review blocked: {reason}; the fixer's work stays uncommitted in the worktree; commits remain local"));
+                DesignExport::Blocked
+            }
+            Err(crate::pen::ExportError::Failed(reason)) => {
+                let request = format!("[engine] pen.dev export failed: {reason}; repair the design so it opens and exports headlessly");
+                let mut requests: Vec<Value> = plan["plan_review"]["outstanding_requests"].as_array().cloned().unwrap_or_default()
+                    .into_iter().filter(|r| !r.as_str().is_some_and(|r| r.starts_with("[engine] pen.dev export failed:"))).collect();
+                requests.push(json!(request));
+                plan["plan_review"]["outstanding_requests"] = json!(requests);
+                record["status"] = json!("failed");
+                record["reason"] = json!(reason);
+                self.log_event("plan_review", &format!("plan fixer design export failed: {reason}; returned to the next fix round"));
+                DesignExport::Failed
+            }
+        };
+        plan["plan_review"]["design_export"] = record;
+        self.plan_action_checkpoint(plan)?;
+        Ok(outcome)
+    }
+
     /// Commit the round's fixes so the next review round starts from a clean
     /// worktree. The fixer still only edits files: the engine alone moves HEAD.
     fn commit_plan_fix_round(&self, plan: &mut Value) -> Result<bool, String> {
@@ -348,6 +421,13 @@ impl Ctx {
         }
         let round = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
         let parent = plan["plan_review"]["head"].as_str().ok_or("missing plan review HEAD")?.to_string();
+        let designs = crate::pen::changed_pen_files(std::path::Path::new(self.project()), &parent)?;
+        let export = &plan["plan_review"]["design_export"];
+        if !designs.is_empty() && (export["status"] != "exported" || export["round"] != round
+            || export["attempt_id"] != plan["plan_review"]["attempt_id"] || export["head"] != parent.as_str()
+            || export["files"] != json!(designs)) {
+            return Err("changed .pen designs have no current successful pen.dev export; plan fix commit refused".into());
+        }
         // Match the finalization staging: git add rejects an explicitly excluded ignored path.
         self.git(&["add", "-A"])?;
         self.git(&["reset", "-q", "HEAD", "--", ".forge"])?;
@@ -660,10 +740,12 @@ impl Ctx {
                     plan["plan_review"]["status"] = json!("fixing");
                     self.plan_action_checkpoint(plan)?;
                     self.run_plan_fixer(plan)?;
-                    let committed = self.commit_plan_fix_round(plan)?;
-                    if self.plan_review_stalled(plan, committed)? { return Ok(false); }
-                    plan["plan_review"]["next_action"] = json!("review_pending");
-                    self.plan_action_checkpoint(plan)?;
+                    if !self.finish_plan_fix_round(plan)? { return Ok(false); }
+                }
+                // Only a blocked export persists this action: resuming retries the
+                // export for the finished fix turn without running the fixer again.
+                "export_pending" => {
+                    if !self.finish_plan_fix_round(plan)? { return Ok(false); }
                 }
                 "review_pending" => {
                     let identity = json!({"plan_id":plan["plan_id"],"revision":plan["revision"],"stage_id":null,"scope":"plan",
