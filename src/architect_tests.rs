@@ -546,3 +546,14 @@ fn recovery_prompts_keep_full_design_without_repeating_review_transcripts() {
     assert!(prompt.len() < 20000);
     assert_eq!(recovered["stages"][0]["reviews"], p["stages"][0]["reviews"]);
 }
+
+#[test]
+fn mock_session_uuid_is_length_safe_for_short_identities() {
+    // A fresh identity can be 18 or 19 hex digits once hyphens are removed.
+    for raw in ["", "1", "18d6239-1-0", "18d623966a2841b-1-0", "18d623966a2841b8-568-39e", &identity(), &"f".repeat(40)] {
+        let id = mock_session_uuid(raw);
+        let parts: Vec<_> = id.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12], "{raw} -> {id}");
+    }
+    assert_eq!(mock_session_uuid("18d623966a2841b-1-0"), "18d62396-6a28-41b1-0000-000000000000");
+}

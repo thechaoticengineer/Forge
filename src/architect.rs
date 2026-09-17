@@ -669,15 +669,7 @@ impl Ctx {
         }
         let evaluations = settings["mock_model_evaluations"].as_array_mut().filter(|a| !a.is_empty()).map(|a| a.remove(0))
             .unwrap_or_else(|| crate::routing::mock_evaluations(plan, routing_ids));
-        let raw = identity().replace('-', "");
-        let id = format!(
-            "{}-{}-{}-{}-{}",
-            &raw[..8],
-            &raw[8..12],
-            &raw[12..16],
-            &raw[16..20],
-            &format!("{raw:0<32}")[20..32]
-        );
+        let id = mock_session_uuid(&identity());
         // An array scripts successive turns, so a rejection followed by a
         // correction can be exercised.
         let scripted = match settings.get_mut("mock_architect_output").and_then(Value::as_array_mut) {
@@ -702,6 +694,13 @@ impl Ctx {
             ..AgentResult::default()
         })
     }
+}
+
+/// Formats an identity as a UUID-shaped mock session id. Identities have
+/// variable-length hex parts, so pad (and truncate) to 32 digits before slicing.
+fn mock_session_uuid(identity: &str) -> String {
+    let raw: String = format!("{:0<32}", identity.replace('-', "")).chars().take(32).collect();
+    format!("{}-{}-{}-{}-{}", &raw[..8], &raw[8..12], &raw[12..16], &raw[16..20], &raw[20..32])
 }
 
 #[cfg(test)]
