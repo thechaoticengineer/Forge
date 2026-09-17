@@ -74,7 +74,7 @@ The executable tests generated from scenarios are the project's business tests. 
 
 ## Runtime state
 
-Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it. This file is not yet produced; it will be created by milestone M3 and later.
+Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it. This file is not yet produced; it will be created starting with milestone M2, which introduces approvals committed to runtime state.
 
 ## See also
 

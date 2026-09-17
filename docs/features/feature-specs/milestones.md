@@ -2,7 +2,7 @@
 
 **Status: M1 is implemented; M2–M5 are planned.**
 
-The feature-spec workflow is split into successive milestones (M1-M5). Scenarios for each milestone (S1-S9 for M1) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
+The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9) have executable business tests; each later milestone's scenarios will gain executable business tests as part of that milestone's plan. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
 
 ## M1: Format and discovery
 

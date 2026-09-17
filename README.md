@@ -834,77 +834,35 @@ blocked goals. `/api/queue/clear` removes pending
 goals; `/api/queue/start` starts processing. `GET /api/state` includes
 the queue and whether it is active.
 
-## Feature specs
+### Feature specs
 
-The feature-spec workflow ([documented in `docs/features/`](docs/features/README.md)) 
-is available for organizing specifications, scenarios and milestones. Milestone M1 
-enables the engine to discover and validate feature folders and expose them through 
-an API and panel list.
-
-### Get features
+The feature-spec workflow ([documented in `docs/features/`](docs/features/README.md)) organizes
+specifications, scenarios and milestones for a feature before it is planned. Milestone M1 lets the
+engine discover and validate feature folders and expose them through a read-only API and a panel list.
 
 ```
 GET /api/features[?project=<path>]
 ```
 
-Returns a read-only list of discovered feature specifications. The response has the structure:
-
-```json
-{
-  "project": "/path/to/project",
-  "features": [
-    {
-      "slug": "feature-name",
-      "title": "Feature title (from README.md heading)",
-      "path": "/absolute/path/docs/features/feature-name",
-      "status": "valid",
-      "reasons": []
-    }
-  ]
-}
-```
-
-Fields:
-- **`slug`**: Directory name under `docs/features/`; folder names starting with `_` 
-  (like `_template`) are excluded.
-- **`title`**: First `# ` heading in `README.md` (outside fenced code blocks), or the 
-  slug if no heading is found.
-- **`path`**: Absolute filesystem path to the feature folder.
-- **`status`**: `"valid"` when all required files exist and scenario/milestone 
-  references are correct; `"invalid"` otherwise.
-- **`reasons`**: Array of validation errors. Empty when status is `"valid"`. 
-  Validation checks for:
-  - Missing required files: `README.md`, `scenarios.md`, `decisions.md`, `milestones.md`
-  - Unreadable files (encoding errors)
-  - Malformed or duplicate scenario IDs (`## S<number>` format)
-  - Unknown scenario IDs referenced in `Covers:` lines
-
-Requests with `?project=<URL-encoded-path>` target another project without switching the active project. 
-When `docs/features/` is absent or empty, the endpoint returns an empty `features` array.
-
-Example:
+Returns `{"project": "/path/to/project", "features": [{"slug", "title", "path", "status", "reasons"}, ...]}`,
+sorted by slug. `slug` is the folder name under `docs/features/` (names starting with `_`, like
+`_template`, are excluded). `title` is the feature's first `# ` heading in `README.md` (outside
+fenced code blocks), or the slug if there is none. `path` is the feature folder's absolute path.
+`status` is `"valid"` or `"invalid"`; `reasons` lists validation errors (missing or unreadable
+required files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines) and
+is empty when valid. The endpoint is read-only: it never creates, modifies or removes files.
+`?project=<URL-encoded-path>` targets another project without switching the active one. When
+`docs/features/` is absent or empty, `features` is `[]`.
 
 ```bash
 curl http://127.0.0.1:8734/api/features
 curl http://127.0.0.1:8734/api/features?project=%2Fpath%2Fto%2Fproject
 ```
 
-### Panel feature list
-
-The panel displays a list of discovered features, available through the **Features** button 
-or by pressing `f` in normal mode. The list shows each feature's title, slug, and validation 
-status (with reasons if invalid). An empty state appears when no features exist.
-
-#### Feature list keys (normal mode)
-
-| Key | Action |
-| --- | --- |
-| `j` / `k` | Select next / previous feature |
-| `Enter` / `o` | Open the selected feature folder in nvim (via `omarchy-launch-editor`) |
-| `R` | Refresh the feature list |
-| `q` / `Escape` | Close the feature list |
-
-The panel fetches features only when the overlay opens or refreshes; it does not poll continuously.
+The panel lists discovered features with their title, slug and validation status (with reasons for
+invalid ones), opened with the **Features** button or the `f` key; see [Feature list](#feature-list)
+below for its overlay controls. Opening a feature runs `omarchy-launch-editor <folder>` to edit it
+in nvim. The panel fetches features only when the overlay opens or refreshes; it does not poll.
 
 ## Run
 
@@ -1114,6 +1072,15 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `gg` / `G` | Jump to top / bottom |
 | `R` | Refresh diff |
 | `q` / `Escape` | Close diff |
+
+#### Feature list
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select next / previous feature |
+| `Enter` / `o` | Open the selected feature folder in nvim (via `omarchy-launch-editor`) |
+| `R` | Refresh the feature list |
+| `q` / `Escape` | Close the feature list |
 
 #### Project chooser
 
