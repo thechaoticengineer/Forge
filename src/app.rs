@@ -360,4 +360,19 @@ impl Ctx {
             .map_err(|_| ())
     }
 
+    /// The search path used to find `pen`/`mise` and as the PATH environment
+    /// of every child process spawned for pen.dev integration. Tests never
+    /// mutate the process-global PATH; they inject a fixture path instead.
+    #[allow(dead_code)]
+    pub(crate) fn pen_search_path(&self) -> std::ffi::OsString {
+        #[cfg(test)]
+        {
+            let settings = self.app.settings.lock().unwrap();
+            if let Some(path) = settings.get("test_pen_search_path").and_then(Value::as_str) {
+                return std::ffi::OsString::from(path);
+            }
+        }
+        std::env::var_os("PATH").unwrap_or_default()
+    }
+
 }

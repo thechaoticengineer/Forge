@@ -21,6 +21,7 @@ mod architect;
 mod review_history;
 mod reports;
 mod contracts;
+mod pen;
 mod app;
 mod http;
 mod plan;
@@ -44,6 +45,8 @@ mod plan_tests;
 mod discussion_tests;
 #[cfg(test)]
 mod feature_spec_tests;
+#[cfg(test)]
+mod pen_dev_tests;
 #[cfg(test)]
 mod architecture_integration_tests;
 #[cfg(test)]
