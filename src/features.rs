@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
 pub(crate) struct Feature {
     pub(crate) slug: String,
     pub(crate) title: String,
@@ -17,7 +16,6 @@ pub(crate) struct Feature {
 }
 
 impl Feature {
-    #[allow(dead_code)]
     pub(crate) fn status(&self) -> &'static str {
         if self.reasons.is_empty() { "valid" } else { "invalid" }
     }
@@ -146,7 +144,6 @@ fn build_feature(slug: String, path: PathBuf) -> Feature {
 
 /// Discovers and validates every feature folder under `<project_root>/docs/features`.
 /// Read-only: never creates, modifies, renames or deletes anything.
-#[allow(dead_code)]
 pub(crate) fn discover(project_root: &Path) -> Vec<Feature> {
     let root = project_root.join("docs/features");
     let Ok(entries) = fs::read_dir(&root) else { return Vec::new() };

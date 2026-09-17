@@ -193,6 +193,22 @@ pub(super) fn api_agent_log(ctx: &Ctx, query: &str) -> ApiResponse {
     (200, json!({"log": log, "size": size}))
 }
 
+pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
+    let features: Vec<Value> = crate::features::discover(std::path::Path::new(ctx.project()))
+        .into_iter()
+        .map(|f| {
+            json!({
+                "slug": f.slug,
+                "title": f.title,
+                "path": f.path.display().to_string(),
+                "status": f.status(),
+                "reasons": f.reasons,
+            })
+        })
+        .collect();
+    (200, json!({"project": ctx.project(), "features": features}))
+}
+
 pub(super) fn api_diff(ctx: &Ctx) -> ApiResponse {
     let diff = ctx.git(&["diff", "HEAD"]).unwrap_or_default();
     let tail: String = diff
