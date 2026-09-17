@@ -533,7 +533,6 @@ impl Drop for Fixture {
 // -------------------------------------------------------- scenario tests
 
 #[test]
-#[ignore = "M4 pending: S20 not implemented yet"]
 fn s20_editing_agents_get_pen_instructions_for_design_stages() {
     // S20: Editing agents get pen.dev instructions when a stage involves designs
     for (text, expected) in [
@@ -629,7 +628,6 @@ fn s20_editing_agents_get_pen_instructions_for_design_stages() {
 }
 
 #[test]
-#[ignore = "M4 pending: S21 not implemented yet"]
 fn s21_stages_without_designs_are_unchanged() {
     // S21: Stages without designs are unchanged
     let cli = PenCli::new();
@@ -654,7 +652,10 @@ fn s21_stages_without_designs_are_unchanged() {
 
     // Contrast: the same pen fixture IS invoked for a stage that changes a
     // .pen file, proving the isolation above is not merely because nothing
-    // ever calls pen.
+    // ever calls pen. This stage only wires prompts, not the export that
+    // will drive `pen` for real (a later stage); export_design already
+    // exists (stage 2) so this constructs that export directly against the
+    // committed snapshot, the same way a later stage's export wiring will.
     let design = Fixture::new();
     design.set("test_pen_search_path", json!(cli.direct_search_path().to_string_lossy()));
     design.set("mock_routing_planner_outputs", json!([{"proposals": [Fixture::proposal(1, "claude", "other")]}]));
@@ -663,6 +664,8 @@ fn s21_stages_without_designs_are_unchanged() {
         "docs/features/demo/design/screen.pen exists and its PNG matches")]);
     design.set("mock_edits", json!([{"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])}]));
     design.ctx.run_worker();
+    assert_eq!(design.plan()["stages"][0]["status"], "committed", "{}", design.ctx.read_history());
+    crate::pen::export_design(&design.root, "docs/features/demo/design/screen.pen", &cli.direct_search_path()).unwrap();
     assert!(!cli.calls().is_empty(), "pen must be invoked for a stage that changes a .pen file");
 }
 
@@ -858,11 +861,13 @@ fn s25_failed_export_returns_to_agent() {
 }
 
 #[test]
-#[ignore = "M4 pending: S26 not implemented yet"]
 fn s26_reviewers_review_designs_through_pngs() {
     // S26: Reviewers review designs through the exported PNGs
 
     // Stage-level reviewer, run alongside a non-design stage for contrast.
+    // Export wiring lands in a later stage, so the PNG is constructed here
+    // as part of the implementer edit, the same way a later stage's engine
+    // export will place it before the reviewer runs.
     let cli = PenCli::new();
     let f = Fixture::new();
     f.set("test_pen_search_path", json!(cli.direct_search_path().to_string_lossy()));
@@ -875,9 +880,11 @@ fn s26_reviewers_review_designs_through_pngs() {
         Fixture::stage(2, "Add screen mockup", "Create docs/features/demo/design/screen.pen using pen interactive.",
             "docs/features/demo/design/screen.pen exists and its PNG matches"),
     ]);
+    let screen_pen = design_json(&[("f1", "Main")]);
+    let screen_png = String::from_utf8(expected_png(screen_pen.as_bytes(), "f1")).unwrap();
     f.set("mock_edits", json!([
         {"README.md": "Hello, friendly world!\n"},
-        {"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])},
+        {"docs/features/demo/design/screen.pen": screen_pen, "docs/features/demo/design/screen.png": screen_png},
     ]));
     f.ctx.run_worker();
 
@@ -907,7 +914,11 @@ fn s26_reviewers_review_designs_through_pngs() {
     plan_fixture.publish_ready("Add a screen mockup", vec![Fixture::stage(1, "Add screen mockup",
         "Create docs/features/demo/design/screen.pen using pen interactive.",
         "docs/features/demo/design/screen.pen exists and its PNG matches")]);
-    plan_fixture.set("mock_edits", json!([{"docs/features/demo/design/screen.pen": design_json(&[("f1", "Main")])}]));
+    let plan_screen_pen = design_json(&[("f1", "Main")]);
+    let plan_screen_png = String::from_utf8(expected_png(plan_screen_pen.as_bytes(), "f1")).unwrap();
+    plan_fixture.set("mock_edits", json!([
+        {"docs/features/demo/design/screen.pen": plan_screen_pen, "docs/features/demo/design/screen.png": plan_screen_png},
+    ]));
     plan_fixture.ctx.run_worker();
     let plan2 = plan_fixture.plan();
     assert_eq!(plan2["status"], "done", "{}", plan_fixture.ctx.read_history());
@@ -1011,6 +1022,38 @@ fn pen_find_pen_uses_only_the_explicit_search_path() {
     let joined = std::env::join_paths([dir.clone(), PathBuf::from(cli.direct_search_path())]).unwrap();
     assert_eq!(crate::pen::find_pen(&joined), Some(PathBuf::from(cli.direct_search_path()).join("pen")));
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pen_editing_instructions_are_provider_neutral_and_stable() {
+    // editing_instructions takes no provider argument, so the same resolved
+    // skill always yields byte-identical text for both providers.
+    let cli = PenCli::new();
+    let skill = crate::pen::resolve_skill(&cli.direct_search_path());
+    let claude = crate::pen::editing_instructions(skill.as_deref());
+    let codex = crate::pen::editing_instructions(skill.as_deref());
+    assert_eq!(claude, codex, "the editing section must not depend on the caller");
+    for text in ["pen interactive --in", "--out", "execute(", "save()", "exit()"] {
+        assert!(claude.contains(text), "{text}: {claude}");
+    }
+    assert!(claude.contains(&skill.unwrap().display().to_string()));
+    assert!(claude.contains("or any MCP server"), "{claude}");
+
+    let none = crate::pen::editing_instructions(None);
+    assert!(none.contains("@pen.dev/cli"), "{none}");
+    assert!(none.contains("dist/out/skills/pen-dev/SKILL.md"), "{none}");
+}
+
+#[test]
+fn pen_reviewer_instructions_list_designs_without_editing_instructions() {
+    let section = crate::pen::reviewer_instructions(&[
+        ("docs/features/demo/design/screen.pen".to_string(), vec!["docs/features/demo/design/screen.png".to_string()]),
+    ]);
+    for text in ["docs/features/demo/design/screen.pen", "docs/features/demo/design/screen.png", "not required to run"] {
+        assert!(section.contains(text), "{text}: {section}");
+    }
+    assert!(!section.contains("pen interactive --in"), "{section}");
+    assert_eq!(crate::pen::reviewer_instructions(&[]), "");
 }
 
 #[test]

@@ -9,6 +9,7 @@ use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
 use crate::util::unix_timestamp;
 use serde_json::{Value, json};
 use std::fs;
+use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -112,6 +113,21 @@ impl Ctx {
                 (self.plan_review_prompt(plan), plan["plan_review"]["acceptance"].as_str().unwrap_or("").to_string(), cp["guidance"].clone(), None)
             }
         };
+        // Reviewer and architect prompts share this path: point both at any
+        // changed designs' PNGs, never at editing instructions.
+        let design_base = match scope {
+            ReviewScope::Stage(idx) => plan["stages"][idx]["attempt_head"].as_str().map(str::to_owned),
+            ReviewScope::Plan => plan["plan_review"]["base"].as_str().map(str::to_owned),
+        };
+        if let Some(base_sha) = design_base {
+            let root = Path::new(self.project());
+            let files = crate::pen::changed_pen_files(root, &base_sha).unwrap_or_default();
+            if !files.is_empty() {
+                let designs: Vec<(String, Vec<String>)> =
+                    files.iter().map(|f| (f.clone(), crate::pen::exported_pngs(root, f))).collect();
+                prompt.push_str(&crate::pen::reviewer_instructions(&designs));
+            }
+        }
         if role == "architect" {
             prompt = prompt.replacen(
                 "You are an independent reviewer in a fresh session.",

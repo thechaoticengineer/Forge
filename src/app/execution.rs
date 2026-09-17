@@ -1,7 +1,7 @@
 //! Stage execution, durable attempt recovery, and completed-run publication.
 use super::{Ctx, FORGE_DIR, WorkerGuard};
 use crate::agent::AgentUsage;
-use crate::prompts::REVIEW_PROMPT;
+use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
 use crate::usage::accumulate_invocation_usage;
 use crate::util::{fill_template, fmt_duration, unix_timestamp};
 use serde_json::{Value, json};
@@ -135,6 +135,21 @@ impl Ctx {
             let diff = self.git(&["diff", "HEAD", "--", ".", ":(exclude).forge"])?;
             prompt.push_str(&format!("\nSAVED ARCHITECTURAL SUMMARY: {}\nRelevant decisions: {}\nWORKTREE: {}\nDIFF (bounded preview; inspect full staged/unstaged diff and all untracked contents yourself):\n{}\nOUTSTANDING FINDINGS:\n{}\nYou may be inheriting partial work from another agent. Inspect and preserve all existing changes, completed interfaces and accepted decisions before editing. Saved findings remain authoritative until resolved with evidence.\n", cp["summary"], cp["recent_decisions"], worktree, diff.chars().take(16000).collect::<String>(), Self::stage_review_context(stage)));
 
+        }
+        // Editing agents (never the reviewer) get pen.dev instructions when the
+        // stage text references designs, or a fix round follows an export
+        // failure that left changed `.pen` files without a design mention.
+        if template == IMPLEMENT_PROMPT || template == FIX_PROMPT {
+            let needs_pen = crate::pen::stage_references_designs(stage)
+                || stage["attempt_head"].as_str().is_some_and(|base| {
+                    crate::pen::changed_pen_files(std::path::Path::new(self.project()), base)
+                        .map(|files| !files.is_empty())
+                        .unwrap_or(false)
+                });
+            if needs_pen {
+                let skill = crate::pen::resolve_skill(&self.pen_search_path());
+                prompt.push_str(&crate::pen::editing_instructions(skill.as_deref()));
+            }
         }
         Ok(prompt)
     }

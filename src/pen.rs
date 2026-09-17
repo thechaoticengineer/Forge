@@ -360,6 +360,20 @@ fn install(from: &Path, to: &Path) -> std::io::Result<()> {
     result
 }
 
+/// Whether `name` is `<stem>.png` or `<stem>.<slug>.png` for this design,
+/// not another design's `<stem>.<x>.pen`-backed export.
+fn owns_export(dir: &Path, stem: &str, name: &str) -> bool {
+    let Some(middle) = name.strip_prefix(stem).and_then(|rest| rest.strip_suffix(".png")) else { return false };
+    match middle.strip_prefix('.') {
+        None => middle.is_empty(),
+        Some(slug) => {
+            !slug.is_empty()
+                && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !dir.join(format!("{stem}.{slug}.pen")).exists()
+        }
+    }
+}
+
 /// Removes `<stem>.png` / `<stem>.<slug>.png` files not just written, keeping
 /// `<stem>.<x>.png` when `<stem>.<x>.pen` exists (another design's export).
 fn remove_stale_exports(dir: &Path, stem: &str, written: &[String]) -> std::io::Result<()> {
@@ -369,20 +383,33 @@ fn remove_stale_exports(dir: &Path, stem: &str, written: &[String]) -> std::io::
         if written.contains(&name) || !entry.file_type()?.is_file() {
             continue;
         }
-        let Some(middle) = name.strip_prefix(stem).and_then(|rest| rest.strip_suffix(".png")) else { continue };
-        let owned = match middle.strip_prefix('.') {
-            None => middle.is_empty(),
-            Some(slug) => {
-                !slug.is_empty()
-                    && slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                    && !dir.join(format!("{stem}.{slug}.pen")).exists()
-            }
-        };
-        if owned {
+        if owns_export(dir, stem, &name) {
             fs::remove_file(entry.path())?;
         }
     }
     Ok(())
+}
+
+/// Repository-relative PNG paths currently exported for a `.pen` file,
+/// following [`export_design`]'s naming rule and excluding files that belong
+/// to another design's `.pen` in the same directory.
+#[allow(dead_code)]
+pub(crate) fn exported_pngs(root: &Path, pen_file: &str) -> Vec<String> {
+    let relative = Path::new(pen_file);
+    let Some(stem) = relative.file_name().and_then(OsStr::to_str).and_then(|name| name.strip_suffix(".pen")) else {
+        return vec![];
+    };
+    let rel_dir = relative.parent().unwrap_or(Path::new(""));
+    let dir = root.join(rel_dir);
+    let Ok(entries) = fs::read_dir(&dir) else { return vec![] };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| owns_export(&dir, stem, name))
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| rel_dir.join(name).to_string_lossy().into_owned()).collect()
 }
 
 fn tail(text: &str) -> String {
@@ -505,13 +532,33 @@ fn run_bounded(command: &mut Command, input: Option<Vec<u8>>, timeout: Duration)
 }
 
 /// Shell-based pen.dev editing instructions for implementer/fixer prompts.
-#[allow(dead_code)]
-pub(crate) fn editing_instructions(_skill: Option<&Path>) -> String {
-    String::new()
+/// Identical for every caller: it takes no provider and carries no MCP
+/// configuration, only the resolved skill path (if any) varies.
+pub(crate) fn editing_instructions(skill: Option<&Path>) -> String {
+    let skill_paragraph = match skill {
+        Some(path) => format!(
+            "Read the pen.dev CLI's bundled skill at {} before editing for the full command reference.",
+            path.display()
+        ),
+        None => crate::prompts::PEN_EDITING_NO_SKILL.to_string(),
+    };
+    format!("\n\n{}\n\n{skill_paragraph}", crate::prompts::PEN_EDITING_PARAGRAPH)
 }
 
-/// Reviewer pointers to a snapshot's changed designs and their exported PNGs.
-#[allow(dead_code)]
-pub(crate) fn reviewer_instructions(_designs: &[(String, Vec<String>)]) -> String {
-    String::new()
+/// Reviewer pointers to a snapshot's changed designs and their exported
+/// PNGs. Returns an empty string when there are no changed designs; never
+/// contains editing instructions.
+pub(crate) fn reviewer_instructions(designs: &[(String, Vec<String>)]) -> String {
+    if designs.is_empty() {
+        return String::new();
+    }
+    let mut section = format!("\n\n{}\n", crate::prompts::PEN_REVIEW_INTRO);
+    for (pen_file, pngs) in designs {
+        if pngs.is_empty() {
+            section.push_str(&format!("- {pen_file} (no exported PNG found)\n"));
+        } else {
+            section.push_str(&format!("- {pen_file} -> {}\n", pngs.join(", ")));
+        }
+    }
+    section
 }

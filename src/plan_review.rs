@@ -235,7 +235,7 @@ impl Ctx {
                 }
                 let cp = self.architecture_store().checkpoint(plan)?;
                 let r = &plan["plan_review"];
-                let prompt = crate::util::fill_template(crate::prompts::PLAN_FIX_PROMPT, &[
+                let mut prompt = crate::util::fill_template(crate::prompts::PLAN_FIX_PROMPT, &[
                     ("{goal}",r["subject"]["goal"].as_str().unwrap_or("")),
                     ("{stages}",&r["subject"]["stages"].to_string()),
                     ("{base}",r["base"].as_str().unwrap_or("")),
@@ -247,6 +247,19 @@ impl Ctx {
                     ("{plan_id}",plan["plan_id"].as_str().unwrap_or("")),
                     ("{git_rule}",crate::prompts::AGENT_GIT_RULE),
                 ]);
+                // Fixing designs needs the same shell instructions an implementer
+                // gets: any reviewed stage referencing designs, or `.pen` files
+                // changed since the plan review base (commits or worktree).
+                let base = r["base"].as_str().unwrap_or("");
+                let stage_designs = r["subject"]["stages"].as_array().into_iter().flatten()
+                    .any(crate::pen::stage_references_designs);
+                let changed_designs = !base.is_empty()
+                    && crate::pen::changed_pen_files(std::path::Path::new(self.project()), base)
+                        .map(|files| !files.is_empty()).unwrap_or(false);
+                if stage_designs || changed_designs {
+                    let skill = crate::pen::resolve_skill(&self.pen_search_path());
+                    prompt.push_str(&crate::pen::editing_instructions(skill.as_deref()));
+                }
                 let turn = crate::architecture::identity();
                 if !plan["plan_review"]["model_invocations"].is_array() { plan["plan_review"]["model_invocations"] = json!([]); }
                 let round = plan["plan_review"]["rounds"].clone();

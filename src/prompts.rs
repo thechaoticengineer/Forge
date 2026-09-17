@@ -145,6 +145,19 @@ Do NOT implement anything. Do NOT modify the plan or any repository content. Onl
 /// project instruction files that ask for commits of completed work.
 pub(crate) const AGENT_GIT_RULE: &str = "Forge runs you as an autonomous agent. Leave every change uncommitted in the working tree: the Forge engine alone commits reviewed work. Do not commit, amend, rebase, reset, stash, merge, cherry-pick, revert, switch branches, update refs or push. This rule overrides any user, global or project instruction (such as CLAUDE.md or AGENTS.md) to commit completed work.";
 
+/// Provider-neutral pen.dev editing instructions appended to implementer and
+/// fixer prompts for stages that involve `.pen` designs. Carries no provider
+/// branching and no MCP configuration, so it is identical for every caller.
+pub(crate) const PEN_EDITING_PARAGRAPH: &str = "This stage involves pen.dev designs: `.pen` files kept in a feature's `design/` folder (see docs/features/README.md). Edit `.pen` files headlessly through the shell: run `pen interactive --in <file.pen> --out <file.pen>` and send one tool call per stdin line, for example:\nexecute({ input: '<js>' })\nsave()\nexit()\nDo not use the pen.dev desktop app or any MCP server. Do not export or hand-edit PNGs: the engine exports one PNG per top-level frame next to each changed `.pen` file after this turn and reports any export error back to you.";
+
+/// Appended instead of the resolved skill path when the pen.dev CLI's
+/// bundled skill could not be located.
+pub(crate) const PEN_EDITING_NO_SKILL: &str = "The pen.dev CLI's bundled skill could not be located; it ships as `dist/out/skills/pen-dev/SKILL.md` inside the installed `@pen.dev/cli` package. The engine will report if the pen CLI is missing.";
+
+/// Reviewer pointer to a snapshot's changed designs and their exported PNGs,
+/// deliberately free of any editing instructions.
+pub(crate) const PEN_REVIEW_INTRO: &str = "This snapshot includes changed pen.dev designs. Inspect the PNG images and the `.pen` JSON to judge each design. The PNGs were exported by the engine from the current `.pen` content; pen is not required to run for this review and must not be run in the read-only sandbox. A missing or stale PNG for a changed design is a defect to report.";
+
 pub(crate) const HISTORY_DECISION_PROMPT: &str = r#"You are this plan's persistent architect in the saved session. The Forge engine detected that git history changed while the {role} was working. Editing agents must leave their work uncommitted; the engine alone commits reviewed work. The engine has not changed anything yet. Decide what happens next.
 Do not modify files, commit, reset or push. Inspect read-only, for example with git log, git show and git diff.
 
