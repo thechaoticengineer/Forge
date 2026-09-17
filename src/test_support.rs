@@ -50,6 +50,10 @@ impl QueueTest {
         for (key, value) in [
             ("user.name", "Forge Test"), ("user.email", "test@example.invalid"),
             ("commit.gpgsign", "false"), ("core.hooksPath", "/dev/null"),
+            // Untracked files are reported individually instead of collapsed
+            // into their topmost untracked directory, so tests can assert on
+            // the actual paths a change touched.
+            ("status.showUntrackedFiles", "all"),
         ] {
             app.git(&["config", key, value]).unwrap();
         }

@@ -2,6 +2,9 @@
 mod agent_execution;
 mod discussion;
 mod execution;
+/// Co-authoring writes are engine-owned, so its validators are unit-tested
+/// directly (see src/feature_author_tests.rs).
+pub(crate) mod feature_author;
 mod git;
 mod history;
 mod persistence;
@@ -104,8 +107,7 @@ pub(crate) struct State {
     /// depends on (M1 S9).
     pub(crate) feature_activity: Value,
     /// Request-id counter for `feature_activity`, assigned by the co-authoring
-    /// and spec-review workers added in the following stages.
-    #[allow(dead_code)]
+    /// worker and the spec-review worker of the next stage.
     pub(crate) feature_serial: i64,
     pub(crate) role_usage: Value,
     pub(crate) agent_started_unix: i64,
