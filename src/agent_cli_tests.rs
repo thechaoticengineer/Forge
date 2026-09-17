@@ -523,6 +523,28 @@ fn stage_agents_must_fix_all_build_and_test_failures() {
 }
 
 #[test]
+fn plan_fixer_must_fix_all_build_and_test_failures() {
+    let forbidden = [
+        "within the approved plan's scope",
+        "pre-existing problems",
+        "blockers outside the approved plan's scope",
+    ];
+    let required = [
+        "regardless of which change",
+        "Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification.",
+        "do not delete, skip, ignore or weaken that test on your own",
+        "escalate to the architect",
+    ];
+    let template = crate::prompts::PLAN_FIX_PROMPT;
+    for phrase in forbidden {
+        assert!(!template.contains(phrase), "unexpected {phrase:?} in template");
+    }
+    for phrase in required {
+        assert!(template.contains(phrase), "missing {phrase:?} in template");
+    }
+}
+
+#[test]
 fn enhancement_and_response_corrections_require_readonly_capabilities() {
     for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "model_policy", "response_correction"].map(|role| (provider, role))) {
         let mut req = AgentRequest {role:"chat",session:None,..request(provider)};
