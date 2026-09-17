@@ -494,6 +494,35 @@ fn editing_agents_are_told_to_leave_history_to_the_engine() {
 }
 
 #[test]
+fn stage_agents_must_fix_all_build_and_test_failures() {
+    let forbidden = [
+        "introduced by your changes within this stage's scope",
+        "pre-existing problems",
+        "blockers outside this stage's scope",
+    ];
+    let required = [
+        "regardless of which change",
+        "Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification.",
+        "do not delete, skip, ignore or weaken that test on your own",
+        "escalate to the architect",
+    ];
+    for template in [crate::prompts::IMPLEMENT_PROMPT, crate::prompts::FIX_PROMPT] {
+        for phrase in forbidden {
+            assert!(!template.contains(phrase), "unexpected {phrase:?} in template");
+        }
+        for phrase in required {
+            assert!(template.contains(phrase), "missing {phrase:?} in template");
+        }
+    }
+    let extract = |template: &str| {
+        let start = template.find("Fix every build error").expect("paragraph start");
+        let end = template.find("Report the exact commands").expect("paragraph end");
+        template[start..end].to_string()
+    };
+    assert_eq!(extract(crate::prompts::IMPLEMENT_PROMPT), extract(crate::prompts::FIX_PROMPT));
+}
+
+#[test]
 fn enhancement_and_response_corrections_require_readonly_capabilities() {
     for (provider, role) in ["codex", "claude"].into_iter().flat_map(|provider| ["enhance", "model_policy", "response_correction"].map(|role| (provider, role))) {
         let mut req = AgentRequest {role:"chat",session:None,..request(provider)};
