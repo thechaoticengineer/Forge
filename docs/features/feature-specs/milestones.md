@@ -18,7 +18,7 @@ Scenarios: to be written before M2 is planned.
 
 ## M3: Feature to plans
 
-Splitting a feature into milestones; supplying feature context to the planner, architect and reviewer; a failing-tests-first first stage in each milestone's plan; scenario coverage required during plan review.
+Splitting a feature into milestones; supplying feature context to the planner, architect and reviewer; a failing-tests-first first stage in each milestone's plan; scenario coverage required during plan review; every plan keeps all existing business tests of all features passing, and a business test may change or be removed only after an approved change to its scenario.
 
 Scenarios: to be written before M3 is planned.
 

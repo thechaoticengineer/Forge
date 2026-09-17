@@ -35,3 +35,9 @@ Reason: Feature specs are meant to feed into that flow (by producing plans), not
 Decision: Approvals, plan links and progress for a feature are stored in `.forge/features/<slug>.json`, not committed to `docs/features/<slug>/`.
 
 Reason: Keeps the committed spec folder as pure documentation, and matches how other runtime/engine state is already kept out of the repository under `.forge/`.
+
+## D7: Business tests always pass unless their scenario is changed
+
+Decision: After every plan, all business tests generated from approved scenarios, across all features, must pass. A business test may be changed or removed only after its scenario is deliberately changed or removed in the feature spec and that change is approved. Agents escalate conflicts with approved scenarios to the architect instead of adjusting the tests.
+
+Reason: Business tests are the executable form of the business documentation. If they could drift or be edited to fit an implementation, the documentation would stop describing what the product actually does.

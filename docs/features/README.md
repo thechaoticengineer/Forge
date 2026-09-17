@@ -59,6 +59,16 @@ The feature specification flow proceeds in order:
 5. **One Forge plan per milestone** — for each milestone:
    - The first stage of the plan turns that milestone's scenarios into executable tests that fail before implementation.
    - Later stages implement the feature until those tests pass.
+6. **Business tests stay green** — once a scenario has an executable business test, that test must keep passing after every later plan, for every feature. See [Business tests](#business-tests).
+
+## Business tests
+
+The executable tests generated from scenarios are the project's business tests. Together with the feature folders they form a living business specification: the documentation says what the product must do, and the business tests prove that it still does.
+
+- After every plan, all business tests of all features pass, not only the tests of the milestone being implemented.
+- A business test is changed or removed only after its scenario is deliberately changed or removed in the feature spec, and that spec change is approved.
+- Agents never change, skip, weaken or delete a business test to make a plan pass. If implementation conflicts with an approved scenario, the agent escalates to the architect, who either adjusts the plan so the scenario still holds or proposes a scenario change for approval.
+- Each business test is traceable to its scenario ID, so a failing test points back to the behavior it protects.
 
 ## Runtime state
 
