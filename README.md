@@ -18,8 +18,9 @@ A feature-spec planning workflow is documented in [docs/features/](docs/features
 4. Forge runs each stage automatically:
    - the **implementer** implements the stage and leaves it uncommitted. The
      implementer must fix every build error and failing test before handing off,
-     regardless of which change caused it; such failures are never out of scope.
-     If git history changed meanwhile, the engine changes nothing itself and asks
+     regardless of which change caused it; such failures are never out of scope
+     and must never be reported as pre-existing or as blockers instead of being
+     fixed. If git history changed meanwhile, the engine changes nothing itself and asks
      the architect to decide (see [Git history changes during a stage](#git-history-changes-during-a-stage)),
    - the engine classifies the full implementation snapshot,
    - a fresh, adversarial **independent reviewer** verifies the stage and its scope
@@ -31,7 +32,8 @@ A feature-spec planning workflow is documented in [docs/features/](docs/features
 5. After the last stage, Forge runs any deferred reviews over the plan's commit
    range and fixes their findings. The plan fixer must fix every build error and
    failing test found by review, regardless of which change caused it; such
-   failures are never out of scope. Only after that gate is clean and any approved
+   failures are never out of scope and must not be reported as pre-existing or
+   as blockers instead of being fixed. Only after that gate is clean and any approved
    fixes are committed does it attempt a push to `origin` when `auto_push` is
    enabled and append the completed-run report. Plans without deferred roles
    skip this phase. Push failures are logged; report-storage failures are returned
