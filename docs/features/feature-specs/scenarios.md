@@ -38,7 +38,7 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 
 - Given: `docs/features/` contains a mix of valid and invalid feature folders
 - When: a client requests the list of features from the engine's read-only API
-- Then: the response identifies each feature by slug, title and validation status, and no file under `docs/features/` is created, modified or removed as a result
+- Then: the response identifies each feature by slug, title (the first `# ` heading of its `README.md`, or the slug when there is none) and validation status, and no file under `docs/features/` is created, modified or removed as a result
 
 ## S7: The panel lists discovered features with their status
 
@@ -46,11 +46,11 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - When: the user opens the panel's feature list
 - Then: each discovered feature is shown with an indication of its validation status
 
-## S8: Opening a feature in nvim from the panel
+## S8: Opening a feature folder in nvim from the panel
 
 - Given: the panel's feature list is showing a discovered feature
 - When: the user chooses the "open in nvim" action for that feature
-- Then: that feature's `README.md` is opened in nvim
+- Then: a terminal window opens nvim on that feature's folder (`nvim .` in `docs/features/<slug>/`), showing the folder's files for browsing
 
 ## S9: The existing goal/discussion/queue flow is unaffected without feature specs
 

@@ -22,7 +22,7 @@ docs/features/<slug>/
   milestones.md       split into successive plans (M1, M2, ...) with scenario IDs
 ```
 
-**README.md** contains the feature's goal, scope and out-of-scope boundaries, intended behavior, and any open questions. It is the entry point for reviewers.
+**README.md** contains the feature's goal, scope and out-of-scope boundaries, intended behavior, and any open questions. It is the entry point for reviewers. Its first `# ` heading is the feature's title; a README without one is titled by its slug.
 
 **design/** holds UI mockups as `.pen` files (pen.dev format), each with an exported PNG next to it using the same base name (e.g. `panel-list.pen` and `panel-list.png`), and diagrams as Mermaid files (`.mmd`) or fenced ` ```mermaid ` blocks in Markdown.
 
@@ -45,6 +45,8 @@ Then: the feature dialog appears with focus on the first input
 
 Covers: S1, S2, S3
 ```
+
+A milestone whose scenarios are not written yet uses `Covers: none yet`.
 
 Empty templates of these files are available in `docs/features/_template/` to copy as a starting point.
 

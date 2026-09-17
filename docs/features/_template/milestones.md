@@ -4,6 +4,6 @@
 
 ## M1: <milestone title>
 
-Scenarios: S…
+Covers: S…
 
 *Brief description of the scope and goals for this milestone.*
