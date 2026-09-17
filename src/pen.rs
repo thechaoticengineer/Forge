@@ -104,6 +104,14 @@ fn skill_beside_entry(entry: &Path) -> Option<PathBuf> {
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
     }
+    // npm-style installs (including mise) expose `node_modules/.bin/pen` as a
+    // generated wrapper script beside the package rather than a symlink to it.
+    if entry.parent().and_then(Path::file_name) == Some(OsStr::new(".bin")) {
+        let skill = entry.parent()?.parent()?.join("@pen.dev/cli/dist").join(SKILL);
+        if skill.is_file() {
+            return fs::canonicalize(skill).ok();
+        }
+    }
     entry.ancestors().skip(1).find_map(|dir| {
         let manifest: Value = serde_json::from_slice(&fs::read(dir.join("package.json")).ok()?).ok()?;
         if manifest.get("name").and_then(Value::as_str) != Some("@pen.dev/cli") {

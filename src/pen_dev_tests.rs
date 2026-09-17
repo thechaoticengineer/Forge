@@ -102,6 +102,9 @@ fn python3_path() -> PathBuf {
 const PEN_SCRIPT_BODY: &str = r##"
 import sys, os, json, hashlib, re
 
+if os.environ.get("FORGE_FAKE_PEN_PROBE"):
+    sys.exit(0)
+
 def _here():
     return os.path.realpath(__file__)
 
@@ -202,6 +205,9 @@ if __name__ == "__main__":
 const MISE_SCRIPT_BODY: &str = r##"
 import sys, os
 
+if os.environ.get("FORGE_FAKE_PEN_PROBE"):
+    sys.exit(0)
+
 def _here():
     return os.path.realpath(__file__)
 
@@ -216,7 +222,8 @@ def main():
     prog = os.path.basename(sys.argv[0])
     if prog == "mise":
         if sys.argv[1:3] == ["which", "pen"]:
-            sys.stdout.write(_index_path() + "\n")
+            # Like real mise npm installs: a generated wrapper script, not a symlink.
+            sys.stdout.write(os.path.join(_root(), "pkg", "node_modules", ".bin", "pen") + "\n")
             return 0
         sys.stderr.write("Error: unsupported mise command\n")
         return 1
@@ -233,6 +240,24 @@ if __name__ == "__main__":
 /// it appends each invocation's argv to `<root>/calls.log`.
 struct PenCli {
     root: PathBuf,
+}
+
+/// Wait until a freshly written script can be executed. A child forked by a
+/// concurrent test can briefly inherit the write descriptor, making exec fail
+/// with "Text file busy"; once one probe run succeeds that window is over.
+fn settle_executable(path: &std::path::Path) {
+    for _ in 0..500 {
+        match std::process::Command::new(path).env("FORGE_FAKE_PEN_PROBE", "1").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                assert!(result.unwrap().status.success(), "probe of {} failed", path.display());
+                return;
+            }
+        }
+    }
+    panic!("{} stayed busy", path.display());
 }
 
 impl PenCli {
@@ -256,6 +281,12 @@ impl PenCli {
         fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink(&index, bin.join("pen")).unwrap();
 
+        let wrapper_dir = root.join("pkg/node_modules/.bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("pen");
+        fs::write(&wrapper, format!("#!/bin/sh\n[ -n \"$FORGE_FAKE_PEN_PROBE\" ] && exit 0\nexec \"{}\" \"$@\"\n", index.display())).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
         let mise_bin = root.join("mise/bin");
         fs::create_dir_all(&mise_bin).unwrap();
         let mise = mise_bin.join("mise");
@@ -266,6 +297,9 @@ impl PenCli {
         fs::create_dir_all(&shims).unwrap();
         std::os::unix::fs::symlink(&mise, shims.join("pen")).unwrap();
 
+        for executable in [&index, &wrapper, &mise] {
+            settle_executable(executable);
+        }
         Self { root }
     }
 
@@ -408,7 +442,7 @@ fn fixture_mise_shim_resolves_and_forwards_to_pen() {
     let cli = PenCli::new();
     let out = std::process::Command::new(cli.mise_path()).args(["which", "pen"]).output().unwrap();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), cli.index_path().display().to_string());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), cli.root.join("pkg/node_modules/.bin/pen").display().to_string());
 
     let shim_pen = PathBuf::from(cli.mise_search_path()).join("pen");
     let out = std::process::Command::new(&shim_pen).arg("status").output().unwrap();
