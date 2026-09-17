@@ -108,7 +108,7 @@ test('S7: openFeatures fetches /api/features for the current project and shows t
 test('S8: open in nvim launches omarchy-launch-editor on the feature folder - editorCommand', () => {
   // S8: Opening a feature folder in nvim from the panel
   const Features = loadFeatures();
-  assert.deepEqual(Features.editorCommand({ path: '/p/docs/features/x' }),
+  assert.deepEqual(plain(Features.editorCommand({ path: '/p/docs/features/x' })),
     ['omarchy-launch-editor', '/p/docs/features/x']);
 });
 
@@ -123,5 +123,5 @@ test('S8: openFeatureInEditor runs the editor command via Quickshell.execDetache
   const feature = { slug: 'x', path: '/p/docs/features/x' };
   ctx.openFeatureInEditor(feature);
   assert.deepEqual(executed, ctx.Features.editorCommand(feature));
-  assert.deepEqual(executed, ['omarchy-launch-editor', '/p/docs/features/x']);
+  assert.deepEqual(plain(executed), ['omarchy-launch-editor', '/p/docs/features/x']);
 });

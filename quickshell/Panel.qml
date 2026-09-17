@@ -18,6 +18,7 @@ import "GoalEnhancement.js" as GoalEnhancement
 import "Discussion.js" as Discussion
 import "PlanEdit.js" as PlanEdit
 import "CataloguePresentation.js" as CataloguePresentation
+import "Features.js" as Features
 
 Item {
   id: root
@@ -243,6 +244,11 @@ Item {
   property string diffText: ""
   property bool diffPending: false
   property string diffError: ""
+
+  property bool featuresOpen: false
+  property var featureList: []
+  property bool featuresPending: false
+  property string featuresError: ""
 
   property var catalogueDetails: null
   property bool catalogueOpen: false
@@ -485,6 +491,10 @@ Item {
     diffText = ""
     diffError = ""
     diffPending = false
+    featuresOpen = false
+    featureList = []
+    featuresPending = false
+    featuresError = ""
     localError = ""
     DetailView.invalidate(logFeed)
     logFeed = DetailView.newFeed()
@@ -857,6 +867,31 @@ Item {
         root.diffError = "Unable to load diff"
       }
     })
+  }
+
+  function openFeatures() {
+    if (root.featuresPending) return
+    root.featuresPending = true
+    const revision = projectViewRevision
+    api("GET", "/api/features?project=" + encodeURIComponent(lastProject), null, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      root.featuresPending = false
+      if (resp && Array.isArray(resp.features)) {
+        root.featureList = Features.featureRows(resp)
+        root.featuresError = ""
+      } else {
+        root.featuresError = "Unable to load feature specs"
+      }
+      root.featuresOpen = true
+    }, true)
+  }
+
+  function closeFeatures() {
+    featuresOpen = false
+  }
+
+  function openFeatureInEditor(feature) {
+    Quickshell.execDetached(Features.editorCommand(feature))
   }
 
   property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
@@ -1402,6 +1437,19 @@ Item {
               else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
                 projectChooser.filterField.forceActiveFocus()
             }
+          } else if (root.featuresOpen) {
+            event.accepted = true
+            if (event.key === Qt.Key_Escape) {
+              root.closeFeatures()
+            } else if (event.modifiers === Qt.ShiftModifier) {
+              if (event.key === Qt.Key_R && !root.featuresPending) root.openFeatures()
+            } else if (event.modifiers === Qt.NoModifier) {
+              if (event.key === Qt.Key_Q) root.closeFeatures()
+              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+                featuresView.listView.moveSelection(event.key === Qt.Key_J ? 1 : -1)
+              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
+                featuresView.listView.activateSelection()
+            }
           } else if (root.discussionOpen) {
             event.accepted = true
             if (question) {
@@ -1478,6 +1526,9 @@ Item {
                 event.accepted = true
               } else if (event.key === Qt.Key_C) {
                 if (root.engineOnline) root.openChooser()
+                event.accepted = true
+              } else if (event.key === Qt.Key_F) {
+                if (root.engineOnline) root.openFeatures()
                 event.accepted = true
               } else if (event.key === Qt.Key_Tab) {
                 root.liveTab = !root.liveTab
@@ -2111,6 +2162,11 @@ Item {
                 onClicked: root.openDiff()
               }
               PanelButton {
+                label: "Features"
+                enabled: root.engineOnline
+                onClicked: root.openFeatures()
+              }
+              PanelButton {
                 label: "Update Forge"
                 enabled: root.engineOnline && !root.busy
                 onClicked: root.act("/api/self_update")
@@ -2662,6 +2718,31 @@ Item {
         onDetailInspected: control => root.inspectDetail(control)
       }
 
+      // ------------------------------------------------ feature specs list
+      FeaturesView {
+        id: featuresView
+
+        anchors.fill: parent
+        open: root.featuresOpen
+        pending: root.featuresPending
+        errorText: root.featuresError
+        rows: root.featureList
+        foreground: root.foreground
+        mutedForeground: root.mutedForeground
+        background: root.background
+        surface: root.surface
+        accent: root.accent
+        urgent: root.urgent
+        success: root.success
+        fontFamily: root.fontFamily
+        fontSize10: root.fs(10)
+        fontSize11: root.fs(11)
+        onCloseRequested: root.closeFeatures()
+        onRefreshRequested: root.openFeatures()
+        onOpenRequested: feature => root.openFeatureInEditor(feature)
+        onLeaveRequested: keyHandler.forceActiveFocus()
+      }
+
       // ------------------------------------------------ project chooser
       ProjectChooser {
         id: projectChooser
@@ -2780,6 +2861,7 @@ Item {
                     { key: "x", description: "Stop run or active queue" },
                     { key: "d", description: "Open uncommitted diff" },
                     { key: "c", description: "Change project" },
+                    { key: "f", description: "Open the feature specs list" },
                     { key: "? (Shift+/) / F1", description: "Open keyboard help" },
                     { key: "", description: "Diff viewer" },
                     { key: "j / k", description: "Scroll down / up" },
@@ -2787,6 +2869,11 @@ Item {
                     { key: "gg / G", description: "Jump to top / bottom" },
                     { key: "R", description: "Refresh diff" },
                     { key: "q / Escape", description: "Close diff" },
+                    { key: "", description: "Feature specs list" },
+                    { key: "j / k", description: "Select next / previous feature" },
+                    { key: "Enter / o", description: "Open the selected feature in nvim" },
+                    { key: "R", description: "Refresh the feature list" },
+                    { key: "q / Escape", description: "Close the feature list" },
                     { key: "", description: "Project chooser · normal mode" },
                     { key: "j / k", description: "Select next / previous project" },
                     { key: "Enter", description: "Open selection; in filter, open first match; in path field, set path" },
