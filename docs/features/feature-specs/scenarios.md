@@ -1,8 +1,8 @@
 # Scenarios
 
-**Status: planned; the engine does not implement any of this yet.**
+**Status: M1 scenarios (S1-S9) have executable business tests and are covered by the implementation.**
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestone M1 only (format and discovery); scenarios for M2-M5 are to be written before those milestones are planned (see `milestones.md`).
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestone M1 only (format and discovery); scenarios for M2-M5 are to be written before those milestones are planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8).
 
 ## S1: A valid feature folder is discovered
 

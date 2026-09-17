@@ -1,6 +1,6 @@
 # Feature specs
 
-**Status: this workflow is planned and not yet implemented.** The Forge engine does not currently discover, validate, read from or act on the `docs/features/` folder. Nothing in this folder changes how goals, discussions, plans or the queue work today. This folder holds documentation only.
+**Status: M1 (format and discovery) is implemented.** The Forge engine discovers `docs/features/<slug>/` folders, validates required files and scenario structure, exposes them via a read-only `GET /api/features` endpoint, and lists them in the panel with an "open in nvim" action. Milestones M2–M5 (spec phase, feature to plans, pen.dev integration, panel viewer) and runtime state storage (`.forge/features/<slug>.json`) are not yet implemented. The existing goal, discussion, planning, execution and queue workflows remain unchanged.
 
 ## Purpose
 
@@ -22,11 +22,11 @@ docs/features/<slug>/
   milestones.md       split into successive plans (M1, M2, ...) with scenario IDs
 ```
 
-**README.md** contains the feature's goal, scope and out-of-scope boundaries, intended behavior, and any open questions. It is the entry point for reviewers. Its first `# ` heading is the feature's title; a README without one is titled by its slug.
+**README.md** contains the feature's goal, scope and out-of-scope boundaries, intended behavior, and any open questions. It is the entry point for reviewers. Its first `# ` heading (outside fenced code blocks) is the feature's title; a README without one is titled by its slug. The engine validates that README.md exists and is readable as UTF-8.
 
 **design/** holds UI mockups as `.pen` files (pen.dev format), each with an exported PNG next to it using the same base name (e.g. `panel-list.pen` and `panel-list.png`), and diagrams as Mermaid files (`.mmd`) or fenced ` ```mermaid ` blocks in Markdown.
 
-**scenarios.md** lists acceptance scenarios in Given/When/Then format, each with a stable ID (`S1`, `S2`, ...). IDs are never renumbered or reused once assigned, so that milestones, plans and executable tests can reliably refer to them. Example:
+**scenarios.md** lists acceptance scenarios in Given/When/Then format, each with a stable ID (`S1`, `S2`, ...). IDs are never renumbered or reused once assigned, so that milestones, plans and executable tests can reliably refer to them. The engine validates that scenario IDs follow the form `## S<number>:` (or `## S<number>` without colon), where `<number>` is one or more ASCII digits. Duplicate or malformed scenario IDs are reported as validation errors. Example:
 
 ```
 ## S1 User opens the feature
@@ -38,7 +38,7 @@ Then: the feature dialog appears with focus on the first input
 
 **decisions.md** records agreed decisions (what was decided and why), in any format suitable for your project.
 
-**milestones.md** splits the feature into successive plans, each labelled M1, M2, etc., and lists the scenario IDs that each milestone covers. For example:
+**milestones.md** splits the feature into successive plans, each labelled M1, M2, etc., and lists the scenario IDs that each milestone covers. The engine validates that each `Covers:` line is followed by either `none yet` or a comma-separated list of scenario IDs that are defined in scenarios.md. Invalid or unknown scenario IDs are reported as validation errors. For example:
 
 ```
 ## M1 Discover and validate
@@ -74,7 +74,7 @@ The executable tests generated from scenarios are the project's business tests. 
 
 ## Runtime state
 
-Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it. This file is not produced by the current Forge engine.
+Approvals, plan links and progress are runtime state, stored in `.forge/features/<slug>.json` inside the project, not in the repository. The committed spec folder under `docs/features/<slug>/` holds only documentation; the JSON file outside the repository captures which scenarios are approved, which milestone is being implemented, and which plan stages cover it. This file is not yet produced; it will be created by milestone M3 and later.
 
 ## See also
 

@@ -1,6 +1,6 @@
 # Feature specs (self-specification)
 
-**Status: planned; the engine does not implement it yet.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). Nothing here changes how Forge currently discovers, validates or acts on anything; today there is no engine support for `docs/features/` at all.
+**Status: M1 (format and discovery) is implemented.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). M1 enables the engine to discover and validate feature folders and expose them via an API and panel list. Milestones M2–M5 (spec phase, feature to plans, pen.dev integration, panel viewer) are not yet implemented, and the existing goal, discussion, planning, execution and queue workflows are unchanged.
 
 ## Goal
 
