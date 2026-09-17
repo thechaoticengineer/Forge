@@ -471,7 +471,13 @@ impl Ctx {
                 context_plan.as_object_mut().unwrap().remove(key);
             }
             for stage in context_plan["stages"].as_array_mut().unwrap() {
-                for key in ["reviews", "last_verdict", "usage"] {
+                // Model routing bookkeeping is engine state, not architectural
+                // context: it dwarfs the design it accompanies (a stage keeps a
+                // copy of itself in model_proposal_inputs, so it grows with every
+                // stage) and the routing turn receives the current proposals
+                // separately. The architect reads events.jsonl for anything else.
+                for key in ["reviews", "last_verdict", "usage", "model_selection", "model_agreement",
+                    "model_proposal_inputs", "reassessment", "model_invocations"] {
                     stage.as_object_mut().unwrap().remove(key);
                 }
             }
