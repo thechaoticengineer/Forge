@@ -1,8 +1,8 @@
 # Milestones
 
-**Status: M1 is implemented; M2–M5 are planned.**
+**Status: M1 and M4 are implemented; M2, M3, and M5 are planned.**
 
-The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9) have executable business tests; each later milestone's scenarios will gain executable business tests as part of that milestone's plan. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
+The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9) and M4's scenarios (S20-S26) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
 
 ## M1: Format and discovery
 
@@ -26,9 +26,11 @@ Covers: none yet
 
 ## M4: pen.dev integration
 
-Not yet implemented. Agents drive `pen interactive` headlessly through the shell, using the pen.dev CLI's bundled skill; a PNG is auto-exported next to every changed `.pen` file; the desktop app's MCP server is used only for manual design work, not by agents.
+**Implemented.** Agents drive `pen interactive` headlessly through the shell, using the pen.dev CLI's bundled skill; a PNG is auto-exported next to every changed `.pen` file; the desktop app's MCP server is used only for manual design work, not by agents. Missing pen CLI or authentication blocks the run; export failures are returned to the fixer like failing checks.
 
 Covers: S20, S21, S22, S23, S24, S25, S26
+
+Business tests: src/pen_dev_tests.rs (S20-S26)
 
 ## M5: Panel viewer
 

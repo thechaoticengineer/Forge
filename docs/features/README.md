@@ -1,6 +1,6 @@
 # Feature specs
 
-**Status: M1 (format and discovery) is implemented.** The Forge engine discovers `docs/features/<slug>/` folders, validates required files and scenario structure, exposes them via a read-only `GET /api/features` endpoint, and lists them in the panel with an "open in nvim" action. Milestones M2–M5 (spec phase, feature to plans, pen.dev integration, panel viewer) and runtime state storage (`.forge/features/<slug>.json`) are not yet implemented. The existing goal, discussion, planning, execution and queue workflows remain unchanged.
+**Status: M1 (format and discovery) and M4 (pen.dev integration) are implemented.** The Forge engine discovers `docs/features/<slug>/` folders, validates required files and scenario structure, and exposes them via a read-only `GET /api/features` endpoint. Agents edit pen.dev `.pen` files headlessly via the shell with the bundled skill, and the engine exports PNGs after each editing turn before review and commit. Milestones M2 (spec phase), M3 (feature to plans), and M5 (panel viewer) remain planned. Runtime state storage (`.forge/features/<slug>.json`) and the existing goal, discussion, planning, execution and queue workflows remain unchanged.
 
 ## Purpose
 
@@ -24,7 +24,7 @@ docs/features/<slug>/
 
 **README.md** contains the feature's goal, scope and out-of-scope boundaries, intended behavior, and any open questions. It is the entry point for reviewers. Its first `# ` heading (outside fenced code blocks) is the feature's title; a README without one is titled by its slug. The engine validates that README.md exists and is readable as UTF-8.
 
-**design/** holds UI mockups as `.pen` files (pen.dev format), each with an exported PNG next to it using the same base name (e.g. `panel-list.pen` and `panel-list.png`; a design with several top-level frames exports one `panel-list.<frame-slug>.png` per frame), and diagrams as Mermaid files (`.mmd`) or fenced ` ```mermaid ` blocks in Markdown.
+**design/** holds UI mockups as `.pen` files (pen.dev format), each with an exported PNG next to it using the same base name (e.g. `panel-list.pen` and `panel-list.png`; a design with several top-level frames exports one `panel-list.<frame-slug>.png` per frame). The engine exports PNGs headlessly after each agent editing turn; agents must not hand-edit PNGs. Diagrams are stored as Mermaid files (`.mmd`) or fenced ` ```mermaid ` blocks in Markdown.
 
 **scenarios.md** lists acceptance scenarios in Given/When/Then format, each with a stable ID (`S1`, `S2`, ...). IDs are never renumbered or reused once assigned, so that milestones, plans and executable tests can reliably refer to them. The engine validates that scenario IDs follow the form `## S<number>:` (or `## S<number>` without colon), where `<number>` is one or more ASCII digits. Duplicate or malformed scenario IDs are reported as validation errors. Example:
 

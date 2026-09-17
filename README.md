@@ -839,6 +839,7 @@ the queue and whether it is active.
 The feature-spec workflow ([documented in `docs/features/`](docs/features/README.md)) organizes
 specifications, scenarios and milestones for a feature before it is planned. Milestone M1 lets the
 engine discover and validate feature folders and expose them through a read-only API and a panel list.
+Milestone M4 adds pen.dev integration for UI mockups in feature specifications.
 
 ```
 GET /api/features[?project=<path>]
@@ -863,6 +864,34 @@ The panel lists discovered features with their title, slug and validation status
 invalid ones), opened with the **Features** button or the `f` key; see [Feature list](#feature-list)
 below for its overlay controls. Opening a feature runs `omarchy-launch-editor <folder>` to edit it
 in nvim. The panel fetches features only when the overlay opens or refreshes; it does not poll.
+
+#### pen.dev integration (M4)
+
+Features can include UI mockups as pen.dev `.pen` files in the `design/` folder. Agents editing designs
+do so headlessly through the shell:
+
+**Requirements:** `npm install -g @pen.dev/cli` and `pen login` to authenticate. Mise-installed `pen` is also supported.
+
+**Shell-based editing:** Agents use identical instructions for both Claude and Codex. They drive `pen interactive --in/--out` with
+stdin tool calls like `execute({ input: '<js>' })`, `save()` and `exit()`, reading the CLI's bundled skill at `dist/out/skills/pen-dev/SKILL.md`
+inside the installed `@pen.dev/cli` package. No MCP server or desktop app is used for automated design work; the desktop app and its MCP server
+are only for manual editing.
+
+**PNG export:** After each implementer or fixer turn that creates or modifies a `.pen` file, the engine exports PNGs
+before review snapshots or commits. Naming follows the design: a single top-level frame produces `<name>.png` in the same directory
+as `<name>.pen`; multiple frames produce `<name>.<frame-slug>.png` for each frame (lowercase with non-alphanumeric characters replaced by `-`).
+Stale exports of that design are removed; exports of other designs and unrelated PNGs are kept.
+
+**Blocking and resuming:** A missing pen CLI or authentication (`pen login` required) leaves the stage uncommitted with a `design_blocked` status and a
+message naming the problem and the fix. Resuming the run retries the export without requiring a new agent turn. Export failures are treated like
+failing checks: they are returned to the fixer alongside other issues, and the stage commits only after successful export.
+
+**Reviewer access:** Reviewers and the architect inspect changed `.pen` files and their exported PNGs in read-only sandboxes without running `pen`.
+Review prompts list the `.pen` paths and PNG paths, direct reviewers to inspect the PNG images and `.pen` JSON, and state that the engine
+exported them (running `pen` is not required or permitted in the sandbox).
+
+**Gate status:** The `design_blocked` gate status appears in stage listings alongside other statuses; blocked designs block the run
+until the fix (install pen or run `pen login`) is complete and the run is resumed.
 
 ## Run
 

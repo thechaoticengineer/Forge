@@ -1,6 +1,6 @@
 # Feature specs (self-specification)
 
-**Status: M1 (format and discovery) is implemented.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). M1 enables the engine to discover and validate feature folders and expose them via an API and panel list. Milestones M2–M5 (spec phase, feature to plans, pen.dev integration, panel viewer) are not yet implemented, and the existing goal, discussion, planning, execution and queue workflows are unchanged.
+**Status: M1 (format and discovery) and M4 (pen.dev integration) are implemented.** This folder specifies the feature-spec workflow itself, using the very format it describes (see `docs/features/README.md`). M1 enables the engine to discover and validate feature folders and expose them via an API and panel list. M4 integrates pen.dev for headless design editing and PNG export (see scenarios S20-S26 and business tests in src/pen_dev_tests.rs). Milestones M2 (spec phase), M3 (feature to plans), and M5 (panel viewer) remain planned, and the existing goal, discussion, planning, execution and queue workflows are unchanged.
 
 ## Goal
 
@@ -47,9 +47,9 @@ See `docs/features/README.md` for the full folder format and flow description, a
 ## Risks
 
 - **pen.dev cost (FS-RISK-PEN-COST).** pen.dev requires an account and may become a paid product. The documented fallback is OpenPencil, an MIT-licensed tool that reads `.pen` files, so mockups would remain usable even if pen.dev access is lost.
-- **pen.dev MCP is desktop-only (FS-RISK-PEN-MCP).** pen.dev's MCP server only connects to the running desktop application. It cannot be used headlessly by agents; the planned headless path instead drives `pen interactive` through the shell using the CLI's bundled skill.
+- **pen.dev MCP is desktop-only (FS-RISK-PEN-MCP).** pen.dev's MCP server only connects to the running desktop application. M4 resolves this by using `pen interactive` through the shell with the CLI's bundled skill, which works headlessly for every provider without MCP.
 - **QML cannot render Mermaid (FS-RISK-MERMAID-QML).** The panel is built with QML, which has no Mermaid renderer. A later implementation must choose between pre-rendering diagrams to SVG with `mmdc` (mermaid-cli) and showing the Mermaid source as text.
-- **Codex MCP parity is unknown (FS-RISK-CODEX-MCP).** Whether Codex-based agents have MCP capabilities equivalent to Claude's is not established. M4 avoids depending on it: agents use `pen interactive` through the shell (D11), which works for every provider.
+- **Codex MCP parity is unknown (FS-RISK-CODEX-MCP).** Whether Codex-based agents have MCP capabilities equivalent to Claude's is not established. M4 resolves this by using `pen interactive` through the shell (D11), which works headlessly for every provider without MCP.
 
 ## Open questions
 
