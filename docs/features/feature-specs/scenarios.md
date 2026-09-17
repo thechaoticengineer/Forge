@@ -117,3 +117,45 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: any feature with reviews or approvals
 - When: its runtime state is saved
 - Then: it is written to `.forge/features/<slug>.json`, never to `docs/features/`, and the file stays valid JSON after an interrupted write
+
+## S20: Editing agents get pen.dev instructions when a stage involves designs
+
+- Given: a stage whose instructions or acceptance criteria reference a `.pen` file or a feature's `design/` folder
+- When: the engine starts the implementer or fixer for that stage, with either Claude or Codex
+- Then: the prompt explains how to edit `.pen` files headlessly with `pen interactive` through the shell and points to the pen.dev CLI's bundled skill file
+
+## S21: Stages without designs are unchanged
+
+- Given: a stage that does not reference `.pen` files or a `design/` folder, and no `.pen` file changed during the stage
+- When: the stage runs
+- Then: no pen.dev instructions are added to prompts and `pen` is never invoked
+
+## S22: A PNG is exported for every changed .pen file
+
+- Given: an implementer or fixer turn created or changed a `.pen` file
+- When: the turn finishes and before the stage snapshot is reviewed or committed
+- Then: the engine exports the design headlessly, the PNG files next to the `.pen` file match its current content, and they are part of the same stage commit
+
+## S23: Export file names follow the design's top-level frames
+
+- Given: a changed `design/<name>.pen` file
+- When: the engine exports it
+- Then: a design with one top-level frame produces `<name>.png`; a design with several produces `<name>.<frame-slug>.png` per frame (frame name lowercased, non-alphanumerics replaced by `-`); PNGs from an earlier export of that file that no longer match a frame are removed
+
+## S24: A missing or unauthenticated pen CLI blocks with an actionable message
+
+- Given: a `.pen` file changed, but `pen` is not installed or `pen status` reports no active session
+- When: the engine tries to export it
+- Then: the stage does not commit, and the run blocks with a message naming the problem and the fix (install `@pen.dev/cli`, or run `pen login`)
+
+## S25: A failed export goes back to the agent
+
+- Given: `pen` is available, but exporting a changed `.pen` file fails (for example the file cannot be opened)
+- When: the engine exports it
+- Then: the export error is returned to the same stage's implementer or fixer to repair, like a failing check, and the stage does not commit until the export succeeds
+
+## S26: Reviewers review designs through the exported PNGs
+
+- Given: a stage snapshot containing `.pen` files and their exported PNGs
+- When: stage or plan reviewers run in their read-only sandbox
+- Then: their prompts point them to the PNGs and the `.pen` JSON, and they are not required to run `pen`

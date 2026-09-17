@@ -28,7 +28,7 @@ Covers: none yet
 
 Not yet implemented. Agents drive `pen interactive` headlessly through the shell, using the pen.dev CLI's bundled skill; a PNG is auto-exported next to every changed `.pen` file; the desktop app's MCP server is used only for manual design work, not by agents.
 
-Covers: none yet
+Covers: S20, S21, S22, S23, S24, S25, S26
 
 ## M5: Panel viewer
 

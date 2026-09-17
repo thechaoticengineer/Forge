@@ -49,7 +49,7 @@ See `docs/features/README.md` for the full folder format and flow description, a
 - **pen.dev cost (FS-RISK-PEN-COST).** pen.dev requires an account and may become a paid product. The documented fallback is OpenPencil, an MIT-licensed tool that reads `.pen` files, so mockups would remain usable even if pen.dev access is lost.
 - **pen.dev MCP is desktop-only (FS-RISK-PEN-MCP).** pen.dev's MCP server only connects to the running desktop application. It cannot be used headlessly by agents; the planned headless path instead drives `pen interactive` through the shell using the CLI's bundled skill.
 - **QML cannot render Mermaid (FS-RISK-MERMAID-QML).** The panel is built with QML, which has no Mermaid renderer. A later implementation must choose between pre-rendering diagrams to SVG with `mmdc` (mermaid-cli) and showing the Mermaid source as text.
-- **Codex MCP parity is unknown (FS-RISK-CODEX-MCP).** Whether Codex-based agents have MCP capabilities equivalent to Claude's is not established and must not be assumed when M4's headless pen.dev integration is designed.
+- **Codex MCP parity is unknown (FS-RISK-CODEX-MCP).** Whether Codex-based agents have MCP capabilities equivalent to Claude's is not established. M4 avoids depending on it: agents use `pen interactive` through the shell (D11), which works for every provider.
 
 ## Open questions
 

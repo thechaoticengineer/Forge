@@ -59,3 +59,15 @@ Reason: The architect already holds the project's architectural context; a spec 
 Decision: `.forge/features/<slug>.json` records, for each approval, the commit and a content hash of `docs/features/<slug>/`. Any later change to the folder returns the feature to `draft`; earlier approvals remain as history.
 
 Reason: An approval must always refer to exactly the content that was reviewed.
+
+## D11: Agents use pen.dev through the shell, not MCP
+
+Decision: Editing agents drive `pen interactive --in/--out` through the shell, using `execute` and `save()` calls and the CLI's bundled skill as documentation. The desktop app and its MCP server are only for manual design work.
+
+Reason: pen.dev's MCP server needs the running desktop app, and MCP support differs between Claude and Codex. The shell path works headlessly for every provider and was verified on 2026-09-17 (creating frames and exporting PNGs without the app).
+
+## D12: The engine owns PNG export
+
+Decision: The engine, not the agent, exports PNGs for changed `.pen` files after each editing turn, one per top-level frame, and treats export failures like failing checks.
+
+Reason: Exported images must always match the committed design, and reviewers in read-only sandboxes need the PNGs because they cannot run `pen` themselves.
