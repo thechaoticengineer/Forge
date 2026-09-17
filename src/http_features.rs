@@ -151,3 +151,68 @@ pub(super) fn api_feature_review(ctx: &Ctx, body: &Value) -> ApiResponse {
     std::thread::spawn(move || worker.feature_review_worker(&worker_slug, request_id));
     (200, json!({"ok": true, "request_id": request_id}))
 }
+
+/// Which approval one request asks for.
+enum Approval {
+    Spec,
+    Scenarios,
+}
+
+/// Approval of the spec (S15/S16) or of the scenarios (S17), both synchronous.
+///
+/// Admission refuses an invalid feature with its reasons before claiming the
+/// busy flag, then holds the busy claim for the whole approval so the Git work
+/// and the state append can never interleave with a chat, a review or another
+/// approval (M2-ARCH-003). The claim is released by `BusyGuard` on every path.
+fn api_feature_approve(ctx: &Ctx, body: &Value, approval: Approval) -> ApiResponse {
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+    let slug = body["slug"].as_str().unwrap_or("").to_string();
+    if let Err(error) = feature_state::validate_slug(&slug) {
+        return (400, json!({"error": error}));
+    }
+    let Some(feature) = crate::features::discover(Path::new(ctx.project()))
+        .into_iter()
+        .find(|feature| feature.slug == slug)
+    else {
+        return (404, json!({"error": format!("unknown feature: {slug}")}));
+    };
+    if !feature.reasons.is_empty() {
+        return (
+            409,
+            json!({
+                "error": format!("feature is invalid: {}", feature.reasons.join("; ")),
+                "reasons": feature.reasons,
+            }),
+        );
+    }
+    if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+        return (409, json!({"error": "busy"}));
+    }
+    let _busy = crate::app::feature_approval::BusyGuard(&ctx.session);
+    let (what, result) = match approval {
+        Approval::Spec => ("spec", ctx.approve_feature_spec(&slug)),
+        Approval::Scenarios => ("scenarios", ctx.approve_feature_scenarios(&slug)),
+    };
+    match result {
+        Ok(response) => {
+            let commit = response["commit"].as_str().unwrap_or("");
+            ctx.log_event("features", &format!("approved {slug} {what} at {commit}"));
+            (200, response)
+        },
+        Err(refusal) => {
+            ctx.log_event(
+                if refusal.status == 409 { "features" } else { "error" },
+                &format!("{what} approval of {slug} refused: {}", refusal.message),
+            );
+            (refusal.status, json!({"error": refusal.message}))
+        },
+    }
+}
+
+pub(super) fn api_feature_approve_spec(ctx: &Ctx, body: &Value) -> ApiResponse {
+    api_feature_approve(ctx, body, Approval::Spec)
+}
+
+pub(super) fn api_feature_approve_scenarios(ctx: &Ctx, body: &Value) -> ApiResponse {
+    api_feature_approve(ctx, body, Approval::Scenarios)
+}

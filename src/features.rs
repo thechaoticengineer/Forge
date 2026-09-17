@@ -55,16 +55,38 @@ fn extract_title(readme: &str) -> Option<String> {
     None
 }
 
+/// The ID token of every non-fenced `## ` heading, in document order, with a
+/// trailing `:` stripped. Shared by validation and `scenario_ids`, so both
+/// read scenario headings exactly the same way.
+fn heading_ids(content: &str) -> impl Iterator<Item = &str> {
+    lines_outside_fences(content).filter_map(|line| {
+        let rest = line.strip_prefix("## ")?;
+        let token = rest.split_whitespace().next()?;
+        Some(token.strip_suffix(':').unwrap_or(token))
+    })
+}
+
+/// The valid scenario IDs of a `scenarios.md`, in document order and without
+/// repeats. Read-only and non-judging: malformed IDs are simply skipped, since
+/// `analyze_scenarios` is what reports them. Used to record the approved
+/// scenario IDs of a feature (M2 S17).
+pub(crate) fn scenario_ids(content: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in heading_ids(content) {
+        if is_valid_scenario_id(id) && !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 /// Scenario IDs defined by `## ` headings, and reasons for malformed or
 /// duplicate IDs.
 fn analyze_scenarios(content: &str) -> (HashSet<String>, Vec<String>) {
     let mut ids = HashSet::new();
     let mut duplicates_reported = HashSet::new();
     let mut reasons = Vec::new();
-    for line in lines_outside_fences(content) {
-        let Some(rest) = line.strip_prefix("## ") else { continue };
-        let Some(token) = rest.split_whitespace().next() else { continue };
-        let id = token.strip_suffix(':').unwrap_or(token);
+    for id in heading_ids(content) {
         if is_valid_scenario_id(id) {
             if !ids.insert(id.to_string()) && duplicates_reported.insert(id.to_string()) {
                 reasons.push(format!("duplicate scenario ID: {id}"));

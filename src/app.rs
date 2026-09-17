@@ -2,6 +2,9 @@
 mod agent_execution;
 mod discussion;
 mod execution;
+/// Approvals bind reviewed content to a commit; their Git and state
+/// discipline is unit-tested directly (see src/feature_approval_tests.rs).
+pub(crate) mod feature_approval;
 /// Co-authoring writes are engine-owned, so its validators are unit-tested
 /// directly (see src/feature_author_tests.rs).
 pub(crate) mod feature_author;
