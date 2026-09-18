@@ -38,6 +38,9 @@ Rectangle {
   property var activity: null
   property string selectedSlug: ""
   property var detailState: null
+  // A tab fills its area: no dimmed backdrop, and clicking beside the list
+  // does not close it. The default stays the full-window overlay.
+  property bool embedded: false
 
   property bool newFeatureOpen: false
   property string newFeatureError: ""
@@ -99,20 +102,21 @@ Rectangle {
   }
 
   visible: view.open
-  color: Qt.rgba(0, 0, 0, 0.55)
+  color: view.embedded ? "transparent" : Qt.rgba(0, 0, 0, 0.55)
 
   MouseArea {
     anchors.fill: parent
+    enabled: !view.embedded
     onClicked: view.closeRequested()
   }
 
   Rectangle {
     anchors.centerIn: parent
-    width: parent.width * 0.82
-    height: parent.height * 0.82
+    width: view.embedded ? parent.width : parent.width * 0.82
+    height: view.embedded ? parent.height : parent.height * 0.82
     radius: 6
     color: view.surface
-    border.width: 1
+    border.width: view.embedded ? 0 : 1
     border.color: Qt.darker(view.foreground, 3)
 
     MouseArea {
@@ -159,7 +163,7 @@ Rectangle {
         ViewButton {
           id: closeFeaturesButton
 
-          label: "Close"
+          label: view.embedded ? "Back" : "Close"
           onClicked: view.closeRequested()
         }
       }

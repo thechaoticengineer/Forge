@@ -9,8 +9,12 @@ const head = qml.match(/readonly property var queueHead: (.+)/)[1];
 const ready = qml.match(/readonly property bool hasQueuedGoals: (.+)/)[1];
 const start = qml.indexOf('  function canMoveQueueGoal(');
 const end = qml.indexOf('  readonly property string phase:', start);
-const button = qml.slice(qml.indexOf('id: startQueueButton'), qml.indexOf('id: queueList'));
-const enabled = button.match(/enabled: (.+)/)[1];
+// The queue list lives in QueueView.qml; Panel.qml's QueueView instance supplies the
+// Start queue guard and sends the button's request.
+const queueView = readFileSync(new URL('../quickshell/QueueView.qml', import.meta.url), 'utf8');
+const button = queueView.slice(queueView.indexOf('id: startQueueButton'), queueView.indexOf('id: queueList'));
+const instance = qml.slice(qml.indexOf('id: queueView'), qml.indexOf('onRemoveRequested', qml.indexOf('id: queueView')));
+const enabled = instance.match(/startEnabled: (.+)/)[1];
 // The button reads the shared guard; evaluate Panel.qml's guard binding for a root state.
 const panelRoot = state => installGuards(qml, {phase: 'idle', revisePending: false, chatPending: false,
   plan: null, goalEnhancePending: false, goalField: {text: ''}, feedbackField: {text: ''},
@@ -32,7 +36,9 @@ test('Start queue can resume the first paused goal, including after reload', () 
 
 test('Start queue remains available for a stopped goal and cannot interrupt active work', () => {
   assert.match(button, /label: "Start queue"/);
-  assert.match(button, /onClicked: root.act\("\/api\/queue\/start"\)/);
+  assert.match(button, /enabled: view\.startEnabled/);
+  assert.match(button, /onClicked: view\.startRequested\(\)/);
+  assert.match(instance, /onStartRequested: root.act\("\/api\/queue\/start"\)/);
   for (const status of ['queued', 'blocked', 'failed', 'running', 'planning', 'awaiting_approval']) {
     const context = {queueHead: {status}};
     const state = {hasQueuedGoals: vm.runInNewContext(ready, context), engineOnline: true,

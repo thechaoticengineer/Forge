@@ -166,6 +166,18 @@ Item {
   // The selected view tab. Only the user changes it: polling, project switches,
   // reopening and closing overlays keep it (a new panel starts on Overview).
   property string currentTab: "overview"
+  // The tab shown before the current one; q / Escape in Features return to it.
+  property string previousTab: "overview"
+  property string shownTab: "overview"
+  onCurrentTabChanged: {
+    if (currentTab !== shownTab) {
+      previousTab = shownTab
+      shownTab = currentTab
+    }
+    // featuresOpen drives the Features keys and activity polling while its tab is shown.
+    featuresOpen = currentTab === "features"
+    if (featuresOpen && featuresLoadedRevision !== projectViewRevision) openFeatures()
+  }
   readonly property string stepText: engineState !== null && engineState.current_step !== ""
     ? (engineState.current_stage !== null
       ? "stage " + engineState.current_stage + ": " + (currentActivity || engineState.current_step)
@@ -265,6 +277,7 @@ Item {
   property string diffError: ""
 
   property bool featuresOpen: false
+  property int featuresLoadedRevision: -1
   property var featureList: []
   property bool featuresPending: false
   property string featuresError: ""
@@ -457,6 +470,8 @@ Item {
   onReportsChanged: {
     if (reports.length === 0 && historyFilter === "reports") historyFilter = "all"
   }
+  // The Activity tab's AgentOutputView: keyboard routing and reading positions.
+  readonly property alias agentOutput: activityView.output
   property var logFeed: DetailView.newFeed()
   property string logError: ""
   ListModel { id: liveEntries }
@@ -516,7 +531,6 @@ Item {
     diffText = ""
     diffError = ""
     diffPending = false
-    featuresOpen = false
     featureList = []
     featuresPending = false
     featuresError = ""
@@ -898,13 +912,16 @@ Item {
     })
   }
 
+  // Shows the Features tab and loads its list.
   function openFeatures() {
+    root.currentTab = "features"
     if (root.featuresPending) return
     root.featuresPending = true
     const revision = projectViewRevision
     api("GET", "/api/features?project=" + encodeURIComponent(lastProject), null, function(resp, status) {
       if (revision !== root.projectViewRevision) return
       root.featuresPending = false
+      root.featuresLoadedRevision = revision
       if (resp && Array.isArray(resp.features)) {
         root.featureList = Features.featureRows(resp)
         root.featureSpecs = Features.featureSpecsBySlug(resp)
@@ -913,15 +930,23 @@ Item {
       } else {
         root.featuresError = "Unable to load feature specs"
       }
-      root.featuresOpen = true
+      root.featuresOpen = root.currentTab === "features"
     }, true)
   }
 
+  // Features is a tab now: closing it returns to the tab shown before, and
+  // the list keeps its selection and reading position.
   function closeFeatures() {
-    featuresOpen = false
-    selectedFeatureSlug = ""
-    featureDetailState = null
+    currentTab = previousTab
   }
+
+  // Reloads the list after a feature action or a project switch without
+  // changing tabs; a hidden Features tab reloads when it is shown again.
+  function refreshFeatures() {
+    if (featuresOpen) openFeatures()
+    else featuresLoadedRevision = -1
+  }
+  onProjectViewRevisionChanged: if (featuresOpen) Qt.callLater(refreshFeatures)
 
   function openFeatureInEditor(feature) {
     Quickshell.execDetached(Features.editorCommand(feature))
@@ -981,7 +1006,7 @@ Item {
             root.featureActivity = resp2.activity || null
             root.featuresError = ""
           }
-          root.featuresOpen = true
+          root.featuresOpen = root.currentTab === "features"
         }, true)
       } else {
         root.featuresError = Features.errorMessage(resp)
@@ -995,7 +1020,7 @@ Item {
       if (revision !== root.projectViewRevision) return
       if (status === 200) {
         root.featuresError = ""
-        root.openFeatures()
+        root.refreshFeatures()
         if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
       } else {
         root.featuresError = Features.errorMessage(resp)
@@ -1009,7 +1034,7 @@ Item {
       if (revision !== root.projectViewRevision) return
       if (status === 200) {
         root.featuresError = ""
-        root.openFeatures()
+        root.refreshFeatures()
         if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
       } else {
         root.featuresError = Features.errorMessage(resp)
@@ -1023,7 +1048,7 @@ Item {
       if (revision !== root.projectViewRevision) return
       if (status === 200) {
         root.featuresError = ""
-        root.openFeatures()
+        root.refreshFeatures()
         if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
       } else {
         root.featuresError = Features.errorMessage(resp)
@@ -1037,7 +1062,7 @@ Item {
       if (revision !== root.projectViewRevision) return
       if (status === 200) {
         root.featuresError = ""
-        root.openFeatures()
+        root.refreshFeatures()
         if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
       } else {
         root.featuresError = Features.errorMessage(resp)
@@ -1513,7 +1538,6 @@ Item {
           root.selectedReportKey = root.reportKey(root.reports[selected], selected)
           agentOutput.reportList.positionViewAtIndex(selected, ListView.Contain)
           agentOutput.reportList.captureReading()
-          panelScroll.reveal(agentOutput.outputFrame)
         }
 
         function scrollOutput(direction) {
@@ -1530,7 +1554,12 @@ Item {
           }
           if (view !== agentOutput.reportList) view.captureReading()
           if (view === agentOutput.reportList) agentOutput.reportList.captureReading()
-          panelScroll.reveal(agentOutput.outputFrame)
+        }
+
+        // The scrollable area of the current tab for Page Up/Down and Home/End.
+        function tabScroller() {
+          return root.currentTab === "architecture" ? architectureView
+            : root.currentTab === "queue" ? queueView.listView : panelScroll
         }
 
         function scrollDiff(amount) {
@@ -1610,12 +1639,24 @@ Item {
               else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
                 projectChooser.filterField.forceActiveFocus()
             }
+          } else if (root.discussionOpen) {
+            event.accepted = true
+            if (question) {
+              root.helpOpen = true
+            } else if (event.key === Qt.Key_Escape
+                || (event.key === Qt.Key_Q && event.modifiers === Qt.NoModifier)) {
+              root.closeDiscussion()
+            } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
+              discussionView.input.forceActiveFocus()
+            }
           } else if (root.featuresOpen) {
+            // The Features tab while no page is pushed on top of it.
             event.accepted = true
             const featureRow = featuresView.currentRow()
             if (viewTab !== "") {
-              if (viewTab !== "features") root.closeFeatures()
               root.currentTab = viewTab
+            } else if (question) {
+              root.helpOpen = true
             } else if (event.key === Qt.Key_Escape) {
               root.closeFeatures()
             } else if (event.modifiers === Qt.ShiftModifier) {
@@ -1634,16 +1675,6 @@ Item {
               } else if (event.key === Qt.Key_V && featureRow) root.requestFeatureReview(featureRow)
               else if (event.key === Qt.Key_A && featureRow) root.approveFeatureSpec(featureRow)
               else if (event.key === Qt.Key_G) pendingKey = "g"
-            }
-          } else if (root.discussionOpen) {
-            event.accepted = true
-            if (question) {
-              root.helpOpen = true
-            } else if (event.key === Qt.Key_Escape
-                || (event.key === Qt.Key_Q && event.modifiers === Qt.NoModifier)) {
-              root.closeDiscussion()
-            } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
-              discussionView.input.forceActiveFocus()
             }
           } else if (question) {
             root.helpOpen = true
@@ -1679,16 +1710,24 @@ Item {
               event.accepted = true
             } else if (event.modifiers === Qt.ControlModifier
                        && (event.key === Qt.Key_D || event.key === Qt.Key_U)) {
+              // Output keys act on Activity, the view that shows the output.
+              root.currentTab = "activity"
               scrollOutput(event.key === Qt.Key_D ? 1 : -1)
               event.accepted = true
             } else if (event.modifiers === Qt.NoModifier) {
               // Keep action guards identical to their PanelButton.enabled bindings.
               if (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp) {
-                panelScroll.scrollPage(event.key === Qt.Key_PageDown ? 1 : -1)
+                const scroller = tabScroller()
+                const step = event.key === Qt.Key_PageDown ? 1 : -1
+                scroller.cancelFlick()
+                scroller.contentY = Math.max(scroller.originY, Math.min(scroller.originY
+                  + Math.max(0, scroller.contentHeight - scroller.height), scroller.contentY + step * scroller.height * 0.8))
                 event.accepted = true
               } else if (event.key === Qt.Key_Home || event.key === Qt.Key_End) {
-                panelScroll.cancelFlick()
-                panelScroll.contentY = event.key === Qt.Key_Home ? 0 : panelScroll.maximumY
+                const scroller = tabScroller()
+                scroller.cancelFlick()
+                scroller.contentY = event.key === Qt.Key_Home ? scroller.originY
+                  : scroller.originY + Math.max(0, scroller.contentHeight - scroller.height)
                 event.accepted = true
               } else if (event.key === Qt.Key_P) {
                 if (root.guards.createPlan)
@@ -1719,12 +1758,15 @@ Item {
                 if (root.guards.features) root.openFeatures()
                 event.accepted = true
               } else if (event.key === Qt.Key_Tab) {
+                root.currentTab = "activity"
                 root.liveTab = !root.liveTab
                 event.accepted = true
               } else if (event.key === Qt.Key_H || event.key === Qt.Key_L) {
+                root.currentTab = "activity"
                 root.liveTab = event.key === Qt.Key_H
                 event.accepted = true
               } else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_6) {
+                root.currentTab = "activity"
                 root.liveTab = false
                 if (event.key !== Qt.Key_6 || root.hasReports)
                   root.historyFilter = ["all", "runs", "git", "reviews", "errors", "reports"][event.key - Qt.Key_1]
@@ -1856,14 +1898,155 @@ Item {
             anchors.bottomMargin: localErrorDetail.visible ? Style.space(10) : 0
 
             TabPlaceholder { tab: "plan" }
-            TabPlaceholder { tab: "activity" }
-            TabPlaceholder { tab: "architecture" }
-            TabPlaceholder { tab: "features" }
-            TabPlaceholder { tab: "queue" }
             TabPlaceholder { tab: "settings" }
+
+            // ------------------------------------------------ activity
+            ActivityView {
+              id: activityView
+
+              anchors.fill: parent
+              visible: root.currentTab === "activity"
+              liveTab: root.liveTab
+              historyFilter: root.historyFilter
+              hasReports: root.hasReports
+              reportsVisible: root.reportsVisible
+              logError: root.logError
+              liveModel: liveEntries
+              historyModel: historyEntries
+              reportIndex: root.reportIndex
+              projectViewRevision: root.projectViewRevision
+              selectedReportKey: root.selectedReportKey
+              expandedReportKey: root.expandedReportKey
+              now: root.agentNow
+              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              success: root.success
+              working: root.working
+              fontFamily: root.fontFamily
+              fontSize10: root.fs(10)
+              fontSize11: root.fs(11)
+              onLiveTabRequested: live => root.liveTab = live
+              onHistoryFilterRequested: filter => root.historyFilter = filter
+              onReportSelected: key => root.selectedReportKey = key
+              onReportExpansionRequested: key => root.expandedReportKey = key
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
+
+            // ------------------------------------------------ architecture
+            ArchitectureView {
+              id: architectureView
+
+              anchors.fill: parent
+              visible: root.currentTab === "architecture"
+              engineState: root.engineState
+              plan: root.plan
+              architecture: root.architecture
+              planReview: root.planReview
+              planReviewView: root.planReviewView
+              planReviewVersion: root.planReviewVersion
+              planReviewScope: root.planReviewScope
+              planReviewExpanded: root.planReviewExpanded
+              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+              planReviewStatusText: root.planReviewStatusText
+              scrollBarSpace: Style.space(16)
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              fontFamily: root.fontFamily
+              fontSize11: root.fs(11)
+              fontSize12: root.fs(12)
+              onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
+              onPlanReviewLoadRequested: root.loadPlanReviewRequests()
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
+
+            // ------------------------------------------------ feature specs
+            FeaturesView {
+              id: featuresView
+
+              anchors.fill: parent
+              visible: root.currentTab === "features"
+              open: root.currentTab === "features"
+              embedded: true
+              pending: root.featuresPending
+              errorText: root.featuresError
+              rows: root.featureList
+              specs: root.featureSpecs
+              activity: root.featureActivity
+              selectedSlug: root.selectedFeatureSlug
+              detailState: root.featureDetailState
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              success: root.success
+              fontFamily: root.fontFamily
+              fontSize10: root.fs(10)
+              fontSize11: root.fs(11)
+              onCloseRequested: root.closeFeatures()
+              onRefreshRequested: root.openFeatures()
+              onOpenRequested: feature => root.openFeatureInEditor(feature)
+              onCreateRequested: (slug, title) => root.createFeature(slug, title)
+              onChatRequested: (feature, message) => root.sendFeatureChat(feature, message)
+              onReviewRequested: feature => root.requestFeatureReview(feature)
+              onApproveSpecRequested: feature => root.approveFeatureSpec(feature)
+              onApproveScenariosRequested: feature => root.approveFeatureScenarios(feature)
+              onFeatureSelected: feature => root.selectFeature(feature)
+              onLeaveRequested: keyHandler.forceActiveFocus()
+            }
+
+            // ------------------------------------------------ queue
+            QueueView {
+              id: queueView
+
+              anchors.fill: parent
+              visible: root.currentTab === "queue"
+              queue: root.queue
+              engineOnline: root.engineOnline
+              startEnabled: root.guards.startQueue
+              canMove: root.canMoveQueueGoal
+              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
+              spacing: Style.space(8)
+              horizontalPadding: Style.space(18)
+              verticalPadding: Style.space(10)
+              foreground: root.foreground
+              mutedForeground: root.mutedForeground
+              background: root.background
+              surface: root.surface
+              accent: root.accent
+              urgent: root.urgent
+              success: root.success
+              working: root.working
+              fontFamily: root.fontFamily
+              fontSize10: root.fs(10)
+              fontSize11: root.fs(11)
+              fontSize12: root.fs(12)
+              onStartRequested: root.act("/api/queue/start")
+              onMoveRequested: (id, dir) => root.act("/api/queue/move", { id: id, dir: dir })
+              onRemoveRequested: id => root.act("/api/queue/remove", { id: id })
+              onCopyRequested: original => Quickshell.clipboardText = original
+              onLeaveRequested: keyHandler.forceActiveFocus()
+              onDetailRevealed: control => root.revealDetail(control)
+              onDetailInspected: control => root.inspectDetail(control)
+            }
           }
 
-          // Overview: for now the whole former page, minus header and project tabs.
+          // Overview: for now the former page minus the header, project tabs and
+          // the views that moved to the Activity, Architecture, Features and Queue tabs.
           Flickable {
             id: panelScroll
             visible: root.currentTab === "overview"
@@ -1874,10 +2057,6 @@ Item {
             flickableDirection: Flickable.VerticalFlick
             boundsBehavior: Flickable.StopAtBounds
             readonly property real maximumY: Math.max(0, contentHeight - height)
-            function scrollPage(direction) {
-              cancelFlick()
-              contentY = Math.max(0, Math.min(maximumY, contentY + direction * height * 0.8))
-            }
             function reveal(item) {
               const top = item.mapToItem(contentItem, 0, 0).y
               if (top < contentY || top + item.height > contentY + height)
@@ -2415,34 +2594,6 @@ Item {
               }
             }
 
-            ArchitectureReviewView {
-              width: parent.width
-              engineState: root.engineState
-              plan: root.plan
-              architecture: root.architecture
-              planReview: root.planReview
-              planReviewView: root.planReviewView
-              planReviewVersion: root.planReviewVersion
-              planReviewScope: root.planReviewScope
-              planReviewExpanded: root.planReviewExpanded
-              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-              planReviewStatusText: root.planReviewStatusText
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              fontFamily: root.fontFamily
-              fontSize11: root.fs(11)
-              fontSize12: root.fs(12)
-              onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
-              onPlanReviewLoadRequested: root.loadPlanReviewRequests()
-              onLeaveRequested: keyHandler.forceActiveFocus()
-              onDetailRevealed: control => root.revealDetail(control)
-              onDetailInspected: control => root.inspectDetail(control)
-            }
-
             // ------------------------------------------------ plan Q&A
             Column {
               id: chatSection
@@ -2547,108 +2698,6 @@ Item {
               }
             }
 
-            // -------------------------------------------------- queue
-            Rectangle {
-              id: queueSection
-              visible: root.queue.length > 0
-              width: parent.width
-              height: queueHeader.height + queueList.height + Style.space(24)
-              color: root.surface
-              radius: 4
-
-              Row {
-                id: queueHeader
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.margins: Style.space(8)
-                spacing: Style.space(8)
-                Text {
-                  width: parent.width - startQueueButton.width - parent.spacing
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Queue (" + root.queue.length + ")"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(12)
-                  font.bold: true
-                }
-                PanelButton {
-                  id: startQueueButton
-                  label: "Start queue"
-                  primary: true
-                  enabled: root.guards.startQueue
-                  onClicked: root.act("/api/queue/start")
-                }
-              }
-
-              ListView {
-                id: queueList
-                anchors.top: queueHeader.bottom
-                anchors.topMargin: Style.space(8)
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.margins: Style.space(8)
-                height: Math.min(contentHeight, Style.space(96))
-                clip: true
-                spacing: Style.space(4)
-                model: root.queue
-                delegate: Row {
-                  id: queueRow
-                  required property var modelData
-                  required property int index
-                  readonly property bool active: modelData.status === "planning"
-                    || modelData.status === "awaiting_approval" || modelData.status === "running"
-                  width: queueList.width
-                  height: Math.max(queueGoal.implicitHeight, queueControls.implicitHeight)
-                  spacing: Style.space(8)
-                  Text {
-                    id: queueGlyph
-                    width: root.fs(12)
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: queueRow.active ? "●" : queueRow.modelData.status === "done" ? "✓"
-                      : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
-                        ? "!" : "·"
-                    color: queueRow.active ? root.accent
-                      : queueRow.modelData.status === "blocked" || queueRow.modelData.status === "failed"
-                        ? root.urgent : root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(12)
-                    font.bold: true
-                  }
-                  PanelDetail {
-                    id: queueGoal
-                    width: Math.max(0, parent.width - queueGlyph.width - parent.spacing
-                      - (queueControls.visible ? queueControls.width + parent.spacing : 0))
-                    metadata: "Goal"
-                    originalText: queueRow.modelData.goal
-                  }
-                  Row {
-                    id: queueControls
-                    visible: queueRow.modelData.status === "queued"
-                      || queueRow.modelData.status === "failed" || queueRow.modelData.status === "blocked"
-                    spacing: Style.space(4)
-                    PanelButton {
-                      label: "↑"
-                      visible: queueRow.modelData.status === "queued"
-                      enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, -1)
-                      onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "up" })
-                    }
-                    PanelButton {
-                      label: "↓"
-                      visible: queueRow.modelData.status === "queued"
-                      enabled: root.engineOnline && root.canMoveQueueGoal(queueRow.index, 1)
-                      onClicked: root.act("/api/queue/move", { id: queueRow.modelData.id, dir: "down" })
-                    }
-                    PanelButton {
-                      label: "×"
-                      enabled: root.engineOnline
-                      onClicked: root.act("/api/queue/remove", { id: queueRow.modelData.id })
-                    }
-                  }
-                }
-              }
-            }
-
             PlanEditorView {
               id: planEditor
 
@@ -2710,43 +2759,6 @@ Item {
               onDetailInspected: control => root.inspectDetail(control)
             }
 
-            AgentOutputView {
-              id: agentOutput
-
-              width: parent.width
-              liveTab: root.liveTab
-              historyFilter: root.historyFilter
-              hasReports: root.hasReports
-              reportsVisible: root.reportsVisible
-              logError: root.logError
-              liveModel: liveEntries
-              historyModel: historyEntries
-              reportIndex: root.reportIndex
-              projectViewRevision: root.projectViewRevision
-              selectedReportKey: root.selectedReportKey
-              expandedReportKey: root.expandedReportKey
-              now: root.agentNow
-              panelHeight: panelScroll.height
-              detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              working: root.working
-              fontFamily: root.fontFamily
-              fontSize10: root.fs(10)
-              fontSize11: root.fs(11)
-              onLiveTabRequested: live => root.liveTab = live
-              onHistoryFilterRequested: filter => root.historyFilter = filter
-              onReportSelected: key => root.selectedReportKey = key
-              onReportExpansionRequested: key => root.expandedReportKey = key
-              onLeaveRequested: keyHandler.forceActiveFocus()
-              onDetailRevealed: control => root.revealDetail(control)
-              onDetailInspected: control => root.inspectDetail(control)
-            }
           }
           }
 
@@ -2926,41 +2938,6 @@ Item {
         onRefreshRequested: root.refreshDiff()
         onLeaveRequested: keyHandler.forceActiveFocus()
         onDetailInspected: control => root.inspectDetail(control)
-      }
-
-      // ------------------------------------------------ feature specs list
-      FeaturesView {
-        id: featuresView
-
-        anchors.fill: parent
-        open: root.featuresOpen
-        pending: root.featuresPending
-        errorText: root.featuresError
-        rows: root.featureList
-        specs: root.featureSpecs
-        activity: root.featureActivity
-        selectedSlug: root.selectedFeatureSlug
-        detailState: root.featureDetailState
-        foreground: root.foreground
-        mutedForeground: root.mutedForeground
-        background: root.background
-        surface: root.surface
-        accent: root.accent
-        urgent: root.urgent
-        success: root.success
-        fontFamily: root.fontFamily
-        fontSize10: root.fs(10)
-        fontSize11: root.fs(11)
-        onCloseRequested: root.closeFeatures()
-        onRefreshRequested: root.openFeatures()
-        onOpenRequested: feature => root.openFeatureInEditor(feature)
-        onCreateRequested: (slug, title) => root.createFeature(slug, title)
-        onChatRequested: (feature, message) => root.sendFeatureChat(feature, message)
-        onReviewRequested: feature => root.requestFeatureReview(feature)
-        onApproveSpecRequested: feature => root.approveFeatureSpec(feature)
-        onApproveScenariosRequested: feature => root.approveFeatureScenarios(feature)
-        onFeatureSelected: feature => root.selectFeature(feature)
-        onLeaveRequested: keyHandler.forceActiveFocus()
       }
 
       // ------------------------------------------------ project chooser

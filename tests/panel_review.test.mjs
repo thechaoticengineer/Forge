@@ -93,7 +93,13 @@ test('plan review status, B+1 rounds, outcomes and fix commit are independent of
   assert.match(section,/Shortened preview · full change requests have not been loaded/);
   assert.match(section,/textComplete: planReviewSection.review.complete === true/);
   assert.match(section,/onCopyRequested: original => Quickshell.clipboardText = original/);
-  assert.ok(qml.indexOf('ArchitectureReviewView {') < qml.indexOf('PlanEditorView {'));
+  // The plan review status used to sit above the stage list on one long page. The redesign
+  // moves it to the Architecture tab (scenario S17): Panel.qml hosts ArchitectureView, which
+  // hosts ArchitectureReviewView.
+  const architectureTab = readFileSync(new URL('../quickshell/ArchitectureView.qml', import.meta.url), 'utf8');
+  assert.ok(architectureTab.includes('ArchitectureReviewView {'));
+  assert.ok(qml.includes('ArchitectureView {'));
+  assert.ok(!qml.includes('ArchitectureReviewView {'));
 });
 test('panel disclosure retrieves all large role-tagged requests through bounded history pages',()=>{
   const {plan,records,originals,event} = planFixture();

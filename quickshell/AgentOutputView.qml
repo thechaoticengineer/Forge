@@ -90,7 +90,8 @@ Column {
     id: outputFrame
 
     width: parent.width
-    height: Math.max(Style.space(180), view.panelHeight * 0.3)
+    // The output frame takes the rest of the view under the Live / History row.
+    height: Math.max(Style.space(180), view.panelHeight - y)
     color: view.surface
     radius: 4
 

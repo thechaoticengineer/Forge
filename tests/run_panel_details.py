@@ -64,8 +64,10 @@ fragments = {
     'METADATA': block(catalogue_editor, 'objectName: "catalogueMetadata"', 'ViewFields'),
     'CHAT': block(panel, 'id: chatList', 'Rectangle'),
     'REPORT': block(reports_view, 'id: reportList', 'ListView'),
-    'QUEUE': block(panel, 'id: queueSection', 'Rectangle'),
+    'QUEUE': block(panel, 'id: queueView', 'QueueView'),
 }
+# The Queue tab fills its area; in the fixture it sits in a Column like the other subtrees.
+fragments['QUEUE'] = fragments['QUEUE'].replace('anchors.fill: parent', 'width: parent.width\n              height: 320')
 fragments['PLAN_REVIEW'] = re.sub(r'\bview\.', 'root.', fragments['PLAN_REVIEW'])
 fragments['PLAN_REVIEW'] = fragments['PLAN_REVIEW'].replace('root.planReviewExpansionRequested(expanded)', 'root.planReviewExpanded = expanded')
 fragments['PLAN_REVIEW'] = fragments['PLAN_REVIEW'].replace('root.planReviewLoadRequested()', 'root.loadPlanReviewRequests()')
@@ -114,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix='forge-panel-details-') as directory:
     (path / 'components').mkdir()
     for name in ('ArchitectureDetails.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'PlanReview.js',
                  'ModelRouting.js', 'ReportFormat.js', 'UsageFormat.js', 'CataloguePresentation.js',
-                 'PanelViewButton.qml'):
+                 'PanelViewButton.qml', 'QueueView.qml', 'PanelActions.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_panel.qml').write_text(fixture)
     runtime = path / 'runtime'

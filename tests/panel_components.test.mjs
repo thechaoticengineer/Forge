@@ -4,11 +4,16 @@ import {readFileSync} from 'node:fs';
 
 const read = name => readFileSync(new URL('../quickshell/' + name, import.meta.url), 'utf8');
 const panel = read('Panel.qml');
-const composition = panel + read('AgentOutputView.qml');
+// Tab views host the focused views that moved out of Panel.qml (ActivityView hosts
+// AgentOutputView, ArchitectureView hosts ArchitectureReviewView).
+const composition = panel + read('AgentOutputView.qml') + read('ActivityView.qml') + read('ArchitectureView.qml');
 const views = [
   'PlanEditorView.qml',
   'AgentOutputView.qml',
   'ArchitectureReviewView.qml',
+  'ActivityView.qml',
+  'ArchitectureView.qml',
+  'QueueView.qml',
   'ReportsView.qml',
   'ProjectChooser.qml',
   'CatalogueEditor.qml',

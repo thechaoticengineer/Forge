@@ -9,6 +9,7 @@ import "components/ModelRouting.js" as ModelRouting
 import "components/ReportFormat.js" as ReportFormat
 import "components/UsageFormat.js" as UsageFormat
 import "components/CataloguePresentation.js" as CataloguePresentation
+import "components/PanelActions.js" as PanelActions
 Item {
     id: root
     width: 360
@@ -19,6 +20,8 @@ Item {
     property color surface: "#202020"
     property color urgent: "red"
     property color accent: "#8888ff"
+    property color success: "#4faf72"
+    property color working: "#d5a542"
     property string fontFamily: "monospace"
     property string lastProject: "/fixture"
     property int projectViewRevision: 1
@@ -41,6 +44,12 @@ Item {
     property bool busy: false
     property bool queueActive: false
     property bool hasQueuedGoals: true
+    property string currentTab: "queue"
+    // Panel.qml's shared action guards, from the same PanelActions.guards().
+    readonly property var guards: PanelActions.guards({engineOnline: engineOnline, busy: busy, phase: "idle",
+        queueActive: queueActive, editingPlan: editingPlan, revisePending: false, chatPending: false,
+        planStatus: null, goalText: "", feedbackText: "", questionText: "", goalEnhancePending: false,
+        hasQueuedGoals: hasQueuedGoals})
     property int actions: 0
     property string mode: "architecture"
     function fs(n) { return n }
