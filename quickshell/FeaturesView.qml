@@ -44,6 +44,11 @@ Rectangle {
   // does not close it. The default stays the full-window overlay.
   property bool embedded: false
 
+  // Implemented features stay hidden until the user asks for them.
+  property bool showImplemented: false
+  readonly property var shownRows: Features.visibleRows(view.rows, view.specs, view.showImplemented)
+  readonly property int implementedCount: Features.implementedCount(view.rows, view.specs)
+
   property bool newFeatureOpen: false
   property string newFeatureError: ""
   property alias newSlugField: newSlugFieldItem
@@ -111,6 +116,7 @@ Rectangle {
       else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
         featuresList.activateSelection()
       else if (event.key === Qt.Key_N) openNewFeatureForm()
+      else if (event.key === Qt.Key_I) view.showImplemented = !view.showImplemented
       else if (event.key === Qt.Key_C && row) {
         view.featureSelected(row)
         focusChatInput()
@@ -163,6 +169,7 @@ Rectangle {
         Text {
           width: parent.width - newFeatureButton.width - refreshFeaturesButton.width
             - closeFeaturesButton.width - parent.spacing * 3
+            - (implementedToggle.visible ? implementedToggle.width + parent.spacing : 0)
           anchors.verticalCenter: parent.verticalCenter
           text: "Features"
           color: view.foreground
@@ -170,6 +177,16 @@ Rectangle {
           font.pixelSize: view.fontSize11
           font.bold: true
           elide: Text.ElideRight
+        }
+
+        ViewButton {
+          id: implementedToggle
+
+          objectName: "featureImplementedToggle"
+          visible: view.implementedCount > 0
+          label: view.showImplemented ? "Hide implemented"
+            : "Show implemented (" + view.implementedCount + ")"
+          onClicked: view.showImplemented = !view.showImplemented
         }
 
         ViewButton {
@@ -286,9 +303,10 @@ Rectangle {
 
       Text {
         objectName: "featuresEmptyState"
-        visible: view.rows.length === 0 && view.errorText === ""
+        visible: view.shownRows.length === 0 && view.errorText === ""
         width: parent.width
-        text: "No feature specs in docs/features/"
+        text: view.rows.length === 0 ? "No feature specs in docs/features/"
+          : "All feature specs are implemented · i shows them"
         wrapMode: Text.Wrap
         color: view.mutedForeground
         font.family: view.fontFamily
@@ -310,7 +328,7 @@ Rectangle {
           height: parent.height
           clip: true
           boundsBehavior: Flickable.StopAtBounds
-          model: view.rows
+          model: view.shownRows
           currentIndex: -1
           onModelChanged: resetSelection()
 
@@ -393,8 +411,9 @@ Rectangle {
 
                 Text {
                   objectName: "featureSpecStatus"
-                  text: Features.specStatusLabel(featureRow.spec)
-                  color: view.mutedForeground
+                  readonly property string progress: Features.progressLabel(featureRow.spec)
+                  text: progress !== "" ? progress : Features.specStatusLabel(featureRow.spec)
+                  color: Features.isImplemented(featureRow.spec) ? view.success : view.mutedForeground
                   font.family: view.fontFamily
                   font.pixelSize: view.fontSize10
                 }

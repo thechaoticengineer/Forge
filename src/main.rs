@@ -45,6 +45,8 @@ mod plan_tests;
 #[cfg(test)]
 mod discussion_tests;
 #[cfg(test)]
+mod feature_progress_tests;
+#[cfg(test)]
 mod feature_spec_tests;
 #[cfg(test)]
 mod feature_spec_m2_tests;

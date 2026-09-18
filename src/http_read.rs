@@ -205,6 +205,12 @@ pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
                 "path": f.path.display().to_string(),
                 "status": f.status(),
                 "reasons": f.reasons,
+                "progress": f.progress(),
+                "milestones": f.milestones.iter().map(|m| json!({
+                    "id": m.id,
+                    "title": m.title,
+                    "status": if m.implemented { "implemented" } else { "planned" },
+                })).collect::<Vec<_>>(),
             });
             for (key, value) in crate::feature_state::listing_fields(ctx, &f.slug)
                 .as_object()

@@ -17,6 +17,26 @@ Item {
             status: "invalid", valid: false, reasons: ["missing required file: scenarios.md"] }
     }
 
+    function doneFeature() {
+        return { slug: "gamma", title: "Gamma", path: "/p/docs/features/gamma",
+            status: "valid", valid: true, reasons: [] }
+    }
+    function partialFeature() {
+        return { slug: "delta", title: "Delta", path: "/p/docs/features/delta",
+            status: "valid", valid: true, reasons: [] }
+    }
+
+    // The progress index the panel builds with Features.featureSpecsBySlug.
+    function progressSpecs() {
+        return {
+            gamma: { slug: "gamma", spec_status: "draft", progress: "implemented",
+                milestones: [{ id: "M1", title: "One", status: "implemented" }] },
+            delta: { slug: "delta", spec_status: "draft", progress: "in progress",
+                milestones: [{ id: "M1", title: "One", status: "implemented" },
+                    { id: "M2", title: "Two", status: "planned" }] }
+        }
+    }
+
     FeaturesView {
         id: view
         anchors.fill: parent
@@ -58,6 +78,8 @@ Item {
             view.rows = [fixture.validFeature(), fixture.invalidFeature()]
             view.errorText = ""
             view.pending = false
+            view.showImplemented = false
+            view.specs = ({})
             fixture.openedFeature = null
             wait(30)
         }
@@ -96,6 +118,45 @@ Item {
             verify(fixture.openedFeature !== null, "clicking the button emits openRequested")
             compare(fixture.openedFeature.slug, "beta")
             compare(fixture.openedFeature.path, "/p/docs/features/beta")
+        }
+
+        function test_implemented_features_are_hidden_until_shown() {
+            view.specs = fixture.progressSpecs()
+            view.rows = [fixture.validFeature(), fixture.doneFeature(), fixture.partialFeature()]
+            wait(30)
+            compare(walk(view, "featureTitle").map(t => t.text), ["Alpha", "Delta"])
+            const toggle = walk(view, "featureImplementedToggle")[0]
+            verify(toggle.visible)
+            compare(toggle.label, "Show implemented (1)")
+            const labels = walk(view, "featureSpecStatus").map(t => t.text)
+            compare(labels[1], "1/2 implemented")
+
+            mouseClick(toggle)
+            wait(30)
+            compare(walk(view, "featureTitle").map(t => t.text), ["Alpha", "Gamma", "Delta"])
+            compare(toggle.label, "Hide implemented")
+            const gamma = walk(view, "featureSpecStatus")[1]
+            compare(gamma.text, "implemented")
+            compare(gamma.color, view.success)
+        }
+
+        function test_i_key_toggles_implemented_and_empty_state_explains_hidden_rows() {
+            view.specs = fixture.progressSpecs()
+            view.rows = [fixture.doneFeature()]
+            wait(30)
+            compare(walk(view, "featureTitle").length, 0)
+            const empty = walk(view, "featuresEmptyState")[0]
+            verify(empty.visible)
+            compare(empty.text, "All feature specs are implemented · i shows them")
+            view.handleKey({ key: Qt.Key_I, modifiers: Qt.NoModifier })
+            wait(30)
+            verify(view.showImplemented)
+            compare(walk(view, "featureTitle").map(t => t.text), ["Gamma"])
+            verify(!empty.visible)
+        }
+
+        function test_toggle_hidden_without_implemented_features() {
+            verify(!walk(view, "featureImplementedToggle")[0].visible)
         }
     }
 }

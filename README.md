@@ -875,8 +875,15 @@ Each feature keeps its M1 fields — `slug` (the folder name under `docs/feature
 `_`, like `_template`, are excluded), `title` (the feature's first `# ` heading in `README.md` outside
 fenced code blocks, or the slug if there is none), `path` (the feature folder's absolute path),
 `status` (`"valid"` or `"invalid"`) and `reasons` (validation errors — missing or unreadable required
-files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines — empty when
-valid) — and adds the M2 spec-phase fields:
+files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines, malformed or
+repeated `Status:` lines — empty when valid) — plus the milestone progress read from `milestones.md`:
+
+- `milestones`: `[{"id": "M1", "title", "status": "implemented"|"planned"}, ...]`, one per `## ` heading,
+  from its `Status:` line (a milestone without one is `planned`).
+- `progress`: `"implemented"` when every milestone is implemented, `"in progress"` when some are, and
+  `"planned"` otherwise. It is independent of `spec_status`.
+
+It also adds the M2 spec-phase fields:
 
 - `spec_status`: `"draft"`, `"spec approved"` or `"scenarios approved"`, derived on every read from the
   feature's approvals and the folder's current content hash; it is never stored as authoritative state.
@@ -1010,7 +1017,9 @@ status to `draft` on the next read, while every earlier review and approval rema
 new approving review and a new spec approval are required before approving again.
 
 The panel lists discovered features with their title, slug, validation status and spec-phase status
-(with reasons for invalid ones), opened with the **Features** tab, the `f` key or `g f`; see
+(with reasons for invalid ones), opened with the **Features** tab, the `f` key or `g f`. Fully
+implemented features are hidden until **Show implemented (N)** or `i` lists them; partly implemented
+ones show `N/M implemented` in place of their spec status; see
 [Feature list](#feature-list) below for its controls. Opening a feature runs
 `omarchy-launch-editor <folder>` to edit it in nvim. The panel fetches features when the tab is shown or
 refreshed; while a chat or review request it started is still running, it also polls `GET /api/features`

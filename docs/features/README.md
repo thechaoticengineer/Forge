@@ -43,10 +43,13 @@ Then: the feature dialog appears with focus on the first input
 ```
 ## M1 Discover and validate
 
+Status: implemented
 Covers: S1, S2, S3
 ```
 
 A milestone whose scenarios are not written yet uses `Covers: none yet`.
+
+Each milestone may carry one `Status:` line, either `Status: implemented` or `Status: planned`. A milestone without one is planned. The engine reports any other value, a second `Status:` line in the same milestone, or a `Status:` line before the first milestone as a validation error. The plan that implements a milestone sets its line to `implemented`. From these lines `GET /api/features` derives each feature's `progress`: `implemented` when every milestone is implemented, `in progress` when some are, and `planned` otherwise. It also returns a `milestones` list of `{id, title, status}`. Progress is independent of the spec approval status: marking a milestone implemented edits the folder, which moves `spec_status` back to `draft` as any other change does. The panel's Features tab hides implemented features until you choose to show them, and labels partly implemented ones `N/M implemented`.
 
 Empty templates of these files are available in `docs/features/_template/` to copy as a starting point.
 

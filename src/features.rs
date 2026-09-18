@@ -13,11 +13,33 @@ pub(crate) struct Feature {
     pub(crate) title: String,
     pub(crate) path: PathBuf,
     pub(crate) reasons: Vec<String>,
+    pub(crate) milestones: Vec<Milestone>,
+}
+
+/// One `## M<n>: <title>` section of `milestones.md` and its `Status:` line.
+/// A milestone without a `Status:` line is planned.
+pub(crate) struct Milestone {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) implemented: bool,
 }
 
 impl Feature {
     pub(crate) fn status(&self) -> &'static str {
         if self.reasons.is_empty() { "valid" } else { "invalid" }
+    }
+
+    /// `implemented` when every milestone is, `in progress` when some are,
+    /// otherwise `planned` (also for a feature without milestones).
+    pub(crate) fn progress(&self) -> &'static str {
+        let done = self.milestones.iter().filter(|m| m.implemented).count();
+        if done > 0 && done == self.milestones.len() {
+            "implemented"
+        } else if done > 0 {
+            "in progress"
+        } else {
+            "planned"
+        }
     }
 }
 
@@ -98,15 +120,41 @@ fn analyze_scenarios(content: &str) -> (HashSet<String>, Vec<String>) {
     (ids, reasons)
 }
 
-/// Reasons for malformed or unknown `Covers:` entries in `milestones.md`.
+/// The milestones of `milestones.md`, and reasons for malformed or unknown
+/// `Covers:` entries and malformed or repeated `Status:` lines.
 /// Unknown-reference checks are skipped when `scenarios_readable` is false.
-fn analyze_milestones(content: &str, known_ids: &HashSet<String>, scenarios_readable: bool) -> Vec<String> {
+fn analyze_milestones(
+    content: &str,
+    known_ids: &HashSet<String>,
+    scenarios_readable: bool,
+) -> (Vec<Milestone>, Vec<String>) {
     let mut reasons = Vec::new();
+    let mut milestones: Vec<Milestone> = Vec::new();
     let mut milestone = String::new();
+    let mut status_seen = false;
     for line in lines_outside_fences(content) {
         if let Some(rest) = line.strip_prefix("## ") {
             let token = rest.split_whitespace().next().unwrap_or("");
             milestone = token.strip_suffix(':').unwrap_or(token).to_string();
+            let title = rest.trim()[token.len()..].trim().to_string();
+            milestones.push(Milestone { id: milestone.clone(), title, implemented: false });
+            status_seen = false;
+            continue;
+        }
+        if let Some(rest) = line.trim().strip_prefix("Status:") {
+            let value = rest.trim();
+            match milestones.last_mut() {
+                None => reasons.push(format!("Status line outside a milestone: {value}")),
+                Some(_) if status_seen => reasons.push(format!("repeated Status line in {milestone}")),
+                Some(current) => match value {
+                    "implemented" => current.implemented = true,
+                    "planned" => {},
+                    _ => reasons.push(format!(
+                        "malformed Status in {milestone}: {value} (expected implemented or planned)"
+                    )),
+                },
+            }
+            status_seen = true;
             continue;
         }
         let Some(rest) = line.trim().strip_prefix("Covers:") else { continue };
@@ -123,7 +171,7 @@ fn analyze_milestones(content: &str, known_ids: &HashSet<String>, scenarios_read
             }
         }
     }
-    reasons
+    (milestones, reasons)
 }
 
 fn build_feature(slug: String, path: PathBuf) -> Feature {
@@ -157,11 +205,14 @@ fn build_feature(slug: String, path: PathBuf) -> Feature {
     };
     reasons.extend(scenario_reasons);
 
+    let mut milestones = Vec::new();
     if let Some(content) = get("milestones.md") {
-        reasons.extend(analyze_milestones(content, &known_ids, scenarios_content.is_some()));
+        let (found, milestone_reasons) = analyze_milestones(content, &known_ids, scenarios_content.is_some());
+        milestones = found;
+        reasons.extend(milestone_reasons);
     }
 
-    Feature { slug, title, path, reasons }
+    Feature { slug, title, path, reasons, milestones }
 }
 
 /// Discovers and validates every feature folder under `<project_root>/docs/features`.

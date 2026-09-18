@@ -4,6 +4,7 @@
 
 ## M1: <milestone title>
 
+Status: planned
 Covers: S…
 
 *Brief description of the scope and goals for this milestone.*

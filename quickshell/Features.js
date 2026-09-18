@@ -36,10 +36,40 @@ function featureSpecsBySlug(response) {
             spec_status: feature.spec_status || "draft",
             content_hash: feature.content_hash,
             latest_review: feature.latest_review || null,
-            review_current: !!feature.review_current
+            review_current: !!feature.review_current,
+            progress: feature.progress || "planned",
+            milestones: Array.isArray(feature.milestones) ? feature.milestones : []
         }
     })
     return bySlug
+}
+
+function isImplemented(spec) {
+    return !!(spec && spec.progress === "implemented")
+}
+
+// Implemented features are hidden from the list unless showImplemented is set.
+// specs is featureSpecsBySlug's index, which carries each feature's progress.
+function visibleRows(rows, specs, showImplemented) {
+    var all = Array.isArray(rows) ? rows : []
+    if (showImplemented) return all
+    return all.filter(function(row) { return !isImplemented(specs && specs[row.slug]) })
+}
+
+function implementedCount(rows, specs) {
+    return (Array.isArray(rows) ? rows : []).filter(function(row) {
+        return isImplemented(specs && specs[row.slug])
+    }).length
+}
+
+// "implemented", "N/M implemented" while some milestones are done, or "" when
+// none are, so the row falls back to its spec status.
+function progressLabel(spec) {
+    if (!spec) return ""
+    if (spec.progress === "implemented") return "implemented"
+    var milestones = Array.isArray(spec.milestones) ? spec.milestones : []
+    var done = milestones.filter(function(m) { return m.status === "implemented" }).length
+    return done > 0 ? done + "/" + milestones.length + " implemented" : ""
 }
 
 function specStatusLabel(feature) {
