@@ -68,6 +68,8 @@ mod queue_tests;
 mod report_tests;
 #[cfg(test)]
 mod provider_stream_tests;
+#[cfg(test)]
+mod growth_tests;
 
 use crate::app::App;
 use crate::http::{PORT, handle};

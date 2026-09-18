@@ -192,6 +192,37 @@ impl Ctx {
         self.run_with_busy_claim();
     }
 
+    /// Test-only: settle exactly one stage (implement/review/commit), without
+    /// looping over the rest of the plan or running plan-level review. Lets a
+    /// test sample saved-plan and architect-prompt state at each stage-commit
+    /// boundary of a multi-stage run.
+    #[cfg(test)]
+    pub(crate) fn run_single_stage_for_test(&self, idx: usize) -> Result<(), String> {
+        let _worker = WorkerGuard(&self.session);
+        let mut plan = self.recover_execution_plan()?;
+        let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
+        let outcome = loop {
+            let title = plan["stages"][idx]["title"].as_str().unwrap_or("").to_string();
+            self.initialize_stage_attempt(&mut plan, idx)?;
+            self.set_step(Some(sid), "implementing");
+            self.log_event("stage", &format!("stage {sid} started: {title}"));
+            match self.run_one_stage(&mut plan, idx)? {
+                "renegotiated" => plan = self.load_plan().ok_or("missing plan after scope renegotiation")?,
+                settled => break settled,
+            }
+        };
+        if outcome != "approved" && outcome != "deferred" {
+            return Err(format!("stage {sid} did not settle for commit: {outcome}"));
+        }
+        let msg = plan["stages"][idx]["commit"].as_str().unwrap_or("forge: stage").to_string();
+        let sha = self.commit_reviewed(&plan, idx, &msg)?;
+        if let Some(sha) = sha {
+            plan["stages"][idx]["sha"] = json!(sha);
+        }
+        self.finish_stage(&mut plan, idx, "committed")?;
+        Ok(())
+    }
+
     /// Run and record failures while the caller owns the busy claim and WorkerGuard.
     /// This method must not construct WorkerGuard or release the busy claim.
     pub(super) fn run_with_busy_claim(&self) {
