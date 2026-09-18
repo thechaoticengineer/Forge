@@ -682,8 +682,11 @@ an encoded `project` path without switching the active project. Existing
 feed/chat/report tail reads are capped at 2 MiB each.
 State keeps only eight recent model invocations per stage with
 `model_invocation_count` and `model_invocations_truncated`, and four reassessment
-history entries. Full selection dialogue and transitive input descriptions stay
-in durable artefacts; polling preserves the choice, both reasons, native effort,
+history entries. A stage's `model_proposal_inputs` is a small fingerprint
+(`version`, serialized `bytes` and `digest`) of the goal, stage, dependency and
+constraint inputs of its selection proposal, not a copy of them, so it stays
+constant-sized as the plan grows. Full selection dialogue and transitive input
+descriptions stay in durable artefacts; polling preserves the choice, both reasons, native effort,
 policy provenance, current gates, editing content and token totals.
 All these artefacts remain inside the existing `.forge` commit exclusion.
 
@@ -1859,6 +1862,12 @@ mean all earlier stages. Goal or applicable constraint changes reconcile affecte
 pending stages before manual/queue approval or legacy execution. Approval,
 unchanged starts, ordinary fixes, restart, unrelated revisions and catalogue
 clock/revision-only changes reuse agreements without selection calls.
+Whether a saved planner proposal still fits its stage is decided by comparing
+the stage's stored fingerprint of the selection inputs with a fresh one, so
+change detection is the same as when the plan stored the expanded inputs.
+Plans written in that old format are still accepted: their stored inputs are
+fingerprinted for the comparison, so unchanged stages need no new selection
+turn, and the compact form replaces them when the stage is next proposed.
 
 Before every implementation/fix invocation, a local check verifies the relevant
 saved inputs, chosen option and policy facts. Unrelated catalogue metadata and

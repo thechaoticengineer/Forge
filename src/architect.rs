@@ -351,7 +351,7 @@ impl Ctx {
             let routing_ids = self.routing_required(&candidate, &cp)?;
             let missing: Vec<i64> = routing_ids.iter().copied().filter(|id| {
                 candidate["stages"].as_array().unwrap().iter().find(|s| s["id"] == *id)
-                    .is_none_or(|s| s["reassessment"]["pending"].is_object() || !s["model_proposal"].is_object() || s["model_proposal_inputs"] != self.proposal_inputs(&candidate, candidate["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap()))
+                    .is_none_or(|s| s["reassessment"]["pending"].is_object() || !s["model_proposal"].is_object() || !self.proposal_inputs_current(&candidate, candidate["stages"].as_array().unwrap().iter().position(|s| s["id"] == *id).unwrap()))
             }).collect();
             self.propose_routing(&mut candidate, &missing, &Value::Null)?;
             let mut required = vec![];

@@ -1191,7 +1191,7 @@ fn global_pin_preserves_configured_effort_through_publication_and_revalidation()
         f.ctx.app.settings.lock().unwrap()["model_catalogue"]["entries"][0]["effort"] =
             json!(effort);
         let effective = json!({"provider":"codex","model":"strong-test","native_effort":effort});
-        assert_eq!(f.ctx.proposal_inputs(&plan(), 0)["constraint"], effective);
+        assert_eq!(f.ctx.proposal_input_material(&plan(), 0)["constraint"], effective);
         let mut choice = proposal("strong-test", "standard", "functionality");
         if effort == "high" {
             let rejected = json!({"proposals":[{"stage_id":1,"proposal":choice}]});
@@ -1298,12 +1298,12 @@ fn global_pin_agreement_survives_policy_normalization_and_save_reload() {
         let agreement = &published["stages"][0]["model_agreement"];
         let cp = f.ctx.architecture_store().checkpoint(&published).unwrap();
         let counts = f.counts();
-        let expected = f.ctx.proposal_inputs(&published, 0)["constraint"].clone();
+        let expected = f.ctx.proposal_input_material(&published, 0)["constraint"].clone();
         assert_eq!(expected.get("native_effort"), effort.map(|e| json!(e)).as_ref());
         for policy in policy_representations(&f) {
             assert_eq!(policy["entries"][0].get("effort"), effort.map(|e| json!(e)).as_ref());
             f.set("model_catalogue", policy);
-            assert_eq!(f.ctx.proposal_inputs(&published, 0)["constraint"], expected);
+            assert_eq!(f.ctx.proposal_input_material(&published, 0)["constraint"], expected);
             assert!(f.ctx.routing_required(&published, &cp).unwrap().is_empty());
             assert_eq!(f.ctx.validated_assignment(&published, 0).unwrap(), *agreement);
             assert_eq!(f.counts(), counts);
@@ -1637,4 +1637,109 @@ fn tier_attempt_reassesses_material_changes_after_binding() {
     assert_eq!(p["stages"][0]["reassessment"]["count"], 1);
     assert_eq!(p["stages"][0]["reassessment"]["history"][0]["old_agreement"]["id"], first["id"]);
     assert!(p["stages"][0]["model_selection"].is_null());
+}
+
+fn three_stage_plan() -> Value {
+    let mut p = plan();
+    p["stages"] = json!([stage(1), stage(2), stage(3)]);
+    p["stages"][1]["depends_on"] = json!([1]);
+    p["stages"][2]["depends_on"] = json!([2]);
+    p
+}
+
+#[test]
+fn proposal_inputs_fingerprint_changes_with_every_direct_and_dependency_input() {
+    let f = Fixture::new();
+    let base = three_stage_plan();
+    let fp = |p: &Value, idx: usize| f.ctx.proposal_inputs(p, idx);
+    let original = fp(&base, 2);
+    assert_eq!(original.as_object().unwrap().keys().collect::<Vec<_>>(), ["bytes", "digest", "version"]);
+    assert_eq!(original["version"], 1);
+    let edits: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        ("goal", Box::new(|p| p["goal"] = json!("Other goal"))),
+        ("title", Box::new(|p| p["stages"][2]["title"] = json!("Other title"))),
+        ("instructions", Box::new(|p| p["stages"][2]["instructions"] = json!("Other work"))),
+        ("acceptance", Box::new(|p| p["stages"][2]["acceptance"] = json!("Other proof"))),
+        ("commit", Box::new(|p| p["stages"][2]["commit"] = json!("feat: other"))),
+        ("depends_on", Box::new(|p| p["stages"][2]["depends_on"] = json!([1]))),
+        ("model_constraint", Box::new(|p| p["stages"][2]["model_constraint"] = json!({"provider":"codex"}))),
+        ("direct dependency", Box::new(|p| p["stages"][1]["instructions"] = json!("Changed interface"))),
+        ("transitive dependency", Box::new(|p| p["stages"][0]["acceptance"] = json!("Changed contract"))),
+    ];
+    for (name, edit) in edits {
+        let mut changed = base.clone();
+        edit(&mut changed);
+        assert_ne!(fp(&changed, 2), original, "{name}");
+    }
+    // Later stages are not inputs of earlier ones.
+    let mut later = base.clone();
+    later["stages"][2]["instructions"] = json!("Other work");
+    assert_eq!(fp(&later, 1), fp(&base, 1));
+    // A changed effective global pin changes the non-tier constraint.
+    f.set("implementer_model", json!("strong-test"));
+    assert_ne!(fp(&base, 2), original);
+}
+
+#[test]
+fn proposal_inputs_fingerprint_ignores_runtime_records_and_survives_save_load() {
+    let f = Fixture::new();
+    let published = f.publish(three_stage_plan()).unwrap();
+    for (idx, stage) in published["stages"].as_array().unwrap().iter().enumerate() {
+        let saved = &stage["model_proposal_inputs"];
+        assert!(saved.get("stage").is_none(), "{saved}");
+        assert!(saved.to_string().len() < 512, "{saved}");
+        assert_eq!(*saved, f.ctx.proposal_inputs(&published, idx));
+        assert!(f.ctx.proposal_inputs_current(&published, idx));
+    }
+    let mut grown = published.clone();
+    let before = f.ctx.proposal_inputs(&grown, 2);
+    let big = "x".repeat(20_000);
+    for idx in 0..3 {
+        let s = &mut grown["stages"][idx];
+        s["reviews"] = json!([{"verdict": big}]);
+        s["model_invocations"] = json!([{"role":"implementer","output": big}]);
+        s["reassessment"] = json!({"count": 1, "history": [{"reason": big}]});
+        s["usage"] = json!({"codex": {"input_tokens": 12345}});
+        s["model_agreement"]["dialogue"] = json!([big]);
+    }
+    assert_eq!(f.ctx.proposal_inputs(&grown, 2), before);
+    assert!(f.ctx.proposal_inputs_current(&grown, 2));
+    let reloaded = f.ctx.load_plan().unwrap();
+    let text: Value = serde_json::from_str(&serde_json::to_string_pretty(&reloaded).unwrap()).unwrap();
+    for idx in 0..3 {
+        assert_eq!(f.ctx.proposal_inputs(&text, idx), f.ctx.proposal_inputs(&published, idx));
+        assert_eq!(text["stages"][idx]["model_proposal_inputs"], published["stages"][idx]["model_proposal_inputs"]);
+        assert!(f.ctx.proposal_inputs_current(&text, idx));
+    }
+}
+
+#[test]
+fn legacy_expanded_proposal_inputs_are_reused_until_the_stage_changes() {
+    for edited in [false, true] {
+        let f = Fixture::new();
+        let published = f.publish(plan()).unwrap();
+        assert_eq!(f.counts(), (1, 1));
+        let mut legacy = published.clone();
+        legacy["stages"][0]["model_proposal_inputs"] = f.ctx.proposal_input_material(&published, 0);
+        assert!(legacy["stages"][0]["model_proposal_inputs"]["stage"].is_object());
+        assert!(f.ctx.proposal_inputs_current(&legacy, 0));
+        if edited {
+            legacy["stages"][0]["instructions"] = json!("Add a localized greeting");
+            assert!(!f.ctx.proposal_inputs_current(&legacy, 0));
+        }
+        f.set("mock_routing_planner_requests", json!([]));
+        f.set("mock_routing_architect_requests", json!([]));
+        f.select(proposal("strong-test", "standard", "functionality"));
+        // Without a prior checkpoint every stage needs agreement, so only the
+        // saved proposal inputs decide whether the planner is asked again.
+        let republished = f.ctx.architect_publish(legacy, None, "legacy plan").unwrap();
+        let planner = f.ctx.app.settings.lock().unwrap()["mock_routing_planner_requests"]
+            .as_array().map_or(0, Vec::len);
+        assert_eq!(planner, usize::from(edited), "edited={edited}");
+        // The stage still needed agreement: the architect evaluated the kept proposal.
+        assert_eq!(f.counts().1, 1, "edited={edited}");
+        let saved = &republished["stages"][0]["model_proposal_inputs"];
+        assert!(saved.get("stage").is_none() || !edited, "{saved}");
+        assert!(f.ctx.proposal_inputs_current(&republished, 0));
+    }
 }

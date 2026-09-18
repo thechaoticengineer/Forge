@@ -183,6 +183,10 @@ pub(crate) fn validate_constraint(value: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+fn proposal_inputs_fingerprint(material: &Value) -> Value {
+    let bytes = material.to_string();
+    json!({"version":1,"bytes":bytes.len(),"digest":crate::metadata::fingerprint(bytes.as_bytes())})
+}
 fn constraint(settings: &Value, stage: &Value) -> Value {
     if stage["model_constraint"].is_object() {
         return stage["model_constraint"].clone();
@@ -472,12 +476,25 @@ impl Ctx {
         }
         Ok(false)
     }
-    pub(crate) fn proposal_inputs(&self, plan: &Value, idx: usize) -> Value {
+    /// Expanded material a stage proposal depends on. It is fingerprinted, never stored.
+    fn proposal_input_material(&self, plan: &Value, idx: usize) -> Value {
         if plan["stages"][idx]["model_proposal"]["tier"].is_string() {
             return json!({"stage":crate::plan::stage_inputs(plan, idx)});
         }
         let settings = self.app.settings.lock().unwrap();
         json!({"stage":crate::plan::stage_inputs(plan, idx),"constraint":constraint(&settings, &plan["stages"][idx])})
+    }
+    /// Constant-sized record of the proposal inputs saved as `model_proposal_inputs`.
+    pub(crate) fn proposal_inputs(&self, plan: &Value, idx: usize) -> Value {
+        proposal_inputs_fingerprint(&self.proposal_input_material(plan, idx))
+    }
+    /// Whether the saved proposal inputs still match the stage. Plans saved
+    /// before fingerprinting store the expanded material itself; it is
+    /// fingerprinted so unchanged legacy stages need no new proposal.
+    pub(crate) fn proposal_inputs_current(&self, plan: &Value, idx: usize) -> bool {
+        let saved = &plan["stages"][idx]["model_proposal_inputs"];
+        let fresh = self.proposal_inputs(plan, idx);
+        *saved == fresh || (saved.get("stage").is_some() && proposal_inputs_fingerprint(saved) == fresh)
     }
     pub(crate) fn routing_prompt(&self) -> Result<String, String> {
         Ok(CONTRACT.into())
