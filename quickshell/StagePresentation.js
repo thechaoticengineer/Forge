@@ -35,8 +35,8 @@ function attentionReason(stage) {
             : detail || oneLine(gate.error) || (gate.status ? "review gate " + gate.status : "blocked")
   }
   if (stage.status === "failed") {
-    return oneLine(stage.error) || oneLine(gate.error) || oneLine(gate.reason)
-      || oneLine((stage.reassessment || {}).error) || "failed"
+    return oneLine(stage.error) || oneLine(stage.model_block) || oneLine(gate.error) || oneLine(gate.reason)
+      || oneLine((stage.reassessment || {}).error) || "the run stopped here; see Activity"
   }
   return ""
 }

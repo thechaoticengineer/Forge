@@ -110,6 +110,10 @@ test('errors keep preview incomplete, retry works, invalid pages never offer ful
 
 const panel = read('Panel.qml');
 const planEditor = read('PlanEditorView.qml');
+// The read-only stage details moved from PlanEditorView's inline expansion (its stageRow card)
+// to StageDetailPage.qml (panel-redesign M2). The card keeps the stage header and its toggle,
+// which now opens the page; the page holds the prose, routing and historical reviews.
+const stageDetail = read('StageDetailPage.qml');
 function panelContext(st = stage([full('a')]), p = plan) {
   const ctx = {ReviewView:review,lastProject:'/a',projectViewRevision:1,plan:{...p,stages:[st]},
     reviewViews:{},reviewViewVersion:0,stageReviewBlocks:{},expandedStageId:-1,editingPlan:false,calls:[],refreshes:0,refresh(){this.refreshes++}};
@@ -135,11 +139,11 @@ test('stage prose identity survives publications while review identity remains s
     assert.notEqual(changed.stageDetailScope(st),key);
   }
   assert.notEqual(ctx.stageDetailScope({...st,id:4}),key);
-  const card=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));
-  assert.match(card,/detailScope: view.stageDetailScope\(modelData\)/);
+  const card=stageDetail;
+  assert.match(card,/detailScope: hasStage \? stageDetailScope\(current\)/);
   assert.ok(!card.includes("reviewDetailScope"));
-  assert.equal((card.match(/detailKey: stageRow.detailScope/g)||[]).length,0);
-  assert.equal((card.match(/detailKey: stageRow.reviewDetailScope/g)||[]).length,0);
+  assert.equal((card.match(/detailKey: page.detailScope/g)||[]).length,0);
+  assert.equal((card.match(/detailKey: page.reviewDetailScope/g)||[]).length,0);
 });
 test('actual Panel handlers load lazily, cache completed text, restart changed snapshots and discard stale callbacks', () => {
   const ctx=panelContext(), st=ctx.plan.stages[0];
@@ -171,20 +175,25 @@ test('stage field wiring preserves each original, full prose, review previews, l
   vm.runInNewContext(read('ReviewPresentation.js').replace(/^\.import .*$/gm,''),ctx);
   const v=full('a'), fields=ctx.reviewFields(v);
   assert.deepEqual(Array.from(fields,f=>f.text),[...v.issues,...v.notes,...v.checks]);
-  const card=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));
+  // The header card (PlanEditorView) and the details it opens (StageDetailPage) together.
+  const header=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));
+  const card=header+stageDetail;
   assert.ok(!card.includes('maximumLineCount: 3'));
   assert.match(card,/label: reviewRound.modelData.complete \? "Summary"/);
   assert.ok(!card.includes("StageDetail"));
   assert.ok(!card.includes("textComplete:"));
   assert.ok(!card.includes("detailKey:"));
-  assert.match(card,/model: reviewRound.modelData.complete \? view.reviewFields/);
-  assert.match(card,/editable: view.editingPlan && modelData.status !== "committed"/);
-  assert.equal((card.match(/objectName: "stageToggle"/g)||[]).length,1);
+  assert.match(card,/model: reviewRound.modelData.complete \? ReviewPresentation.reviewFields/);
+  assert.match(header,/editable: view.editingPlan && modelData.status !== "committed"/);
+  assert.equal((header.match(/objectName: "stageToggle"/g)||[]).length,1);
+  assert.equal((stageDetail.match(/objectName: "stageToggle"/g)||[]).length,0);
   assert.equal((card.match(/objectName: "stageRoutingToggle"/g)||[]).length,1);
   assert.ok(!card.includes('TapHandler'));
-  assert.match(card,/StageProseField \{/);
-  assert.match(card,/active: stageRow.expanded && !stageRow.editable && stageRow.prose !== null/);
-  for (const name of ['commit','instructions','acceptance']) assert.match(card,new RegExp('originalText: stageRow.prose \\? stageRow.prose.'+name));
+  assert.match(stageDetail,/StageProseField \{/);
+  // Full prose only for an open stage (the snapshot is taken on open) that is not being edited.
+  assert.match(stageDetail,/editable: editingPlan && stage.status !== "committed"/);
+  assert.match(stageDetail,/prose: hasStage && !editable && stageSnapshot && stageSnapshot.key === detailScope/);
+  for (const name of ['commit','instructions','acceptance']) assert.match(stageDetail,new RegExp('originalText: page.prose \\? page.prose.'+name));
 });
 
 test('a byte-limited older page followed by failure keeps its unfilled gap reachable', () => {

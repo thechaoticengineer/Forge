@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
-const planEditor = readFileSync(new URL('../quickshell/PlanEditorView.qml', import.meta.url), 'utf8');
+// The stage prose fields moved from PlanEditorView's inline expansion to StageDetailPage.qml (M2).
+const stageDetail = readFileSync(new URL('../quickshell/StageDetailPage.qml', import.meta.url), 'utf8');
 const architectureReview = readFileSync(new URL('../quickshell/ArchitectureReviewView.qml', import.meta.url), 'utf8');
 const read = name => readFileSync(new URL('../quickshell/' + name, import.meta.url), 'utf8');
 // The stage review presentation moved from Panel.qml to ReviewPresentation.js.
@@ -15,7 +16,7 @@ test('documentation architect is explicitly not required, never approved', () =>
   const text = context.reviewGateText({review_policy:{scope:'ordinary_documentation',rationale:'Prose only'},review_gate:{status:'approved',roles:{architect:'not_required',reviewer:'approved'}}});
   assert.match(text,/Architect: review not required/); assert.match(text,/Independent: approved/);
   assert.doesNotMatch(text,/Architect: approved/); assert.doesNotMatch(text,/Prose only/);
-  assert.match(planEditor, /originalText: stageRow.prose \? stageRow.prose.policyRationale/);
+  assert.match(stageDetail, /originalText: page.prose \? page.prose.policyRationale/);
 });
 test('current gate is independent of historical approval and partial outcomes', () => {
   const stage = {last_verdict:{approved:true,issues:[],notes:[]}, review_gate:{status:'error',roles:{reviewer:'approved',architect:'pending'}}};

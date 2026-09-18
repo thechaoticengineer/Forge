@@ -31,6 +31,17 @@ Item {
     // The stage keys act on the Plan tab, which shows the stages.
     property string currentTab: "plan"
     property int leakedKeys: 0
+    // Panel.qml services the stage detail wiring uses.
+    property bool helpOpen: false
+    property bool liveTab: false
+    property var guards: ({diff: true, stop: true})
+    property int diffOpened: 0
+    function openDiff() { diffOpened++ }
+    function act(path) {}
+    readonly property var reviewGateText: ReviewPresentation.reviewGateText
+    readonly property var theme: ({foreground: foreground, mutedForeground: mutedForeground, background: background,
+        surface: "#282828", accent: accent, urgent: urgent, success: success, working: working,
+        fontFamily: fontFamily, fontSize10: 10, fontSize11: 11, fontSize12: 12})
     Keys.onPressed: event => { leakedKeys++; event.accepted = true }
     // PANEL_STAGE_STATE
     property bool busy: true
@@ -56,17 +67,31 @@ Item {
     }
     QtObject { id: style; function space(n) { return n } }
     QtObject { id: clipboard; property string clipboardText: "" }
+    // Panel.qml's panelStack and panelPage: the stack records which page is current.
+    QtObject { id: panelPage }
+    QtObject {
+        id: panelStack
+        property var currentItem: panelPage
+        function push(item, operation) { currentItem = item }
+        function pop(item, operation) { currentItem = item }
+    }
     Item {
         id: keyHandler
+        property string pendingKey: ""
         Keys.onPressed: event => {
+            const prefix = pendingKey
+            pendingKey = ""
+            const question = false
+            const viewTab = ""
             const stages = root.displayedStages
-            // PANEL_STAGE_SHORTCUT
+            // PANEL_STAGE_KEYS
         }
     }
     // PANEL_HELPERS
     Flickable {
         id: panelScroll
-        anchors.fill: parent
+        width: parent.width
+        height: 150
         contentHeight: root.currentStageRow ? root.currentStageRow.height : 0
         clip: true
         function reveal(control) {
@@ -85,26 +110,51 @@ Item {
             width: stageList.width
             height: stageContent.implicitHeight
             // PANEL_STAGE_DELEGATE
-            // PANEL_STAGE_PROPERTIES
             // PANEL_STAGE_CONTENT
             Loader { id: stageEditor; active: stageRow.editable }
           }
         }
     }
+    // The stage detail page, where the expanded stage's details moved.
+    Item {
+        id: pageArea
+        anchors.top: panelScroll.bottom
+        anchors.bottom: parent.bottom
+        width: parent.width
+        // PANEL_STAGE_DETAIL_PAGE
+    }
     TestCase {
         name: "ActualStageDetails"
         when: windowShown
+        // The Plan card of the first stage, and the page its toggle opens.
         readonly property var stageRow: root.currentStageRow
+        readonly property var page: stageDetailPage
         function descendants(item) {
             let found = [item]
             for (const child of item.children || []) found = found.concat(descendants(child))
             return found
         }
-        function prose(label) { return descendants(stageRow).find(d => d.stageProseField && d.label === label) }
+        function everything() { return descendants(stageRow).concat(descendants(page)) }
+        function prose(label) { return everything().find(d => d.stageProseField && d.label === label) }
         function nativeText(original) { return original.replace(/\r\n/g,"\n").replace(/\r/g,"\n") }
+        // The page shows one sub-tab at a time: show the one holding a control before using it.
+        function showTab(item) {
+            for (let at = item; at; at = at.parent) {
+                if (at.objectName && at.objectName.indexOf("stageSubTabContent_") === 0) {
+                    root.stageDetailTab = at.objectName.slice("stageSubTabContent_".length)
+                    wait(20)
+                    return true
+                }
+            }
+            return false
+        }
+        readonly property var detailNames: ["detailToggle","detailPreview","detailFullText","stageProseText","stageRoutingToggle"]
         function assertCollapsed() {
-            for (const name of ["detailToggle","detailPreview","detailFullText","stageProseText","stageRoutingToggle"])
-                compare(all(name).length,0,name + " is not instantiated anywhere in the collapsed card")
+            verify(!page.visible,"the stage detail page is closed")
+            for (const name of detailNames) {
+                compare(descendants(stageRow).filter(d => d.objectName === name).length,0,name + " is not instantiated in the Plan card")
+                compare(all(name).filter(d => d.visible).length,0,name + " is not shown anywhere while the stage is closed")
+            }
             const buttons = descendants(stageRow).filter(d => d instanceof Button)
             compare(buttons.length,1)
             compare(buttons[0].objectName,"stageToggle")
@@ -116,24 +166,20 @@ Item {
             }
         }
         function assertExpandedControls() {
-            const owned = descendants(stageRow)
-            const buttons = owned.filter(d => d instanceof Button)
-            compare(buttons.filter(d => d.objectName === "stageToggle").length,1)
+            verify(page.visible,"the stage detail page is open")
+            const header = descendants(stageRow).filter(d => d instanceof Button)
+            compare(header.length,1)
+            compare(header[0].objectName,"stageToggle")
+            const buttons = descendants(page).filter(d => d instanceof Button)
             compare(buttons.filter(d => d.objectName === "stageRoutingToggle").length,1)
-            verify(buttons.every(d => ["stageToggle","stageRoutingToggle","stageReviewsOlder","stageReviewsRetry"].includes(d.objectName)))
+            verify(buttons.every(d => ["stageRoutingToggle","stageReviewsOlder","stageReviewsRetry"].includes(d.objectName)))
             const historical = all("stageHistoricalReviews")[0]
             verify(descendants(historical).filter(d => d instanceof Button).every(d =>
                 ["stageReviewsOlder","stageReviewsRetry"].includes(d.objectName)))
-            verify(!owned.some(d => ["detailToggle","detailPreview","detailFullText","detailCopy"].includes(d.objectName)))
+            verify(!everything().some(d => ["detailToggle","detailPreview","detailFullText","detailCopy"].includes(d.objectName)))
         }
         function all(name) {
-            const found=[]
-            function walk(item) {
-                if (item.objectName === name) found.push(item)
-                for (const child of item.children || []) walk(child)
-            }
-            walk(stageRow)
-            return found
+            return everything().filter(d => d.objectName === name)
         }
         function control(item,name) {
             if (item.objectName === name) return item
@@ -145,16 +191,23 @@ Item {
         }
         function click(item) {
             verify(!!item,"control exists")
-            panelScroll.reveal(item)
+            if (showTab(item)) page.reveal(item)
+            else panelScroll.reveal(item)
             wait(20)
             mouseClick(item,Math.min(item.width-1,20),Math.min(item.height-1,12))
             wait(20)
+        }
+        // The Plan card's header toggle opens the stage; the page's ‹ Plan closes it.
+        function toggle() {
+            if (root.expandedStageId === -1) click(all("stageToggle")[0])
+            else click(all("stageBack")[0])
         }
         function init() {
             root.lastProject="/fixture"; root.projectViewRevision=1
             root.calls=[]; root.reviewViews=({}); root.stageReviewBlocks=({}); root.refreshes=0; root.reviewViewVersion++
             root.expandedStageId=-1; root.editingPlan=false; root.editStages=[]; root.width=440
             root.selectedStageIndex=0; root.leakedKeys=0
+            panelStack.currentItem=panelPage; root.stageDetailTab="instructions"; root.diffOpened=0
             root.fullRecords=Array.from({length:10},function(_,i) {
                 return {id:"review-"+i,round:1,role:i%2 ? "reviewer" : "architect",approved:false,
                     summary:"\n same preview\r\n" + "界🙂".repeat(100) + "\nsummary " + i + " END  \t",
@@ -194,13 +247,16 @@ Item {
             const scrollBaseline=panelScroll.contentHeight
             verify(baseline>0)
             for (let cycle=0;cycle<5;cycle++) {
-                click(all("stageToggle")[0])
-                tryVerify(()=>stageRow.height>baseline+1,2000)
-                verify(!!prose("Instructions"),"expansion constructs full stage text")
+                toggle()
+                // The details open on their own page; the Plan card keeps its geometry.
+                tryVerify(()=>page.visible && page.contentFlick.contentHeight>1,2000)
+                verify(!!prose("Instructions"),"opening constructs full stage text")
+                verify(prose("Instructions").visible)
                 compare(prose("Instructions").originalText,stage.instructions)
-                tryVerify(()=>stageList.contentHeight>listBaseline+1,2000)
-                tryVerify(()=>panelScroll.contentHeight>scrollBaseline+1,2000)
-                click(all("stageToggle")[0])
+                compare(stageRow.height,baseline)
+                compare(stageList.contentHeight,listBaseline)
+                compare(panelScroll.contentHeight,scrollBaseline)
+                toggle()
                 assertCollapsed()
                 tryVerify(()=>Math.abs(stageRow.height-baseline)<=1,2000,
                     "collapsed stage releases the Loader's retained height")
@@ -210,9 +266,9 @@ Item {
         }
         function test_status_prose_and_nested_selection() {
             compare(root.calls.length,0)
-            verify(stageRow.reviewHistory.length > 0,"collapsed assertions include populated reviews")
+            verify(root.reviewView(root.plan.stages[0]).rows.length > 0,"collapsed assertions include populated reviews")
             assertCollapsed()
-            click(all("stageToggle")[0])
+            toggle()
             compare(root.expandedStageId,1)
             assertExpandedControls()
             const st=stageRow.modelData
@@ -223,6 +279,7 @@ Item {
                 const d=prose(label)
                 verify(!!d,label)
                 compare(d.originalText,originals[label],label+" preserves the original")
+                showTab(d)
                 const editor=control(d,"stageProseText")
                 verify(!!editor); verify(editor.readOnly); verify(editor.selectByMouse)
                 compare(editor.text,nativeText(originals[label]))
@@ -242,6 +299,7 @@ Item {
                 verify(keyHandler.activeFocus)
             }
             const instructions=prose("Instructions"), editor=control(instructions,"stageProseText")
+            showTab(instructions)
             editor.forceActiveFocus(); editor.select(1,21)
             compare(instructions.selectedText," instructions first\r\n")
             keyClick(Qt.Key_C,Qt.ControlModifier)
@@ -249,7 +307,7 @@ Item {
             verify(ModelRouting.stageModelStatus(st).includes("configured-model"))
             verify(root.reviewGateText(st).includes("Independent: approved"))
             verify(stageRow.activity.includes("reviewing"))
-            verify(descendants(stageRow).some(d => d instanceof Text && d.text===ModelRouting.stageModelErrors(st) && d.color===root.urgent))
+            verify(everything().some(d => d instanceof Text && d.text===ModelRouting.stageModelErrors(st) && d.color===root.urgent))
             compare(prose("Risk"),undefined)
             click(all("stageRoutingToggle")[0])
             for (const f of ModelRouting.stageModelDiagnostics(st)) {
@@ -271,7 +329,7 @@ Item {
             verify(!!prose("Planner")); verify(!!prose("retry · Planner 1"))
             root.width=240; wait(40)
             verify(editor.width>0)
-            click(all("stageToggle")[0]); assertCollapsed()
+            toggle(); assertCollapsed()
             compare(root.stageSnapshot,null); compare(root.stageRoutingExpanded,false)
             compare(root.calls.length,1)
         }
@@ -280,20 +338,31 @@ Item {
             p.stages.push(Object.assign({},p.stages[0],{id:2,title:"Other stage"}))
             root.plan=p;root.selectedStageIndex=1;wait(40)
             const toggle=all("stageToggle")[0]
+            // The header opens its stage's page; the page's q / Escape close it again.
             for (const key of [Qt.Key_Return,Qt.Key_Enter,Qt.Key_Space]) {
+                root.selectedStageIndex=1
                 toggle.forceActiveFocus(Qt.TabFocusReason)
                 keyClick(key);wait(20)
                 compare(root.expandedStageId,1,"focused header activates once, not the selected other card")
-                keyClick(key);wait(20)
+                compare(root.selectedStageIndex,0,"the opened stage is selected for the return to Plan")
+                verify(root.stageDetailOpen)
+                keyClick(key === Qt.Key_Space ? Qt.Key_Q : Qt.Key_Escape);wait(20)
                 compare(root.expandedStageId,-1)
+                verify(!root.stageDetailOpen)
             }
+            root.selectedStageIndex=1
             toggle.forceActiveFocus();keyClick(Qt.Key_O);keyClick(Qt.Key_R)
             compare(root.expandedStageId,-1);compare(root.leakedKeys,0)
             for (const key of [Qt.Key_Return,Qt.Key_Enter,Qt.Key_O,Qt.Key_Space]) {
                 keyHandler.forceActiveFocus();keyClick(key);wait(20)
                 compare(root.expandedStageId,2,"unchanged panel shortcut uses selected stage")
-                keyClick(key);wait(20);compare(root.expandedStageId,-1)
+                verify(root.stageDetailOpen)
+                keyClick(key);wait(20)
+                compare(root.expandedStageId,2,"the shortcut keeps the open stage")
+                keyClick(Qt.Key_Escape);wait(20);compare(root.expandedStageId,-1)
+                compare(root.selectedStageIndex,1)
             }
+            compare(root.leakedKeys,0)
         }
         function publish(snapshot, checkpoint) {
             const p=JSON.parse(JSON.stringify(root.plan))
@@ -302,6 +371,7 @@ Item {
             root.plan=p;root.syncReviewViews();wait(60)
         }
         function assertFailure(message) {
+            showTab(all("stageReviewStatus")[0])
             const lines=all("stageReviewStatus").filter(d=>d.visible)
             compare(lines.length,1)
             compare(lines[0].text,message)
@@ -321,11 +391,11 @@ Item {
             root.respond(0,500); wait(40)
             assertFailure("Fixture offline")
             publish("snapshot-2","checkpoint-2")
-            compare(stageRow.reviewView.error,"")
+            compare(page.reviews.error,"")
             assertFailure("Fixture offline")
             compare(root.calls.length,1)
-            click(all("stageToggle")[0]);assertCollapsed()
-            click(all("stageToggle")[0]);assertFailure("Fixture offline")
+            toggle();assertCollapsed()
+            toggle();assertFailure("Fixture offline")
             compare(root.calls.length,1)
             click(all("stageReviewsRetry")[0]);compare(root.calls.length,2)
             root.respond(1,200);wait(80)
@@ -356,8 +426,8 @@ Item {
                 compare(editor.selectedText,selection);compare(loaded.selectedText,exact)
                 verify(editor.activeFocus)
                 keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
-                if (stageRow.reviewView.pending) {
-                    verify(stageRow.reviewHistory.some(r=>!r.complete),"held text never imports completeness")
+                if (page.reviews.pending) {
+                    verify(page.reviewHistory.some(r=>!r.complete),"held text never imports completeness")
                     root.respond(root.calls.length-1,200);wait(60)
                     compare(control(loaded,"stageProseText"),editor)
                     compare(editor.selectedText,selection)
@@ -372,26 +442,26 @@ Item {
             // even when older records are inserted before its delegate.
             const requestSelection=requestEditor.selectedText
             click(all("stageReviewsOlder")[0]);root.respond(root.calls.length-1,200);wait(80)
-            compare(stageRow.reviewHistory.length,11);compare(stageRow.reviewView.older,0)
+            compare(page.reviewHistory.length,11);compare(page.reviews.older,0)
             compare(control(request,"stageProseText"),requestEditor)
             compare(requestEditor.selectedText,requestSelection)
-            compare(stageRow.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
+            compare(page.reviewHistory[0].verdict.summary,root.fullRecords[0].summary)
             assertExpandedControls()
             const count=root.calls.length
-            click(all("stageToggle")[0]);assertCollapsed()
-            click(all("stageToggle")[0]);compare(root.calls.length,count,"complete records do not reload")
+            toggle();assertCollapsed()
+            toggle();compare(root.calls.length,count,"complete records do not reload")
             root.loadStageReviews(1,0,2);const obsolete=root.calls[root.calls.length-1]
             root.projectViewRevision++;root.reviewViews=({});root.lastProject="/another";root.expandedStageId=-1;wait(30)
             obsolete.done({error:"stale"},500);wait(30)
-            compare(stageRow.reviewView.error,"")
+            compare(root.reviewView(root.plan.stages[0]).error,"")
             compare(Object.keys(root.stageReviewBlocks).length,0)
-            verify(stageRow.reviewHistory.every(r=>!r.complete))
+            verify(root.reviewView(root.plan.stages[0]).rows.every(r=>!r.complete))
         }
         function test_changed_refresh_and_retry_failure_remain_blocked() {
             root.expandedStageId=1;wait(40)
             root.respond(0,200,"unverified-snapshot");wait(40)
             compare(root.refreshes,1)
-            const message=stageRow.reviewMessage
+            const message=page.reviewMessage
             verify(message.includes("cannot be verified"));assertFailure(message)
             publish("snapshot-2","checkpoint-2")
             assertFailure(message);compare(root.calls.length,1)
@@ -399,8 +469,8 @@ Item {
             publish("snapshot-3","checkpoint-3")
             assertFailure("Fixture offline");compare(root.calls.length,2)
             click(all("stageReviewsRetry")[0]);root.respond(2,200);wait(40)
-            verify(stageRow.reviewHistory.every(r=>r.complete))
-            compare(stageRow.reviewMessage,"")
+            verify(page.reviewHistory.every(r=>r.complete))
+            compare(page.reviewMessage,"")
             // An older-page action can fail after successful automatic/retry
             // loading too. New publications must not bypass that failure.
             click(all("stageReviewsOlder")[0]);root.respond(3,500);wait(40)
@@ -408,7 +478,7 @@ Item {
             publish("snapshot-4","checkpoint-4")
             assertFailure("Fixture offline");compare(root.calls.length,4)
             click(all("stageReviewsRetry")[0]);root.respond(4,200);wait(40)
-            verify(stageRow.reviewHistory.every(r=>r.complete));compare(stageRow.reviewMessage,"")
+            verify(page.reviewHistory.every(r=>r.complete));compare(page.reviewMessage,"")
         }
         function test_collapse_before_deferred_start_and_during_continuation() {
             root.expandedStageId=1;root.expandedStageId=-1;wait(50)
@@ -430,6 +500,7 @@ Item {
             p.stages[0].review_count=1;p.stages[0].reviews_truncated=false;root.plan=p
             root.expandedStageId=1;wait(40)
             const summary=prose("Summary"),editor=control(summary,"stageProseText")
+            showTab(summary)
             editor.forceActiveFocus();editor.select(2,16)
             const selection=editor.selectedText,exact=summary.selectedText,start=editor.selectionStart,end=editor.selectionEnd
             root.syncReviewViews();root.syncReviewViews();root.width=300;wait(40)
@@ -442,13 +513,14 @@ Item {
         function test_selected_preview_completion_and_unidentified_replacement() {
             root.expandedStageId=1;wait(50)
             const preview=prose("Summary preview · feedback may be omitted"),editor=control(preview,"stageProseText")
+            showTab(preview)
             editor.forceActiveFocus();editor.select(1,15)
             const start=editor.selectionStart,end=editor.selectionEnd,exact=preview.selectedText,original=preview.originalText
             root.respond(0,200);wait(80)
             compare(control(preview,"stageProseText"),editor)
             compare(preview.originalText,original);compare(editor.selectionStart,start);compare(editor.selectionEnd,end)
             compare(prose("Summary").originalText,root.fullRecords[2].summary)
-            verify(stageRow.reviewHistory.every(r=>r.complete))
+            verify(page.reviewHistory.every(r=>r.complete))
             verify(all("stageReviewStatus")[0].text.includes("Selected preview retained"))
             keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,exact)
             editor.deselect();wait(50)
@@ -468,16 +540,16 @@ Item {
             compare(control(old,"stageProseText"),oldEditor)
             compare(old.originalText,"old legacy\r\noriginal  ")
             compare(oldEditor.selectionStart,oldStart);compare(oldEditor.selectionEnd,oldEnd)
-            verify(descendants(stageRow).some(d=>d.stageProseField && d.originalText===replacement.stages[0].reviews[0].summary))
-            verify(descendants(stageRow).some(d=>d instanceof Text && d.text.includes("held from an earlier publication")))
+            verify(everything().some(d=>d.stageProseField && d.originalText===replacement.stages[0].reviews[0].summary))
+            verify(everything().some(d=>d instanceof Text && d.text.includes("held from an earlier publication")))
             keyClick(Qt.Key_C,Qt.ControlModifier);compare(clipboard.clipboardText,oldExact)
             compare(root.calls.length,1,"complete legacy publications do not fetch")
             oldEditor.deselect();wait(40)
-            verify(!descendants(stageRow).some(d=>d.stageProseField && d.originalText==="old legacy\r\noriginal  "))
+            verify(!everything().some(d=>d.stageProseField && d.originalText==="old legacy\r\noriginal  "))
         }
         function test_block_scope_retirement_and_plan_edit_gate() {
             root.expandedStageId=1;wait(50);root.respond(0,500);wait(30)
-            const oldKey=stageRow.detailScope
+            const oldKey=page.detailScope
             verify(!!root.stageReviewBlocks[oldKey])
             const p=JSON.parse(JSON.stringify(root.plan));p.revision++;root.plan=p;wait(50)
             compare(root.stageReviewBlocks[oldKey],undefined)
@@ -494,10 +566,10 @@ Item {
             click(all("stageReviewsRetry")[0]);compare(root.calls.length,3)
             root.editingPlan=false;wait(40);compare(root.calls.length,3)
             old.done({error:"stale failure"},500);wait(30)
-            compare(stageRow.reviewMessage,"")
+            compare(page.reviewMessage,"")
         }
         function test_poll_replacement_preserves_editor_identity_and_native_selection() {
-            click(all("stageToggle")[0])
+            toggle()
             const row=stageRow, d=prose("Instructions"), editor=control(d,"stageProseText")
             const commitEditor=control(prose("Commit"),"stageProseText"), oldCommit=prose("Commit").originalText
             editor.forceActiveFocus();editor.select(1,21)
@@ -537,9 +609,9 @@ Item {
                 verify(descendants(stageRow).some(t=>t instanceof Text && t.text==="blocked" && t.color===root.urgent))
             }
             click(all("stageRoutingToggle")[0])
-            click(all("stageToggle")[0]);assertCollapsed()
+            toggle();assertCollapsed()
             compare(root.stageSnapshot,null);compare(root.stageRoutingExpanded,false)
-            click(all("stageToggle")[0])
+            toggle()
             compare(prose("Instructions").originalText,root.plan.stages[0].instructions)
             compare(prose("Commit").originalText,root.plan.stages[0].commit)
             compare(prose("Planner").originalText,root.plan.stages[0].model_agreement.planner_reason)
@@ -561,7 +633,7 @@ Item {
             if (data.scope==="stage") root.expandedStageId=2
             root.syncReviewViews();wait(60)
             verify(root.stageSnapshot.key!==oldKey)
-            compare(root.stageSnapshot.key,stageRow.detailScope)
+            compare(root.stageSnapshot.key,page.detailScope)
             compare(prose("Instructions").originalText,p.stages[0].instructions)
             compare(control(prose("Instructions"),"stageProseText").text,nativeText(p.stages[0].instructions))
         }
@@ -571,7 +643,7 @@ Item {
             compare(stageRow.editable,false)
             verify(descendants(stageRow).some(t => t instanceof Text && t.text === "committed — locked abc123"))
             assertCollapsed()
-            click(all("stageToggle")[0])
+            toggle()
             verify(prose("Instructions").visible)
             verify(control(prose("Instructions"),"stageProseText").readOnly)
         }

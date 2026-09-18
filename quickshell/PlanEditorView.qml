@@ -3,16 +3,15 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls as QQC
-import Quickshell
 import qs.Commons
-import "ModelRouting.js" as ModelRouting
-import "PanelDetails.js" as PanelDetails
 import "PlanEdit.js" as PlanEdit
-import "UsageFormat.js" as UsageFormat
+import "StagePresentation.js" as StagePresentation
 
-// Interface: plan/edit projections and review callbacks enter as properties;
-// edit, expansion, review-loading, and focus actions leave as signals. The list,
-// frame, and save control aliases preserve root keyboard routing and focus.
+// Interface: the plan editor. Plan/edit projections enter as properties; edit,
+// open-stage and focus actions leave as signals. Committed stages keep a locked
+// read-only header whose toggle opens the stage detail page, which shows their
+// details. The list, frame, and save control aliases preserve root keyboard
+// routing and focus.
 Column {
   id: view
 
@@ -25,27 +24,13 @@ Column {
   required property var displayedStages
   required property var editStages
   required property var plan
-  required property var stageSnapshot
   required property int expandedStageId
   required property int selectedStageIndex
-  required property bool stageRoutingExpanded
-  required property var stageReviewBlocks
   required property real agentNow
   required property real panelHeight
   required property var editFocusedField
   required property var fs
   required property var stageActivity
-  required property var stageDetailScope
-  required property var reviewView
-  required property var reviewGateText
-  required property var reviewDecision
-  required property var reviewFields
-  required property var reviewRoundLabel
-  required property var reviewTimestamp
-  required property var stageReviewIncompleteRange
-  required property var stageReviewHasHeldPreview
-  required property var ensureStageReviewsLoaded
-  required property var reconcileStageReviewPresentation
   required property color foreground
   required property color mutedForeground
   required property color background
@@ -66,15 +51,12 @@ Column {
   signal deleteEditStage(int index)
   signal changeStageField(int index, string field, var value)
   signal changeModelConstraint(int index, string key, string value)
-  signal loadStageReviews(int stageId, var cursor, var end)
-  signal retryStageReviews(var stage)
-  signal expandedStageRequested(int stageId)
-  signal stageRoutingExpandedRequested(bool expanded)
+  // A committed stage's locked header asks to open its stage detail page.
+  signal stageOpened(int index)
   signal editFocusChanged(var field)
   signal helpRequested
   signal leaveRequested
   signal detailRevealed(var control)
-  signal detailInspected(var control)
 
         // ------------------------------------------------- stages
         Flow {
@@ -143,18 +125,6 @@ Column {
                 ? Math.max(0, Math.floor(view.agentNow - modelData.started_unix))
                 : typeof modelData.duration_secs === "number"
                   ? Math.max(0, Math.floor(modelData.duration_secs)) : -1
-              readonly property var reviewView: view.reviewView(modelData)
-              readonly property var reviewHistory: reviewView.rows
-              readonly property string detailScope: view.stageDetailScope(modelData)
-              readonly property var prose: view.stageSnapshot && view.stageSnapshot.key === detailScope
-                ? view.stageSnapshot : null
-              readonly property string reviewMessage: reviewView.error || view.stageReviewBlocks[detailScope] || ""
-              readonly property bool reviewRetryAvailable: reviewMessage !== "" && (!!reviewView.retry
-                || view.stageReviewIncompleteRange(reviewView) !== null || reviewView.older > 0)
-              readonly property var lastReview: reviewHistory.length > 0
-                ? reviewHistory[reviewHistory.length - 1] : null
-              readonly property var lastDecision: lastReview
-                ? view.reviewDecision(lastReview.verdict) : null
               readonly property string activity: view.stageActivity(modelData)
               width: stageList.width
               height: editable ? stageEditor.height : stageContent.implicitHeight
@@ -173,11 +143,11 @@ Column {
                   implicitHeight: Math.max(32, headerLabel.implicitHeight + 12)
                   padding: 6
                   focusPolicy: Qt.StrongFocus
-                  Accessible.name: (stageRow.expanded ? "Collapse stage " : "Expand stage ") + stageRow.modelData.id
+                  Accessible.name: (stageRow.expanded ? "Close stage " : "Open stage ") + stageRow.modelData.id
                   contentItem: Row {
                     spacing: Style.space(4)
                     Text {
-                      text: stageRow.expanded ? "▾" : "▸"
+                      text: stageRow.expanded ? "▾" : "›"
                       textFormat: Text.PlainText
                       wrapMode: Text.Wrap
                       color: view.foreground
@@ -216,7 +186,7 @@ Column {
                     border.width: stageToggle.visualFocus ? 1 : 0
                     border.color: view.accent
                   }
-                  onClicked: view.expandedStageRequested(stageRow.expanded ? -1 : stageRow.modelData.id)
+                  onClicked: view.stageOpened(stageRow.index)
                   onActiveFocusChanged: if (activeFocus && focusReason !== Qt.MouseFocusReason
                     && focusReason !== Qt.PopupFocusReason) view.detailRevealed(stageToggle)
                   Keys.priority: Keys.AfterItem
@@ -232,15 +202,7 @@ Column {
                   Text {
                     width: Math.min(implicitWidth, stageRow.width)
                     textFormat: Text.PlainText
-                    text: (view.editingPlan && stageRow.modelData.status === "committed"
-                      ? "committed — locked" : stageRow.modelData.status === "blocked"
-                      ? (stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "scope_blocked"
-                         ? "blocked · stage cannot be built as written"
-                         : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "design_blocked"
-                         ? "blocked · pen.dev export unavailable"
-                         : stageRow.modelData.review_gate && stageRow.modelData.review_gate.status === "exhausted"
-                         ? "blocked · fix rounds exhausted" : "blocked") : stageRow.modelData.status)
-                      + (stageRow.modelData.sha ? " " + stageRow.modelData.sha : "")
+                    text: StagePresentation.statusText(stageRow.modelData, view.editingPlan)
                     color: stageRow.modelData.status === "committed" ? view.success
                       : stageRow.modelData.status === "in_progress" ? view.working
                       : stageRow.modelData.status === "blocked" ? view.urgent
@@ -261,33 +223,6 @@ Column {
                     font.bold: true
                   }
                   Text {
-                    visible: !!stageRow.modelData.review_gate
-                    width: stageRow.width
-                    text: view.reviewGateText(stageRow.modelData)
-                    textFormat: Text.PlainText
-                    color: view.mutedForeground
-                    wrapMode: Text.Wrap
-                    font.family: view.fontFamily
-                    font.pixelSize: view.fs(11)
-                  }
-                  Text {
-                    visible: stageRow.reviewHistory.length > 0
-                    width: Math.min(implicitWidth, stageRow.width)
-                    text: stageRow.lastReview && stageRow.lastDecision
-                      ? "historical review · " + view.reviewRoundLabel(stageRow.lastReview)
-                        + ": " + stageRow.lastDecision.label
-                        + (stageRow.modelData.last_verdict_valid === false ? " · obsolete for current work" : "")
-                      : ""
-                    textFormat: Text.PlainText
-                    color: stageRow.modelData.last_verdict_valid === false ? view.mutedForeground
-                      : stageRow.lastDecision && stageRow.lastDecision.optionalNotes ? view.working
-                      : stageRow.lastDecision && stageRow.lastDecision.clean
-                      ? (stageRow.activity ? view.mutedForeground : view.success) : view.urgent
-                    wrapMode: Text.Wrap
-                    font.family: view.fontFamily
-                    font.pixelSize: view.fs(11)
-                  }
-                  Text {
                     width: stageRow.width
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
@@ -297,250 +232,6 @@ Column {
                     color: view.mutedForeground
                     font.family: view.fontFamily
                     font.pixelSize: view.fs(11)
-                  }
-                }
-                Text {
-                  width: stageRow.width
-                  text: ModelRouting.stageModelStatus(stageRow.modelData)
-                  textFormat: Text.PlainText
-                  color: view.mutedForeground
-                  wrapMode: Text.Wrap
-                  font.family: view.fontFamily
-                  font.pixelSize: view.fs(11)
-                }
-                Text {
-                  visible: text !== ""
-                  width: stageRow.width
-                  text: ModelRouting.stageModelErrors(stageRow.modelData)
-                  textFormat: Text.PlainText
-                  color: view.urgent
-                  wrapMode: Text.Wrap
-                  font.family: view.fontFamily
-                  font.pixelSize: view.fs(11)
-                }
-                Loader {
-                  width: stageRow.width
-                  active: stageRow.expanded && !stageRow.editable && stageRow.prose !== null
-                  // An inactive Loader retains its height after destroying its item.
-                  // Exclude it from the Column when the stage details are closed.
-                  visible: active
-                  sourceComponent: Column {
-                    width: stageRow.width
-                    spacing: 2
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Commit"
-                      originalText: stageRow.prose ? stageRow.prose.commit : ""
-                    }
-                    Column {
-                      width: stageRow.width
-                      spacing: 2
-                      Repeater {
-                        model: stageRow.prose ? stageRow.prose.rationale : []
-                        delegate: StageProseField {
-                          required property var modelData
-                          width: stageRow.width
-                          label: modelData.label
-                          originalText: modelData.text
-                        }
-                      }
-                      QQC.Button {
-                        id: stageRoutingToggle
-                        objectName: "stageRoutingToggle"
-                        width: stageRow.width
-                        implicitHeight: Math.max(32, routingLabel.implicitHeight + 12)
-                        padding: 6
-                        focusPolicy: Qt.StrongFocus
-                        Accessible.name: (view.stageRoutingExpanded ? "Collapse " : "Expand ") + "model agreement and routing details"
-                        contentItem: Text {
-                          id: routingLabel
-                          text: (view.stageRoutingExpanded ? "▾  " : "▸  ") + "Model agreement and routing details"
-                          textFormat: Text.PlainText
-                          wrapMode: Text.Wrap
-                          color: view.foreground
-                          font.family: view.fontFamily
-                          font.pixelSize: view.fs(11)
-                        }
-                        background: Rectangle {
-                          radius: 4
-                          color: stageRoutingToggle.hovered || stageRoutingToggle.down ? Qt.alpha(view.foreground, 0.06) : "transparent"
-                          border.width: stageRoutingToggle.visualFocus ? 1 : 0
-                          border.color: view.accent
-                        }
-                        onClicked: view.stageRoutingExpandedRequested(!view.stageRoutingExpanded)
-                        onActiveFocusChanged: if (activeFocus && focusReason !== Qt.MouseFocusReason
-                          && focusReason !== Qt.PopupFocusReason) view.detailRevealed(stageRoutingToggle)
-                        Keys.priority: Keys.AfterItem
-                        Keys.onPressed: event => {
-                          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) stageRoutingToggle.clicked()
-                          else if (event.key === Qt.Key_Escape) view.leaveRequested()
-                          if (event.key !== Qt.Key_Tab && event.key !== Qt.Key_Backtab) event.accepted = true
-                        }
-                      }
-                      Repeater {
-                        model: view.stageRoutingExpanded && stageRow.prose ? stageRow.prose.diagnostics : []
-                        delegate: StageProseField {
-                          required property var modelData
-                          width: stageRow.width
-                          label: modelData.label
-                          originalText: modelData.text
-                        }
-                      }
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Review policy rationale"
-                      originalText: stageRow.prose ? stageRow.prose.policyRationale : ""
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Instructions"
-                      originalText: stageRow.prose ? stageRow.prose.instructions : ""
-                    }
-                    StageProseField {
-                      width: stageRow.width
-                      label: "Acceptance criteria"
-                      originalText: stageRow.prose ? stageRow.prose.acceptance : ""
-                    }
-                    Column {
-                      id: stageReviews
-                      objectName: "stageHistoricalReviews"
-                      readonly property var currentRows: stageRow.reviewHistory
-                      readonly property string currentScope: stageRow.reviewView.scope.key
-                      readonly property bool planEditing: view.editingPlan
-                      readonly property bool heldPreview: view.stageReviewHasHeldPreview(reviewPresentation, stageRow.reviewView)
-                      // A single queued update coalesces publications and runs
-                      // against current delegate state, outside binding evaluation.
-                      onCurrentRowsChanged: reviewUpdate.restart()
-                      onCurrentScopeChanged: reviewUpdate.restart()
-                      onPlanEditingChanged: reviewUpdate.restart()
-                      Timer {
-                        id: reviewUpdate
-                        interval: 0
-                        running: true
-                        onTriggered: {
-                          view.ensureStageReviewsLoaded(stageRow.modelData)
-                          view.reconcileStageReviewPresentation(stageRow.modelData, reviewPresentation, reviewRepeater)
-                        }
-                      }
-                      ListModel { id: reviewPresentation; dynamicRoles: true }
-                      width: stageRow.width
-                      spacing: 2
-                      Text {
-                        visible: stageRow.expanded && stageRow.reviewHistory.length > 0
-                        width: stageRow.width
-                        text: "Historical reviews · showing " + stageRow.reviewHistory.length
-                          + " of " + stageRow.reviewView.scope.count
-                          + (stageRow.reviewHistory.some(function(r) { return !r.complete }) ? " · previews require full-text loading" : "")
-                        textFormat: Text.PlainText
-                        color: view.mutedForeground
-                        wrapMode: Text.Wrap
-                        font.family: view.fontFamily
-                        font.pixelSize: view.fs(11)
-                      }
-                      Text {
-                        objectName: "stageReviewStatus"
-                        visible: text !== ""
-                        width: stageRow.width
-                        text: stageRow.reviewMessage || (stageRow.reviewView.pending ? "Loading complete reviews…"
-                          : view.stageReviewIncompleteRange(stageRow.reviewView) ? "Complete reviews have not been loaded."
-                          : stageReviews.heldPreview ? "Selected preview retained; complete reviews are shown separately." : "")
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        color: stageRow.reviewMessage ? view.urgent : view.mutedForeground
-                        font.family: view.fontFamily
-                        font.pixelSize: view.fs(11)
-                      }
-                      Flow {
-                        width: stageRow.width
-                        spacing: Style.space(6)
-                        Button {
-                          objectName: "stageReviewsOlder"
-                          visible: stageRow.reviewView.older > 0
-                          width: Math.min(implicitWidth, stageRow.width)
-                          text: "Load older reviews (" + stageRow.reviewView.older + ")"
-                          enabled: !stageRow.reviewView.pending
-                          onClicked: view.loadStageReviews(stageRow.modelData.id,
-                            Math.max(0, stageRow.reviewView.older - 8), stageRow.reviewView.older)
-                        }
-                        Button {
-                          objectName: "stageReviewsRetry"
-                          visible: stageRow.reviewRetryAvailable
-                          width: Math.min(implicitWidth, stageRow.width)
-                          text: "Retry reviews"
-                          enabled: !stageRow.reviewView.pending
-                          onClicked: view.retryStageReviews(stageRow.modelData)
-                        }
-                      }
-                      Repeater {
-                        id: reviewRepeater
-                        model: reviewPresentation
-                        delegate: Column {
-                          id: reviewRound
-                          required property var record
-                          required property string sourceScope
-                          readonly property var modelData: record
-                          readonly property var verdict: modelData.verdict
-                          readonly property var decision: view.reviewDecision(verdict)
-                          visible: stageRow.expanded
-                          width: stageRow.width
-                          spacing: 2
-                          Text {
-                            width: stageRow.width
-                            text: "Historical · " + (reviewRound.verdict.role || "reviewer") + " review " + view.reviewRoundLabel(reviewRound.modelData) + " — "
-                              + reviewRound.decision.label
-                              + (reviewRound.sourceScope !== stageReviews.currentScope
-                                ? " · selected text held from an earlier publication" : "")
-                            textFormat: Text.PlainText
-                            color: reviewRound.decision.optionalNotes ? view.working
-                              : reviewRound.decision.clean
-                                ? (stageRow.activity ? view.mutedForeground : view.success) : view.urgent
-                            wrapMode: Text.Wrap
-                            font.family: view.fontFamily
-                            font.pixelSize: view.fs(11)
-                          }
-                          Text {
-                            visible: text !== ""
-                            width: stageRow.width
-                            text: view.reviewTimestamp(reviewRound.verdict)
-                            textFormat: Text.PlainText
-                            color: view.mutedForeground
-                            wrapMode: Text.Wrap
-                            font.family: view.fontFamily
-                            font.pixelSize: view.fs(11)
-                          }
-                          StageProseField {
-                            width: stageRow.width
-                            label: reviewRound.modelData.complete ? "Summary" : "Summary preview · feedback may be omitted"
-                            originalText: reviewRound.verdict.summary || ""
-                            onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
-                          }
-                          Repeater {
-                            // Shortened feedback is never offered as complete. Each full
-                            // request, legacy note and check gets its own copy source.
-                            model: reviewRound.modelData.complete ? view.reviewFields(reviewRound.verdict) : []
-                            delegate: StageProseField {
-                              required property var modelData
-                              width: stageRow.width
-                              label: modelData.label
-                              foreground: modelData.kind === "issues" ? view.urgent : view.mutedForeground
-                              originalText: modelData.text
-                              onHasSelectionChanged: if (!hasSelection) reviewUpdate.restart()
-                            }
-                          }
-                        }
-                      }
-                    }
-                    Text {
-                      visible: stageRow.expanded && text !== ""
-                      width: stageRow.width
-                      text: UsageFormat.usageSummary(stageRow.modelData.usage)
-                      textFormat: Text.PlainText
-                      color: view.mutedForeground
-                      wrapMode: Text.Wrap
-                      font.family: view.fontFamily
-                      font.pixelSize: view.fs(11)
-                    }
                   }
                 }
               }
@@ -634,13 +325,6 @@ Column {
                 }
               }
             }
-            Text {
-              visible: !view.editingPlan && view.plan === null
-              text: "no plan yet"
-              color: view.mutedForeground
-              font.family: view.fontFamily
-              font.pixelSize: view.fs(12)
-            }
           }
         }
   component PlanEditField: Column {
@@ -728,20 +412,6 @@ Column {
         }
       }
     }
-  }
-
-  component StageProseField: StageProse {
-    id: stageProse
-
-    foreground: view.mutedForeground
-    mutedForeground: view.mutedForeground
-    background: view.background
-    fontFamily: view.fontFamily
-    fontSize: view.fs(11)
-    onCopyRequested: original => Quickshell.clipboardText = original
-    onLeaveRequested: view.leaveRequested()
-    onFocusRevealed: control => view.detailRevealed(control)
-    onInspecting: view.detailInspected(stageProse)
   }
 
   component ViewButton: PanelViewButton {

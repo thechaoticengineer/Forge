@@ -3,14 +3,16 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import "PanelDetails.js" as PanelDetails
-import "ReviewPresentation.js" as ReviewPresentation
 
-// Interface: the Plan tab. It hosts the unchanged PlanEditorView plus the plan
-// actions that belong to Plan, the plan Q&A and the "what should be improved"
-// feedback field. Plan state and guards enter as properties; actions leave as
-// actionRequested(id), which Panel.qml maps to the calls the old buttons made.
-// The editor, the two text fields and the chat list stay reachable as aliases,
-// so root keyboard routing, drafts and reading positions keep working.
+// Interface: the Plan tab. A summary line with the plan actions the phase
+// allows, one compact PlanStageList row per stage with the plan review strip,
+// the "what should be improved" feedback field and the plan Q&A. While editing,
+// PlanEditorView replaces the compact rows. Plan state and guards enter as
+// properties; actions leave as actionRequested(id), which Panel.qml maps to the
+// calls the old buttons made, and a stage row or the review strip leave as
+// stageOpened(index) and planReviewRequested(). The editor, the stage rows, the
+// two text fields and the chat list stay reachable as aliases, so root keyboard
+// routing, drafts and reading positions keep working.
 Flickable {
   id: view
 
@@ -24,19 +26,17 @@ Flickable {
   required property var displayedStages
   required property var editStages
   required property var plan
-  required property var stageSnapshot
+  required property var planReview
   required property int expandedStageId
   required property int selectedStageIndex
-  required property bool stageRoutingExpanded
-  required property var stageReviewBlocks
   required property real agentNow
   required property var editFocusedField
   required property var fs
   required property var stageActivity
-  required property var stageDetailScope
-  required property var reviewView
-  required property var stageReviewIncompleteRange
-  required property var ensureStageReviewsLoaded
+  // The current step of the stage being worked on, shown on its row.
+  property string activityText: ""
+  // The review cadence ("per plan" / "per stage") for the summary line.
+  property string reviewCadenceText: ""
   required property var chat
   required property bool chatExpanded
   required property bool chatPending
@@ -60,6 +60,7 @@ Flickable {
   property real scrollBarSpace: 16
 
   property alias planEditor: planEditor
+  property alias stageRows: stageRows
   property alias feedbackField: feedbackField
   property alias questionField: questionField
   property alias chatList: chatList
@@ -68,6 +69,8 @@ Flickable {
   signal copyRequested(string original)
   signal detailRevealed(var control)
   signal chatExpandedRequested(bool expanded)
+  signal stageOpened(int index)
+  signal planReviewRequested
   signal savePlanEdit
   signal cancelPlanEdit
   signal addEditStage
@@ -75,20 +78,14 @@ Flickable {
   signal deleteEditStage(int index)
   signal changeStageField(int index, string field, var value)
   signal changeModelConstraint(int index, string key, string value)
-  signal loadStageReviews(int stageId, var cursor, var end)
-  signal retryStageReviews(var stage)
-  signal expandedStageRequested(int stageId)
-  signal stageRoutingExpandedRequested(bool expanded)
   signal editFocusChanged(var field)
   signal helpRequested
   signal leaveRequested
-  signal detailInspected(var control)
 
-  // The review preview rows of a stage, reconciled against its current reviews.
-  function reconcileStageReviewPresentation(stage, presentation, repeater) {
-    ReviewPresentation.reconcileStageReviewPresentation(view.reviewView(stage), view.stageDetailScope(stage),
-      presentation, repeater)
-  }
+  readonly property var stages: plan && plan.stages ? plan.stages : []
+  readonly property string summaryText: stages.length === 0 ? "" : stages.length + " stages · "
+    + stages.filter(function(stage) { return stage.status === "committed" }).length + " committed"
+    + (reviewCadenceText !== "" && reviewCadenceText[0] !== "…" ? " · review: " + reviewCadenceText : "")
 
   function reveal(item) {
     const top = item.mapToItem(contentItem, 0, 0).y
@@ -111,31 +108,128 @@ Flickable {
     width: view.width - view.scrollBarSpace
     spacing: view.spacing + 2
 
-    // Only the plan actions the current phase allows; the rest stay in ⋯.
-    Flow {
+    // The plan summary and only the plan actions the current phase allows; the rest stay in ⋯.
+    Item {
       width: parent.width
-      spacing: view.spacing
-      visible: approveButton.visible || runButton.visible || editButton.visible
+      height: Math.max(summaryLine.implicitHeight, actionRow.height)
+      visible: summaryLine.text !== "" || actionRow.width > 0
 
-      PlanButton {
-        id: approveButton
-        label: "Plan is OK — approve"
-        visible: view.guards.approve
-        onClicked: view.actionRequested("approve")
+      Text {
+        id: summaryLine
+
+        anchors.left: parent.left
+        anchors.right: actionRow.left
+        anchors.rightMargin: view.spacing
+        anchors.verticalCenter: parent.verticalCenter
+        text: view.summaryText
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: view.mutedForeground
+        font.family: view.fontFamily
+        font.pixelSize: view.fs(11)
       }
-      PlanButton {
-        id: runButton
-        label: "Start implementing"
-        primary: true
-        visible: view.guards.run
-        onClicked: view.actionRequested("run")
+
+      Row {
+        id: actionRow
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: view.spacing
+
+        PlanButton {
+          id: approveButton
+          label: "Plan is OK — approve"
+          visible: view.guards.approve
+          onClicked: view.actionRequested("approve")
+        }
+        PlanButton {
+          id: runButton
+          label: "Start implementing"
+          primary: true
+          visible: view.guards.run
+          onClicked: view.actionRequested("run")
+        }
+        PlanButton {
+          id: editButton
+          label: "Edit plan"
+          visible: !view.editingPlan && view.guards.editPlan
+          onClicked: view.actionRequested("editPlan")
+        }
+        PlanButton {
+          objectName: "planQaButton"
+          label: "Q&A"
+          visible: view.plan !== null
+          onClicked: view.chatExpandedRequested(!view.chatExpanded)
+        }
       }
-      PlanButton {
-        id: editButton
-        label: "Edit plan"
-        visible: !view.editingPlan && view.guards.editPlan
-        onClicked: view.actionRequested("editPlan")
-      }
+    }
+
+    // ------------------------------------ compact stage rows, or the editor
+    PlanStageList {
+      id: stageRows
+
+      visible: !view.editingPlan
+      width: parent.width
+      stages: view.displayedStages
+      selectedIndex: view.selectedStageIndex
+      now: view.agentNow
+      planReview: view.planReview
+      activityText: view.activityText
+      theme: view.theme
+      gap: view.spacing
+      onStageOpened: index => view.stageOpened(index)
+      onPlanReviewRequested: view.planReviewRequested()
+    }
+
+    Text {
+      visible: !view.editingPlan && view.plan === null
+      text: "no plan yet"
+      color: view.mutedForeground
+      font.family: view.fontFamily
+      font.pixelSize: view.fs(12)
+    }
+
+    PlanEditorView {
+      id: planEditor
+
+      visible: view.editingPlan
+      width: parent.width
+      editingPlan: view.editingPlan
+      editPending: view.editPending
+      editValid: view.editValid
+      queueActive: view.queueActive
+      engineOnline: view.engineOnline
+      busy: view.busy
+      displayedStages: view.displayedStages
+      editStages: view.editStages
+      plan: view.plan
+      expandedStageId: view.expandedStageId
+      selectedStageIndex: view.selectedStageIndex
+      agentNow: view.agentNow
+      panelHeight: view.height
+      editFocusedField: view.editFocusedField
+      fs: view.fs
+      stageActivity: view.stageActivity
+      foreground: view.foreground
+      mutedForeground: view.mutedForeground
+      background: view.background
+      surface: view.surface
+      accent: view.accent
+      urgent: view.urgent
+      success: view.success
+      working: view.working
+      fontFamily: view.fontFamily
+      onSavePlanEdit: view.savePlanEdit()
+      onCancelPlanEdit: view.cancelPlanEdit()
+      onAddEditStage: view.addEditStage()
+      onMoveEditStage: (index, direction) => view.moveEditStage(index, direction)
+      onDeleteEditStage: index => view.deleteEditStage(index)
+      onChangeStageField: (index, field, value) => view.changeStageField(index, field, value)
+      onChangeModelConstraint: (index, key, value) => view.changeModelConstraint(index, key, value)
+      onStageOpened: index => view.stageOpened(index)
+      onEditFocusChanged: field => view.editFocusChanged(field)
+      onHelpRequested: view.helpRequested()
+      onLeaveRequested: view.leaveRequested()
+      onDetailRevealed: control => view.reveal(control)
     }
 
     // ------------------------------------------- what should be improved
@@ -304,68 +398,6 @@ Flickable {
           }
         }
       }
-    }
-
-    // --------------------------------------------- the stage list, unchanged
-    PlanEditorView {
-      id: planEditor
-
-      width: parent.width
-      editingPlan: view.editingPlan
-      editPending: view.editPending
-      editValid: view.editValid
-      queueActive: view.queueActive
-      engineOnline: view.engineOnline
-      busy: view.busy
-      displayedStages: view.displayedStages
-      editStages: view.editStages
-      plan: view.plan
-      stageSnapshot: view.stageSnapshot
-      expandedStageId: view.expandedStageId
-      selectedStageIndex: view.selectedStageIndex
-      stageRoutingExpanded: view.stageRoutingExpanded
-      stageReviewBlocks: view.stageReviewBlocks
-      agentNow: view.agentNow
-      panelHeight: view.height
-      editFocusedField: view.editFocusedField
-      fs: view.fs
-      stageActivity: view.stageActivity
-      stageDetailScope: view.stageDetailScope
-      reviewView: view.reviewView
-      reviewGateText: ReviewPresentation.reviewGateText
-      reviewDecision: ReviewPresentation.reviewDecision
-      reviewFields: ReviewPresentation.reviewFields
-      reviewRoundLabel: ReviewPresentation.reviewRoundLabel
-      reviewTimestamp: ReviewPresentation.reviewTimestamp
-      stageReviewIncompleteRange: view.stageReviewIncompleteRange
-      stageReviewHasHeldPreview: ReviewPresentation.stageReviewHasHeldPreview
-      ensureStageReviewsLoaded: view.ensureStageReviewsLoaded
-      reconcileStageReviewPresentation: view.reconcileStageReviewPresentation
-      foreground: view.foreground
-      mutedForeground: view.mutedForeground
-      background: view.background
-      surface: view.surface
-      accent: view.accent
-      urgent: view.urgent
-      success: view.success
-      working: view.working
-      fontFamily: view.fontFamily
-      onSavePlanEdit: view.savePlanEdit()
-      onCancelPlanEdit: view.cancelPlanEdit()
-      onAddEditStage: view.addEditStage()
-      onMoveEditStage: (index, direction) => view.moveEditStage(index, direction)
-      onDeleteEditStage: index => view.deleteEditStage(index)
-      onChangeStageField: (index, field, value) => view.changeStageField(index, field, value)
-      onChangeModelConstraint: (index, key, value) => view.changeModelConstraint(index, key, value)
-      onLoadStageReviews: (stageId, cursor, end) => view.loadStageReviews(stageId, cursor, end)
-      onRetryStageReviews: stage => view.retryStageReviews(stage)
-      onExpandedStageRequested: stageId => view.expandedStageRequested(stageId)
-      onStageRoutingExpandedRequested: expanded => view.stageRoutingExpandedRequested(expanded)
-      onEditFocusChanged: field => view.editFocusChanged(field)
-      onHelpRequested: view.helpRequested()
-      onLeaveRequested: view.leaveRequested()
-      onDetailRevealed: control => view.reveal(control)
-      onDetailInspected: control => view.detailInspected(control)
     }
   }
 

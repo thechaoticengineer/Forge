@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import "StagePresentation.js" as StagePresentation
 
 // Interface: the Overview tab. The goal, the actions possible in the current
 // phase and a status summary: while busy a now-working card, a one-line progress
@@ -76,7 +77,7 @@ Flickable {
   readonly property var currentStage: stages.find(function(stage) {
     return stage.id === view.currentStageNumber
   }) || null
-  // The first stage that needs attention, shown at the top with a link to Plan.
+  // The first stage that needs attention, shown at the top with a link to its detail.
   readonly property int attentionIndex: stages.findIndex(function(stage) {
     return stage.status === "blocked" || stage.status === "failed"
   })
@@ -211,25 +212,15 @@ Flickable {
       }
     }
 
-    Text {
-      width: parent.width
-      visible: text !== ""
-      text: view.goalEnhanceStatus
-      textFormat: Text.PlainText
-      color: view.goalEnhanceError ? view.urgent : view.mutedForeground
-      wrapMode: Text.Wrap
-      font.family: view.fontFamily
-      font.pixelSize: view.fontSize11
-    }
-
     // ------------------------------------------------ needs attention
+    // A blocked or failed stage comes first, in every phase; it opens its stage detail.
     Text {
       objectName: "overviewAttention"
-      visible: view.attentionIndex >= 0 && !view.busy
+      readonly property var stage: view.attentionIndex >= 0 ? view.stages[view.attentionIndex] : null
+      visible: stage !== null
       width: parent.width
-      text: visible ? "! stage " + view.stages[view.attentionIndex].id + " · "
-        + view.stages[view.attentionIndex].title + " · " + view.stages[view.attentionIndex].status
-        + " — Plan ›" : ""
+      text: stage ? "! stage " + stage.id + " · " + stage.title + " · " + stage.status
+        + " — " + StagePresentation.attentionReason(stage) + " ›" : ""
       textFormat: Text.PlainText
       elide: Text.ElideRight
       color: view.urgent
@@ -240,6 +231,17 @@ Flickable {
         cursorShape: Qt.PointingHandCursor
         onClicked: view.stageRequested(view.attentionIndex)
       }
+    }
+
+    Text {
+      width: parent.width
+      visible: text !== ""
+      text: view.goalEnhanceStatus
+      textFormat: Text.PlainText
+      color: view.goalEnhanceError ? view.urgent : view.mutedForeground
+      wrapMode: Text.Wrap
+      font.family: view.fontFamily
+      font.pixelSize: view.fontSize11
     }
 
     // ------------------------------------------------ now working

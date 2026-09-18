@@ -79,13 +79,16 @@ var viewHints = {
   features: "j/k select · Enter open · n new · c chat · v review · a approve",
   queue: "PgDn/PgUp scroll · x stop · d diff · c project",
   settings: "j/k select · Enter toggle · c project · d diff",
-  stageDetail: "h/l sub-tab · [ ] prev/next stage · q/Esc back to Plan"
+  stageDetail: "h/l sub-tab · [ ] prev/next stage · q/Esc back to Plan",
+  discussion: "i message · Enter send · q/Esc close chat"
 }
 
 function hintText(tab, insertMode) {
   if (insertMode) return "INSERT - Esc to normal mode"
-  // On stage detail [ ] move between stages, so the view-switch text would be wrong there.
-  const views = tab === "stageDetail" ? "g o/p/a/r/f/q/s switch views · " : "g o/p/a/r/f/q/s or [ ] switch views · "
+  // On stage detail [ ] move between stages, so the view-switch text would be wrong there;
+  // the discussion chat owns its keys, and the tab bar leaves it.
+  const views = tab === "discussion" ? "" : tab === "stageDetail" ? "g o/p/a/r/f/q/s switch views · "
+    : "g o/p/a/r/f/q/s or [ ] switch views · "
   return "NORMAL · " + views + (viewHints[tab] || viewHints.overview) + " · ? help"
 }
 

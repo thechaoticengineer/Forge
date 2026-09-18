@@ -16,7 +16,6 @@ import "ModelRouting.js" as ModelRouting
 import "UsageFormat.js" as UsageFormat
 import "GoalEnhancement.js" as GoalEnhancement
 import "Discussion.js" as Discussion
-import "PlanEdit.js" as PlanEdit
 import "PanelNavigation.js" as PanelNavigation
 import "PanelActions.js" as PanelActions
 
@@ -46,6 +45,15 @@ Item {
     return stage ? stageDetailScope(stage) : ""
   }
   onExpandedStageScopeChanged: syncStageSnapshot()
+  // The stage detail page follows the stage expandedStageId names across polls and closes
+  // only when that stage goes (a project switch clears expandedStageId).
+  readonly property bool stageDetailOpen: panelStack.currentItem === stageDetailPage
+  readonly property int stageDetailIndex: (displayedStages || []).findIndex(s => s.id === expandedStageId)
+  onStageDetailIndexChanged: if (stageDetailOpen) {
+    if (stageDetailIndex < 0) closeStageDetail()
+    else selectedStageIndex = stageDetailIndex
+  }
+  property string stageDetailTab: "instructions"
   property int selectedStageIndex: -1
   property string lastProject: ""
   property int projectViewRevision: 0
@@ -224,13 +232,23 @@ Item {
   }
 
   property bool chooserOpen: false
-  property var projectsData: null
-  property bool manualEntry: false
+  ChooserController {
+    id: chooserController
+    host: root
+    chooser: projectChooser
+    keyTarget: keyHandler
+  }
 
-  property bool diffOpen: false
-  property string diffText: ""
-  property bool diffPending: false
-  property string diffError: ""
+  property alias diffOpen: diffController.diffOpen
+  DiffController {
+    id: diffController
+    host: root
+    lastProject: root.lastProject
+    projectViewRevision: root.projectViewRevision
+    active: window.visible
+    busy: root.busy
+    listView: diffView.listView
+  }
 
   FeaturesController {
     id: features
@@ -238,11 +256,6 @@ Item {
     lastProject: root.lastProject
     projectViewRevision: root.projectViewRevision
     active: window.visible
-  }
-
-  function changeModelConstraint(index, key, value) {
-    const stage = editStages[index]
-    changeStageField(index, "model_constraint", PlanEdit.modelConstraint(stage, key, value))
   }
 
   CatalogueController {
@@ -362,10 +375,6 @@ Item {
     goalFlick.contentY = 0
     expandedStageId = -1
     selectedStageIndex = -1
-    diffOpen = false
-    diffText = ""
-    diffError = ""
-    diffPending = false
     features.reset()
     localError = ""
     DetailView.invalidate(logFeed)
@@ -638,109 +647,48 @@ Item {
     keyHandler.forceActiveFocus()
   }
 
-  function beginPlanEdit() {
-    if (!root.guards.editPlan) return
-    // Editing happens in the Plan view, wherever it was started from.
+  // Hand editing (e) lives in PlanEditController; the keys and views call these.
+  function beginPlanEdit() { planEdit.beginPlanEdit() }
+  function cancelPlanEdit() { planEdit.cancelPlanEdit() }
+  PlanEditController {
+    id: planEdit
+    host: root
+    keyTarget: keyHandler
+    editor: root.planEditor
+  }
+
+  function openChooser() { chooserController.openChooser() }
+
+  function openDiff() { diffController.openDiff() }
+  function refreshDiff() { diffController.refreshDiff() }
+
+  // Stage detail: a persistent page pushed over the tab views. Plan keeps its
+  // selection and reading position underneath, so closing returns to them.
+  function openStageDetail(index) {
+    const stages = displayedStages
+    const at = Math.max(0, Math.min(index, stages.length - 1))
+    if (stages.length === 0 || stages[at].id === undefined) return
+    if (!stageDetailOpen) stageDetailTab = "instructions"
     currentTab = "plan"
-    editStages = PlanEdit.cloneStages(plan)
-    editGoal = plan.goal || ""
-    editProject = lastProject
-    editSession++
-    editingPlan = true
-    localError = ""
+    selectedStageIndex = at
+    expandedStageId = stages[at].id
+    if (!stageDetailOpen) panelStack.push(stageDetailPage, StackView.Immediate)
+    keyHandler.pendingKey = ""
     keyHandler.forceActiveFocus()
-    keyHandler.selectStage(selectedStageIndex < 0 ? 0 : selectedStageIndex)
   }
 
-  function cancelPlanEdit() {
-    if (editingPlan) keyHandler.forceActiveFocus()
-    editingPlan = false
-    editPending = false
-    editFocusedField = null
-    editStages = []
-    editGoal = ""
-    editProject = ""
-    editSession++
-    selectedStageIndex = Math.min(selectedStageIndex, displayedStages.length - 1)
-  }
-
-  function changeStageField(index, field, value) {
-    if (!editingPlan || editPending || !editStages[index]
-        || editStages[index].status === "committed") return
-    editStages[index][field] = value
-    editRevision++
-  }
-
-  function moveEditStage(index, direction) {
-    if (editPending || editStages[index].status === "committed") return
-    const target = PlanEdit.editableNeighbor(editStages, index, direction)
-    if (target < 0) return
+  function closeStageDetail() {
+    if (stageDetailOpen) panelStack.pop(panelPage, StackView.Immediate)
+    expandedStageId = -1
+    keyHandler.pendingKey = ""
     keyHandler.forceActiveFocus()
-    editStages = PlanEdit.moveStages(editStages, index, target)
-    keyHandler.selectStage(target)
   }
 
-  function deleteEditStage(index) {
-    if (editPending || editStages[index].status === "committed") return
-    keyHandler.forceActiveFocus()
-    const stages = PlanEdit.deleteStage(editStages, index)
-    editStages = stages
-    selectedStageIndex = -1
-    keyHandler.selectStage(Math.min(index, stages.length - 1))
-  }
-
-  function addEditStage() {
-    if (editPending) return
-    keyHandler.forceActiveFocus()
-    editStages = PlanEdit.addStage(editStages)
-    keyHandler.selectStage(editStages.length - 1)
-  }
-
-  function savePlanEdit() {
-    if (!planEditor.saveButton.enabled) return
-    keyHandler.forceActiveFocus()
-    const session = editSession
-    const content = PlanEdit.payload(editGoal, editStages)
-    editPending = true
-    act("/api/plan/edit", { project: editProject, plan: content }, function(resp) {
-      if (session !== root.editSession) return
-      root.editPending = false
-      if (resp && resp.ok) root.cancelPlanEdit()
-      else if (!resp || !resp.error) root.localError = "Could not save plan. Check the engine connection and try again."
-    })
-  }
-
-  function openChooser() {
-    manualEntry = false
-    api("GET", "/api/projects", null, function(resp) {
-      if (!resp) return
-      root.projectsData = resp
-      root.chooserOpen = true
-    })
-  }
-
-  function openDiff() {
-    diffText = ""
-    diffError = ""
-    diffOpen = true
-    diffView.listView.positionViewAtBeginning()
-    refreshDiff()
-  }
-
-  function refreshDiff() {
-    if (diffPending) return
-    diffPending = true
-    const revision = projectViewRevision
-    api("GET", "/api/diff?project=" + encodeURIComponent(lastProject), null, function(resp) {
-      if (revision !== root.projectViewRevision) return
-      root.diffPending = false
-      if (resp && typeof resp.diff === "string") {
-        root.diffError = ""
-        root.diffText = resp.diff
-      } else {
-        root.diffError = "Unable to load diff"
-      }
-    })
+  // A tab click or a g jump leaves a pushed page first, then shows the tab.
+  function selectTab(id) {
+    if (stageDetailOpen) closeStageDetail()
+    if (discussionOpen) closeDiscussion()
+    currentTab = id
   }
 
   property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
@@ -921,20 +869,6 @@ Item {
     return "now: " + activity + " · " + ReviewPresentation.reviewRoundLabel({ round: stage.rounds })
   }
 
-  function chooseRow(row) {
-    if (row.kind === "local") {
-      act("/api/project/select", { path: row.path })
-      chooserOpen = false
-    } else if (row.kind === "remote") {
-      act("/api/project/select", { repo: row.name })
-      chooserOpen = false
-    } else if (row.kind === "path") {
-      manualEntry = !manualEntry
-      if (manualEntry) projectChooser.manualField.forceActiveFocus()
-      else keyHandler.forceActiveFocus()
-    }
-  }
-
   function reviewerLabel() {
     const s = engineState ? engineState.settings : {}
     return s.reviewer_provider_mode === "configured" || s.reviewer_model || s.automatic_routing === false
@@ -965,13 +899,6 @@ Item {
     repeat: true
     running: window.visible
     onTriggered: root.refresh()
-  }
-
-  Timer {
-    interval: 3000
-    repeat: true
-    running: window.visible && root.diffOpen && root.busy
-    onTriggered: root.refreshDiff()
   }
 
   Timer {
@@ -1028,8 +955,7 @@ Item {
             planEditor.stageList.positionViewAtIndex(root.selectedStageIndex, ListView.Contain)
             planView.reveal(planEditor.stageFrame)
           } else {
-            planEditor.stageList.forceLayout()
-            const row = planEditor.stageList.itemAtIndex(root.selectedStageIndex)
+            const row = planView.stageRows.rowItem(root.selectedStageIndex)
             if (row) planView.reveal(row)
           }
         }
@@ -1105,6 +1031,15 @@ Item {
             } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
               discussionView.input.forceActiveFocus()
             }
+          } else if (root.stageDetailOpen && !(prefix === "g" && viewTab !== "")) {
+            // The page owns ] [ l h q Escape; g and a tab letter still jump (viewTab below).
+            event.accepted = true
+            if (question) root.helpOpen = true
+            else if (stageDetailPage.handleKey(event) === "" && event.modifiers === Qt.NoModifier) {
+              if (event.key === Qt.Key_G) pendingKey = "g"
+              else if (event.key === Qt.Key_D) { if (root.guards.diff) root.openDiff() }
+              else if (event.key === Qt.Key_X) { if (root.guards.stop) root.act("/api/stop") }
+            }
           } else if (features.featuresOpen) {
             // The Features tab while no page is pushed on top of it.
             event.accepted = true
@@ -1115,7 +1050,7 @@ Item {
             root.helpOpen = true
             event.accepted = true
           } else if (viewTab !== "") {
-            root.currentTab = viewTab
+            root.selectTab(viewTab)
             event.accepted = true
           } else if (root.currentTab === "settings" && settingsKey(event, prefix)) {
             event.accepted = true
@@ -1231,14 +1166,11 @@ Item {
                   root.expandedReportKey = root.expandedReportKey === root.selectedReportKey
                     ? "" : root.selectedReportKey
                 } else if (root.selectedStageIndex >= 0 && root.selectedStageIndex < stages.length) {
-                  root.currentTab = "plan"
-                  const row = planEditor.stageList.itemAtIndex(root.selectedStageIndex)
                   if (root.editingPlan && stages[root.selectedStageIndex].status !== "committed") {
+                    root.currentTab = "plan"
+                    const row = planEditor.stageList.itemAtIndex(root.selectedStageIndex)
                     if (row) row.focusEditor()
-                  } else {
-                    const stageId = stages[root.selectedStageIndex].id
-                    root.expandedStageId = root.expandedStageId === stageId ? -1 : stageId
-                  }
+                  } else root.openStageDetail(root.selectedStageIndex)
                 }
                 event.accepted = true
               }
@@ -1246,74 +1178,81 @@ Item {
           }
         }
 
-        StackView {
-          id: panelStack
+        // ------------------------------------------ fixed header and tabs
+        PanelHeader {
+          id: panelHeader
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.margins: Style.space(16)
+          projectName: root.projectName
+          projectPath: root.engineState ? root.engineState.project : ""
+          sessions: root.sessions
+          activeProject: root.activeProject
+          phase: root.phase
+          engineOnline: root.engineOnline
+          busy: root.busy
+          stepText: root.stepText
+          backgroundBusy: root.backgroundBusy
+          activeProjectCount: root.activeProjectCount
+          theme: root.theme
+          titleFontSize: root.fs(18)
+          spacing: Style.space(10)
+          onProjectSelected: path => root.act("/api/project/select", { path: path })
+          onChangeProjectRequested: if (root.guards.changeProject) root.openChooser()
+          onOverflowRequested: overflowMenu.open = true
+        }
 
-          anchors.fill: parent
-          initialItem: panelPage
-          // Instant page swaps: the panel is a navigation stack, not an animated app.
-          pushEnter: Transition {}
-          pushExit: Transition {}
-          popEnter: Transition {}
-          popExit: Transition {}
-          replaceEnter: Transition {}
-          replaceExit: Transition {}
+        PanelTabBar {
+          id: panelTabBar
+          anchors.top: panelHeader.bottom
+          anchors.topMargin: Style.space(8)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.leftMargin: Style.space(16)
+          anchors.rightMargin: Style.space(16)
+          currentTab: root.currentTab
+          queueCount: root.queue.length
+          theme: root.theme
+          onTabRequested: id => root.selectTab(id)
+        }
+
+        // The pages under the header: the tab views (panelPage), the discussion
+        // and stage detail. The header, tab bar, errors and hint stay around them.
+        Item {
+          id: stackArea
+          anchors.top: panelTabBar.bottom
+          anchors.topMargin: Style.space(10)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: localErrorArea.top
+          anchors.bottomMargin: localErrorDetail.visible ? Style.space(10) : 0
+
+          StackView {
+            id: panelStack
+
+            anchors.fill: parent
+            initialItem: panelPage
+            // Instant page swaps: the panel is a navigation stack, not an animated app.
+            pushEnter: Transition {}
+            pushExit: Transition {}
+            popEnter: Transition {}
+            popExit: Transition {}
+            replaceEnter: Transition {}
+            replaceExit: Transition {}
+          }
         }
 
         Item {
           id: panelPage
 
-          // ------------------------------------------ fixed header and tabs
-          PanelHeader {
-            id: panelHeader
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.margins: Style.space(16)
-            projectName: root.projectName
-            projectPath: root.engineState ? root.engineState.project : ""
-            sessions: root.sessions
-            activeProject: root.activeProject
-            phase: root.phase
-            engineOnline: root.engineOnline
-            busy: root.busy
-            stepText: root.stepText
-            backgroundBusy: root.backgroundBusy
-            activeProjectCount: root.activeProjectCount
-            theme: root.theme
-            titleFontSize: root.fs(18)
-            spacing: Style.space(10)
-            onProjectSelected: path => root.act("/api/project/select", { path: path })
-            onChangeProjectRequested: if (root.guards.changeProject) root.openChooser()
-            onOverflowRequested: overflowMenu.open = true
-          }
-
-          PanelTabBar {
-            id: panelTabBar
-            anchors.top: panelHeader.bottom
-            anchors.topMargin: Style.space(8)
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.leftMargin: Style.space(16)
-            anchors.rightMargin: Style.space(16)
-            currentTab: root.currentTab
-            queueCount: root.queue.length
-            theme: root.theme
-            onTabRequested: id => root.currentTab = id
-          }
-
           // The content area under the tab bar. Each tab has one persistent
           // item that is shown while its tab is selected, never rebuilt.
           Item {
             id: tabArea
-            anchors.top: panelTabBar.bottom
-            anchors.topMargin: Style.space(10)
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: localErrorArea.top
+            anchors.fill: parent
             anchors.leftMargin: Style.space(16)
             anchors.rightMargin: Style.space(16)
-            anchors.bottomMargin: localErrorDetail.visible ? Style.space(10) : 0
 
             // ------------------------------------------------ plan
             PlanView {
@@ -1331,19 +1270,15 @@ Item {
               displayedStages: root.displayedStages
               editStages: root.editStages
               plan: root.plan
-              stageSnapshot: root.stageSnapshot
+              planReview: root.planReview
               expandedStageId: root.expandedStageId
               selectedStageIndex: root.selectedStageIndex
-              stageRoutingExpanded: root.stageRoutingExpanded
-              stageReviewBlocks: root.stageReviewBlocks
               agentNow: root.agentNow
               editFocusedField: root.editFocusedField
               fs: root.fs
               stageActivity: root.stageActivity
-              stageDetailScope: root.stageDetailScope
-              reviewView: root.reviewView
-              stageReviewIncompleteRange: root.stageReviewIncompleteRange
-              ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
+              activityText: root.currentActivity
+              reviewCadenceText: root.reviewCadenceLabel(root.engineState, "architect")
               chat: root.chat
               chatExpanded: root.chatExpanded
               chatPending: root.chatPending
@@ -1363,23 +1298,25 @@ Item {
                 else if (id === "ask") root.askPlanQuestion()
               }
               onChatExpandedRequested: expanded => root.chatExpanded = expanded
-              onSavePlanEdit: root.savePlanEdit()
-              onCancelPlanEdit: root.cancelPlanEdit()
-              onAddEditStage: root.addEditStage()
-              onMoveEditStage: (index, direction) => root.moveEditStage(index, direction)
-              onDeleteEditStage: index => root.deleteEditStage(index)
-              onChangeStageField: (index, field, value) => root.changeStageField(index, field, value)
-              onChangeModelConstraint: (index, key, value) => root.changeModelConstraint(index, key, value)
-              onLoadStageReviews: (stageId, cursor, end) => root.loadStageReviews(stageId, cursor, end)
-              onRetryStageReviews: stage => root.retryStageReviews(stage)
-              onExpandedStageRequested: stageId => root.expandedStageId = stageId
-              onStageRoutingExpandedRequested: expanded => root.stageRoutingExpanded = expanded
+              onStageOpened: index => root.openStageDetail(index)
+              // The review strip opens the plan review details, as expanding them in Architecture does.
+              onPlanReviewRequested: {
+                root.currentTab = "architecture"
+                root.planReviewExpanded = true
+                root.loadPlanReviewRequests()
+              }
+              onSavePlanEdit: planEdit.savePlanEdit()
+              onCancelPlanEdit: planEdit.cancelPlanEdit()
+              onAddEditStage: planEdit.addEditStage()
+              onMoveEditStage: (index, direction) => planEdit.moveEditStage(index, direction)
+              onDeleteEditStage: index => planEdit.deleteEditStage(index)
+              onChangeStageField: (index, field, value) => planEdit.changeStageField(index, field, value)
+              onChangeModelConstraint: (index, key, value) => planEdit.changeModelConstraint(index, key, value)
               onEditFocusChanged: field => root.editFocusedField = field
               onHelpRequested: root.helpOpen = true
               onCopyRequested: original => Quickshell.clipboardText = original
               onLeaveRequested: keyHandler.forceActiveFocus()
               onDetailRevealed: control => root.revealDetail(control)
-              onDetailInspected: control => root.inspectDetail(control)
             }
 
             // ------------------------------------------------ settings
@@ -1601,78 +1538,76 @@ Item {
               }
             }
             onOpenTab: id => root.currentTab = id
-            // A stage row opens Plan with that stage selected and expanded.
-            onStageRequested: index => {
-              keyHandler.selectStage(index)
-              root.expandedStageId = root.displayedStages[index].id
-            }
+            // A stage row or the needs-attention stage opens its stage detail page.
+            onStageRequested: index => root.openStageDetail(index)
             onOverflowRequested: overflowMenu.open = true
             onCopyRequested: original => Quickshell.clipboardText = original
             onHelpRequested: root.helpOpen = true
             onLeaveRequested: keyHandler.forceActiveFocus()
           }
+        }
 
-          // Errors stay visible on every tab, just above the hint line.
-          Item {
-            id: localErrorArea
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: keyboardHint.top
-            anchors.leftMargin: Style.space(16)
-            anchors.rightMargin: Style.space(16)
-            anchors.bottomMargin: Style.space(10)
-            height: localErrorDetail.visible ? localErrorDetail.height : 0
+        // Errors stay visible on every tab, just above the hint line.
+        Item {
+          id: localErrorArea
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: keyboardHint.top
+          anchors.leftMargin: Style.space(16)
+          anchors.rightMargin: Style.space(16)
+          anchors.bottomMargin: Style.space(10)
+          height: localErrorDetail.visible ? localErrorDetail.height : 0
 
-            PanelDetail {
-              id: localErrorDetail
-              objectName: "localErrorDetail"
-              width: parent.width
-              visible: root.localError !== ""
-              originalText: root.localError
-              metadata: "Error"
-              error: true
-            }
+          PanelDetail {
+            id: localErrorDetail
+            objectName: "localErrorDetail"
+            width: parent.width
+            visible: root.localError !== ""
+            originalText: root.localError
+            metadata: "Error"
+            error: true
           }
+        }
 
-          Text {
-            id: keyboardHint
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            anchors.margins: Style.space(16)
-            text: PanelNavigation.hintText(root.currentTab, root.insertMode)
-            elide: Text.ElideRight
-            color: root.mutedForeground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(10)
-            font.underline: !root.insertMode && keyboardHintMouseArea.containsMouse
-            MouseArea {
-              id: keyboardHintMouseArea
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: if (!root.helpOpen) root.helpOpen = true
-            }
+        Text {
+          id: keyboardHint
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          anchors.margins: Style.space(16)
+          text: PanelNavigation.hintText(root.stageDetailOpen ? "stageDetail"
+            : root.discussionOpen ? "discussion" : root.currentTab, root.insertMode)
+          elide: Text.ElideRight
+          color: root.mutedForeground
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(10)
+          font.underline: !root.insertMode && keyboardHintMouseArea.containsMouse
+          MouseArea {
+            id: keyboardHintMouseArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (!root.helpOpen) root.helpOpen = true
           }
+        }
 
-          OverflowMenu {
-            id: overflowMenu
-            anchors.top: panelHeader.bottom
-            anchors.topMargin: Style.space(4)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(16)
-            width: Style.space(220)
-            items: PanelActions.overflowItems(root.guardFlags)
-            theme: root.theme
-            // The same calls the old buttons made.
-            onItemChosen: id => {
-              if (id === "update") root.act("/api/self_update")
-              else if (id === "discard") root.act("/api/reset_plan")
-              else if (id === "refactor") root.act("/api/plan", { mode: "refactor", goal: goalField.text })
-              else if (id === "diff") root.openDiff()
-              else if (id === "changeProject") root.openChooser()
-              else if (id === "help") root.helpOpen = true
-            }
+        OverflowMenu {
+          id: overflowMenu
+          anchors.top: panelHeader.bottom
+          anchors.topMargin: Style.space(4)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(16)
+          width: Style.space(220)
+          items: PanelActions.overflowItems(root.guardFlags)
+          theme: root.theme
+          // The same calls the old buttons made.
+          onItemChosen: id => {
+            if (id === "update") root.act("/api/self_update")
+            else if (id === "discard") root.act("/api/reset_plan")
+            else if (id === "refactor") root.act("/api/plan", { mode: "refactor", goal: goalField.text })
+            else if (id === "diff") root.openDiff()
+            else if (id === "changeProject") root.openChooser()
+            else if (id === "help") root.helpOpen = true
           }
         }
       }
@@ -1703,6 +1638,52 @@ Item {
         onCloseRequested: root.closeDiscussion()
         onLeaveRequested: keyHandler.forceActiveFocus()
         onHelpRequested: root.helpOpen = true
+        onDetailRevealed: control => root.revealDetail(control)
+        onDetailInspected: control => root.inspectDetail(control)
+      }
+
+      // ------------------------------------------------ stage detail
+      // A persistent stack page like the discussion: openStageDetail pushes it and
+      // closeStageDetail pops it; the StackView owns its visibility and size.
+      StageDetailPage {
+        id: stageDetailPage
+
+        visible: false
+
+        stages: root.displayedStages
+        stageIndex: root.stageDetailIndex
+        subTab: root.stageDetailTab
+        stageSnapshot: root.stageSnapshot
+        stageReviewBlocks: root.stageReviewBlocks
+        stageRoutingExpanded: root.stageRoutingExpanded
+        agentNow: root.agentNow
+        editingPlan: root.editingPlan
+        reviewView: root.reviewView
+        stageDetailScope: root.stageDetailScope
+        stageActivity: root.stageActivity
+        stageReviewIncompleteRange: root.stageReviewIncompleteRange
+        ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
+        margin: Style.space(16)
+        spacing: Style.space(8)
+        horizontalPadding: Style.space(18)
+        verticalPadding: Style.space(10)
+        scrollBarSpace: Style.space(16)
+        theme: root.theme
+        onBackRequested: root.closeStageDetail()
+        onStageStepRequested: step => root.openStageDetail(PanelNavigation.stepStageIndex(
+          root.displayedStages.length, root.stageDetailIndex, step))
+        onSubTabRequested: id => root.stageDetailTab = id
+        onLoadStageReviews: (stageId, cursor, end) => root.loadStageReviews(stageId, cursor, end)
+        onRetryStageReviews: stage => root.retryStageReviews(stage)
+        onStageRoutingExpandedRequested: expanded => root.stageRoutingExpanded = expanded
+        onDiffRequested: if (root.guards.diff) root.openDiff()
+        onLiveOutputRequested: {
+          root.closeStageDetail()
+          root.currentTab = "activity"
+          root.liveTab = true
+        }
+        onCopyRequested: original => Quickshell.clipboardText = original
+        onLeaveRequested: keyHandler.forceActiveFocus()
         onDetailRevealed: control => root.revealDetail(control)
         onDetailInspected: control => root.inspectDetail(control)
       }
@@ -1743,9 +1724,9 @@ Item {
         anchors.fill: parent
         open: root.diffOpen
         engineOnline: root.engineOnline
-        pending: root.diffPending
-        diffText: root.diffText
-        errorText: root.diffError
+        pending: diffController.diffPending
+        diffText: diffController.diffText
+        errorText: diffController.diffError
         theme: root.theme
         onCloseRequested: root.diffOpen = false
         onRefreshRequested: root.refreshDiff()
@@ -1759,11 +1740,11 @@ Item {
 
         anchors.fill: parent
         open: root.chooserOpen
-        manualEntry: root.manualEntry
-        projectsData: root.projectsData
+        manualEntry: chooserController.manualEntry
+        projectsData: chooserController.projectsData
         theme: root.theme
         onCloseRequested: root.chooserOpen = false
-        onRowChosen: row => root.chooseRow(row)
+        onRowChosen: row => chooserController.chooseRow(row)
         onManualPathRequested: path => {
           root.act("/api/project", {path: path})
           root.chooserOpen = false

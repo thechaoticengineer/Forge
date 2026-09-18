@@ -55,6 +55,8 @@ Item {
   property real horizontalPadding: 18
   property real verticalPadding: 10
   property real scrollBarSpace: 16
+  // The left and right margin of the page content; Panel.qml passes the shell margin.
+  property real margin: 0
 
   property alias contentFlick: flick
 
@@ -79,7 +81,9 @@ Item {
   readonly property bool hasPrevious: hasStage && stageIndex > 0
   readonly property bool hasNext: hasStage && stageIndex < stages.length - 1
   readonly property string detailScope: hasStage ? stageDetailScope(current) : ""
-  readonly property var prose: hasStage && stageSnapshot && stageSnapshot.key === detailScope
+  // A stage being edited in Plan shows no prose, as the inline expansion never did.
+  readonly property bool editable: editingPlan && stage.status !== "committed"
+  readonly property var prose: hasStage && !editable && stageSnapshot && stageSnapshot.key === detailScope
     ? stageSnapshot : null
   readonly property string activity: hasStage ? stageActivity(current) : ""
   // The same elapsed/duration rule as the stage rows.
@@ -151,7 +155,8 @@ Item {
   Column {
     id: header
 
-    width: parent.width
+    x: page.margin
+    width: parent.width - page.margin * 2
     spacing: page.spacing
 
     Item {
@@ -164,6 +169,7 @@ Item {
       Item {
         id: backLink
 
+        objectName: "stageBack"
         width: backText.implicitWidth
         height: parent.height
 
@@ -380,7 +386,8 @@ Item {
     visible: !page.hasStage
     anchors.top: header.bottom
     anchors.topMargin: page.spacing
-    width: parent.width
+    x: page.margin
+    width: parent.width - page.margin * 2
     text: "No stage to show."
     textFormat: Text.PlainText
     color: page.mutedForeground
@@ -398,6 +405,8 @@ Item {
     anchors.left: parent.left
     anchors.right: parent.right
     anchors.bottom: parent.bottom
+    anchors.leftMargin: page.margin
+    anchors.rightMargin: page.margin
     clip: true
     contentWidth: width
     contentHeight: {
@@ -423,7 +432,7 @@ Item {
       Text {
         visible: page.prose === null
         width: parent.width
-        text: "Loading stage details…"
+        text: page.editable ? "This stage is being edited in Plan." : "Loading stage details…"
         textFormat: Text.PlainText
         color: page.mutedForeground
         font.family: page.fontFamily
@@ -471,7 +480,7 @@ Item {
       Text {
         visible: page.prose === null
         width: parent.width
-        text: "Loading stage details…"
+        text: page.editable ? "This stage is being edited in Plan." : "Loading stage details…"
         textFormat: Text.PlainText
         color: page.mutedForeground
         font.family: page.fontFamily
@@ -783,8 +792,8 @@ Item {
     }
   }
 
-  // Loads the stage's complete reviews while the Review tab is shown, then
-  // reconciles the retained review preview rows against them.
+  // Loads the stage's complete reviews while the page is shown, as the inline
+  // expanded stage did, then reconciles the retained review preview rows.
   Timer {
     id: reviewUpdate
 
@@ -792,7 +801,7 @@ Item {
     running: true
     onTriggered: {
       if (!page.hasStage) return
-      if (page.visible && page.subTab === "review") page.ensureStageReviewsLoaded(page.current)
+      if (page.visible) page.ensureStageReviewsLoaded(page.current)
       ReviewPresentation.reconcileStageReviewPresentation(page.reviews, page.detailScope,
         reviewPresentation, reviewRepeater)
     }

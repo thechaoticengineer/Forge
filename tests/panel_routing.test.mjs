@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
-const planEditor = readFileSync(new URL('../quickshell/PlanEditorView.qml', import.meta.url), 'utf8');
+// The stage routing lines moved from PlanEditorView's inline expansion to the Routing sub-tab of
+// StageDetailPage.qml (panel-redesign M2); hand-edit saving moved to PlanEditController.qml.
+const stageDetail = readFileSync(new URL('../quickshell/StageDetailPage.qml', import.meta.url), 'utf8');
+const planEditController = readFileSync(new URL('../quickshell/PlanEditController.qml', import.meta.url), 'utf8');
 const ctx = {};
 vm.runInNewContext(readFileSync(new URL('../quickshell/ModelRouting.js', import.meta.url), 'utf8'), ctx);
 const planEdit = {};
@@ -16,7 +19,7 @@ const stage = {model_agreement: {id:'agreed-1', valid:true, availability:'unveri
 test('collapsed drafts show both reasons, native effort, unverified availability and configured tier provenance', () => {
   const text = ctx.stageModelText(stage, false);
   for (const part of ['codex/configured-model', 'high', 'unverified', 'strong (configured)', 'Planner: Complex storage', 'Architect: A failure']) assert.ok(text.includes(part));
-  assert.match(planEditor, /text: ModelRouting.stageModelStatus\(stageRow.modelData\)/);
+  assert.match(stageDetail, /text: ModelRouting.stageModelStatus\(page.stage\)/);
 });
 test('expanded details distinguish relative preferences from prices and handle unknowns', () => {
   assert.match(ctx.stageModelText(stage,true), /configured relative preference 2 \(not a price\)/);
@@ -32,7 +35,8 @@ test('stage constraints can be narrowed or cleared and survive manual save', () 
   constraint = planEdit.modelConstraint({model_constraint:constraint},'model','');
   constraint = planEdit.modelConstraint({model_constraint:constraint},'provider','');
   assert.equal(constraint,null);
-  assert.match(qml,/PlanEdit.payload\(editGoal, editStages\)/);
+  assert.match(planEditController,/PlanEdit.payload\(host.editGoal, host.editStages\)/);
+  assert.match(qml,/onSavePlanEdit: planEdit.savePlanEdit\(\)/);
   assert.match(qml,/automatic_routing:/);
 });
 test('routing status shows bounded retry counts, trigger evidence and both decision reasons', () => {
@@ -57,9 +61,9 @@ test('stage status stays live while full rationale and optional diagnostics use 
   multiline.model_block = 'blocked\nfull error';
   assert.equal(ctx.stageModelErrors(multiline), multiline.model_block);
   assert.match(qml, /rationale: ModelRouting.stageModelRationale\(stage\), diagnostics: ModelRouting.stageModelDiagnostics\(stage\)/);
-  assert.match(planEditor, /model: stageRow.prose \? stageRow.prose.rationale : \[\]/);
-  assert.match(planEditor, /model: view.stageRoutingExpanded && stageRow.prose \? stageRow.prose.diagnostics : \[\]/);
-  assert.match(planEditor, /text: ModelRouting.stageModelErrors\(stageRow.modelData\)\s+textFormat: Text.PlainText\s+color: view.urgent\s+wrapMode: Text.Wrap/);
+  assert.match(stageDetail, /model: page.prose \? page.prose.rationale : \[\]/);
+  assert.match(stageDetail, /model: page.stageRoutingExpanded && page.prose \? page.prose.diagnostics : \[\]/);
+  assert.match(stageDetail, /text: ModelRouting.stageModelErrors\(page.stage\)\s+textFormat: Text.PlainText\s+color: page.urgent\s+wrapMode: Text.Wrap/);
 });
 
 test('pending model agreements still expose routing outcomes and execution identity', () => {

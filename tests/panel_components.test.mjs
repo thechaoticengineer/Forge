@@ -5,12 +5,15 @@ import {readFileSync} from 'node:fs';
 const read = name => readFileSync(new URL('../quickshell/' + name, import.meta.url), 'utf8');
 const panel = read('Panel.qml');
 // Tab views host the focused views that moved out of Panel.qml (ActivityView hosts
-// AgentOutputView, ArchitectureView hosts ArchitectureReviewView, PlanView hosts PlanEditorView).
+// AgentOutputView, ArchitectureView hosts ArchitectureReviewView, PlanView hosts PlanEditorView and
+// PlanStageList; the stage detail page moved out of PlanEditorView's inline expansion).
 const composition = panel + read('AgentOutputView.qml') + read('ActivityView.qml') + read('ArchitectureView.qml')
   + read('PlanView.qml') + read('SettingsView.qml');
 const views = [
   'PlanEditorView.qml',
   'PlanView.qml',
+  'PlanStageList.qml',
+  'StageDetailPage.qml',
   'SettingsView.qml',
   'AgentOutputView.qml',
   'ArchitectureReviewView.qml',
@@ -41,7 +44,8 @@ test('Panel composes focused views while retaining state and API coordination', 
 });
 
 test('moved views reuse shared prose and detail components', () => {
-  const plan = read('PlanEditorView.qml');
+  // The stage prose fields moved with the inline expansion to the stage detail page (M2).
+  const plan = read('StageDetailPage.qml');
   const architecture = read('ArchitectureReviewView.qml');
   const output = read('AgentOutputView.qml');
   const reports = read('ReportsView.qml');
