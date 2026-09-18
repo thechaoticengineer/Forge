@@ -489,7 +489,13 @@ discard them.
 To ask AI for changes, type feedback into the field beside **Improve with
 AI**, then click the button or press `Enter`. Forge re-runs the planner
 against the current plan and your feedback, keeping the same overall goal.
-A failed AI revision keeps the previous plan.
+The planner's prompt only receives the plan's content — goal, stages,
+instructions, acceptance criteria, commit messages, status and explicit
+dependencies — never model selection, agreement, proposal-input,
+reassessment, or invocation records; the engine still revises against the
+complete saved plan internally, so committed stages, saved model constraints
+and other bookkeeping are preserved exactly as before. A failed AI revision
+keeps the previous plan.
 
 Saving manual edits or completing an AI revision produces a new draft that
 needs your approval again before running. Both paths preserve committed
@@ -704,9 +710,12 @@ All these artefacts remain inside the existing `.forge` commit exclusion.
 
 Type a question about the current plan into the field beside **Plan Q&A**
 in the panel, then click **Ask** or press `Enter`. The selected planner tool
-answers without modifying the plan. Expand **Plan Q&A** to read the
-conversation. Asking requires an existing plan, with Forge idle, the queue
-inactive, and plan editing closed.
+answers without modifying the plan. Its prompt receives only the plan's
+content — goal, stages, instructions, acceptance criteria, commit messages,
+status and explicit dependencies — not model selection, agreement,
+proposal-input, reassessment or invocation records. Expand **Plan Q&A** to
+read the conversation. Asking requires an existing plan, with Forge idle, the
+queue inactive, and plan editing closed.
 
 This is separate from the **Discuss before planning** chat, which does not
 require an existing plan and produces a new plan from the discussion rather than

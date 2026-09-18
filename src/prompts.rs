@@ -89,7 +89,7 @@ Rewrite the plan and write it as JSON to the file {plan_path} (create the direct
    "status": "pending", "rounds": 0}
 ]}
 
-Stages whose status is "committed" are already done and MUST be kept exactly as-is at the start of the plan, in their original relative order (same id, title, instructions, acceptance, commit, status, rounds).
+Stages whose status is "committed" are already done and MUST be kept exactly as-is at the start of the plan, in their original relative order (same id, title, instructions, acceptance, commit, status, depends_on).
 Apply the feedback to the remaining stages: you may rewrite, merge, split, add, remove, or reorder them.
 Rules: 2 to 8 stages total, each independently committable, ordered by dependency.
 Do NOT implement anything and do NOT modify any other file. Only write {plan_path}."#;

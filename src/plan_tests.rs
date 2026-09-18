@@ -175,7 +175,7 @@ fn plan_chat_persists_transcript_and_preserves_plan_and_phase() {
         assert_eq!(settings["mock_chat_step"], "answering plan question");
         assert_eq!(settings["mock_chat_busy"], true);
         let prompt = settings["mock_chat_prompt"].as_str().unwrap();
-        assert!(prompt.contains(&serde_json::to_string_pretty(&original).unwrap()));
+        assert!(prompt.contains(&serde_json::to_string_pretty(&crate::plan::content_view(&original)).unwrap()));
         assert!(prompt.contains(&prior));
         assert!(prompt.contains(question));
         assert!(prompt.contains("{\"answer\": \"...\"}"));
@@ -694,7 +694,9 @@ fn plan_revise_api_preserves_committed_work_and_passes_feedback_to_planner() {
     assert_eq!(settings["mock_planner_phase"], "planning");
     assert_eq!(settings["mock_planner_had_plan"], false);
     let prompt = settings["mock_planner_prompt"].as_str().unwrap();
-    assert!(prompt.contains(&serde_json::to_string_pretty(&original).unwrap()));
+    assert!(prompt.contains(&serde_json::to_string_pretty(&crate::plan::content_view(&original)).unwrap()));
+    assert!(!prompt.contains("abc123"));
+    assert!(!prompt.contains("\"reviews\""));
     assert!(prompt.contains(&feedback));
     assert!(prompt.contains("Keep the same overall goal:\nOriginal {feedback} goal"));
     assert!(prompt.contains("Only write .forge/plan-candidate.json."));
@@ -706,6 +708,117 @@ fn plan_revise_api_preserves_committed_work_and_passes_feedback_to_planner() {
     assert_eq!(history[0]["text"], format!("revision started: {}",
         feedback.chars().take(300).collect::<String>()));
     assert!(history.as_array().unwrap().iter().any(|e| e["text"] == "plan revised with 2 stages"));
+}
+
+#[test]
+fn content_view_projects_goal_and_allowlisted_stage_fields_only() {
+    let plan = json!({"goal": "Ship it", "status": "draft", "plan_id": "p1", "revision": 4,
+        "architecture": {"checkpoint": 1}, "stages": [
+            {"id": 1, "title": "Stage one", "instructions": "Do the thing", "acceptance": "It works",
+             "commit": "feat: thing", "status": "committed", "depends_on": [],
+             "model_agreement": {"dialogue": ["secret"]}, "model_proposal": {"provider": "codex"},
+             "model_proposal_inputs": {"digest": "abc"}, "model_proposer": "architect",
+             "model_selection": {"provider": "codex"}, "model_invocations": [{"role": "implementer"}],
+             "reassessment": {"pending": true, "history": []}, "reviews": [{"approved": true}],
+             "last_verdict": {"status": "approved"}, "usage": {"codex": {"input_tokens": 1}}},
+            {"id": 2, "title": "Stage two", "instructions": "Do more", "acceptance": "Still works",
+             "commit": "feat: more", "status": "pending"},
+        ]});
+    assert_eq!(crate::plan::content_view(&plan), json!({"goal": "Ship it", "stages": [
+        {"id": 1, "title": "Stage one", "instructions": "Do the thing", "acceptance": "It works",
+         "commit": "feat: thing", "status": "committed", "depends_on": []},
+        {"id": 2, "title": "Stage two", "instructions": "Do more", "acceptance": "Still works",
+         "commit": "feat: more", "status": "pending"},
+    ]}));
+}
+
+fn stage_with_routing_bookkeeping(id: i64) -> Value {
+    let mut stage = editable_stage(id);
+    stage["status"] = json!("committed");
+    stage["depends_on"] = json!([]);
+    stage["model_agreement"] = json!({"actor": "architect", "dialogue": [{"text": "BOOKKEEPING_DIALOGUE_MARKER"}],
+        "relevant_inputs": {"x": 1}, "architectural_constraints": ["BOOKKEEPING_CONSTRAINT_MARKER"],
+        "input_fingerprint": "BOOKKEEPING_FINGERPRINT_MARKER"});
+    stage["model_proposal"] = json!({"provider": "BOOKKEEPING_PROPOSAL_PROVIDER", "model": "BOOKKEEPING_PROPOSAL_MODEL",
+        "rationale": "BOOKKEEPING_PROPOSAL_RATIONALE"});
+    stage["model_proposal_inputs"] = json!({"version": 1, "bytes": 123, "digest": "BOOKKEEPING_DIGEST_MARKER"});
+    stage["model_proposer"] = json!("BOOKKEEPING_PROPOSER_MARKER");
+    stage["model_selection"] = json!({"provider": "BOOKKEEPING_SELECTION_PROVIDER", "model": "BOOKKEEPING_SELECTION_MODEL"});
+    stage["model_invocations"] = json!([{"role": "implementer", "output": "BOOKKEEPING_INVOCATION_OUTPUT_MARKER"}]);
+    stage["reassessment"] = json!({"pending": true, "history": [{"reason": "BOOKKEEPING_REASSESSMENT_MARKER"}]});
+    stage["reviews"] = json!([{"approved": true, "notes": "BOOKKEEPING_REVIEW_MARKER"}]);
+    stage["last_verdict"] = json!({"status": "approved", "notes": "BOOKKEEPING_VERDICT_MARKER"});
+    stage["usage"] = json!({"codex": {"input_tokens": 99999, "marker": "BOOKKEEPING_USAGE_MARKER"}});
+    stage
+}
+
+const ROUTING_BOOKKEEPING_MARKERS: &[&str] = &["BOOKKEEPING_DIALOGUE_MARKER", "BOOKKEEPING_CONSTRAINT_MARKER",
+    "BOOKKEEPING_FINGERPRINT_MARKER", "BOOKKEEPING_PROPOSAL_PROVIDER", "BOOKKEEPING_PROPOSAL_MODEL",
+    "BOOKKEEPING_PROPOSAL_RATIONALE", "BOOKKEEPING_DIGEST_MARKER", "BOOKKEEPING_PROPOSER_MARKER",
+    "BOOKKEEPING_SELECTION_PROVIDER", "BOOKKEEPING_SELECTION_MODEL", "BOOKKEEPING_INVOCATION_OUTPUT_MARKER",
+    "BOOKKEEPING_REASSESSMENT_MARKER", "BOOKKEEPING_REVIEW_MARKER", "BOOKKEEPING_VERDICT_MARKER",
+    "BOOKKEEPING_USAGE_MARKER", "\"model_agreement\"", "\"model_proposal_inputs\"", "\"model_proposer\"",
+    "\"model_selection\"", "\"model_invocations\"", "\"reassessment\"", "\"reviews\"", "\"last_verdict\"", "\"usage\""];
+
+#[test]
+fn plan_revise_prompt_sends_stage_content_without_routing_bookkeeping() {
+    let test = QueueTest::new(false);
+    let committed = stage_with_routing_bookkeeping(1);
+    let plan = json!({"goal": "Ship the bookkeeping-free revise prompt", "status": "draft",
+        "stages": [committed, {"id": 2, "title": "Second stage", "instructions": "More work",
+            "acceptance": "Still works", "commit": "feat: more", "status": "pending"}]});
+    test.app.save_plan(&plan).unwrap();
+    let original = test.app.load_plan().unwrap();
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan/revise",
+        json!({"feedback": "tighten the scope"})), (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let settings = test.app.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    let prompt = requests.iter().rev().find(|r| r["role"] == "planner").unwrap()["prompt"].as_str().unwrap();
+    assert!(prompt.contains(&serde_json::to_string_pretty(&crate::plan::content_view(&original)).unwrap()));
+    for marker in ROUTING_BOOKKEEPING_MARKERS { assert!(!prompt.contains(marker), "unexpected {marker} in revise prompt"); }
+}
+
+#[test]
+fn plan_chat_prompt_sends_stage_content_without_routing_bookkeeping() {
+    let test = QueueTest::new(false);
+    let committed = stage_with_routing_bookkeeping(1);
+    let plan = json!({"goal": "Answer without bookkeeping", "status": "draft",
+        "stages": [committed, {"id": 2, "title": "Second stage", "instructions": "More work",
+            "acceptance": "Still works", "commit": "feat: more", "status": "pending"}]});
+    test.app.save_plan(&plan).unwrap();
+    let original = test.app.load_plan().unwrap();
+    test.app.set_phase("plan_ready");
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan/chat",
+        json!({"question": "What is stage 1 about?"})), (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let settings = test.app.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    let prompt = requests.iter().rev().find(|r| r["role"] == "chat").unwrap()["prompt"].as_str().unwrap();
+    assert!(prompt.contains(&serde_json::to_string_pretty(&crate::plan::content_view(&original)).unwrap()));
+    for marker in ROUTING_BOOKKEEPING_MARKERS { assert!(!prompt.contains(marker), "unexpected {marker} in chat prompt"); }
+    assert!(!prompt.contains("\"model_proposal\""));
+}
+
+#[test]
+fn plan_revise_prompt_is_far_smaller_than_a_plan_with_large_bookkeeping() {
+    let test = QueueTest::new(false);
+    let mut stage = editable_stage(1);
+    stage["model_invocations"] = json!([{"role": "implementer", "output": "x".repeat(200_000)}]);
+    stage["reassessment"] = json!({"pending": true, "history": (0..50)
+        .map(|i| json!({"seq": i, "old_agreement": {"dialogue": "y".repeat(2000)}})).collect::<Vec<_>>()});
+    let plan = json!({"goal": "Ship it", "status": "draft", "stages": [stage]});
+    test.app.save_plan(&plan).unwrap();
+    let original = test.app.load_plan().unwrap();
+    let original_len = serde_json::to_string(&original).unwrap().len();
+    assert!(original_len > 200_000);
+    assert_eq!(api_request(&test.app.app, "POST", "/api/plan/revise",
+        json!({"feedback": "tighten the scope"})), (200, json!({"ok": true})));
+    wait_for_worker(&test.app);
+    let settings = test.app.app.settings.lock().unwrap();
+    let requests = settings["mock_agent_requests"].as_array().unwrap();
+    let prompt = requests.iter().rev().find(|r| r["role"] == "planner").unwrap()["prompt"].as_str().unwrap();
+    assert!(prompt.len() < original_len / 10);
 }
 
 #[test]

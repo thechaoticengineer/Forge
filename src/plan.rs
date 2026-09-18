@@ -202,6 +202,22 @@ pub(crate) fn mutate_queue(queue: &mut Value, action: &str, body: &Value) -> Res
     }
 }
 
+/// Content-only projection of a plan for revision and chat prompts: an allowlist
+/// of design fields with no routing, agreement, reassessment or review bookkeeping.
+/// `depends_on` is included only when the stage actually carries one, since its
+/// absence has the distinct meaning "all earlier stages" (see `stage_inputs`).
+pub(crate) fn content_view(plan: &Value) -> Value {
+    let stages: Vec<Value> = plan["stages"].as_array().into_iter().flatten().map(|stage| {
+        let mut view = json!({
+            "id": stage["id"], "title": stage["title"], "instructions": stage["instructions"],
+            "acceptance": stage["acceptance"], "commit": stage["commit"], "status": stage["status"],
+        });
+        if let Some(depends_on) = stage.get("depends_on") { view["depends_on"] = depends_on.clone(); }
+        view
+    }).collect();
+    json!({"goal": plan["goal"], "stages": stages})
+}
+
 /// Absent dependency lists conservatively mean all preceding stages. Explicit
 /// lists permit unrelated edits and reordering without losing model agreements.
 pub(crate) fn stage_inputs(plan: &Value, index: usize) -> Value {

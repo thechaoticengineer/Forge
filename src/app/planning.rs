@@ -85,7 +85,7 @@ impl Ctx {
         let _worker = WorkerGuard(&self.session);
         let authoritative = self.load_plan().unwrap_or_else(|| current_plan.clone());
         let current_plan = &authoritative;
-        let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
+        let snapshot = serde_json::to_string_pretty(&crate::plan::content_view(current_plan)).unwrap();
         let goal = current_plan["goal"].as_str().unwrap_or("");
         let prompt = fill_template(REVISE_PROMPT, &[
             ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
@@ -103,7 +103,7 @@ impl Ctx {
     pub(crate) fn chat_worker(&self, current_plan: &Value, question: &str) {
         let _worker = WorkerGuard(&self.session);
         self.set_step(None, "answering plan question");
-        let snapshot = serde_json::to_string_pretty(current_plan).unwrap();
+        let snapshot = serde_json::to_string_pretty(&crate::plan::content_view(current_plan)).unwrap();
         let history = serde_json::to_string_pretty(&self.read_chat()).unwrap();
         let prompt = fill_template(CHAT_PROMPT, &[
             ("{current_plan}", snapshot.as_str()), ("{history}", history.as_str()),
