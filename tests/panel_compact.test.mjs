@@ -203,7 +203,7 @@ test('leaving and revisiting a project resets both lists and strands the earlier
     goalEnhanceReady: '', goalEnhanceUndo: '', goalEnhanceError: '',
     feedbackField: {text: ''}, questionField: {text: ''}, goalDrafts: {},
     discussionView: {input: {text: ''}},
-    cancelPlanEdit(){}, syncCatalogueSuggestion(){}, syncReviewViews(){}, syncDiscussion(){},
+    cancelPlanEdit(){}, catalogueController: {syncCatalogueSuggestion(){}, reset(){}}, features: {reset(){}}, syncReviewViews(){}, syncDiscussion(){},
     closeDiscussion(){},
     calls: [], Qt: {callLater(){}},
     logFeed: view.newFeed(), logError: '', lastProject: '/a', projectViewRevision: 1,

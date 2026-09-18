@@ -88,6 +88,12 @@ const assignsCurrentTab = text =>
 
 const panelSource = () => readSource('Panel.qml');
 
+// Overlay and view keys moved out of Panel.qml into the views' handleKey() functions,
+// which the keyHandler calls; the routing contract spans both.
+const handleKeySource = file => blockAfter(readSource(file), 'function handleKey(');
+const viewKeySource = () => ['DiffView.qml', 'ProjectChooser.qml', 'FeaturesView.qml', 'SettingsView.qml']
+  .map(handleKeySource).join('\n');
+
 // The normal-mode key handler of the root item.
 const keyHandlerBody = source => {
   const at = source.indexOf('id: keyHandler');
@@ -641,20 +647,26 @@ test('S18: Queue and Features are tabs, and f and g f both select Features', () 
   assert.match(panel, /queueCount:\s*(root\.)?queue\.length/);
   const nav = loadModule('PanelNavigation.js');
   assert.equal(nav.call('tabForGKey', 'f'), 'features');
-  const opener = blockAfter(panel, 'function openFeatures()');
+  const opener = blockAfter(readSource('FeaturesController.qml'), 'function openFeatures()');
   assert.match(opener, /currentTab\s*=\s*["']features["']/, 'openFeatures() must select the Features tab');
   assert.match(keyHandlerBody(panel), /Qt\.Key_F\)[^}]{0,160}openFeatures\(\)/,
     'f keeps opening the feature list');
 });
 
 test('S18: Features keeps its actions and shortcuts', () => {
-  const body = keyHandlerBody(panelSource());
-  for (const call of ['featuresView.openNewFeatureForm()', 'root.requestFeatureReview(featureRow)',
-    'root.approveFeatureSpec(featureRow)', 'root.approveFeatureScenarios(featureRow)',
-    'featuresView.focusChatInput()', 'featuresView.listView.activateSelection()'])
-    assert.ok(body.includes(call), `keyHandler must still call ${call}`);
+  const panel = panelSource();
+  const body = keyHandlerBody(panel);
+  assert.ok(body.includes('featuresView.handleKey(event)'), 'keyHandler must route Features keys to the view');
+  const keys = handleKeySource('FeaturesView.qml');
+  for (const call of ['openNewFeatureForm()', 'view.reviewRequested(row)', 'view.approveSpecRequested(row)',
+    'view.approveScenariosRequested(row)', 'focusChatInput()', 'featuresList.activateSelection()'])
+    assert.ok(keys.includes(call), `FeaturesView.handleKey must still call ${call}`);
   for (const key of ['Key_N', 'Key_V', 'Key_C', 'Key_A', 'Key_O'])
-    assert.ok(body.includes(`Qt.${key}`), key);
+    assert.ok(keys.includes(`Qt.${key}`), key);
+  const view = only(panel, 'FeaturesView');
+  for (const call of ['features.requestFeatureReview(feature)', 'features.approveFeatureSpec(feature)',
+    'features.approveFeatureScenarios(feature)', 'features.selectFeature(feature)'])
+    assert.ok(view.includes(call), `the Features tab must still reach ${call}`);
 });
 
 test('S18: QueueView keeps Start queue and the ↑ ↓ × row actions', () => {
@@ -687,15 +699,23 @@ test('S19: closing the diff, chooser, discussion, catalogue or help never assign
 
 test('S19: the key handler branches that close pushed pages never assign currentTab', () => {
   const body = keyHandlerBody(panelSource());
-  const start = body.indexOf('if (root.catalogueOpen)');
+  const start = body.indexOf('if (catalogueController.catalogueOpen)');
   assert.ok(start >= 0, 'the catalogue branch must exist');
-  const ends = ['else if (root.featuresOpen)', 'else if (root.discussionOpen)', 'else if (question)']
+  const ends = ['else if (features.featuresOpen)', 'else if (root.discussionOpen)', 'else if (question)']
     .map(marker => body.indexOf(marker, start)).filter(i => i > start);
   assert.ok(ends.length > 0, 'the modal branches must be followed by the discussion or help branch');
   const modal = body.slice(start, Math.min(...ends));
-  for (const close of ['root.diffOpen = false', 'root.chooserOpen = false', 'root.helpOpen = false',
-    'root.catalogueOpen = false'])
+  for (const close of ['root.helpOpen = false', 'catalogueController.catalogueOpen = false'])
     assert.ok(modal.includes(close), `the key handler must still close pages with ${close}`);
+  // The diff and the chooser close through their views' handleKey(), whose closeRequested()
+  // Panel.qml wires to the same flag assignments.
+  for (const call of ['diffView.handleKey(', 'projectChooser.handleKey('])
+    assert.ok(modal.includes(call), `the key handler must still route keys with ${call}`);
+  for (const file of ['DiffView.qml', 'ProjectChooser.qml'])
+    assert.ok(handleKeySource(file).includes('closeRequested()'), `${file} must close on q / Escape`);
+  const panel = panelSource();
+  assert.match(only(panel, 'DiffView'), /onCloseRequested:\s*root\.diffOpen = false/);
+  assert.match(only(panel, 'ProjectChooser'), /onCloseRequested:\s*root\.chooserOpen = false/);
   assert.ok(!assignsCurrentTab(modal), 'closing a pushed page must not change the tab');
   const at = body.indexOf('else if (root.discussionOpen)');
   assert.ok(at >= 0, 'the discussion branch must exist');
@@ -765,7 +785,7 @@ test('S21: the bottom hint line follows the insert mode and names the current vi
 
 test('S21: keyHandler still handles every key it handled before the redesign', () => {
   const panel = panelSource();
-  const body = keyHandlerBody(panel);
+  const body = keyHandlerBody(panel) + '\n' + viewKeySource();
   const constants = ['Question', 'Slash', 'F1', 'Escape', 'I', 'E', 'T', 'G', 'P', 'D', 'U',
     'PageDown', 'PageUp', 'Home', 'End', 'A', 'R', 'X', 'C', 'F', 'Tab', 'H', 'L',
     '1', '6', 'J', 'K', 'Return', 'Enter', 'O', 'Space', 'Q', 'N', 'V'];
@@ -776,15 +796,16 @@ test('S21: keyHandler still handles every key it handled before the redesign', (
   for (const key of ['D', 'U'])
     assert.match(flat, new RegExp(`Qt\\.ControlModifier[^;{}]{0,80}Qt\\.Key_${key}\\b`), `Ctrl+${key}`);
   for (const call of ['root.enhanceGoal()', 'root.openDiscussion()', 'root.planFromDiscussion()',
-    'root.beginPlanEdit()', 'root.openDiff()', 'root.openChooser()', 'root.openFeatures()',
+    'root.beginPlanEdit()', 'root.openDiff()', 'root.openChooser()', 'features.openFeatures()',
     'root.cancelPlanEdit()', 'scrollOutput(', 'selectStage(', 'selectReport('])
     assert.ok(body.includes(call), `keyHandler must still reach ${call}`);
   // Diff, chooser, features, help, catalogue and discussion branches keep their own keys.
-  for (const branch of ['root.diffOpen', 'root.chooserOpen', 'root.featuresOpen', 'root.helpOpen',
-    'root.catalogueOpen', 'root.discussionOpen'])
+  for (const branch of ['root.diffOpen', 'root.chooserOpen', 'features.featuresOpen', 'root.helpOpen',
+    'catalogueController.catalogueOpen', 'root.discussionOpen'])
     assert.ok(body.includes(branch), `keyHandler must keep the ${branch} branch`);
-  assert.match(flat, /root\.refreshDiff\(\)/);
-  assert.match(flat, /projectChooser\.chooserList\.activateSelection\(\)/);
+  assert.match(flat, /refreshRequested\(\)/);
+  assert.match(panel, /onRefreshRequested:\s*root\.refreshDiff\(\)/);
+  assert.match(flat, /chooserList\.activateSelection\(\)/);
 });
 
 // ---- S22: views live in their own files --------------------------------------------------------

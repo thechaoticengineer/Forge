@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
+const qml = readFileSync(new URL('../quickshell/CatalogueController.qml', import.meta.url), 'utf8');
 const context = {};
 vm.runInNewContext(readFileSync(new URL('../quickshell/CataloguePresentation.js', import.meta.url), 'utf8'), context);
 test('provider states show unavailable evidence and stale/cache errors', () => {
@@ -54,11 +54,11 @@ test('model settings load full policy and submit JSON; invalid edits stay local'
   const calls = [];
   const root = {};
   const catalogueEditor = {text:'{'};
-  const sandbox = {root, catalogueEditor, catalogueEditorView:{editor:catalogueEditor},
+  const sandbox = {root, host: root, catalogueEditor, catalogueEditorView:{editor:catalogueEditor},
     api(method,path,body,done) { calls.push([method,path,body]); done({policy,options:[]},200); },
     act(path,body,done) { calls.push(['POST',path,body]); done({},200); },
   };
-  const code = qml.slice(qml.indexOf('  function openCatalogue()'), qml.indexOf('  property bool helpOpen:'));
+  const code = qml.slice(qml.indexOf('  function openCatalogue()'), qml.lastIndexOf('\n}'));
   vm.runInNewContext(code, sandbox);
   root.openCatalogue = sandbox.openCatalogue;
   sandbox.openCatalogue();
@@ -84,8 +84,9 @@ function aiPanel() {
     // The suggestion message text moved from Panel.qml to CataloguePresentation.js.
     CataloguePresentation: context, encodeURIComponent, JSON};
   sandbox.root = sandbox;
+  sandbox.host = sandbox;
   vm.runInNewContext(qml.slice(qml.indexOf('  function openCatalogue()'),
-    qml.indexOf('  property bool helpOpen:')), sandbox);
+    qml.lastIndexOf('\n}')), sandbox);
   return {sandbox,calls};
 }
 

@@ -260,6 +260,15 @@ needed by top-level keyboard routing. `Panel.qml` remains the manifest entry
 point and the owner of engine state, polling, project/session scoping, request
 IDs and API coordination.
 
+The tabbed redesign (docs/features/panel-redesign, milestone M1) keeps that
+boundary. `DiffView.qml`, `ProjectChooser.qml`, `FeaturesView.qml` and
+`SettingsView.qml` route their own normal-mode keys through a `handleKey()`
+function that the root key handler calls, and the feature specs and model
+policy API calls live in the non-visual `FeaturesController.qml` and
+`CatalogueController.qml`, which Panel.qml hosts and passes `host`, the project
+identity and the engine snapshot. `PanelPalette.qml` reads the theme's status
+colors. Panel.qml stays below 1,800 lines.
+
 The architecture overview is a bordered card with always-visible context,
 activity and recovery/error fields. Stage guidance, open risks and decisions
 have separate labelled disclosure controls with record counts and start

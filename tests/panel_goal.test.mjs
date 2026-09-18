@@ -32,7 +32,7 @@ function fixture() {
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
     historyList, reportList, agentOutput:{liveOutput,historyList,reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
-    cancelPlanEdit(){}, syncHistory(){}, syncCatalogueSuggestion(){}, syncReviewViews(){},
+    cancelPlanEdit(){}, syncHistory(){}, catalogueController: {syncCatalogueSuggestion(){}, reset(){}}, features: {reset(){}}, syncReviewViews(){},
     syncDiscussion(){}, closeDiscussion(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});

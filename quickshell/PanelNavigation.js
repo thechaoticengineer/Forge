@@ -51,25 +51,23 @@ function sessionMarker(session) {
 }
 
 var viewHints = {
-  overview: "i goal · p plan · a approve · r run · x stop · t discuss",
-  plan: "j/k stage · Enter open · e edit · I feedback",
+  overview: "j/k select · Enter open · i goal · p plan · x stop",
+  plan: "j/k select · Enter open · e edit · I feedback",
   activity: "Tab/h/l live/history · 1-6 filter · Ctrl+d/u scroll · j/k report",
   architecture: "PgDn/PgUp scroll · Home/End",
-  features: "j/k feature · Enter open · n new · c chat · v review · a approve",
-  queue: "x stop · d diff · c project",
+  features: "j/k select · Enter open · n new · c chat · v review · a approve",
+  queue: "PgDn/PgUp scroll · x stop · d diff · c project",
   settings: "j/k select · Enter toggle · c project · d diff"
 }
 
 function hintText(tab, insertMode) {
   if (insertMode) return "INSERT - Esc to normal mode"
-  return "NORMAL · " + (viewHints[tab] || viewHints.overview) + " · [ ] or g o/p/a/r/f/q/s views · ? help"
+  return "NORMAL · g o/p/a/r/f/q/s or [ ] switch views · " + (viewHints[tab] || viewHints.overview) + " · ? help"
 }
 
 function helpRows() {
   return [
     { key: "", description: "Panel · normal mode" },
-    { key: "[ / ]", description: "Switch to the previous / next view tab" },
-    { key: "g o / p / a / r / f / q / s", description: "Go to Overview / Plan / Activity / Architecture / Features / Queue / Settings" },
     { key: "i", description: "Edit the goal (insert mode)" },
     { key: "I", description: "Edit plan feedback (insert mode); Enter improves with AI" },
     { key: "Escape", description: "Leave a text field, close the top overlay, or cancel plan editing" },
@@ -95,6 +93,11 @@ function helpRows() {
     { key: "c", description: "Change project" },
     { key: "f", description: "Open the feature specs list" },
     { key: "? (Shift+/) / F1", description: "Open keyboard help" },
+    { key: "", description: "Views" },
+    { key: "[ / ]", description: "Switch to the previous / next view tab" },
+    { key: "g o / p / a / r / f / q / s", description: "Go to Overview / Plan / Activity / Architecture / Features / Queue / Settings; gg is unchanged" },
+    { key: "PgDn / PgUp / Home / End", description: "Scroll the current view (Activity scrolls with Ctrl+d / Ctrl+u)" },
+    { key: "Tab / h / l / 1-6", description: "Act on Activity, the view that shows the output: Live / History and the History filters" },
     { key: "", description: "Diff viewer" },
     { key: "j / k", description: "Scroll down / up" },
     { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },

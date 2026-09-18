@@ -42,6 +42,34 @@ Rectangle {
     diffList.contentY = Math.max(top, Math.min(bottom, diffList.contentY + amount))
   }
 
+  // Normal-mode keys while the diff is open. Returns the pending key prefix:
+  // "g" after a first g, so the router can pair it with the next key.
+  function handleKey(event, prefix) {
+    if (event.key === Qt.Key_Escape) {
+      view.closeRequested()
+    } else if (event.modifiers === Qt.ShiftModifier) {
+      if (event.key === Qt.Key_G) {
+        diffList.cancelFlick()
+        diffList.positionViewAtEnd()
+      } else if (event.key === Qt.Key_R && !view.pending) {
+        view.refreshRequested()
+      }
+    } else if (event.modifiers === Qt.ControlModifier) {
+      if (event.key === Qt.Key_D || event.key === Qt.Key_U)
+        scrollBy((event.key === Qt.Key_D ? 1 : -1) * diffList.height / 2)
+    } else if (event.modifiers === Qt.NoModifier) {
+      if (event.key === Qt.Key_Q) view.closeRequested()
+      else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+        scrollBy(event.key === Qt.Key_J ? 40 : -40)
+      else if (event.key === Qt.Key_G) {
+        if (prefix !== "g") return "g"
+        diffList.cancelFlick()
+        diffList.positionViewAtBeginning()
+      }
+    }
+    return ""
+  }
+
   visible: open
   color: Qt.rgba(0, 0, 0, 0.55)
 

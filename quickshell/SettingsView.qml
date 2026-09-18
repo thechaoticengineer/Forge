@@ -69,6 +69,24 @@ Flickable {
     else rows[selectedIndex].activate()
   }
 
+  // j/k, gg/G and Enter act on the rows while Settings is shown. Returns
+  // "handled", "g" (a pending g prefix) or "" when the key is not for Settings.
+  function handleKey(event, prefix) {
+    if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier)
+      selectRow(rows.length - 1)
+    else if (event.modifiers !== Qt.NoModifier) return ""
+    else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+      selectRow(selectedIndex < 0 ? 0 : selectedIndex + (event.key === Qt.Key_J ? 1 : -1))
+    else if (event.key === Qt.Key_G) {
+      if (prefix !== "g") return "g"
+      selectRow(0)
+    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+               || event.key === Qt.Key_O || event.key === Qt.Key_Space)
+      activateSelection()
+    else return ""
+    return "handled"
+  }
+
   function reveal(item) {
     const top = item.mapToItem(contentItem, 0, 0).y
     if (top < contentY) contentY = top

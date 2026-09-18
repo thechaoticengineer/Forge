@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
+const qml = readFileSync(new URL('../quickshell/FeaturesController.qml', import.meta.url), 'utf8');
 const featuresJsSource = readFileSync(new URL('../quickshell/Features.js', import.meta.url), 'utf8');
 
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -14,16 +14,16 @@ function loadFeatures() {
   return module;
 }
 
-// Extracts a top-level `function <name>(...) { ... }` from Panel.qml by
+// Extracts a top-level `function <name>(...) { ... }` from FeaturesController.qml by
 // brace-matching, so a test fails with a clear assertion message (not a
 // crash, and not silently matching the wrong snippet) when the function
 // does not exist yet.
 function extractFunction(source, name) {
   const marker = `function ${name}(`;
   const start = source.indexOf(marker);
-  assert.ok(start >= 0, `Panel.qml must define function ${name}(); it does not exist yet`);
+  assert.ok(start >= 0, `FeaturesController.qml must define function ${name}(); it does not exist yet`);
   const braceStart = source.indexOf('{', start);
-  assert.ok(braceStart >= 0, `Panel.qml's ${name} has no function body`);
+  assert.ok(braceStart >= 0, `FeaturesController.qml's ${name} has no function body`);
   let depth = 0;
   let end = -1;
   for (let i = braceStart; i < source.length; i++) {
@@ -33,7 +33,7 @@ function extractFunction(source, name) {
       if (depth === 0) { end = i + 1; break; }
     }
   }
-  assert.ok(end >= 0, `Panel.qml's ${name} function body is never closed`);
+  assert.ok(end >= 0, `FeaturesController.qml's ${name} function body is never closed`);
   return source.slice(start, end);
 }
 
@@ -48,6 +48,7 @@ function fixture() {
   ctx.Features = loadFeatures();
   ctx.api = (method, path, body, done) => ctx.calls.push({ method, path, body, done });
   ctx.root = ctx;
+  ctx.host = ctx;
   return ctx;
 }
 

@@ -45,7 +45,7 @@ function fixture() {
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
     historyList, reportList, agentOutput: {liveOutput, historyList, reportList}, logFeed: {},
     DetailView: { invalidate(){}, newFeed(){ return {}; } }, Qt: {callLater(){}},
-    cancelPlanEdit(){}, syncHistory(){}, syncGoalEnhancement(){}, syncCatalogueSuggestion(){},
+    cancelPlanEdit(){}, syncHistory(){}, syncGoalEnhancement(){}, catalogueController: {syncCatalogueSuggestion(){}, reset(){}}, features: {reset(){}},
     syncReviewViews(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.panelStack = {currentItem: ctx.discussionView, pushed: null, poppedTo: null,

@@ -39,6 +39,21 @@ Rectangle {
   signal detailInspected(var control)
 
   // Local and GitHub projects matching the filter, with section headers and the path row.
+  // Normal-mode keys while the chooser is open (a focused text field handles its own).
+  function handleKey(event) {
+    if (event.key === Qt.Key_Escape) {
+      closeRequested()
+    } else if (event.modifiers === Qt.NoModifier) {
+      if (event.key === Qt.Key_Q) closeRequested()
+      else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+        chooserList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
+      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+        chooserList.activateSelection()
+      else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
+        filterField.forceActiveFocus()
+    }
+  }
+
   function chooserRows(data, filter) {
     if (!data) return []
     const f = filter.toLowerCase()

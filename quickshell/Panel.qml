@@ -5,7 +5,6 @@ import QtQuick.Controls
 // qs.Ui exports its own Button, which shadows the Controls one and carries a
 // different API. Controls-specific buttons name it explicitly.
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "DetailView.js" as DetailView
@@ -15,11 +14,9 @@ import "PlanReview.js" as PlanReview
 import "PanelDetails.js" as PanelDetails
 import "ModelRouting.js" as ModelRouting
 import "UsageFormat.js" as UsageFormat
-import "CataloguePresentation.js" as CataloguePresentation
 import "GoalEnhancement.js" as GoalEnhancement
 import "Discussion.js" as Discussion
 import "PlanEdit.js" as PlanEdit
-import "Features.js" as Features
 import "PanelNavigation.js" as PanelNavigation
 import "PanelActions.js" as PanelActions
 
@@ -99,29 +96,10 @@ Item {
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: Style.font.family
 
-  // Semantic status colors from the active theme's full palette; the shell's
-  // Color singleton only exposes five roles, so read colors.toml directly.
-  property color success: "#4faf72"
-  property color working: "#d5a542"
-  property color info: "#56a8c7"
-
-  function loadPalette(raw) {
-    function grab(key, fallback) {
-      const m = String(raw).match(new RegExp('^' + key + '\\s*=\\s*"([^"]+)"', "m"))
-      return m ? m[1] : fallback
-    }
-    success = grab("green", success)
-    working = grab("yellow", working)
-    info = grab("cyan", info)
-  }
-
-  FileView {
-    path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadPalette(text())
-    onFileChanged: reload()
-  }
+  PanelPalette { id: statusPalette }
+  readonly property color success: statusPalette.success
+  readonly property color working: statusPalette.working
+  readonly property color info: statusPalette.info
 
   // Font size in design pixels; Style.fontPx takes a multiplier of the 12px base.
   function fs(px) { return Style.fontPx(px / 12) }
@@ -182,8 +160,9 @@ Item {
       shownTab = currentTab
     }
     // featuresOpen drives the Features keys and activity polling while its tab is shown.
-    featuresOpen = currentTab === "features"
-    if (featuresOpen && featuresLoadedRevision !== projectViewRevision) openFeatures()
+    features.featuresOpen = currentTab === "features"
+    if (features.featuresOpen && features.featuresLoadedRevision !== projectViewRevision)
+      features.openFeatures()
   }
   readonly property string stepText: engineState !== null && engineState.current_step !== ""
     ? (engineState.current_stage !== null
@@ -253,35 +232,12 @@ Item {
   property bool diffPending: false
   property string diffError: ""
 
-  property bool featuresOpen: false
-  property int featuresLoadedRevision: -1
-  property var featureList: []
-  property bool featuresPending: false
-  property string featuresError: ""
-  property var featureSpecs: ({})
-  property var featureActivity: null
-  property string selectedFeatureSlug: ""
-  property var featureDetailState: null
-
-  property var catalogueDetails: null
-  property bool catalogueOpen: false
-  property string catalogueDraft: ""
-  property bool catalogueAiPending: false
-  property int catalogueAiRequest: -1
-  property string catalogueAiSent: ""
-  property string catalogueAiReady: ""
-  property string catalogueAiUndo: ""
-  property string catalogueAiMessage: ""
-  property bool catalogueWasRefreshing: false
-  readonly property var catalogue: engineState && engineState.model_catalogue ? engineState.model_catalogue : null
-  onCatalogueChanged: {
-    const refreshing = !!catalogue && catalogue.refreshing
-    if (catalogueWasRefreshing && !refreshing && catalogueOpen) {
-      api("GET", "/api/models", null, function(resp, status) {
-        if (status === 200 && resp) root.catalogueDetails = resp
-      })
-    }
-    catalogueWasRefreshing = refreshing
+  FeaturesController {
+    id: features
+    host: root
+    lastProject: root.lastProject
+    projectViewRevision: root.projectViewRevision
+    active: window.visible
   }
 
   function changeModelConstraint(index, key, value) {
@@ -289,107 +245,16 @@ Item {
     changeStageField(index, "model_constraint", PlanEdit.modelConstraint(stage, key, value))
   }
 
-  function openCatalogue() {
-    if (root.catalogueAiPending || root.catalogueAiUndo || root.catalogueAiReady) {
-      root.catalogueOpen = true
-      return
-    }
-    api("GET", "/api/models", null, function(resp, status) {
-      if (status !== 200 || !resp) return
-      root.catalogueDetails = resp
-      root.catalogueDraft = JSON.stringify(resp.policy, null, 2)
-      root.catalogueOpen = true
-    })
+  CatalogueController {
+    id: catalogueController
+    host: root
+    engineState: root.engineState
+    catalogue: root.catalogue
+    catalogueEditorView: catalogueEditorView
+    lastProject: root.lastProject
+    projectViewRevision: root.projectViewRevision
   }
-  function saveCatalogue() {
-    let policy
-    try { policy = JSON.parse(catalogueEditorView.editor.text) }
-    catch (e) { root.localError = "Model policy must be valid JSON: " + e; return }
-    act("/api/settings", { model_catalogue: policy,
-      expected_model_policy: root.catalogueDetails ? root.catalogueDetails.policy : undefined }, function(resp, status) {
-      if (status === 200) {
-        root.catalogueAiUndo = ""
-        root.catalogueAiReady = ""
-        root.catalogueAiMessage = ""
-        root.openCatalogue()
-      } else {
-        root.catalogueAiMessage = resp && resp.error ? resp.error : "Could not save model policy."
-      }
-    })
-  }
-
-  function reloadCatalogue() {
-    catalogueAiUndo = ""
-    catalogueAiReady = ""
-    catalogueAiMessage = ""
-    root.openCatalogue()
-  }
-
-  function suggestCatalogue() {
-    if (catalogueAiPending) return
-    let policy
-    try { policy = JSON.parse(catalogueEditorView.editor.text) }
-    catch (e) { root.catalogueAiMessage = "Model policy must be valid JSON: " + e; return }
-    const revision = projectViewRevision
-    catalogueAiSent = catalogueEditorView.editor.text
-    catalogueAiPending = true
-    catalogueAiRequest = -1
-    catalogueAiReady = ""
-    catalogueAiMessage = "AI is checking official sources and selecting up to 4 models per provider…"
-    api("POST", "/api/models/suggest", { project: lastProject, policy: policy }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 202 && resp) {
-        root.catalogueAiRequest = resp.request_id
-        root.refresh()
-        root.syncCatalogueSuggestion()
-      } else {
-        root.catalogueAiPending = false
-        root.catalogueAiMessage = resp && resp.error ? resp.error : "Could not request AI tiers. Check the engine connection."
-      }
-    }, true)
-  }
-
-  function syncCatalogueSuggestion() {
-    const snapshot = engineState ? engineState.model_policy_suggestion : null
-    if (catalogueAiRequest < 0 || !snapshot || snapshot.request_id !== catalogueAiRequest
-        || snapshot.status === "running") return
-    const requestId = catalogueAiRequest
-    if (snapshot.status === "failed") {
-      catalogueAiRequest = -1
-      catalogueAiPending = false
-      catalogueAiMessage = snapshot.error || "Could not assign model tiers."
-      return
-    }
-    if (snapshot.status !== "ready") return
-    catalogueAiRequest = -1
-    const revision = projectViewRevision
-    api("GET", "/api/models/suggestion?project=" + encodeURIComponent(lastProject), null, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      root.catalogueAiPending = false
-      if (status !== 200 || !resp || resp.request_id !== requestId || resp.status !== "ready" || !resp.policy) {
-        root.catalogueAiMessage = "Could not load AI tiers. Try again."
-        return
-      }
-      root.catalogueAiReady = JSON.stringify(resp.policy, null, 2)
-      root.catalogueAiMessage = CataloguePresentation.suggestionMessage(resp)
-      if (catalogueEditorView.editor.text === root.catalogueAiSent) root.applyCatalogueSuggestion()
-    }, true)
-  }
-
-  function applyCatalogueSuggestion() {
-    if (catalogueAiReady === "") return
-    catalogueAiUndo = catalogueEditorView.editor.text
-    catalogueEditorView.editor.text = catalogueAiReady
-    catalogueDraft = catalogueAiReady
-    catalogueAiReady = ""
-  }
-
-  function undoCatalogueSuggestion() {
-    catalogueEditorView.editor.text = catalogueAiUndo
-    catalogueDraft = catalogueAiUndo
-    catalogueAiUndo = ""
-    catalogueAiMessage = "AI changes undone."
-  }
+  readonly property var catalogue: engineState && engineState.model_catalogue ? engineState.model_catalogue : null
 
   property bool helpOpen: false
   // The Plan view owns these controls; the panel keeps driving them by name.
@@ -463,14 +328,12 @@ Item {
 
   onEngineStateChanged: {
     const project = engineState ? engineState.project : ""
-    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); syncCatalogueSuggestion(); syncReviewViews(); syncDiscussion(); return }
+    if (project === lastProject) { syncHistory(); syncGoalEnhancement(); catalogueController.syncCatalogueSuggestion(); syncReviewViews(); syncDiscussion(); return }
     if (lastProject !== "") goalDrafts[lastProject] = goalField.text
     lastProject = project
     // Ignore log/diff responses from an earlier visit, even after switching back.
     projectViewRevision++
-    catalogueAiPending = false
-    catalogueAiRequest = -1
-    catalogueAiMessage = ""
+    catalogueController.reset()
     reviewViews = ({})
     stageReviewBlocks = ({})
     stageSnapshot = null
@@ -503,13 +366,7 @@ Item {
     diffText = ""
     diffError = ""
     diffPending = false
-    featureList = []
-    featuresPending = false
-    featuresError = ""
-    featureSpecs = ({})
-    featureActivity = null
-    selectedFeatureSlug = ""
-    featureDetailState = null
+    features.reset()
     localError = ""
     DetailView.invalidate(logFeed)
     logFeed = DetailView.newFeed()
@@ -886,164 +743,6 @@ Item {
     })
   }
 
-  // Shows the Features tab and loads its list.
-  function openFeatures() {
-    root.currentTab = "features"
-    if (root.featuresPending) return
-    root.featuresPending = true
-    const revision = projectViewRevision
-    api("GET", "/api/features?project=" + encodeURIComponent(lastProject), null, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      root.featuresPending = false
-      root.featuresLoadedRevision = revision
-      if (resp && Array.isArray(resp.features)) {
-        root.featureList = Features.featureRows(resp)
-        root.featureSpecs = Features.featureSpecsBySlug(resp)
-        root.featureActivity = resp.activity || null
-        root.featuresError = ""
-      } else {
-        root.featuresError = "Unable to load feature specs"
-      }
-      root.featuresOpen = root.currentTab === "features"
-    }, true)
-  }
-
-  // Features is a tab now: closing it returns to the tab shown before, and
-  // the list keeps its selection and reading position.
-  function closeFeatures() {
-    currentTab = previousTab
-  }
-
-  // Reloads the list after a feature action or a project switch without
-  // changing tabs; a hidden Features tab reloads when it is shown again.
-  function refreshFeatures() {
-    if (featuresOpen) openFeatures()
-    else featuresLoadedRevision = -1
-  }
-  onProjectViewRevisionChanged: if (featuresOpen) Qt.callLater(refreshFeatures)
-
-  function openFeatureInEditor(feature) {
-    Quickshell.execDetached(Features.editorCommand(feature))
-  }
-
-  function selectFeature(feature) {
-    if (!feature || root.selectedFeatureSlug === feature.slug) return
-    root.selectedFeatureSlug = feature.slug
-    root.featureDetailState = null
-    root.loadFeatureState(feature.slug)
-  }
-
-  function loadFeatureState(slug) {
-    const revision = projectViewRevision
-    api("GET", "/api/features/state?project=" + encodeURIComponent(root.lastProject)
-      + "&slug=" + encodeURIComponent(slug), null, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (root.selectedFeatureSlug !== slug) return
-      if (status === 200) {
-        root.featureDetailState = resp
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
-  // Re-fetches the feature list and, while its activity is still running,
-  // the selected feature's detail state; only called by the polling Timer.
-  function pollFeatureActivity() {
-    const revision = projectViewRevision
-    api("GET", "/api/features?project=" + encodeURIComponent(root.lastProject), null, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200 && resp && Array.isArray(resp.features)) {
-        root.featureList = Features.featureRows(resp)
-        root.featureSpecs = Features.featureSpecsBySlug(resp)
-        root.featureActivity = resp.activity || null
-        if (root.featureActivity && root.featureActivity.status === "failed")
-          root.featuresError = root.featureActivity.error || "Feature activity failed"
-      }
-      if (root.selectedFeatureSlug !== "") root.loadFeatureState(root.selectedFeatureSlug)
-    }, true)
-  }
-
-  function createFeature(slug, title) {
-    const revision = projectViewRevision
-    api("POST", "/api/features/create", { project: root.lastProject, slug: slug, title: title }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200) {
-        root.featuresError = ""
-        // Inlined rather than delegated to openFeatures(): keeps this
-        // function self-contained for isolated testing and reuse.
-        api("GET", "/api/features?project=" + encodeURIComponent(root.lastProject), null, function(resp2, status2) {
-          if (revision !== root.projectViewRevision) return
-          if (resp2 && Array.isArray(resp2.features)) {
-            root.featureList = Features.featureRows(resp2)
-            root.featureSpecs = Features.featureSpecsBySlug(resp2)
-            root.featureActivity = resp2.activity || null
-            root.featuresError = ""
-          }
-          root.featuresOpen = root.currentTab === "features"
-        }, true)
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
-  function sendFeatureChat(feature, message) {
-    const revision = projectViewRevision
-    api("POST", "/api/features/chat", { project: root.lastProject, slug: feature.slug, message: message }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200) {
-        root.featuresError = ""
-        root.refreshFeatures()
-        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
-  function requestFeatureReview(feature) {
-    const revision = projectViewRevision
-    api("POST", "/api/features/review", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200) {
-        root.featuresError = ""
-        root.refreshFeatures()
-        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
-  function approveFeatureSpec(feature) {
-    const revision = projectViewRevision
-    api("POST", "/api/features/approve_spec", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200) {
-        root.featuresError = ""
-        root.refreshFeatures()
-        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
-  function approveFeatureScenarios(feature) {
-    const revision = projectViewRevision
-    api("POST", "/api/features/approve_scenarios", { project: root.lastProject, slug: feature.slug }, function(resp, status) {
-      if (revision !== root.projectViewRevision) return
-      if (status === 200) {
-        root.featuresError = ""
-        root.refreshFeatures()
-        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
-      } else {
-        root.featuresError = Features.errorMessage(resp)
-      }
-    }, true)
-  }
-
   property var reportIdentityCache: ({nextId: 0, byRecord: new Map()})
   readonly property var reportIndex: PanelDetails.indexReports(reports, reportIdentityCache)
 
@@ -1278,14 +977,6 @@ Item {
   Timer {
     interval: 1000
     repeat: true
-    running: window.visible && root.featuresOpen && root.featureActivity !== null
-      && root.featureActivity.status === "running"
-    onTriggered: root.pollFeatureActivity()
-  }
-
-  Timer {
-    interval: 1000
-    repeat: true
     // Poll through idle as well: the terminal page can arrive after busy clears.
     running: window.visible
     triggeredOnStart: true
@@ -1359,22 +1050,11 @@ Item {
             : root.currentTab === "settings" ? settingsView : overviewView
         }
 
-        // j/k, gg/G and Enter act on the Settings rows while Settings is shown.
+        // Settings owns j/k, gg/G and Enter while it is shown.
         function settingsKey(event, prefix) {
-          if (event.key === Qt.Key_G && event.modifiers === Qt.ShiftModifier)
-            settingsView.selectRow(settingsView.rows.length - 1)
-          else if (event.modifiers !== Qt.NoModifier) return false
-          else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-            settingsView.selectRow(settingsView.selectedIndex < 0 ? 0
-              : settingsView.selectedIndex + (event.key === Qt.Key_J ? 1 : -1))
-          else if (event.key === Qt.Key_G) {
-            if (prefix === "g") settingsView.selectRow(0)
-            else pendingKey = "g"
-          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
-                     || event.key === Qt.Key_O || event.key === Qt.Key_Space)
-            settingsView.activateSelection()
-          else return false
-          return true
+          const result = settingsView.handleKey(event, prefix)
+          if (result === "g") pendingKey = "g"
+          return result !== ""
         }
 
         Keys.onPressed: event => {
@@ -1399,9 +1079,9 @@ Item {
             }
           }
           // Modal normal mode owns every key; focused text fields handle insert mode.
-          if (root.catalogueOpen) {
+          if (catalogueController.catalogueOpen) {
             event.accepted = true
-            if (event.key === Qt.Key_Escape) root.catalogueOpen = false
+            if (event.key === Qt.Key_Escape) catalogueController.catalogueOpen = false
             return
           }
           if (root.helpOpen) {
@@ -1411,42 +1091,10 @@ Item {
               root.helpOpen = false
           } else if (root.diffOpen) {
             event.accepted = true
-            if (event.key === Qt.Key_Escape) {
-              root.diffOpen = false
-            } else if (event.modifiers === Qt.ShiftModifier) {
-              if (event.key === Qt.Key_G) {
-                diffView.listView.cancelFlick()
-                diffView.listView.positionViewAtEnd()
-              } else if (event.key === Qt.Key_R && !root.diffPending) {
-                root.refreshDiff()
-              }
-            } else if (event.modifiers === Qt.ControlModifier) {
-              if (event.key === Qt.Key_D || event.key === Qt.Key_U)
-                diffView.scrollBy((event.key === Qt.Key_D ? 1 : -1) * diffView.listView.height / 2)
-            } else if (event.modifiers === Qt.NoModifier) {
-              if (event.key === Qt.Key_Q) root.diffOpen = false
-              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-                diffView.scrollBy(event.key === Qt.Key_J ? 40 : -40)
-              else if (event.key === Qt.Key_G) {
-                if (prefix === "g") {
-                  diffView.listView.cancelFlick()
-                  diffView.listView.positionViewAtBeginning()
-                } else pendingKey = "g"
-              }
-            }
+            pendingKey = diffView.handleKey(event, prefix)
           } else if (root.chooserOpen) {
             event.accepted = true
-            if (event.key === Qt.Key_Escape) {
-              root.chooserOpen = false
-            } else if (event.modifiers === Qt.NoModifier) {
-              if (event.key === Qt.Key_Q) root.chooserOpen = false
-              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-                projectChooser.chooserList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
-              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
-                projectChooser.chooserList.activateSelection()
-              else if (event.key === Qt.Key_Slash || event.key === Qt.Key_I)
-                projectChooser.filterField.forceActiveFocus()
-            }
+            projectChooser.handleKey(event)
           } else if (root.discussionOpen) {
             event.accepted = true
             if (question) {
@@ -1457,33 +1105,12 @@ Item {
             } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
               discussionView.input.forceActiveFocus()
             }
-          } else if (root.featuresOpen) {
+          } else if (features.featuresOpen) {
             // The Features tab while no page is pushed on top of it.
             event.accepted = true
-            const featureRow = featuresView.currentRow()
-            if (viewTab !== "") {
-              root.currentTab = viewTab
-            } else if (question) {
-              root.helpOpen = true
-            } else if (event.key === Qt.Key_Escape) {
-              root.closeFeatures()
-            } else if (event.modifiers === Qt.ShiftModifier) {
-              if (event.key === Qt.Key_R && !root.featuresPending) root.openFeatures()
-              else if (event.key === Qt.Key_A && featureRow) root.approveFeatureScenarios(featureRow)
-            } else if (event.modifiers === Qt.NoModifier) {
-              if (event.key === Qt.Key_Q) root.closeFeatures()
-              else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-                featuresView.listView.moveSelection(event.key === Qt.Key_J ? 1 : -1)
-              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
-                featuresView.listView.activateSelection()
-              else if (event.key === Qt.Key_N) featuresView.openNewFeatureForm()
-              else if (event.key === Qt.Key_C && featureRow) {
-                root.selectFeature(featureRow)
-                featuresView.focusChatInput()
-              } else if (event.key === Qt.Key_V && featureRow) root.requestFeatureReview(featureRow)
-              else if (event.key === Qt.Key_A && featureRow) root.approveFeatureSpec(featureRow)
-              else if (event.key === Qt.Key_G) pendingKey = "g"
-            }
+            if (viewTab !== "") root.currentTab = viewTab
+            else if (question) root.helpOpen = true
+            else pendingKey = featuresView.handleKey(event)
           } else if (question) {
             root.helpOpen = true
             event.accepted = true
@@ -1567,7 +1194,7 @@ Item {
                 if (root.guards.changeProject) root.openChooser()
                 event.accepted = true
               } else if (event.key === Qt.Key_F) {
-                if (root.guards.features) root.openFeatures()
+                if (root.guards.features) features.openFeatures()
                 event.accepted = true
               } else if (event.key === Qt.Key_Tab) {
                 root.currentTab = "activity"
@@ -1766,7 +1393,7 @@ Item {
               quota: root.engineState ? root.engineState.claude_quota : null
               engineOnline: root.engineOnline
               busy: root.busy
-              catalogueOpen: root.catalogueOpen
+              catalogueOpen: catalogueController.catalogueOpen
               reviewerLabel: root.reviewerLabel()
               cadenceLabels: ({
                 architect: root.reviewCadenceLabel(root.engineState, "architect"),
@@ -1796,7 +1423,7 @@ Item {
                     && root.engineState.settings.queue_auto_approve) })
               }
               onActionRequested: id => {
-                if (id === "modelSettings") { if (root.catalogueOpen) root.catalogueOpen = false; else root.openCatalogue() }
+                if (id === "modelSettings") { if (catalogueController.catalogueOpen) catalogueController.catalogueOpen = false; else catalogueController.openCatalogue() }
                 else if (id === "refreshModels") root.act("/api/models/refresh", {})
                 else if (id === "cancelRefresh") root.act("/api/models/cancel", {})
                 else if (id === "refreshLimits") root.act("/api/quota/refresh", {})
@@ -1870,23 +1497,23 @@ Item {
               visible: root.currentTab === "features"
               open: root.currentTab === "features"
               embedded: true
-              pending: root.featuresPending
-              errorText: root.featuresError
-              rows: root.featureList
-              specs: root.featureSpecs
-              activity: root.featureActivity
-              selectedSlug: root.selectedFeatureSlug
-              detailState: root.featureDetailState
+              pending: features.featuresPending
+              errorText: features.featuresError
+              rows: features.featureList
+              specs: features.featureSpecs
+              activity: features.featureActivity
+              selectedSlug: features.selectedFeatureSlug
+              detailState: features.featureDetailState
               theme: root.theme
-              onCloseRequested: root.closeFeatures()
-              onRefreshRequested: root.openFeatures()
-              onOpenRequested: feature => root.openFeatureInEditor(feature)
-              onCreateRequested: (slug, title) => root.createFeature(slug, title)
-              onChatRequested: (feature, message) => root.sendFeatureChat(feature, message)
-              onReviewRequested: feature => root.requestFeatureReview(feature)
-              onApproveSpecRequested: feature => root.approveFeatureSpec(feature)
-              onApproveScenariosRequested: feature => root.approveFeatureScenarios(feature)
-              onFeatureSelected: feature => root.selectFeature(feature)
+              onCloseRequested: features.closeFeatures()
+              onRefreshRequested: features.openFeatures()
+              onOpenRequested: feature => features.openFeatureInEditor(feature)
+              onCreateRequested: (slug, title) => features.createFeature(slug, title)
+              onChatRequested: (feature, message) => features.sendFeatureChat(feature, message)
+              onReviewRequested: feature => features.requestFeatureReview(feature)
+              onApproveSpecRequested: feature => features.approveFeatureSpec(feature)
+              onApproveScenariosRequested: feature => features.approveFeatureScenarios(feature)
+              onFeatureSelected: feature => features.selectFeature(feature)
               onLeaveRequested: keyHandler.forceActiveFocus()
             }
 
@@ -2085,24 +1712,24 @@ Item {
         id: catalogueEditorView
 
         anchors.fill: parent
-        open: root.catalogueOpen
+        open: catalogueController.catalogueOpen
         engineOnline: root.engineOnline
         engineBusy: !!root.engineState && (root.engineState.busy || root.engineState.queue_active)
-        aiPending: root.catalogueAiPending
-        aiReady: root.catalogueAiReady
-        aiUndo: root.catalogueAiUndo
-        aiMessage: root.catalogueAiMessage
+        aiPending: catalogueController.catalogueAiPending
+        aiReady: catalogueController.catalogueAiReady
+        aiUndo: catalogueController.catalogueAiUndo
+        aiMessage: catalogueController.catalogueAiMessage
         catalogue: root.catalogue
-        details: root.catalogueDetails
-        draft: root.catalogueDraft
+        details: catalogueController.catalogueDetails
+        draft: catalogueController.catalogueDraft
         detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
         theme: root.theme
-        onCloseRequested: root.catalogueOpen = false
-        onSuggestRequested: root.suggestCatalogue()
-        onApplyRequested: root.applyCatalogueSuggestion()
-        onUndoRequested: root.undoCatalogueSuggestion()
-        onReloadRequested: root.reloadCatalogue()
-        onSaveRequested: root.saveCatalogue()
+        onCloseRequested: catalogueController.catalogueOpen = false
+        onSuggestRequested: catalogueController.suggestCatalogue()
+        onApplyRequested: catalogueController.applyCatalogueSuggestion()
+        onUndoRequested: catalogueController.undoCatalogueSuggestion()
+        onReloadRequested: catalogueController.reloadCatalogue()
+        onSaveRequested: catalogueController.saveCatalogue()
         onMetadataRefreshRequested: root.act("/api/models/metadata/refresh", {})
         onLeaveRequested: keyHandler.forceActiveFocus()
         onDetailRevealed: control => root.revealDetail(control)

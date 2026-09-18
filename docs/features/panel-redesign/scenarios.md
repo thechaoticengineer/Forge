@@ -1,42 +1,50 @@
 # Scenarios
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. The panel window is the default 760×760 unless a scenario says otherwise. Mockups are in `design/`.
+**Status: M1 scenarios (S1-S6, S8-S11 and S16-S22) are implemented and have executable business tests; M2 scenarios (S7, S12-S15 and S23) are planned.**
+
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. The panel window is the default 760×760 unless a scenario says otherwise. Mockups are in `design/`. The M1 scenarios are verified by business tests in `tests/panel_redesign_m1.test.mjs` (source and pure-JS contracts of `Panel.qml`, `PanelNavigation.js`, `PanelActions.js` and the view files) and the QML tests `tests/qml/tst_panel_shell.qml` (S1, S2, S10, S11), `tst_panel_overview.qml` (S4-S6), `tst_panel_settings.qml` (S8, S9) and `tst_panel_queue.qml` (S18); each scenario below names its tests. Scenarios S19-S21 were additionally exercised against a running offscreen panel.
 
 ## S1: The header and tab bar are always visible
 
 - Given: the panel is open on any tab, with a plan of at least 5 stages
 - When: the user scrolls the current view to its end
 - Then: the header (FORGE, project switcher, phase badge, current step, `⋯`) and the tab bar Overview · Plan · Activity · Architecture · Features · Queue · Settings stay in place, and the selected tab is marked
+- Implemented (M1): `tests/qml/tst_panel_shell.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S2: Clicking a tab shows that view
 
 - Given: the panel is open on Overview
 - When: the user clicks each tab in turn
 - Then: the matching view replaces the content area, the clicked tab becomes the selected tab, and no other view's content is shown at the same time
+- Implemented (M1): `tests/qml/tst_panel_shell.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S3: Tabs can be switched from the keyboard
 
 - Given: the panel is open in normal mode on Overview
 - When: the user presses `]`, then `[`, then `g` followed by each of `o`, `p`, `a`, `r`, `f`, `q`, `s`
 - Then: `]` selects Plan, `[` returns to Overview, and each `g`-sequence selects Overview, Plan, Activity, Architecture, Features, Queue and Settings respectively, while `gg` keeps its existing meaning
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S4: The running Overview fits on one screen
 
 - Given: a run is in progress on stage 3 of a 5-stage plan, with an active agent and retained output
 - When: the user views Overview
 - Then: the goal, a "now working" card (stage number and title, role, tool, model, elapsed time, latest output line), a one-line progress summary, one line per stage, and a Stop action are all visible without scrolling, and no stage shows routing or review policy lines
+- Implemented (M1): `tests/qml/tst_panel_overview.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S5: The idle Overview offers goal actions
 
 - Given: no plan exists and the engine is idle
 - When: the user views Overview
 - Then: the goal field is shown with Create plan, Discuss first, Enhance with AI and Add to queue, and pressing `i` focuses the goal field
+- Implemented (M1): `tests/qml/tst_panel_overview.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S6: Overview actions follow the phase
 
 - Given: the engine is in each of the phases idle, planning, plan_ready, awaiting_approval, running, blocked, failed and done in turn
 - When: the user views Overview
 - Then: only actions that are enabled in that phase are shown as buttons there, every other current action remains reachable from its own view or the `⋯` menu, and clicking a shown action calls the same API endpoint as before the redesign
+- Implemented (M1): `tests/qml/tst_panel_overview.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S7: A stage that needs attention is surfaced on Overview
 
@@ -49,24 +57,28 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: the panel is open
 - When: the user opens Settings
 - Then: planner, architect, implementer, reviewer, automatic routing, architect review cadence, reviewer review cadence, push at end and auto-approve are shown as label/value rows, and clicking a row cycles its value through the same API calls the old buttons used
+- Implemented (M1): `tests/qml/tst_panel_settings.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S9: Settings holds models, limits and maintenance
 
 - Given: the model catalogue and Claude quota are available, and the catalogue reports a policy error
 - When: the user opens Settings
 - Then: quota lines, catalogue metadata and the policy error are shown there, with Model settings & options, Refresh models (and Cancel refresh while refreshing), Refresh Claude limits, Update Forge and Change project, and none of these appear on Overview
+- Implemented (M1): `tests/qml/tst_panel_settings.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S10: The overflow menu reaches rare actions
 
 - Given: the panel is open on any tab
 - When: the user opens `⋯`
 - Then: Update Forge, Discard plan, Refactor plan, View diff, Change project and Keyboard help are listed, disabled items reflect the same guards as today, and choosing one performs the same action as before the redesign
+- Implemented (M1): `tests/qml/tst_panel_shell.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S11: The project switcher lists sessions
 
 - Given: two projects have sessions, one busy and one blocked
 - When: the user opens the project switcher in the header
 - Then: both projects are listed with the same status markers used today (● busy, ! needs attention, ✓ done, +N queued), choosing one selects that project, "Change project…" opens the project chooser, and the selected tab stays the same
+- Implemented (M1): `tests/qml/tst_panel_shell.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S12: Plan shows compact stage rows
 
@@ -97,42 +109,49 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: an agent is producing output and history, git and review entries exist
 - When: the user opens Activity
 - Then: Live / History / Reports and the All / Runs / Git / Reviews / Errors / Reports filters fill the view height, and `Tab`, `h`/`l`, `Ctrl+d`/`Ctrl+u` and the digit filters work there as before
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S17: Architecture holds architecture and review status
 
 - Given: an architecture context with guidance, risks and decisions, role usage totals, and a plan review in round 2
 - When: the user opens Architecture
 - Then: the architecture card, the role token totals and the plan review status with its fix commits are shown there and nowhere on Overview
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S18: Queue and Features are tabs
 
 - Given: two queued goals and at least one feature spec
 - When: the user opens Queue, then Features
 - Then: Queue shows the list with Start queue, ↑, ↓ and ×, the Queue tab label shows the count, and Features shows the existing feature list with its actions and shortcuts
+- Implemented (M1): `tests/qml/tst_panel_queue.qml`, `tests/panel_redesign_m1.test.mjs`
 
 ## S19: Pushed pages return to their tab
 
 - Given: the user is on Plan
 - When: the user opens the diff viewer, the discussion chat, model settings, the project chooser or keyboard help, and closes it with q, Escape or Back
 - Then: the panel returns to Plan with its selection and scroll position intact
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S20: State survives polling and reopening
 
 - Given: the user is on Activity reading older history
 - When: several polling refreshes arrive, and later the panel is closed and reopened
 - Then: the tab and reading position do not change during polling, and reopening shows Activity again
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S21: Every existing shortcut still works
 
 - Given: the keyboard help list from before the redesign
 - When: each shortcut is pressed in the view that shows its target
 - Then: it performs the same action as before, keyboard help lists every old shortcut plus the new view keys, and the bottom hint line names the current view's keys
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S22: Views live in their own files
 
 - Given: milestone M1 is complete
 - When: the `quickshell/` directory is inspected
 - Then: each tab view is a separate QML file, `Panel.qml` holds engine state, polling, API actions and navigation and is under 1,800 lines, and all `node --test tests/*.test.mjs`, `qmltestrunner -input tests/qml` and `cargo test` checks pass
+- Implemented (M1): `tests/panel_redesign_m1.test.mjs`
 
 ## S23: Stage detail lives in its own file
 

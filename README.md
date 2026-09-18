@@ -405,10 +405,9 @@ A `ready` result adds `goal` (the trimmed rewrite); a `failed` result adds `erro
 
 Before creating a plan, you can have a multi-turn conversation with the configured
 planner tool about the repository and possible solutions. Click the **Discuss before
-planning** entry point in the panel to open a dedicated chat view showing the full
-discussion. The chat replaces the visible panel content while it is open: the goal
-field, the plan and stage list, the action buttons, the feedback field, the
-architecture review, the agent output and the keyboard hint are all hidden, and the
+planning** entry point on the Overview tab (or press `t`) to open a dedicated chat view showing the full
+discussion. The chat replaces the visible panel content while it is open: the header, tab bar,
+the current view and the keyboard hint are all hidden, and the
 chat view alone fills the window. Type a message into the composer and click
 **Send**, or press `Enter`.
 The planner reads the repository read-only and replies in a normal back-and-forth
@@ -709,7 +708,7 @@ All these artefacts remain inside the existing `.forge` commit exclusion.
 ### Asking about the plan
 
 Type a question about the current plan into the field beside **Plan Q&A**
-in the panel, then click **Ask** or press `Enter`. The selected planner tool
+on the Plan tab, then click **Ask** or press `Enter`. The selected planner tool
 answers without modifying the plan. Its prompt receives only the plan's
 content — goal, stages, instructions, acceptance criteria, commit messages,
 status and explicit dependencies — not model selection, agreement,
@@ -809,7 +808,7 @@ The append log is not an exactly-once completion ledger: explicitly rerunning a
 completed plan can append another report for the same plan/revision.
 
 `GET /api/state` returns the last 100 reports for the project under `reports`
-(an empty array when none exist). In the panel, open **History** and select
+(an empty array when none exist). In the panel, open the **Activity** tab, choose **History** and select
 **reports** to see completed tasks with their duration, commit count, and
 token totals per tool. Expand a task to see commit SHAs and messages, input/output/total
 counts, call counts, model totals, separate planner and role usage, architecture,
@@ -820,8 +819,8 @@ also show token summaries when available.
 
 ## Queue
 
-Add multiple goals from the panel's queue section, reorder them, then
-start the queue. Forge processes one goal at a time through the same
+Add multiple goals with **Add to queue** on the Overview tab, reorder them on the
+Queue tab, then start the queue. Forge processes one goal at a time through the same
 plan → approve → run loop above.
 
 The `queue_auto_approve` setting is off by default: Forge pauses at each
@@ -841,13 +840,13 @@ Approving or running a saved plan for a later queued goal cannot bypass this ord
 
 Successfully completed goals are removed from the queue automatically.
 Failed or blocked goals stay visible until you dismiss them with their
-**×** remove button in the panel. Removing a failed or blocked goal explicitly
+**×** remove button on the Queue tab. Removing a failed or blocked goal explicitly
 allows the following goal to proceed; do this only when intentionally abandoning
 that prerequisite. Pending goals can be reordered within a pending group, but
 cannot be moved across a blocked, failed, or active goal.
 
-Queue state lives in `.forge/queue.json` in the project. The panel shows
-each item's status; the bar widget shows the pending count and a queue tooltip.
+Queue state lives in `.forge/queue.json` in the project. The Queue tab shows
+each item's status and its label shows the count; the bar widget shows the pending count and a queue tooltip.
 
 The JSON API accepts POST requests to `/api/queue/add` with `{"goal":"…"}`,
 `/api/queue/remove` with `{"id":1}`, and `/api/queue/move` with
@@ -1011,10 +1010,10 @@ status to `draft` on the next read, while every earlier review and approval rema
 new approving review and a new spec approval are required before approving again.
 
 The panel lists discovered features with their title, slug, validation status and spec-phase status
-(with reasons for invalid ones), opened with the **Features** button or the `f` key; see
-[Feature list](#feature-list) below for its overlay controls. Opening a feature runs
-`omarchy-launch-editor <folder>` to edit it in nvim. The panel fetches features when the overlay opens or
-refreshes; while a chat or review request it started is still running, it also polls `GET /api/features`
+(with reasons for invalid ones), opened with the **Features** tab, the `f` key or `g f`; see
+[Feature list](#feature-list) below for its controls. Opening a feature runs
+`omarchy-launch-editor <folder>` to edit it in nvim. The panel fetches features when the tab is shown or
+refreshed; while a chat or review request it started is still running, it also polls `GET /api/features`
 (and the selected feature's state) once a second until that activity is ready or failed.
 
 From the feature list you can create a feature (slug and title), select one to see its detail — the
@@ -1066,8 +1065,57 @@ The Omarchy plugin (`manifest.json`, `quickshell/`) provides the bar
 widget and the Forge panel: pick planner/architect/implementer/reviewer, set the
 project path, type the goal, create the plan, approve, start.
 
-The settings row has **architect review: per stage | per plan** and
-**reviewer review: per stage | per plan** controls. Each reflects the current
+### Panel layout
+
+The panel is a compact tabbed window instead of one long page. A fixed header and
+tab bar stay in place while each view scrolls on its own, only when its content is
+taller than the window. The design and scenarios are in
+[`docs/features/panel-redesign/`](docs/features/panel-redesign/).
+
+- **Header:** `FORGE`, the project switcher, the phase badge, the current step
+  and the `⋯` menu. The switcher shows the current project name and `N projects`
+  when several sessions exist. Its dropdown lists every session with its status
+  marker (`●` busy, `!` needs attention, `✓` done, `+N` queued), the full path of
+  the active project, and **Change project…**. Choosing a session selects that
+  project and keeps the current tab. The `N projects active` indicator for
+  background work stays in the header.
+- **`⋯` menu:** Update Forge, Discard plan, Refactor plan, View diff, Change project
+  and Keyboard help. Items use the same enabled rules as the old buttons.
+- **Tab bar:** Overview · Plan · Activity · Architecture · Features · Queue (with
+  the queued count) · Settings. The selected tab is underlined. Every tab view is
+  a persistent instance that is shown or hidden, never rebuilt, so the tab, reading
+  positions and drafts survive polling, project switches and reopening the panel.
+  A new panel starts on Overview.
+- **Overview:** the goal, the phase's actions and a status summary. While Forge is
+  busy it shows a "now working" card (stage, role, tool, model, elapsed time,
+  latest output line), a one-line progress summary, one compact line per stage
+  (click to open it in Plan) and **Stop**. While idle it shows the goal field with
+  **Create plan**, **Discuss first**, **Enhance with AI** and **Add to queue**, a
+  short last-run card and the one-line quota summary. Only actions that are enabled
+  in the current phase are shown as buttons; the others stay reachable from their
+  own view or the `⋯` menu.
+- **Plan:** the stage list with plan editing, the plan Q&A and the “what should be
+  improved” feedback field with **Improve with AI**, plus **Approve**, **Start**
+  and **Edit plan** while they apply.
+- **Activity:** Live, History and Reports with their filters, using the full
+  height of the view.
+- **Architecture:** the architecture card, role token totals, and the plan review
+  status with its fix commits and history.
+- **Features:** the feature specs list (see [Feature list](#feature-list)).
+- **Queue:** the queue with **Start queue**, ↑, ↓ and ×.
+- **Settings:** planner, architect, implementer, reviewer, automatic routing,
+  architect review, reviewer review, push at end and auto-approve as label/value
+  rows that cycle on click; the quota and model catalogue summaries with their
+  errors, **Model settings & options**, **Refresh models**, **Cancel refresh**,
+  **Refresh Claude limits**, **Update Forge** and **Change project**.
+
+Pushed pages (discussion chat, model settings, diff viewer, project chooser and
+keyboard help) sit on top of the current tab; closing one returns to the same tab
+with its selection and scroll position intact. The bottom hint line names the
+current view's keys.
+
+The Settings tab has **architect review: per stage | per plan** and
+**reviewer review: per stage | per plan** rows. Each reflects the current
 setting, initially **per plan** for both roles on engine startup, and shows an
 unavailable placeholder before settings arrive. Each toggles only its role while
 posting both cadence keys. They are disabled offline;
@@ -1215,27 +1263,33 @@ The panel uses vim-inspired normal and insert modes. In normal mode, `i`
 focuses the goal for typing; clicking a text field also enters insert mode.
 `Escape` leaves the field, or closes the top overlay when already in normal mode.
 
-Open keyboard help with the `? Help` button in the panel header or by clicking the
-mode hint at the bottom of the panel, which says "click here or press ? (Shift+/)
-or F1 for keyboard help" and underlines on hover.
+Open keyboard help with **Keyboard help** in the `⋯` menu or by clicking the
+hint line at the bottom of the panel, which underlines on hover. The hint line names
+the keys of the current view, for example `NORMAL · g o/p/a/r/f/q/s or [ ] switch
+views · j/k select · Enter open · ? help`, and reads `INSERT - Esc to normal mode`
+while a text field has focus.
 
-Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
+Actions follow the buttons’ enabled state. Uppercase keys use `Shift`. Keys act on the
+view that shows their target and select that view: stage keys select Plan, and
+`Tab`, `h`/`l`, `Ctrl+d`/`Ctrl+u` and the digit filters select Activity.
 
 #### Panel (normal mode)
 
 | Key | Action |
 | --- | --- |
+| `[` / `]` | Switch to the previous / next view tab |
+| `g` then `o` / `p` / `a` / `r` / `f` / `q` / `s` | Go to Overview / Plan / Activity / Architecture / Features / Queue / Settings; `gg` is unchanged |
 | `i` | Edit the goal (insert mode) |
 | `I` | Edit plan feedback (insert mode); Enter improves with AI |
 | `Escape` | Leave a text field, close the top overlay, or cancel plan editing |
-| `j` / `k` | Select next / previous stage |
+| `j` / `k` | Select next / previous stage (a row on Settings, a report in Reports) |
 | `gg` / `G` | Select first / last stage |
 | `Enter` / `o` / `Space` | Expand or collapse the whole selected stage card; focus its title when editing |
 | `Tab` | Toggle Live / History |
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
-| `Page Down` / `Page Up` | Scroll the whole panel down / up |
-| `Home` / `End` | Jump to the top / bottom of the panel |
+| `Page Down` / `Page Up` | Scroll the current view down / up |
+| `Home` / `End` | Jump to the top / bottom of the current view |
 | `1` / `2` / `3` / `4` / `5` | History: All / Runs / Git / Reviews / Errors |
 | `6` | History: Reports (when reports exist) |
 | `p` | Create plan from goal |
@@ -1248,7 +1302,7 @@ Actions follow the buttons’ enabled state. Uppercase keys use `Shift`.
 | `x` | Stop run or active queue |
 | `d` | Open uncommitted diff |
 | `c` | Change project |
-| `f` | Open feature list |
+| `f` | Open the Features tab |
 | `?` (`Shift+/`) / `F1` | Open keyboard help |
 
 #### Diff viewer
@@ -1276,7 +1330,7 @@ text fields; the shortcuts below apply in normal mode.
 | `a` | Approve the selected feature's spec |
 | `A` | Approve the selected feature's scenarios |
 | `R` | Refresh the feature list |
-| `q` / `Escape` | Close the feature list |
+| `q` / `Escape` | Return to the tab shown before Features |
 
 #### Project chooser
 
@@ -2082,9 +2136,7 @@ cargo build --offline
 cargo test --offline
 node --test tests/*.test.mjs bridges/claude-models/discovery.test.mjs
 omarchy plugin validate "$PWD"
-/usr/lib/qt6/bin/qmlformat quickshell/Panel.qml > /dev/null
-/usr/lib/qt6/bin/qmlformat quickshell/BarWidget.qml > /dev/null
-/usr/lib/qt6/bin/qmlformat quickshell/DetailFields.qml > /dev/null
+for file in quickshell/*.qml; do /usr/lib/qt6/bin/qmlformat "$file" > /dev/null; done
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
   /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 python3 tests/run_compact_clipboard.py

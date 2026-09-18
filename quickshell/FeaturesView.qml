@@ -95,6 +95,32 @@ Rectangle {
     return rows[featuresList.currentIndex] || null
   }
 
+  // Normal-mode keys while the Features tab is shown. Returns the pending key
+  // prefix ("g" after a first g).
+  function handleKey(event) {
+    const row = currentRow()
+    if (event.key === Qt.Key_Escape) {
+      view.closeRequested()
+    } else if (event.modifiers === Qt.ShiftModifier) {
+      if (event.key === Qt.Key_R && !view.pending) view.refreshRequested()
+      else if (event.key === Qt.Key_A && row) view.approveScenariosRequested(row)
+    } else if (event.modifiers === Qt.NoModifier) {
+      if (event.key === Qt.Key_Q) view.closeRequested()
+      else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
+        featuresList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
+      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
+        featuresList.activateSelection()
+      else if (event.key === Qt.Key_N) openNewFeatureForm()
+      else if (event.key === Qt.Key_C && row) {
+        view.featureSelected(row)
+        focusChatInput()
+      } else if (event.key === Qt.Key_V && row) view.reviewRequested(row)
+      else if (event.key === Qt.Key_A && row) view.approveSpecRequested(row)
+      else if (event.key === Qt.Key_G) return "g"
+    }
+    return ""
+  }
+
   function submitChatMessage(feature) {
     const message = chatMessageFieldItem.text.trim()
     const target = feature || (view.selectedSlug !== "" ? { slug: view.selectedSlug } : null)
