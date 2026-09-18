@@ -171,15 +171,96 @@ Flickable {
     }
 
     SectionTitle { text: "MODELS & LIMITS" }
-    Text {
+    Item {
+      id: quotaSummary
+
+      readonly property var quotaWithoutError: view.quota ? Object.assign({}, view.quota, {error: ""}) : null
+      property bool expanded: false
+
       objectName: "quotaSummary"
       width: parent.width
-      text: UsageFormat.quotaSummary(view.quota ? Object.assign({}, view.quota, {error: ""}) : null)
-      textFormat: Text.PlainText
-      color: view.foreground
-      wrapMode: Text.Wrap
-      font.family: view.fontFamily
-      font.pixelSize: view.fontSize12
+      height: quotaColumn.implicitHeight
+
+      Column {
+        id: quotaColumn
+
+        width: parent.width
+        spacing: view.spacing / 4
+
+        // One elided line per usage window; the full text is the tooltip and the details.
+        Repeater {
+          model: UsageFormat.quotaCompactLines(quotaSummary.quotaWithoutError)
+
+          Text {
+            id: quotaLine
+
+            required property string modelData
+
+            objectName: "quotaLine"
+            width: quotaColumn.width
+            text: modelData
+            textFormat: Text.PlainText
+            maximumLineCount: 1
+            elide: Text.ElideRight
+            color: view.foreground
+            font.family: view.fontFamily
+            font.pixelSize: view.fontSize12
+            ToolTip.text: UsageFormat.quotaSummary(quotaSummary.quotaWithoutError)
+            ToolTip.visible: quotaHover.hovered
+            ToolTip.delay: 500
+
+            HoverHandler {
+              id: quotaHover
+            }
+          }
+        }
+        Rectangle {
+          id: quotaToggle
+
+          objectName: "quotaDetailsToggle"
+          width: toggleLabel.implicitWidth + view.horizontalPadding
+          height: toggleLabel.implicitHeight + view.verticalPadding / 2
+          radius: 4
+          color: view.surface
+          border.width: 1
+          border.color: activeFocus ? view.accent : view.surface
+          activeFocusOnTab: true
+          onActiveFocusChanged: if (activeFocus) view.detailRevealed(quotaToggle)
+          Keys.onPressed: event => {
+            if (event.key === Qt.Key_Escape) view.leaveRequested()
+            else if (event.key === Qt.Key_Space || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              if (!event.isAutoRepeat) quotaSummary.expanded = !quotaSummary.expanded
+            } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) return
+            event.accepted = true
+          }
+
+          Text {
+            id: toggleLabel
+
+            anchors.centerIn: parent
+            text: (quotaSummary.expanded ? "▾" : "▸") + " details"
+            textFormat: Text.PlainText
+            color: view.mutedForeground
+            font.family: view.fontFamily
+            font.pixelSize: view.fontSize11
+          }
+          MouseArea {
+            anchors.fill: parent
+            onClicked: quotaSummary.expanded = !quotaSummary.expanded
+          }
+        }
+        Text {
+          objectName: "quotaDetails"
+          width: quotaColumn.width
+          visible: quotaSummary.expanded
+          text: UsageFormat.quotaSummary(quotaSummary.quotaWithoutError)
+          textFormat: Text.PlainText
+          color: view.mutedForeground
+          wrapMode: Text.Wrap
+          font.family: view.fontFamily
+          font.pixelSize: view.fontSize11
+        }
+      }
     }
     SettingsDetail {
       visible: view.quota ? !!view.quota.error : false

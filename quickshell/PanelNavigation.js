@@ -37,6 +37,27 @@ function stepTab(id, step) {
   return tabs[(at + step % tabs.length + tabs.length) % tabs.length]
 }
 
+var stageDetailTabs = ["instructions", "acceptance", "review", "routing", "output"]
+
+var stageDetailTabLabels = {
+  instructions: "Instructions",
+  acceptance: "Acceptance",
+  review: "Review",
+  routing: "Routing",
+  output: "Output"
+}
+
+// The stage index after moving by step, clamped to the plan; -1 when there are no stages.
+function stepStageIndex(count, index, step) {
+  return count > 0 ? Math.max(0, Math.min(count - 1, index + step)) : -1
+}
+
+// The previous (step -1) or next (step +1) stage detail sub-tab, wrapping around.
+function stepDetailTab(id, step) {
+  const at = Math.max(0, stageDetailTabs.indexOf(id))
+  return stageDetailTabs[(at + step % stageDetailTabs.length + stageDetailTabs.length) % stageDetailTabs.length]
+}
+
 function tabForGKey(letter) {
   return Object.prototype.hasOwnProperty.call(gKeys, letter) ? gKeys[letter] : ""
 }
@@ -52,17 +73,20 @@ function sessionMarker(session) {
 
 var viewHints = {
   overview: "j/k select · Enter open · i goal · p plan · x stop",
-  plan: "j/k select · Enter open · e edit · I feedback",
+  plan: "j/k select stage · Enter open detail · e edit · I feedback",
   activity: "Tab/h/l live/history · 1-6 filter · Ctrl+d/u scroll · j/k report",
   architecture: "PgDn/PgUp scroll · Home/End",
   features: "j/k select · Enter open · n new · c chat · v review · a approve",
   queue: "PgDn/PgUp scroll · x stop · d diff · c project",
-  settings: "j/k select · Enter toggle · c project · d diff"
+  settings: "j/k select · Enter toggle · c project · d diff",
+  stageDetail: "h/l sub-tab · [ ] prev/next stage · q/Esc back to Plan"
 }
 
 function hintText(tab, insertMode) {
   if (insertMode) return "INSERT - Esc to normal mode"
-  return "NORMAL · g o/p/a/r/f/q/s or [ ] switch views · " + (viewHints[tab] || viewHints.overview) + " · ? help"
+  // On stage detail [ ] move between stages, so the view-switch text would be wrong there.
+  const views = tab === "stageDetail" ? "g o/p/a/r/f/q/s switch views · " : "g o/p/a/r/f/q/s or [ ] switch views · "
+  return "NORMAL · " + views + (viewHints[tab] || viewHints.overview) + " · ? help"
 }
 
 function helpRows() {
@@ -98,6 +122,11 @@ function helpRows() {
     { key: "g o / p / a / r / f / q / s", description: "Go to Overview / Plan / Activity / Architecture / Features / Queue / Settings; gg is unchanged" },
     { key: "PgDn / PgUp / Home / End", description: "Scroll the current view (Activity scrolls with Ctrl+d / Ctrl+u)" },
     { key: "Tab / h / l / 1-6", description: "Act on Activity, the view that shows the output: Live / History and the History filters" },
+    { key: "Enter / click", description: "Plan: open the selected stage's detail page" },
+    { key: "", description: "Stage detail" },
+    { key: "[ / ]", description: "Previous / next stage" },
+    { key: "h / l", description: "Previous / next sub-tab: Instructions / Acceptance / Review / Routing / Output" },
+    { key: "q / Escape", description: "Back to Plan with the stage selected" },
     { key: "", description: "Diff viewer" },
     { key: "j / k", description: "Scroll down / up" },
     { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },

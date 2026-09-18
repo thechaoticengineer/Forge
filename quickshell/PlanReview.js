@@ -108,3 +108,20 @@ function planReviewStatusText(review) {
         + fixCommitsText(review)
         + (review.fix_sha ? "\nFinal fix commit: " + review.fix_sha : "")
 }
+
+// The one-line plan review strip of the Plan tab: verdict, round and both role outcomes.
+// The gate role "reviewer" is shown as Independent.
+function planReviewStripText(review) {
+    if (!review) return ""
+    const roles = (review.gate || {}).roles || {}
+    function outcome(role) {
+        const value = roles[role]
+        return value === "approved" ? "✓" : value === "changes_requested" ? "✗"
+            : value === "not_required" ? "not required" : value || "unavailable"
+    }
+    const round = typeof review.rounds === "number" ? review.rounds : "—"
+    const maximum = typeof review.budget === "number" ? review.budget + 1 : "—"
+    return "Plan review · " + (review.status || "unavailable")
+        + " · round " + round + " of " + maximum
+        + " · architect " + outcome("architect") + " independent " + outcome("reviewer")
+}

@@ -51,6 +51,34 @@ function quotaLine(quota) {
     }).join(" · ") + (quota.status === "stale" ? " · previous reading" : "")
 }
 
+// One single line per quota window for Settings: "<name> <N>% remaining · resets <Ddd HH:MM>".
+// The full text stays in quotaSummary.
+var weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+function twoDigits(value) {
+    return (value < 10 ? "0" : "") + value
+}
+
+function quotaResetText(window) {
+    const seconds = typeof window.resets_unix === "number" && window.resets_unix > 0 ? window.resets_unix
+        : window.resets_at ? Date.parse(window.resets_at) / 1000 : NaN
+    if (!isFinite(seconds)) return ""
+    const date = new Date(seconds * 1000)
+    return " · resets " + weekdayNames[date.getDay()] + " " + twoDigits(date.getHours()) + ":" + twoDigits(date.getMinutes())
+}
+
+function quotaCompactLines(quota) {
+    const windows = quota && quota.status !== "pending" && quota.status !== "unavailable" ? quota.windows || [] : []
+    if (!windows.length) return [quotaSummary(quota).split("\n")[0]]
+    return windows.map(function(window) {
+        const expired = window.resets_unix && window.resets_unix * 1000 <= Date.now()
+        const remaining = expired ? "awaiting refresh" : typeof window.used_percent === "number"
+            ? Math.max(0, 100 - window.used_percent).toFixed(0) + "% remaining" : "remaining unknown"
+        return String(window.name).replace(/\s+/g, " ") + " " + remaining + (expired ? "" : quotaResetText(window))
+            + (quota.status === "stale" ? " · previous reading" : "")
+    })
+}
+
 function usageSummary(usage) {
     return usageTools(usage).map(function(tool) {
         return tool + " " + formatTokens(usage[tool].total_tokens) + " tok"
