@@ -28,6 +28,8 @@ Item {
     property real agentNow: 100
     property int selectedStageIndex: 0
     property bool reportsVisible: false
+    // The stage keys act on the Plan tab, which shows the stages.
+    property string currentTab: "plan"
     property int leakedKeys: 0
     Keys.onPressed: event => { leakedKeys++; event.accepted = true }
     // PANEL_STAGE_STATE

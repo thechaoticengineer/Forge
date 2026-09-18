@@ -8,7 +8,10 @@ const architectureView = read('ArchitectureReviewView.qml');
 const catalogueView = read('CatalogueEditor.qml');
 const diffView = read('DiffView.qml');
 const reportsView = read('ReportsView.qml');
-const markup = panel + architectureView + catalogueView + diffView + reportsView;
+// The settings and plan surfaces moved into their tab views.
+const settingsView = read('SettingsView.qml');
+const planView = read('PlanView.qml');
+const markup = panel + architectureView + catalogueView + diffView + reportsView + settingsView + planView;
 vm.runInNewContext(read('PanelDetails.js'), fields);
 vm.runInNewContext(read('DetailText.js'), preview);
 for (const helper of ['ModelRouting.js','ReportFormat.js','UsageFormat.js','CataloguePresentation.js'])

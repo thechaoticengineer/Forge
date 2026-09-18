@@ -51,6 +51,16 @@ Item {
         planStatus: null, goalText: "", feedbackText: "", questionText: "", goalEnhancePending: false,
         hasQueuedGoals: hasQueuedGoals})
     property int actions: 0
+    // The settings rows keep their keyboard selection in the view; the fixture
+    // exercises focus and key activation, so nothing is selected by j/k here.
+    property int selectedIndex: -1
+    property var rows: []
+    property bool catalogueOpen: false
+    function cycleTool(key) { actions++; settingsPatch = {[key]: "codex"} }
+    function cycleReviewer() { actions++ }
+    function openCatalogue() { catalogueOpen = true }
+    function openChooser() { actions++ }
+    function reviewerLabel() { return "reviewer: codex" }
     property string mode: "architecture"
     function fs(n) { return n }
     property var settingsPatch: null
@@ -154,9 +164,10 @@ Item {
         function test_cadence_keyboard() {
             root.mode="cadence";root.engineOnline=true
             root.engineState={settings:{review_cadence:{architect:"per_stage",reviewer:"per_plan"}}};wait(30)
-            const architect=named(root,"architectCadence"), reviewer=named(root,"reviewerCadence")
-            compare(architect.label,"architect review: per stage")
-            compare(reviewer.label,"reviewer review: per plan")
+            // The cadence controls are Settings rows now: label and cadence value, same keys.
+            const architect=named(root,"settingRow_architect_review"), reviewer=named(root,"settingRow_reviewer_review")
+            compare(architect.label,"architect review");compare(architect.value,"per stage")
+            compare(reviewer.label,"reviewer review");compare(reviewer.value,"per plan")
             keyHandler.forceActiveFocus();keyClick(Qt.Key_Tab);wait(20)
             verify(architect.activeFocus,"Tab reaches architect cadence")
             keyClick(Qt.Key_Space);compare(root.actions,1)
@@ -175,7 +186,7 @@ Item {
                 "disabled cadence remains focusable for Escape routing")
             keyClick(Qt.Key_Enter);compare(root.actions,3)
             keyClick(Qt.Key_Escape);verify(keyHandler.activeFocus)
-            root.engineState=null;wait(20);verify(architect.label.indexOf("unavailable")>0)
+            root.engineState=null;wait(20);verify(architect.value.indexOf("unavailable")>=0)
             root.engineOnline=true
         }
         function test_plan_review_full_requests_data() {

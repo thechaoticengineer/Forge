@@ -12,6 +12,8 @@ import tempfile
 repo = Path(__file__).resolve().parents[1]
 panel = (repo / 'quickshell/Panel.qml').read_text()
 architecture_view = (repo / 'quickshell/ArchitectureReviewView.qml').read_text()
+settings_view = (repo / 'quickshell/SettingsView.qml').read_text()
+plan_view = (repo / 'quickshell/PlanView.qml').read_text()
 catalogue_editor = (repo / 'quickshell/CatalogueEditor.qml').read_text()
 reports_view = (repo / 'quickshell/ReportsView.qml').read_text()
 
@@ -51,23 +53,53 @@ def block(source, marker, kind):
 helpers = between('  function revealDetail(', '  function reviewScope(')
 helpers += between('  function canMoveQueueGoal(', '  readonly property string phase:')
 helpers += between('  property var reportIdentityCache:', '  property var reviewViews:')
-helpers += between('  component CadenceButton:', '\n}')
+# The cadence controls are Settings rows now: the row component, the two cadence
+# rows and Panel.qml's own mapping from a row to the cadence call.
+setting_row = settings_view[settings_view.index('  component SettingRow:'):settings_view.index('  component SettingsDetail:')]
+setting_row = re.sub(r'\bview\.', 'root.', setting_row)
+setting_row = setting_row.replace('settingsColumn.width', 'root.width')
+setting_row = setting_row.replace('root.settingActivated(key)', 'root.settingActivated(key)')
+setting_row = setting_row.replace('root.detailRevealed(row)', 'root.revealDetail(row)')
+setting_row = setting_row.replace('root.leaveRequested()', 'keyHandler.forceActiveFocus()')
+setting_row = setting_row.replace('root.horizontalPadding', 'style.space(18)')
+setting_row = setting_row.replace('root.verticalPadding', 'style.space(10)')
+setting_row = setting_row.replace('root.spacing', 'style.space(8)')
+setting_row = setting_row.replace('root.fontSize12', 'root.fs(12)')
+helpers += setting_row
+settings_mapping = panel[panel.index('              onSettingActivated: key => {'):]
+settings_mapping = settings_mapping[settings_mapping.index('{') + 1:settings_mapping.index('\n              }')]
+helpers += '  function settingActivated(key) {' + settings_mapping + '\n  }\n'
 helpers += between('  readonly property var planReview:', '  property bool chooserOpen:')
 fragments = {
     'PLAN_REVIEW': block(architecture_view, 'id: planReviewSection', 'Column'),
-    'CADENCE': 'CadenceButton { objectName: "architectCadence"; role: "architect" }\nCadenceButton { objectName: "reviewerCadence"; role: "reviewer" }',
+    'CADENCE': '\n'.join(
+        'SettingRow { key: "%s_review"; label: "%s review"; available: root.engineOnline;'
+        ' value: root.reviewCadenceLabel(root.engineState, "%s") }' % (role, role, role)
+        for role in ('architect', 'reviewer')),
     'LOCAL_ERROR': block(panel, 'objectName: "localErrorDetail"', 'PanelDetail'),
     'ARCHITECTURE': block(architecture_view, 'objectName: "architectureDetails"', 'ArchitectureDetails'),
-    'PROVIDERS': block(panel, 'objectName: "providerDetails"', 'PanelFields'),
+    'PROVIDERS': block(settings_view, 'objectName: "providerDetails"', 'SettingsDetail'),
     'OPTIONS': block(catalogue_editor, 'objectName: "catalogueOptions"', 'ViewFields'),
     'SOURCES': block(catalogue_editor, 'objectName: "catalogueSources"', 'ViewFields'),
     'METADATA': block(catalogue_editor, 'objectName: "catalogueMetadata"', 'ViewFields'),
-    'CHAT': block(panel, 'id: chatList', 'Rectangle'),
+    'CHAT': block(plan_view, 'id: chatList', 'Rectangle'),
     'REPORT': block(reports_view, 'id: reportList', 'ListView'),
     'QUEUE': block(panel, 'id: queueView', 'QueueView'),
 }
 # The Queue tab fills its area; in the fixture it sits in a Column like the other subtrees.
 fragments['QUEUE'] = fragments['QUEUE'].replace('anchors.fill: parent', 'width: parent.width\n              height: 320')
+# providerDetails and the plan Q&A moved into SettingsView and PlanView.
+fragments['PROVIDERS'] = fragments['PROVIDERS'].replace('SettingsDetail {', 'PanelFields {\n              width: parent.width')
+fragments['PROVIDERS'] = re.sub(r'\bview\.', 'root.', fragments['PROVIDERS'])
+fragments['CHAT'] = re.sub(r'\bview\.', 'root.', fragments['CHAT'])
+fragments['CHAT'] = fragments['CHAT'].replace('root.chatMaxHeight', 'style.space(96)')
+fragments['CHAT'] = fragments['CHAT'].replace('root.spacing', 'style.space(8)')
+fragments['CHAT'] = fragments['CHAT'].replace('root.detailScope',
+    'JSON.stringify([root.lastProject, root.projectViewRevision, root.plan.plan_id || ""])')
+fragments['CHAT'] = fragments['CHAT'].replace('root.copyRequested(original)', 'clipboard.clipboardText = original')
+fragments['CHAT'] = fragments['CHAT'].replace('root.leaveRequested()', 'keyHandler.forceActiveFocus()')
+fragments['CHAT'] = fragments['CHAT'].replace('root.detailRevealed(control)', 'root.revealDetail(control)')
+fragments['CHAT'] = fragments['CHAT'].replace('root.fs(11)', 'root.fs(11)')
 fragments['PLAN_REVIEW'] = re.sub(r'\bview\.', 'root.', fragments['PLAN_REVIEW'])
 fragments['PLAN_REVIEW'] = fragments['PLAN_REVIEW'].replace('root.planReviewExpansionRequested(expanded)', 'root.planReviewExpanded = expanded')
 fragments['PLAN_REVIEW'] = fragments['PLAN_REVIEW'].replace('root.planReviewLoadRequested()', 'root.loadPlanReviewRequests()')

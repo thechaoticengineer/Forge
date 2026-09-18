@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const panel = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const bar = readFileSync(new URL('../quickshell/BarWidget.qml', import.meta.url), 'utf8');
+const settings = readFileSync(new URL('../quickshell/SettingsView.qml', import.meta.url), 'utf8');
 const ctx = {};
 vm.runInNewContext(readFileSync(new URL('../quickshell/ModelRouting.js', import.meta.url), 'utf8'), ctx);
 vm.runInNewContext(readFileSync(new URL('../quickshell/ReportFormat.js', import.meta.url), 'utf8'), ctx);
@@ -54,12 +55,19 @@ test('cadence controls toggle only their role and post both normalized keys',()=
     assert.equal(cadence.reviewCadenceLabel({settings:{}},role),'… (unavailable)');
     assert.equal(cadence.reviewCadenceLabel({settings:{review_cadence:{[role]:'per_plan'}}},role),'per plan');
     assert.equal(cadence.reviewCadenceLabel({settings:{review_cadence:{[role]:'per_stage'}}},role),'per stage');
-    assert.equal((panel.match(new RegExp('CadenceButton \\{ role: "'+role+'" \\}','g'))||[]).length,1);
+    // The cadence controls are Settings rows now; Panel.qml still owns the toggle.
+    assert.equal((settings.match(new RegExp('key: "'+role+'_review"','g'))||[]).length,1);
+    assert.equal((panel.match(new RegExp('root.toggleReviewCadence\\("'+role+'"\\)','g'))||[]).length,1);
+    assert.ok(settings.includes('value: view.cadenceLabels ? view.cadenceLabels.'+role+' : "…"'));
   }
-  const button=panel.slice(panel.indexOf('  component CadenceButton:'),panel.indexOf('  component PanelButton:'));
-  assert.match(button,/enabled: root.engineOnline/);
-  assert.match(button,/activeFocusOnTab: enabled/);
-  assert.match(button,/root.toggleReviewCadence\(role\)/);
-  for(const key of ['Key_Space','Key_Return','Key_Enter','Key_Tab','Key_Backtab','Key_Escape']) assert.ok(button.includes(key));
-  assert.match(button,/Key_Escape\) keyHandler.forceActiveFocus\(\)/);
+  assert.match(panel,/cadenceLabels: \(\{[\s\S]*?root.reviewCadenceLabel\(root.engineState, "architect"\)/);
+  const row=settings.slice(settings.indexOf('  component SettingRow:'),settings.indexOf('  component SettingsDetail:'));
+  // Each cadence row keeps the old button's engine gate, focus and key behaviour.
+  for(const role of ['architect','reviewer'])
+    assert.match(settings.slice(settings.indexOf('key: "'+role+'_review"')),/^[\s\S]{0,200}?available: view.engineOnline/);
+  assert.match(row,/activeFocusOnTab: available/);
+  assert.match(row,/if \(available\) view.settingActivated\(key\)/);
+  for(const key of ['Key_Space','Key_Return','Key_Enter','Key_Tab','Key_Backtab','Key_Escape']) assert.ok(row.includes(key));
+  assert.match(row,/Key_Escape\) view.leaveRequested\(\)/);
+  assert.match(panel.slice(panel.indexOf('SettingsView {')),/onLeaveRequested: keyHandler.forceActiveFocus\(\)/);
 });

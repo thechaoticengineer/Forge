@@ -57,7 +57,7 @@ var viewHints = {
   architecture: "PgDn/PgUp scroll · Home/End",
   features: "j/k feature · Enter open · n new · c chat · v review · a approve",
   queue: "x stop · d diff · c project",
-  settings: "c project · f features · d diff"
+  settings: "j/k select · Enter toggle · c project · d diff"
 }
 
 function hintText(tab, insertMode) {
