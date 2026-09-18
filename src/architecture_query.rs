@@ -29,9 +29,10 @@ impl Store {
                 stage["model_invocations"] = json!(recent);
             }
             if let Some(history) = stage["reassessment"]["history"].as_array().cloned() {
-                stage["reassessment"]["history_count"] = json!(history.len().max(
-                    stage["reassessment"]["history_count"].as_u64().unwrap_or(0) as usize));
-                stage["reassessment"]["history"] = json!(history.into_iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().map(|mut h| {
+                // The saved count is the true total once older entries are archived.
+                stage["reassessment"]["history_count"] = json!(stage["reassessment"]["history_count"]
+                    .as_u64().map_or(history.len(), |count| (count as usize).max(history.len())));
+                stage["reassessment"]["history"] = json!(history.into_iter().rev().take(crate::app::reassessment::HISTORY_KEEP).collect::<Vec<_>>().into_iter().rev().map(|mut h| {
                     for key in ["old_agreement","new_agreement"] {
                         if h[key].is_object() { h[key] = json!({"id":h[key]["id"],"effective":h[key]["effective"]}); }
                     }
@@ -222,9 +223,15 @@ impl Store {
         }
         f.seek(SeekFrom::Start(cursor)).map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        f.take((end - cursor).min(HISTORY_PAGE_BYTES as u64))
+        (&mut f).take((end - cursor).min(HISTORY_PAGE_BYTES as u64))
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
+        // A committed event may exceed one page (up to the event limit, for
+        // example with archived reassessment history); such a page holds it alone.
+        if !bytes.contains(&b'\n') && cursor + (bytes.len() as u64) < end {
+            let rest = (end - cursor - bytes.len() as u64).min((EVENT_LIMIT - bytes.len()) as u64);
+            f.take(rest).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        }
         let mut items = Vec::new();
         let mut next = cursor;
         let mut expanded_bytes = 0;

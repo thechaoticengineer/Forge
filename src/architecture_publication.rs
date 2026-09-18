@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::reassessment;
 use crate::durable_json::{publish_pretty, publish_pretty_checked};
 use crate::util::unix_timestamp;
 use std::fs::OpenOptions;
@@ -119,20 +120,43 @@ impl Store {
         } else {
             0
         };
-        let event = json!({"version": VERSION, "id": identity(), "plan_id": id,
-            "revision": revision, "unix": unix_timestamp(), "checkpoint": token, "payload": payload});
         // Plan verdicts are retrieved only through history. Admit them only if
         // their lossless stored form fits one existing page; expansion keeps its
         // separate 4 MiB limit. Reject before publishing any event or reference.
-        let event_limit = if event["payload"]["kind"] == "plan_review" {
+        let event_limit = if payload["kind"] == "plan_review" {
             HISTORY_PAGE_BYTES
         } else { EVENT_LIMIT };
-        let stored_event = storage::pack(&event, event_limit - 1, "architecture event")?;
-        let mut bytes = serde_json::to_vec(&stored_event).map_err(|e| e.to_string())?;
-        bytes.push(b'\n');
-        if bytes.len() > EVENT_LIMIT {
-            return Err("oversized architecture event".into());
-        }
+        // Older reassessment history moves, complete, into this event. A batch
+        // that does not fit shrinks; the remainder drains on later publications.
+        let saved = old.as_ref().filter(|_| same);
+        let mut batch = reassessment::ARCHIVE_MAX_ENTRIES;
+        let bytes = loop {
+            let mut bounded = plan.clone();
+            let archived = reassessment::archive_history(&mut bounded, saved, batch, reassessment::ARCHIVE_MAX_BYTES);
+            let moved: usize = archived.iter().map(|a| a["entries"].as_array().map_or(0, Vec::len)).sum();
+            let mut payload = payload.clone();
+            if moved > 0 {
+                payload["archived_reassessment_history"] = json!(archived);
+            }
+            let event = json!({"version": VERSION, "id": identity(), "plan_id": id,
+                "revision": revision, "unix": unix_timestamp(), "checkpoint": token, "payload": payload});
+            let stored = storage::pack(&event, event_limit - 1, "architecture event").and_then(|stored| {
+                let mut bytes = serde_json::to_vec(&stored).map_err(|e| e.to_string())?;
+                bytes.push(b'\n');
+                if bytes.len() > EVENT_LIMIT {
+                    return Err("oversized architecture event".into());
+                }
+                Ok(bytes)
+            });
+            match stored {
+                Ok(bytes) => {
+                    plan = bounded;
+                    break bytes;
+                }
+                Err(_) if moved > 0 => batch = moved - 1,
+                Err(error) => return Err(error),
+            }
+        };
         let end = start
             .checked_add(bytes.len() as u64)
             .ok_or("event position overflow")?;

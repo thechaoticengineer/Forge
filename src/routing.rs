@@ -857,7 +857,7 @@ impl Ctx {
                 if plan["stages"][idx]["reassessment"]["pending"].is_object() {
                     let state = &mut plan["stages"][idx]["reassessment"];
                     let pending = state["pending"].clone();
-                    state["history"].as_array_mut().unwrap().push(json!({"kind":pending["kind"],"evidence":pending["evidence"],"old_agreement":pending["old_agreement"],"new_agreement":record,"planner_reason":record["planner_reason"],"architect_reason":record["architect_reason"]}));
+                    crate::app::reassessment::push_history(state, json!({"kind":pending["kind"],"evidence":pending["evidence"],"old_agreement":pending["old_agreement"],"new_agreement":record,"planner_reason":record["planner_reason"],"architect_reason":record["architect_reason"]}));
                     state.as_object_mut().unwrap().remove("pending");
                     state["status"] = json!("reusing");
                 }

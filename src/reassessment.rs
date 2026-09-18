@@ -81,6 +81,116 @@ fn parse_outcome(plan: &Value, idx: usize, turn: &str, text: &str) -> Result<Opt
     Ok(Some(o))
 }
 
+/// Stage reassessment history entries kept in the saved plan. Older entries
+/// move, complete, to the architecture event log when the plan is published.
+pub(crate) const HISTORY_KEEP: usize = 4;
+/// Per-publication archive batch, well inside the 512 KiB event limit.
+pub(crate) const ARCHIVE_MAX_ENTRIES: usize = 32;
+pub(crate) const ARCHIVE_MAX_BYTES: usize = 128 * 1024;
+
+/// Give legacy or partially migrated stage history strictly increasing `seq`
+/// values, a true `history_count` and a watermark, without reordering entries.
+pub(crate) fn normalize_history(state: &mut Value) {
+    if !state.is_object() {
+        return;
+    }
+    if !state["history"].is_array() {
+        state["history"] = json!([]);
+    }
+    let watermark = state["history_archived_through"].as_u64().unwrap_or(0);
+    let len = state["history"].as_array().unwrap().len() as u64;
+    let count = state["history_count"].as_u64().unwrap_or(len).max(len);
+    let history = state["history"].as_array_mut().unwrap();
+    // Valid positions are kept. A missing, duplicate or decreasing one follows
+    // its predecessor; a leading one follows the archived or dropped prefix.
+    let mut previous: Option<u64> = None;
+    for entry in history.iter_mut() {
+        let floor = previous.map_or(0, |p| p + 1);
+        let seq = match entry["seq"].as_u64() {
+            Some(seq) if seq >= floor => seq,
+            _ => previous.map_or(watermark.max(count - len), |p| p + 1),
+        };
+        if entry.is_object() {
+            entry["seq"] = json!(seq);
+        }
+        previous = Some(seq);
+    }
+    state["history_count"] = json!(count.max(previous.map_or(0, |p| p + 1)));
+    state["history_archived_through"] = json!(watermark);
+}
+
+/// Append a stage reassessment history entry with the next monotonic position.
+pub(crate) fn push_history(state: &mut Value, entry: Value) {
+    normalize_history(state);
+    let seq = state["history_count"].as_u64().unwrap();
+    let mut entry = entry;
+    entry["seq"] = json!(seq);
+    state["history"].as_array_mut().unwrap().push(entry);
+    state["history_count"] = json!(seq + 1);
+}
+
+/// Bound every stage's history for publication. Entries at or above the
+/// effective watermark (the maximum of this copy's and the saved same-attempt
+/// stage's) stay; entries below it were archived already and are dropped, so a
+/// stale copy republishes idempotently. At most `max_entries` of the oldest
+/// excess entries, within `max_bytes` (the first is always admitted so one large
+/// entry cannot stall draining), are removed and returned grouped by stage.
+pub(crate) fn archive_history(
+    plan: &mut Value,
+    saved: Option<&Value>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Vec<Value> {
+    let mut archived = Vec::new();
+    let (mut entries_left, mut bytes) = (max_entries, 0usize);
+    let Some(stages) = plan["stages"].as_array_mut() else {
+        return archived;
+    };
+    for stage in stages {
+        if !stage["reassessment"]["history"].is_array() {
+            continue;
+        }
+        let (id, attempt) = (stage["id"].clone(), stage["reassessment"]["attempt_id"].clone());
+        let state = &mut stage["reassessment"];
+        normalize_history(state);
+        // A reset attempt restarts its positions; only the same attempt's saved
+        // watermark describes these entries.
+        let saved_state = saved
+            .and_then(|p| p["stages"].as_array())
+            .and_then(|s| s.iter().find(|s| s["id"] == id))
+            .map(|s| &s["reassessment"])
+            .filter(|s| s["attempt_id"] == attempt);
+        let mut watermark = state["history_archived_through"].as_u64().unwrap_or(0);
+        if let Some(saved_state) = saved_state {
+            watermark = watermark.max(saved_state["history_archived_through"].as_u64().unwrap_or(0));
+            let count = state["history_count"].as_u64().unwrap_or(0)
+                .max(saved_state["history_count"].as_u64().unwrap_or(0));
+            state["history_count"] = json!(count);
+        }
+        let history = state["history"].as_array_mut().unwrap();
+        history.retain(|h| h["seq"].as_u64().is_none_or(|seq| seq >= watermark));
+        let mut moved = Vec::new();
+        while history.len() > HISTORY_KEEP && entries_left > 0 {
+            let size = serde_json::to_vec(&history[0]).map_or(usize::MAX, |b| b.len());
+            let first = max_entries - entries_left == 0;
+            if !first && bytes.saturating_add(size) > max_bytes {
+                entries_left = 0;
+                break;
+            }
+            let entry = history.remove(0);
+            watermark = entry["seq"].as_u64().map_or(watermark, |seq| seq + 1);
+            bytes = bytes.saturating_add(size);
+            entries_left -= 1;
+            moved.push(entry);
+        }
+        state["history_archived_through"] = json!(watermark);
+        if !moved.is_empty() {
+            archived.push(json!({"stage_id": id, "attempt_id": attempt, "entries": moved}));
+        }
+    }
+    archived
+}
+
 impl Ctx {
     pub(super) fn validate_implementer_response(&self, plan: &Value, idx: usize, turn: &str, text: &str) -> Result<(), String> {
         parse_outcome(plan, idx, turn, text).map(|_| ())
@@ -94,7 +204,7 @@ impl Ctx {
         }
         let limits = self.app.settings.lock().unwrap()["reassessment_limits"].clone();
         plan["stages"][idx]["reassessment"] = json!({"attempt_id":plan["stages"][idx]["attempt_id"],"limits":limits,
-            "status":"reusing","count":0,"operational_retries":0,"signatures":[],"visited":[],"history":[],"failures":{}});
+            "status":"reusing","count":0,"operational_retries":0,"signatures":[],"visited":[],"history":[],"history_count":0,"history_archived_through":0,"failures":{}});
     }
     fn boundary_guard(&self, plan: &Value, idx: usize) -> Result<(), String> {
         if self.session.stop_requested.load(Ordering::SeqCst) {
@@ -130,7 +240,7 @@ impl Ctx {
                     self.reviewer_config(agreement["effective"]["provider"].as_str().ok_or("missing agreed provider")?)?;
                 }
                 let state = &mut plan["stages"][idx]["reassessment"];
-                state["history"].as_array_mut().unwrap().push(json!({
+                push_history(state, json!({
                     "kind":if pending["kind"] == "provider_operational_failure" {"provider_operation_resumed"} else {"material_assignment_restored"}, "reservation":pending,
                     "agreement_id":agreement["id"], "unix":unix_timestamp()
                 }));
@@ -288,7 +398,12 @@ impl Ctx {
         }
         state["operational_retries"] = json!(n + 1);
         state["status"] = json!("retrying");
-        state["history"].as_array_mut().unwrap().push(json!({"kind":"operational_retry","role":role,"failure_kind":kind,"error":crate::util::last_chars(error,1000),"retry":n+1}));
+        let entry = json!({"kind":"operational_retry","role":role,"failure_kind":kind,"error":crate::util::last_chars(error,1000),"retry":n+1});
+        if idx.is_some() {
+            push_history(state, entry);
+        } else {
+            state["history"].as_array_mut().unwrap().push(entry);
+        }
         self.save_plan(plan)?;
         let delay = 1000u64.saturating_mul(1 << n.min(4));
         #[cfg(test)]

@@ -682,7 +682,17 @@ an encoded `project` path without switching the active project. Existing
 feed/chat/report tail reads are capped at 2 MiB each.
 State keeps only eight recent model invocations per stage with
 `model_invocation_count` and `model_invocations_truncated`, and four reassessment
-history entries. A stage's `model_proposal_inputs` is a small fingerprint
+history entries. The saved plan itself also keeps only the four most recent
+reassessment history entries per stage, each with a monotonic `seq`, plus the
+true total in `history_count` and a `history_archived_through` watermark.
+Publishing the plan moves older entries, complete and unmodified, into that
+publication's architecture event as `archived_reassessment_history` (grouped by
+stage; at most 32 entries or about 128 KiB per event, so an oversized history
+drains over successive saves), where they stay fully readable through
+`GET /api/architecture/history`. Republishing a stale copy never archives an
+entry twice, and plans saved without these fields are numbered on first touch.
+Reassessment limits and counters (`count`, `operational_retries`, signatures)
+are unaffected. A stage's `model_proposal_inputs` is a small fingerprint
 (`version`, serialized `bytes` and `digest`) of the goal, stage, dependency and
 constraint inputs of its selection proposal, not a copy of them, so it stays
 constant-sized as the plan grows. Full selection dialogue and transitive input

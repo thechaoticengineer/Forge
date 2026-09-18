@@ -19,7 +19,7 @@ mod queue;
 #[path = "review.rs"]
 mod review;
 #[path = "reassessment.rs"]
-mod reassessment;
+pub(crate) mod reassessment;
 use crate::util::{canonical_project, unix_timestamp};
 use serde_json::{Value, json};
 use std::collections::HashMap;

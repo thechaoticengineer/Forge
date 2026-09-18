@@ -387,3 +387,57 @@ fn legacy_review_snapshots_detect_hidden_changes_and_last_verdict_only_is_readab
     assert_eq!(fs::read(&path).unwrap(),before);
     assert!(!test.app.forge_path("architecture").exists());
 }
+
+#[test]
+fn oversized_legacy_reassessment_history_drains_into_readable_events() {
+    let test = QueueTest::new(false);
+    // Unique text, so compaction cannot shrink the archive batches.
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    let mut text = |len: usize| (0..len / 16).map(|_| {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; format!("{seed:016x}")
+    }).collect::<String>();
+    // Legacy entries without positions; one exceeds a batch and a history page alone.
+    let entries: Vec<_> = (0..60).map(|n| json!({"kind": "material_assignment_change", "n": n,
+        "old_agreement": {"id": format!("old-{n}"), "dialogue": [text(if n == 7 { 300 * 1024 } else { 24 * 1024 })]}})).collect();
+    let mut stage = editable_stage(1);
+    stage["attempt_id"] = json!("attempt");
+    stage["reassessment"] = json!({"attempt_id": "attempt", "count": 2, "signatures": ["a", "b"], "history": entries});
+    test.app.save_plan(&json!({"goal": "Goal", "status": "draft", "stages": [stage]})).unwrap();
+    let mut publications = 1;
+    loop {
+        let plan = test.app.load_plan().unwrap();
+        let state = &plan["stages"][0]["reassessment"];
+        assert_eq!(state["history_count"], 60);
+        assert_eq!((state["count"].clone(), state["signatures"].clone()), (json!(2), json!(["a", "b"])));
+        if state["history"].as_array().unwrap().len() == crate::app::reassessment::HISTORY_KEEP { break; }
+        assert!(publications < 60, "history did not drain");
+        test.app.save_plan(&plan).unwrap();
+        publications += 1;
+    }
+    assert!(publications > 3);
+    let plan = test.app.load_plan().unwrap();
+    let kept = plan["stages"][0]["reassessment"]["history"].as_array().unwrap();
+    assert_eq!(kept.iter().map(|h| h["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![56, 57, 58, 59]);
+    let (_, state) = api_request(&test.app.app, "GET", "/api/state", json!({}));
+    assert_eq!(state["plan"]["stages"][0]["reassessment"]["history_count"], 60);
+    let (mut archived, mut cursor) = (Vec::new(), 0);
+    loop {
+        let (code, page) = api_request(&test.app.app, "GET",
+            &format!("/api/architecture/history?limit=100&cursor={cursor}"), json!({}));
+        assert_eq!(code, 200, "{page}");
+        for item in page["items"].as_array().unwrap() {
+            assert!(!item["payload"]["kind"].as_str().unwrap().is_empty());
+            for group in item["payload"]["archived_reassessment_history"].as_array().into_iter().flatten() {
+                assert_eq!(group["stage_id"], 1);
+                archived.extend(group["entries"].as_array().unwrap().iter().cloned());
+            }
+        }
+        match page["next_cursor"].as_u64() { Some(next) => cursor = next, None => break }
+    }
+    assert_eq!(archived.len(), 56);
+    for (n, entry) in archived.iter().enumerate() {
+        let mut original = entries[n].clone();
+        original["seq"] = json!(n);
+        assert_eq!(*entry, original);
+    }
+}

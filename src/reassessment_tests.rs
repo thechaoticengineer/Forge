@@ -989,3 +989,154 @@ fn tier_plan_executes_local_selection_and_preserves_bounded_failure_escalation()
     assert_eq!(s["rounds"], 3);
     assert_eq!(s["reassessment"]["history"][0]["old_agreement"]["kind"], "selection");
 }
+
+fn archived_history(ctx: &Ctx) -> Vec<Value> {
+    let (mut entries, mut cursor) = (Vec::new(), 0);
+    loop {
+        let page = ctx.architecture_store().history(None, cursor, 100).unwrap();
+        for item in page["items"].as_array().unwrap() {
+            for group in item["payload"]["archived_reassessment_history"].as_array().into_iter().flatten() {
+                assert_eq!(group["stage_id"], 1);
+                entries.extend(group["entries"].as_array().unwrap().iter().cloned());
+            }
+        }
+        match page["next_cursor"].as_u64() {
+            Some(next) => cursor = next,
+            None => return entries,
+        }
+    }
+}
+
+#[test]
+fn history_positions_are_monotonic_and_legacy_histories_are_numbered_once() {
+    let mut state = json!({"history":[]});
+    for n in 0..3 {
+        push_history(&mut state, json!({"kind":"operational_retry","retry":n}));
+    }
+    assert_eq!(state["history_count"], 3);
+    assert_eq!(state["history"].as_array().unwrap().iter().map(|h| h["seq"].clone()).collect::<Vec<_>>(), vec![json!(0), json!(1), json!(2)]);
+    // Legacy arrays are numbered from their index; missing, duplicate or
+    // decreasing positions follow their predecessor so nothing is skipped.
+    let mut legacy = json!({"history":[{"kind":"a"},{"kind":"b","seq":5},{"kind":"c","seq":5},{"kind":"d","seq":1},{"kind":"e"}]});
+    normalize_history(&mut legacy);
+    assert_eq!(legacy["history"].as_array().unwrap().iter().map(|h| h["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![0, 5, 6, 7, 8]);
+    assert_eq!((legacy["history_count"].clone(), legacy["history_archived_through"].clone()), (json!(9), json!(0)));
+    let before = legacy.clone();
+    normalize_history(&mut legacy);
+    assert_eq!(legacy, before);
+    push_history(&mut legacy, json!({"kind":"f"}));
+    assert_eq!(legacy["history"][5]["seq"], 9);
+    // A trimmed legacy array without positions continues after the archived prefix.
+    let mut trimmed = json!({"history":[{"kind":"x"},{"kind":"y"}],"history_count":7,"history_archived_through":5});
+    normalize_history(&mut trimmed);
+    assert_eq!((trimmed["history"][0]["seq"].clone(), trimmed["history"][1]["seq"].clone()), (json!(5), json!(6)));
+}
+
+#[test]
+fn publication_keeps_recent_history_and_archives_older_entries_exactly_once() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    f.ctx.reassessment_init(&mut p, 0);
+    let entries: Vec<Value> = (0..12).map(|n| json!({"kind":"operational_retry","role":"implementer",
+        "failure_kind":"transient","error":format!("error {n}"),"retry":n,
+        "old_agreement":{"id":format!("old-{n}"),"dialogue":[format!("turn {n}")]}})).collect();
+    for entry in &entries {
+        push_history(&mut p["stages"][0]["reassessment"], entry.clone());
+    }
+    let stale = p.clone();
+    f.ctx.save_plan(&p).unwrap();
+    let saved = f.ctx.load_plan().unwrap();
+    let state = &saved["stages"][0]["reassessment"];
+    assert_eq!(state["history"].as_array().unwrap().len(), HISTORY_KEEP);
+    assert_eq!(state["history_count"], 12);
+    assert_eq!(state["history_archived_through"], 8);
+    assert_eq!(state["history"], json!(stale["stages"][0]["reassessment"]["history"].as_array().unwrap()[8..]));
+    let expected: Vec<Value> = stale["stages"][0]["reassessment"]["history"].as_array().unwrap()[..8].to_vec();
+    assert_eq!(archived_history(&f.ctx), expected);
+    for (n, entry) in expected.iter().enumerate() {
+        assert_eq!(entry["seq"], n);
+        assert_eq!(entry["old_agreement"], entries[n]["old_agreement"]);
+    }
+    let polled = f.ctx.architecture_store().state_plan(saved.clone());
+    assert_eq!(polled["stages"][0]["reassessment"]["history_count"], 12);
+
+    // A stale in-memory copy that still holds every entry archives nothing again,
+    // through the plan save path and directly through publication.
+    f.ctx.save_plan(&stale).unwrap();
+    assert_eq!(f.ctx.load_plan().unwrap(), saved);
+    let mut direct = stale.clone();
+    direct["architecture"] = saved["architecture"].clone();
+    let cp = f.ctx.architecture_store().checkpoint(&saved).unwrap();
+    let published = f.ctx.architecture_store().publish(direct, cp, json!({"kind":"stale_copy"})).unwrap();
+    assert_eq!(published["stages"][0]["reassessment"], saved["stages"][0]["reassessment"]);
+    assert_eq!(archived_history(&f.ctx), expected);
+
+    // The stale copy keeps working: a new entry archives only the next oldest one.
+    let mut next = stale.clone();
+    push_history(&mut next["stages"][0]["reassessment"], json!({"kind":"operational_retry","retry":12}));
+    f.ctx.save_plan(&next).unwrap();
+    let saved = f.ctx.load_plan().unwrap();
+    let state = &saved["stages"][0]["reassessment"];
+    assert_eq!(state["history_count"], 13);
+    assert_eq!(state["history"].as_array().unwrap().iter().map(|h| h["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![9, 10, 11, 12]);
+    let archived = archived_history(&f.ctx);
+    assert_eq!(archived.iter().map(|h| h["seq"].as_u64().unwrap()).collect::<Vec<_>>(), (0..9).collect::<Vec<_>>());
+    assert_eq!(archived[8], stale["stages"][0]["reassessment"]["history"][8]);
+}
+
+#[test]
+fn archive_batches_are_bounded_and_drain_over_successive_publications() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    f.ctx.reassessment_init(&mut p, 0);
+    // Legacy entries: no positions or counters, as saved before bounding.
+    let legacy: Vec<Value> = (0..40).map(|n| json!({"kind":"operational_retry","retry":n})).collect();
+    p["stages"][0]["reassessment"]["history"] = json!(legacy);
+    for key in ["history_count", "history_archived_through"] {
+        p["stages"][0]["reassessment"].as_object_mut().unwrap().remove(key);
+    }
+    f.ctx.save_plan(&p).unwrap();
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["reassessment"]["history"].as_array().unwrap().len(), 40 - ARCHIVE_MAX_ENTRIES);
+    assert_eq!(saved["stages"][0]["reassessment"]["history_count"], 40);
+    f.ctx.save_plan(&saved).unwrap();
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["reassessment"]["history"].as_array().unwrap().len(), HISTORY_KEEP);
+    let archived = archived_history(&f.ctx);
+    assert_eq!(archived.iter().map(|h| h["retry"].as_u64().unwrap()).collect::<Vec<_>>(), (0..36).collect::<Vec<_>>());
+    assert_eq!(archived.iter().map(|h| h["seq"].as_u64().unwrap()).collect::<Vec<_>>(), (0..36).collect::<Vec<_>>());
+    // Nothing is left to drain: an unchanged save stays a no-op.
+    let end = saved["architecture"]["event_end"].clone();
+    f.ctx.save_plan(&saved).unwrap();
+    assert_eq!(f.ctx.load_plan().unwrap()["architecture"]["event_end"], end);
+}
+
+#[test]
+fn archived_history_leaves_reassessment_budget_and_blocking_unchanged() {
+    let f = Fixture::new();
+    f.set("reassessment_limits", json!({"max_reassessments":2,"max_operational_retries":2,"repeat_threshold":2,"context_percent":85}));
+    let mut p = f.attempt();
+    f.ctx.reassessment_init(&mut p, 0);
+    for n in 0..12 {
+        push_history(&mut p["stages"][0]["reassessment"], json!({"kind":"operational_retry","retry":n}));
+    }
+    f.ctx.save_plan(&p).unwrap();
+    let mut p = f.ctx.load_plan().unwrap();
+    assert_eq!(p["stages"][0]["reassessment"]["history"].as_array().unwrap().len(), HISTORY_KEEP);
+    let blocked = "model routing blocked: reassessment/signature budget exhausted; partial work and checkpoint retained";
+    f.choose("codex", "large", "provider_default");
+    f.ctx.reassess(&mut p, 0, "repeated_reasoning_failure", json!(["[reviewer] test failed"])).unwrap();
+    let mut p = f.ctx.load_plan().unwrap();
+    let state = &p["stages"][0]["reassessment"];
+    assert_eq!((state["count"].clone(), state["signatures"].as_array().unwrap().len()), (json!(1), 1));
+    assert_eq!(state["history_count"], 13);
+    // A repeated signature blocks with the same message as before.
+    assert_eq!(f.ctx.reassess(&mut p, 0, "repeated_reasoning_failure", json!(["[reviewer] test failed"])).unwrap_err(), blocked);
+    // With the stage limit reached, a new trigger blocks the same way.
+    p["stages"][0]["reassessment"]["limits"]["max_reassessments"] = json!(1);
+    // The limit counts reassessments, not history entries.
+    assert_eq!(f.ctx.reassess(&mut p, 0, "material_scope_change", json!(["new"])).unwrap_err(), blocked);
+    let saved = f.ctx.load_plan().unwrap();
+    assert_eq!(saved["stages"][0]["reassessment"]["count"], 1);
+    assert_eq!(saved["stages"][0]["reassessment"]["signatures"].as_array().unwrap().len(), 1);
+}

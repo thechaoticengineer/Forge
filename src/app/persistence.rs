@@ -114,7 +114,13 @@ impl Ctx {
                     }
                 }
             }
-            if old.as_ref() == Some(&next) { return Ok(next); }
+            // Drop history a stale copy still holds after it was archived, so an
+            // otherwise unchanged save stays a no-op unless older history remains
+            // to be drained. Publication does the archiving.
+            super::reassessment::archive_history(&mut next, old.as_ref().filter(|_| same), 0, 0);
+            let draining = next["stages"].as_array().unwrap().iter().any(|s| s["reassessment"]["history"]
+                .as_array().is_some_and(|h| h.len() > super::reassessment::HISTORY_KEEP));
+            if old.as_ref() == Some(&next) && !draining { return Ok(next); }
             store.publish(next, cp, json!({"kind": kind, "reviews": reviews, "removed_stage_ids": removed, "invalidations": invalidations, "execution_outcomes":outcomes}))
         })();
         *self.session.persistence_error.lock().unwrap() = result.as_ref().err().cloned();
