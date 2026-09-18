@@ -42,20 +42,31 @@ impl Fixture {
         Self { root, ctx }
     }
 
-    /// A placeholder stage: non-documentation intent (so review always
+    /// A stage with a realistically sized design (about 6 KB, like the
+    /// stages of a real plan): non-documentation intent (so review always
     /// requires both roles, keeping the architect the deterministic last
-    /// call of each round), independent of its siblings (no dependency
-    /// cascade), with real design text supplied later via `finalize`.
-    fn placeholder_stage(id: i64) -> Value {
-        json!({"id":id,"title":format!("Implement handler {id}"),
-            "instructions":format!("Placeholder for handler {id}."),
-            "acceptance":"Placeholder acceptance.","commit":format!("feat: handler {id}"),
+    /// call of each round) and independent of its siblings (no dependency
+    /// cascade when one stage is edited).
+    fn stage(id: i64) -> Value {
+        let (instructions, acceptance) = Self::design(id);
+        json!({"id":id,"title":format!("Implement handler {id}"),"instructions":instructions,
+            "acceptance":acceptance,"commit":format!("feat: handler {id}"),
             "depends_on":[],"status":"pending","rounds":0})
     }
 
-    fn finalize(id: i64) -> (String, String) {
-        (format!("Implement handler {id} for the greeting service: cover the primary success path and one edge case, matching the style of the other handlers."),
-         format!("Handler {id} responds correctly.\nExisting checks still pass."))
+    fn design(id: i64) -> (String, String) {
+        let step = |n: i64| format!("Step {n}: extend handler {id} of the greeting service so it validates its input, \
+            maps each failure to the shared error type, logs the request id at debug level, and keeps the response \
+            shape identical to the other handlers; add a unit test for the success path and for the failure path.\n");
+        ((1..=24).map(step).collect(),
+         format!("Handler {id} responds correctly on the success path and on every documented failure path.\n\
+            Its unit tests cover each step of the instructions.\nExisting checks still pass."))
+    }
+
+    /// The small edit made to stage `id` just before it runs; the final
+    /// instructions are the published design plus this line.
+    fn edited_instructions(id: i64) -> String {
+        format!("{}Also cover the empty-name edge case for handler {id}.\n", Self::design(id).0)
     }
 
     fn plan_json_len(&self) -> usize {
@@ -75,24 +86,23 @@ impl Drop for Fixture {
 #[test]
 fn saved_plan_and_architect_context_stay_flat_across_a_six_stage_plan() {
     let f = Fixture::new();
-    let stages: Vec<Value> = (1..=STAGES).map(Fixture::placeholder_stage).collect();
+    let stages: Vec<Value> = (1..=STAGES).map(Fixture::stage).collect();
     f.ctx.architect_publish(json!({"goal":"Ship the greeting service","status":"ready","stages":stages}), None, "draft").unwrap();
 
     let mut plan_bytes = Vec::new();
     let mut architect_prompt_lens = Vec::new();
 
     for id in 1..=STAGES {
-        // Finalize this stage's real design just before it runs. Every earlier
-        // stage is already committed and carries its own reviews, invocations
-        // and model agreement, so this is the point where the pre-refactor
-        // engine would have re-embedded all of that bookkeeping into the next
-        // architect turn's plan clone.
+        // Edit this stage just before it runs. Every earlier stage is already
+        // committed and carries its own reviews, invocations and model
+        // agreement, so this is the point where the pre-refactor engine would
+        // have re-embedded all of that bookkeeping into the next architect
+        // turn's plan clone.
         let current = f.ctx.load_plan().unwrap();
         let idx = current["stages"].as_array().unwrap().iter().position(|s| s["id"] == id).unwrap();
-        let (instructions, acceptance) = Fixture::finalize(id);
+        let (instructions, acceptance) = (Fixture::edited_instructions(id), Fixture::design(id).1);
         let mut candidate = current.clone();
         candidate["stages"][idx]["instructions"] = json!(instructions);
-        candidate["stages"][idx]["acceptance"] = json!(acceptance);
 
         // Stage input-change detection still invalidates an edited stage: the
         // stored fingerprint no longer matches freshly computed material.
@@ -131,36 +141,38 @@ fn saved_plan_and_architect_context_stay_flat_across_a_six_stage_plan() {
     assert_eq!(plan_bytes.len(), STAGES as usize);
     assert_eq!(architect_prompt_lens.len(), STAGES as usize);
 
-    // Each additional committed stage necessarily adds real content (its own
-    // design, sha, review pointer, one more compact architect entry), so the
-    // saved plan and the architect prompt both grow roughly linearly with the
-    // stage count — that is the "roughly flat" this stage protects: a
-    // constant marginal cost per stage, never one that grows with how many
-    // stages already exist (the original quadratic bug: a stage's stored
-    // `model_proposal_inputs`/context re-embedded every earlier stage's own
-    // bookkeeping, so later stages cost dramatically more than earlier ones).
-    // Measured on this fixture: plan.json costs ~13.8 KB/stage and the
-    // architect prompt ~2 KB/stage, both essentially constant across all 5
-    // transitions. The bounds below assert that constancy with headroom,
-    // rather than a fixed total-size ratio that would depend on how much
-    // upfront content (here, all 6 stages' initial proposals) a given run
-    // happens to start with.
-    fn assert_flat_growth(label: &str, samples: &[usize], per_transition_headroom: usize, total_headroom: usize) {
-        let deltas: Vec<i64> = samples.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
-        let (min_delta, max_delta) = (*deltas.iter().min().unwrap(), *deltas.iter().max().unwrap());
-        assert!(max_delta <= min_delta * 2 + per_transition_headroom as i64,
-            "{label}: a later stage cost {max_delta} bytes to commit vs {min_delta} for an earlier one \
-             (samples {samples:?}, deltas {deltas:?}); a stage's marginal cost must stay roughly constant, \
-             not grow with how many stages already exist");
-        let bound = samples[0] + (samples.len() - 1) * max_delta.max(0) as usize * 2 + total_headroom;
-        let last = *samples.last().unwrap();
-        assert!(last <= bound,
-            "{label}: grew from {} to {last} bytes across {} stages, beyond the {bound}-byte linear-growth budget \
-             (samples {samples:?}); routing/reassessment bookkeeping may have leaked back into per-stage content",
-            samples[0], samples.len());
+    // Fixed bounds, independent of the samples they check. Measured on this
+    // fixture: plan.json goes from ~125 KB after the first stage to ~199 KB
+    // after the sixth (~14.8 KB per committed stage: that stage's own reviews,
+    // verdict, gate, agreement and invocations), and the architect prompt from
+    // ~28.8 KB to ~39.3 KB (~2.1 KB per committed stage: one compact stage
+    // entry with its outcome summary plus the checkpoint's outcome record).
+    //
+    // Saved plan: the final size must stay within about twice the size after
+    // the first stage. The quadratic bug (a stage storing copies of its
+    // dependencies' inputs and its own earlier records) grew the file far
+    // faster than that. The per-stage cap names the stage that broke it.
+    const PLAN_MAX_GROWTH_FACTOR: usize = 2;
+    const PLAN_MAX_BYTES_PER_STAGE: usize = 20 * 1024;
+    // Architect prompt: each completed stage may add at most this many bytes.
+    // Re-embedding a committed stage's bookkeeping (its reviews alone are
+    // ~3.5 KB here) or the plan document in the work-status context exceeds it.
+    const ARCHITECT_PROMPT_MAX_BYTES_PER_STAGE: usize = 3 * 1024;
+    let transitions = |samples: &[usize]| samples.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect::<Vec<_>>();
+    let (first_plan, last_plan) = (plan_bytes[0], *plan_bytes.last().unwrap());
+    assert!(last_plan <= first_plan * PLAN_MAX_GROWTH_FACTOR,
+        "plan.json grew from {first_plan} to {last_plan} bytes over {STAGES} stages, more than {PLAN_MAX_GROWTH_FACTOR}x \
+         (samples {plan_bytes:?}); routing/reassessment bookkeeping may be copied into stages again");
+    for (n, delta) in transitions(&plan_bytes).into_iter().enumerate() {
+        assert!(delta <= PLAN_MAX_BYTES_PER_STAGE as i64,
+            "committing stage {} added {delta} bytes to plan.json, over the {PLAN_MAX_BYTES_PER_STAGE}-byte per-stage cap \
+             (samples {plan_bytes:?})", n + 2);
     }
-    assert_flat_growth("plan.json size", &plan_bytes, 2048, 4096);
-    assert_flat_growth("architect prompt length", &architect_prompt_lens, 512, 1024);
+    for (n, delta) in transitions(&architect_prompt_lens).into_iter().enumerate() {
+        assert!(delta <= ARCHITECT_PROMPT_MAX_BYTES_PER_STAGE as i64,
+            "completing stage {} grew the architect prompt by {delta} bytes, over the {ARCHITECT_PROMPT_MAX_BYTES_PER_STAGE}-byte \
+             per-stage cap (samples {architect_prompt_lens:?}); the work-status context may be carrying plan bookkeeping again", n + 2);
+    }
 
     // The completed plan still carries the full design and only a compact
     // proposal-input fingerprint per stage.
@@ -168,7 +180,7 @@ fn saved_plan_and_architect_context_stay_flat_across_a_six_stage_plan() {
     assert_eq!(done["status"], "done", "{}", f.ctx.read_history());
     for id in 1..=STAGES {
         let stage = done["stages"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap();
-        let (instructions, acceptance) = Fixture::finalize(id);
+        let (instructions, acceptance) = (Fixture::edited_instructions(id), Fixture::design(id).1);
         assert_eq!(stage["instructions"], json!(instructions));
         assert_eq!(stage["acceptance"], json!(acceptance));
         let inputs = &stage["model_proposal_inputs"];
