@@ -1,7 +1,7 @@
 import QtQuick
-import qs.Commons
 
-// Shared extracted-view button presentation. Callers provide the palette and font.
+// Shared extracted-view button presentation. Callers provide the palette, font and
+// padding, so the button stays loadable without the shell modules.
 Rectangle {
   id: button
 
@@ -17,12 +17,14 @@ Rectangle {
   required property string fontFamily
   required property real fontSize
   property color labelColor: primary && enabled ? background : foreground
+  property real horizontalPadding: 18
+  property real verticalPadding: 10
 
   signal clicked
 
-  implicitWidth: buttonText.implicitWidth + Style.space(18)
+  implicitWidth: buttonText.implicitWidth + horizontalPadding
   width: implicitWidth
-  height: buttonText.implicitHeight + Style.space(10)
+  height: buttonText.implicitHeight + verticalPadding
   radius: 4
   color: button.primary && button.enabled ? button.accent : button.surface
   border.width: button.primary && button.enabled ? 0 : 1
@@ -33,7 +35,7 @@ Rectangle {
     id: buttonText
 
     anchors.centerIn: parent
-    width: Math.max(0, button.width - Style.space(18))
+    width: Math.max(0, button.width - button.horizontalPadding)
     text: button.label
     textFormat: Text.PlainText
     elide: Text.ElideRight

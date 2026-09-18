@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { installGuards } from './panel_guards.mjs';
 
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const slice = (start, end) => qml.slice(qml.indexOf(start), qml.indexOf(end));
@@ -9,6 +10,7 @@ const goalCallbacks = slice('  function syncGoalEnhancement(', '  function revis
 const stateHandler = slice('  onEngineStateChanged: {', '  onBusyChanged: {')
   .replace('onEngineStateChanged: {', 'function engineStateChanged() {');
 const enabled = qml.match(/id: enhanceGoalButton[\s\S]*?enabled: ([\s\S]*?)\n\s*onClicked:/)[1];
+const navigation = readFileSync(new URL('../quickshell/PanelNavigation.js', import.meta.url), 'utf8');
 const defaults = Object.fromEntries([...qml.matchAll(/property (?:bool|int|string) (goalEnhance\w+): (.+)/g)]
   .map(([, key, value]) => [key, JSON.parse(value)]));
 const state = ctx => Object.fromEntries(Object.keys(defaults).map(key => [key, ctx[key]]));
@@ -21,6 +23,7 @@ function fixture() {
     engineState: {project: '/a'}, lastProject: '/a', engineOnline: true, busy: false,
     editingPlan: false, revisePending: false, localError: '', calls: [], goalDrafts: {},
     feedbackField: {text: ''}, questionField: {text: ''}, chatList: {}, goalFlick: {},
+    phase: 'idle', queueActive: false, chatPending: false, plan: null, hasQueuedGoals: false,
     discussionView: {input: {text: ''}},
     liveEntries: {clear(){}}, historyEntries: {clear(){}}, liveOutput,
     historyList, reportList, agentOutput:{liveOutput,historyList,reportList}, logFeed: {},
@@ -29,6 +32,7 @@ function fixture() {
     syncDiscussion(){}, closeDiscussion(){}, refreshAgentLog(){} };
   ctx.root = ctx;
   ctx.act = (path, body, done) => ctx.calls.push({path, body, done});
+  installGuards(qml, ctx);
   ctx.enhanceGoalButton = { get enabled() { return vm.runInNewContext(enabled, ctx); } };
   const goalEnhancement = {};
   vm.runInNewContext(readFileSync(new URL('../quickshell/GoalEnhancement.js', import.meta.url), 'utf8'), goalEnhancement);
@@ -224,6 +228,9 @@ test('goal buttons, wrapping plain status and exact Shift+E shortcut are wired w
   for (const text of ['enhancing the description…', 'root.goalEnhanceError', 'AI rewrite ready — press Apply AI description',
     'Text.PlainText', 'Text.Wrap', 'root.urgent', 'root.mutedForeground', 'root.fontFamily', 'root.fs(11)']) assert.ok(status.includes(text));
   assert.match(qml, /event.key === Qt.Key_E && event.modifiers === Qt.ShiftModifier\) \{\s*root.enhanceGoal\(\)\s*event.accepted = true/);
-  assert.match(qml, /event.modifiers === Qt.NoModifier\) \{[\s\S]*?event.key === Qt.Key_E\) \{\s*if \(editPlanButton.enabled\) root.beginPlanEdit\(\)/);
-  assert.match(qml, /\{ key: "E", description: "Enhance the goal description with AI" \}/);
+  // The e shortcut shares the Edit plan button's guard.
+  assert.match(qml, /id: editPlanButton[\s\S]*?enabled: root\.guards\.editPlan\n/);
+  assert.match(qml, /event.modifiers === Qt.NoModifier\) \{[\s\S]*?event.key === Qt.Key_E\) \{\s*if \(root\.guards\.editPlan\) root.beginPlanEdit\(\)/);
+  assert.match(qml, /model: PanelNavigation\.helpRows\(\)/);
+  assert.match(navigation, /\{ key: "E", description: "Enhance the goal description with AI" \}/);
 });

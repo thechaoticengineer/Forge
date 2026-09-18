@@ -494,12 +494,15 @@ test('the discussion modal branch routes keys like the other full views', () => 
 });
 
 test('the keyboard help overlay documents the discussion chat', () => {
-  const headingIndex = qml.indexOf('{ key: "", description: "Discussion chat" }');
-  const keyboardHelpIndex = qml.indexOf('{ key: "", description: "Keyboard help" }');
+  // The help rows live in PanelNavigation.js; Panel.qml renders them in its help overlay.
+  assert.match(qml, /model: PanelNavigation\.helpRows\(\)/);
+  const help = readFileSync(new URL('../quickshell/PanelNavigation.js', import.meta.url), 'utf8');
+  const headingIndex = help.indexOf('{ key: "", description: "Discussion chat" }');
+  const keyboardHelpIndex = help.indexOf('{ key: "", description: "Keyboard help" }');
   assert.ok(headingIndex >= 0 && keyboardHelpIndex >= 0 && headingIndex < keyboardHelpIndex);
-  const section = qml.slice(headingIndex, keyboardHelpIndex);
+  const section = help.slice(headingIndex, keyboardHelpIndex);
   assert.match(section, /\{ key: "i", description: "Edit the message \(insert mode\)" \}/);
   assert.match(section, /\{ key: "Enter \/ Shift\+Enter", description: "Send the message \/ insert a newline" \}/);
   assert.match(section, /\{ key: "q \/ Escape", description: "Close the chat \(Escape leaves the message field first\)" \}/);
-  assert.match(qml, /\{ key: "t", description: "Open the discussion chat" \}/);
+  assert.match(help, /\{ key: "t", description: "Open the discussion chat" \}/);
 });

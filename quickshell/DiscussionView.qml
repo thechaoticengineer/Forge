@@ -251,5 +251,7 @@ Rectangle {
     accent: view.accent
     fontFamily: view.fontFamily
     fontSize: view.fontSize11
+    horizontalPadding: Style.space(18)
+    verticalPadding: Style.space(10)
   }
 }

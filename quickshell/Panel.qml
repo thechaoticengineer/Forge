@@ -19,6 +19,8 @@ import "Discussion.js" as Discussion
 import "PlanEdit.js" as PlanEdit
 import "CataloguePresentation.js" as CataloguePresentation
 import "Features.js" as Features
+import "PanelNavigation.js" as PanelNavigation
+import "PanelActions.js" as PanelActions
 
 Item {
   id: root
@@ -160,6 +162,23 @@ Item {
   readonly property string projectName: engineState
     ? engineState.project.split("/").filter(function(p) { return p !== "" }).pop() || "?"
     : "?"
+
+  // The selected view tab. Only the user changes it: polling, project switches,
+  // reopening and closing overlays keep it (a new panel starts on Overview).
+  property string currentTab: "overview"
+  readonly property string stepText: engineState !== null && engineState.current_step !== ""
+    ? (engineState.current_stage !== null
+      ? "stage " + engineState.current_stage + ": " + (currentActivity || engineState.current_step)
+      : engineState.current_step) : ""
+  // One guard per action, shared by its button and its keyboard shortcut.
+  readonly property var guardFlags: ({
+    engineOnline: engineOnline, busy: busy, phase: phase, queueActive: queueActive,
+    editingPlan: editingPlan, revisePending: revisePending, chatPending: chatPending,
+    planStatus: plan !== null ? plan.status : null, goalText: goalField.text,
+    feedbackText: feedbackField.text, questionText: questionField.text,
+    goalEnhancePending: goalEnhancePending, hasQueuedGoals: hasQueuedGoals
+  })
+  readonly property var guards: PanelActions.guards(guardFlags)
 
   readonly property bool discussionCanSend: engineOnline && !busy && !queueActive
     && !editingPlan && !revisePending && !discussionPending
@@ -653,7 +672,7 @@ Item {
   }
 
   function enhanceGoal() {
-    if (!enhanceGoalButton.enabled) return
+    if (!root.guards.enhance) return
     const text = goalField.text
     const revision = projectViewRevision
     goalEnhanceRequest = -1
@@ -687,7 +706,7 @@ Item {
   }
 
   function revisePlan() {
-    if (!improvePlanButton.enabled) return
+    if (!root.guards.improve) return
     const feedback = feedbackField.text
     const revision = projectViewRevision
     revisePending = true
@@ -703,7 +722,7 @@ Item {
   }
 
   function askPlanQuestion() {
-    if (!askPlanButton.enabled) return
+    if (!root.guards.ask) return
     const question = questionField.text
     const revision = projectViewRevision
     chatPending = true
@@ -777,7 +796,7 @@ Item {
   }
 
   function beginPlanEdit() {
-    if (!editPlanButton.enabled) return
+    if (!root.guards.editPlan) return
     editStages = PlanEdit.cloneStages(plan)
     editGoal = plan.goal || ""
     editProject = lastProject
@@ -1528,6 +1547,20 @@ Item {
             && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier))
             || (event.key === Qt.Key_Slash && event.modifiers === Qt.ShiftModifier)
             || (event.key === Qt.Key_F1 && event.modifiers === Qt.NoModifier)
+          // View keys: ] / [ step through the tabs; g then o/p/a/r/f/q/s jumps to one.
+          const viewTab = event.modifiers !== Qt.NoModifier ? ""
+            : event.key === Qt.Key_BracketRight || event.key === Qt.Key_BracketLeft
+              ? PanelNavigation.stepTab(root.currentTab, event.key === Qt.Key_BracketRight ? 1 : -1)
+            : prefix === "g" ? PanelNavigation.tabForGKey(event.text) : ""
+          // The project switcher and the ⋯ menu close on any key; Escape only closes them.
+          if (overflowMenu.open || panelHeader.switcherOpen) {
+            overflowMenu.open = false
+            panelHeader.closeSwitcher()
+            if (event.key === Qt.Key_Escape) {
+              event.accepted = true
+              return
+            }
+          }
           // Modal normal mode owns every key; focused text fields handle insert mode.
           if (root.catalogueOpen) {
             event.accepted = true
@@ -1580,7 +1613,10 @@ Item {
           } else if (root.featuresOpen) {
             event.accepted = true
             const featureRow = featuresView.currentRow()
-            if (event.key === Qt.Key_Escape) {
+            if (viewTab !== "") {
+              if (viewTab !== "features") root.closeFeatures()
+              root.currentTab = viewTab
+            } else if (event.key === Qt.Key_Escape) {
               root.closeFeatures()
             } else if (event.modifiers === Qt.ShiftModifier) {
               if (event.key === Qt.Key_R && !root.featuresPending) root.openFeatures()
@@ -1597,6 +1633,7 @@ Item {
                 featuresView.focusChatInput()
               } else if (event.key === Qt.Key_V && featureRow) root.requestFeatureReview(featureRow)
               else if (event.key === Qt.Key_A && featureRow) root.approveFeatureSpec(featureRow)
+              else if (event.key === Qt.Key_G) pendingKey = "g"
             }
           } else if (root.discussionOpen) {
             event.accepted = true
@@ -1610,6 +1647,9 @@ Item {
             }
           } else if (question) {
             root.helpOpen = true
+            event.accepted = true
+          } else if (viewTab !== "") {
+            root.currentTab = viewTab
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             goalField.forceActiveFocus()
@@ -1651,32 +1691,32 @@ Item {
                 panelScroll.contentY = event.key === Qt.Key_Home ? 0 : panelScroll.maximumY
                 event.accepted = true
               } else if (event.key === Qt.Key_P) {
-                if (createPlanButton.enabled)
+                if (root.guards.createPlan)
                   root.act("/api/plan", { goal: goalField.text })
                 event.accepted = true
               } else if (event.key === Qt.Key_A) {
-                if (approvePlanButton.enabled)
+                if (root.guards.approve)
                   root.act("/api/approve")
                 event.accepted = true
               } else if (event.key === Qt.Key_R) {
-                if (runPlanButton.enabled)
+                if (root.guards.run)
                   root.act("/api/run")
                 event.accepted = true
               } else if (event.key === Qt.Key_E) {
-                if (editPlanButton.enabled) root.beginPlanEdit()
+                if (root.guards.editPlan) root.beginPlanEdit()
                 event.accepted = true
               } else if (event.key === Qt.Key_X) {
-                if (root.phase === "running" || root.queueActive)
+                if (root.guards.stop)
                   root.act("/api/stop")
                 event.accepted = true
               } else if (event.key === Qt.Key_D) {
-                if (root.engineOnline) root.openDiff()
+                if (root.guards.diff) root.openDiff()
                 event.accepted = true
               } else if (event.key === Qt.Key_C) {
-                if (root.engineOnline) root.openChooser()
+                if (root.guards.changeProject) root.openChooser()
                 event.accepted = true
               } else if (event.key === Qt.Key_F) {
-                if (root.engineOnline) root.openFeatures()
+                if (root.guards.features) root.openFeatures()
                 event.accepted = true
               } else if (event.key === Qt.Key_Tab) {
                 root.liveTab = !root.liveTab
@@ -1741,11 +1781,93 @@ Item {
         Item {
           id: panelPage
 
+          // ------------------------------------------ fixed header and tabs
+          PanelHeader {
+            id: panelHeader
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: Style.space(16)
+            projectName: root.projectName
+            projectPath: root.engineState ? root.engineState.project : ""
+            sessions: root.sessions
+            activeProject: root.activeProject
+            phase: root.phase
+            engineOnline: root.engineOnline
+            busy: root.busy
+            stepText: root.stepText
+            backgroundBusy: root.backgroundBusy
+            activeProjectCount: root.activeProjectCount
+            foreground: root.foreground
+            mutedForeground: root.mutedForeground
+            background: root.background
+            surface: root.surface
+            accent: root.accent
+            urgent: root.urgent
+            success: root.success
+            working: root.working
+            fontFamily: root.fontFamily
+            fontSize10: root.fs(10)
+            fontSize11: root.fs(11)
+            fontSize12: root.fs(12)
+            titleFontSize: root.fs(18)
+            spacing: Style.space(10)
+            onProjectSelected: path => root.act("/api/project/select", { path: path })
+            onChangeProjectRequested: if (root.guards.changeProject) root.openChooser()
+            onOverflowRequested: overflowMenu.open = true
+          }
+
+          PanelTabBar {
+            id: panelTabBar
+            anchors.top: panelHeader.bottom
+            anchors.topMargin: Style.space(8)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(16)
+            anchors.rightMargin: Style.space(16)
+            currentTab: root.currentTab
+            queueCount: root.queue.length
+            foreground: root.foreground
+            mutedForeground: root.mutedForeground
+            background: root.background
+            surface: root.surface
+            accent: root.accent
+            urgent: root.urgent
+            success: root.success
+            working: root.working
+            fontFamily: root.fontFamily
+            fontSize10: root.fs(10)
+            fontSize11: root.fs(11)
+            fontSize12: root.fs(12)
+            onTabRequested: id => root.currentTab = id
+          }
+
+          // The content area under the tab bar. Each tab has one persistent
+          // item that is shown while its tab is selected, never rebuilt.
+          Item {
+            id: tabArea
+            anchors.top: panelTabBar.bottom
+            anchors.topMargin: Style.space(10)
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: localErrorArea.top
+            anchors.leftMargin: Style.space(16)
+            anchors.rightMargin: Style.space(16)
+            anchors.bottomMargin: localErrorDetail.visible ? Style.space(10) : 0
+
+            TabPlaceholder { tab: "plan" }
+            TabPlaceholder { tab: "activity" }
+            TabPlaceholder { tab: "architecture" }
+            TabPlaceholder { tab: "features" }
+            TabPlaceholder { tab: "queue" }
+            TabPlaceholder { tab: "settings" }
+          }
+
+          // Overview: for now the whole former page, minus header and project tabs.
           Flickable {
             id: panelScroll
-            anchors.fill: parent
-            anchors.margins: Style.space(16)
-            anchors.bottomMargin: Style.space(16) + keyboardHint.height + Style.space(10)
+            visible: root.currentTab === "overview"
+            anchors.fill: tabArea
             clip: true
             contentWidth: width
             contentHeight: panelColumn.implicitHeight
@@ -1769,77 +1891,6 @@ Item {
             id: panelColumn
             width: panelScroll.width - Style.space(16)
             spacing: Style.space(10)
-
-            // ---------------------------------------------------- header
-            Row {
-              width: parent.width
-              spacing: Style.space(10)
-
-              Text {
-                id: forgeTitle
-                text: "FORGE"
-                color: root.accent
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(18)
-                font.bold: true
-              }
-              Text {
-                id: projectActivity
-                visible: root.backgroundBusy
-                text: root.activeProjectCount + " project"
-                  + (root.activeProjectCount === 1 ? "" : "s") + " active"
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(10)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-              Rectangle {
-                id: phaseBadge
-                width: phaseText.implicitWidth + Style.space(16)
-                height: phaseText.implicitHeight + Style.space(6)
-                radius: height / 2
-                color: "transparent"
-                border.width: 1
-                border.color: root.phase === "failed" || root.phase === "blocked"
-                  ? root.urgent
-                  : root.busy ? root.working
-                  : root.phase === "done" ? root.success
-                  : root.mutedForeground
-                Text {
-                  id: phaseText
-                  anchors.centerIn: parent
-                  text: root.engineOnline ? root.phase : "engine offline"
-                  color: root.phase === "failed" || root.phase === "blocked"
-                    ? root.urgent
-                    : root.busy ? root.working
-                    : root.phase === "done" ? root.success
-                    : root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-              }
-              Text {
-                visible: root.engineState !== null && root.engineState.current_step !== ""
-                width: Math.max(0, parent.width - forgeTitle.width - phaseBadge.width
-                  - (projectActivity.visible ? projectActivity.width + parent.spacing : 0)
-                  - helpButton.width - parent.spacing
-                  - 2 * parent.spacing)
-                elide: Text.ElideRight
-                text: root.engineState && root.engineState.current_stage !== null
-                  ? "stage " + root.engineState.current_stage + ": "
-                    + (root.currentActivity || root.engineState.current_step)
-                  : (root.engineState ? root.engineState.current_step : "")
-                color: root.mutedForeground
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(12)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-              PanelButton {
-                id: helpButton
-                label: "? Help"
-                onClicked: root.helpOpen = true
-              }
-            }
 
             // ------------------------------------------------ now working
             Rectangle {
@@ -1957,32 +2008,6 @@ Item {
               }
             }
 
-            // ----------------------------------------------- project tabs
-            Flow {
-              id: projectTabs
-              visible: root.sessions.length > 1
-              width: parent.width
-              spacing: Style.space(8)
-              Repeater {
-                model: root.sessions
-                delegate: PanelButton {
-                  required property var modelData
-                  readonly property bool needsAttention: modelData.phase === "blocked"
-                    || modelData.phase === "failed"
-                  label: modelData.name + " "
-                    + (modelData.busy || modelData.queue_active ? "●" : needsAttention ? "!"
-                      : modelData.phase === "done" ? "✓" : "·")
-                    + (modelData.queued > 0 ? " +" + modelData.queued : "")
-                  width: Math.min(implicitWidth, projectTabs.width)
-                  primary: modelData.project === root.activeProject
-                  labelColor: !primary && needsAttention ? root.urgent
-                    : primary && enabled ? root.background : root.foreground
-                  enabled: root.engineOnline
-                  onClicked: root.act("/api/project/select", { path: modelData.project })
-                }
-              }
-            }
-
             // -------------------------------------------- project + tools
             Row {
               width: parent.width
@@ -2009,7 +2034,7 @@ Item {
               PanelButton {
                 id: changeProjectButton
                 label: "Change project"
-                enabled: root.engineOnline
+                enabled: root.guards.changeProject
                 onClicked: root.openChooser()
               }
             }
@@ -2238,14 +2263,13 @@ Item {
                 id: createPlanButton
                 label: "Create plan"
                 primary: true
-                enabled: !root.editingPlan && !root.revisePending && !root.busy && goalField.text.trim() !== ""
+                enabled: root.guards.createPlan
                 onClicked: root.act("/api/plan", { goal: goalField.text })
               }
               PanelButton {
                 id: enhanceGoalButton
                 label: "Enhance with AI"
-                enabled: root.engineOnline && !root.busy && !root.editingPlan && !root.revisePending
-                  && !root.goalEnhancePending && goalField.text.trim() !== ""
+                enabled: root.guards.enhance
                 onClicked: root.enhanceGoal()
               }
               PanelButton {
@@ -2260,12 +2284,12 @@ Item {
               }
               PanelButton {
                 label: "Refactor plan"
-                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.engineOnline
+                enabled: root.guards.refactor
                 onClicked: root.act("/api/plan", { mode: "refactor", goal: goalField.text })
               }
               PanelButton {
                 label: "Add to queue"
-                enabled: root.engineOnline && goalField.text.trim() !== ""
+                enabled: root.guards.addToQueue
                 onClicked: {
                   root.act("/api/queue/add", { goal: goalField.text })
                   goalField.text = ""
@@ -2274,49 +2298,46 @@ Item {
               PanelButton {
                 id: approvePlanButton
                 label: "Plan is OK — approve"
-                enabled: !root.editingPlan && !root.revisePending && !root.busy
-                  && root.plan !== null && root.plan.status === "draft"
+                enabled: root.guards.approve
                 onClicked: root.act("/api/approve")
               }
               PanelButton {
                 id: runPlanButton
                 label: "Start implementing"
                 primary: true
-                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
-                  && (root.plan.status === "approved" || root.plan.status === "done")
+                enabled: root.guards.run
                 onClicked: root.act("/api/run")
               }
               PanelButton {
                 label: "Stop"
-                enabled: root.phase === "running" || root.queueActive
+                enabled: root.guards.stop
                 onClicked: root.act("/api/stop")
               }
               PanelButton {
                 id: editPlanButton
                 label: "Edit plan"
                 visible: !root.editingPlan
-                enabled: !root.editingPlan && !root.revisePending && root.engineOnline && !root.busy && !root.queueActive
-                  && root.plan !== null && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
+                enabled: root.guards.editPlan
                 onClicked: root.beginPlanEdit()
               }
               PanelButton {
                 label: "Discard plan"
-                enabled: !root.editingPlan && !root.revisePending && !root.busy && root.plan !== null
+                enabled: root.guards.discard
                 onClicked: root.act("/api/reset_plan")
               }
               PanelButton {
                 label: "View diff"
-                enabled: root.engineOnline
+                enabled: root.guards.diff
                 onClicked: root.openDiff()
               }
               PanelButton {
                 label: "Features"
-                enabled: root.engineOnline
+                enabled: root.guards.features
                 onClicked: root.openFeatures()
               }
               PanelButton {
                 label: "Update Forge"
-                enabled: root.engineOnline && !root.busy
+                enabled: root.guards.update
                 onClicked: root.act("/api/self_update")
               }
             }
@@ -2389,10 +2410,7 @@ Item {
               PanelButton {
                 id: improvePlanButton
                 label: "Improve with AI"
-                enabled: root.engineOnline && !root.busy && !root.queueActive
-                  && !root.editingPlan && !root.revisePending && root.plan !== null
-                  && ["draft", "approved", "done"].indexOf(root.plan.status) !== -1
-                  && feedbackField.text.trim() !== ""
+                enabled: root.guards.improve
                 onClicked: root.revisePlan()
               }
             }
@@ -2484,9 +2502,7 @@ Item {
                 PanelButton {
                   id: askPlanButton
                   label: root.chatPending ? "Asking…" : "Ask"
-                  enabled: root.engineOnline && !root.busy && !root.queueActive
-                    && !root.editingPlan && !root.revisePending && !root.chatPending
-                    && root.plan !== null && questionField.text.trim() !== ""
+                  enabled: root.guards.ask
                   onClicked: root.askPlanQuestion()
                 }
               }
@@ -2530,14 +2546,6 @@ Item {
                 }
               }
             }
-            PanelDetail {
-              objectName: "localErrorDetail"
-              width: parent.width
-              visible: root.localError !== ""
-              originalText: root.localError
-              metadata: "Error"
-              error: true
-            }
 
             // -------------------------------------------------- queue
             Rectangle {
@@ -2568,7 +2576,7 @@ Item {
                   id: startQueueButton
                   label: "Start queue"
                   primary: true
-                  enabled: !root.editingPlan && root.engineOnline && !root.busy && !root.queueActive && root.hasQueuedGoals
+                  enabled: root.guards.startQueue
                   onClicked: root.act("/api/queue/start")
                 }
               }
@@ -2742,13 +2750,36 @@ Item {
           }
           }
 
+          // Errors stay visible on every tab, just above the hint line.
+          Item {
+            id: localErrorArea
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: keyboardHint.top
+            anchors.leftMargin: Style.space(16)
+            anchors.rightMargin: Style.space(16)
+            anchors.bottomMargin: Style.space(10)
+            height: localErrorDetail.visible ? localErrorDetail.height : 0
+
+            PanelDetail {
+              id: localErrorDetail
+              objectName: "localErrorDetail"
+              width: parent.width
+              visible: root.localError !== ""
+              originalText: root.localError
+              metadata: "Error"
+              error: true
+            }
+          }
+
           Text {
             id: keyboardHint
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
             anchors.margins: Style.space(16)
-            text: root.insertMode ? "INSERT - Esc to normal mode" : "NORMAL - click here or press ? (Shift+/) or F1 for keyboard help"
+            text: PanelNavigation.hintText(root.currentTab, root.insertMode)
+            elide: Text.ElideRight
             color: root.mutedForeground
             font.family: root.fontFamily
             font.pixelSize: root.fs(10)
@@ -2759,6 +2790,37 @@ Item {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: if (!root.helpOpen) root.helpOpen = true
+            }
+          }
+
+          OverflowMenu {
+            id: overflowMenu
+            anchors.top: panelHeader.bottom
+            anchors.topMargin: Style.space(4)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(16)
+            width: Style.space(220)
+            items: PanelActions.overflowItems(root.guardFlags)
+            foreground: root.foreground
+            mutedForeground: root.mutedForeground
+            background: root.background
+            surface: root.surface
+            accent: root.accent
+            urgent: root.urgent
+            success: root.success
+            working: root.working
+            fontFamily: root.fontFamily
+            fontSize10: root.fs(10)
+            fontSize11: root.fs(11)
+            fontSize12: root.fs(12)
+            // The same calls the old buttons made.
+            onItemChosen: id => {
+              if (id === "update") root.act("/api/self_update")
+              else if (id === "discard") root.act("/api/reset_plan")
+              else if (id === "refactor") root.act("/api/plan", { mode: "refactor", goal: goalField.text })
+              else if (id === "diff") root.openDiff()
+              else if (id === "changeProject") root.openChooser()
+              else if (id === "help") root.helpOpen = true
             }
           }
         }
@@ -2994,60 +3056,7 @@ Item {
                 spacing: Style.space(5)
 
                 Repeater {
-                  model: [
-                    { key: "", description: "Panel · normal mode" },
-                    { key: "i", description: "Edit the goal (insert mode)" },
-                    { key: "I", description: "Edit plan feedback (insert mode); Enter improves with AI" },
-                    { key: "Escape", description: "Leave a text field, close the top overlay, or cancel plan editing" },
-                    { key: "j / k", description: "Select next / previous stage (report in Reports)" },
-                    { key: "gg / G", description: "Select first / last stage (report in Reports)" },
-                    { key: "Enter / o / Space", description: "Expand or collapse selected stage or report; focus stage title when editing" },
-                    { key: "Tab", description: "Toggle Live / History" },
-                    { key: "h / l", description: "Select Live / History" },
-                    { key: "Ctrl+d / Ctrl+u", description: "Scroll Live / History half a page down / up" },
-                    { key: "Page Down / Page Up", description: "Scroll the whole panel down / up" },
-                    { key: "Home / End", description: "Jump to the top / bottom of the panel" },
-                    { key: "1 / 2 / 3 / 4 / 5", description: "History: All / Runs / Git / Reviews / Errors" },
-                    { key: "6", description: "History: Reports (when available)" },
-                    { key: "p", description: "Create plan from goal" },
-                    { key: "t", description: "Open the discussion chat" },
-                    { key: "P", description: "Create plan from discussion" },
-                    { key: "E", description: "Enhance the goal description with AI" },
-                    { key: "e", description: "Edit plan stages by hand" },
-                    { key: "a", description: "Approve draft plan" },
-                    { key: "r", description: "Run approved or completed plan" },
-                    { key: "x", description: "Stop run or active queue" },
-                    { key: "d", description: "Open uncommitted diff" },
-                    { key: "c", description: "Change project" },
-                    { key: "f", description: "Open the feature specs list" },
-                    { key: "? (Shift+/) / F1", description: "Open keyboard help" },
-                    { key: "", description: "Diff viewer" },
-                    { key: "j / k", description: "Scroll down / up" },
-                    { key: "Ctrl+d / Ctrl+u", description: "Scroll half a page down / up" },
-                    { key: "gg / G", description: "Jump to top / bottom" },
-                    { key: "R", description: "Refresh diff" },
-                    { key: "q / Escape", description: "Close diff" },
-                    { key: "", description: "Feature specs list" },
-                    { key: "j / k", description: "Select next / previous feature" },
-                    { key: "Enter / o", description: "Open the selected feature in nvim" },
-                    { key: "R", description: "Refresh the feature list" },
-                    { key: "n", description: "New feature (slug and title form)" },
-                    { key: "c", description: "Chat with the co-authoring agent about the selected feature" },
-                    { key: "v", description: "Request an architect spec review of the selected feature" },
-                    { key: "a / A", description: "Approve the selected feature's spec / scenarios" },
-                    { key: "q / Escape", description: "Close the feature list" },
-                    { key: "", description: "Project chooser · normal mode" },
-                    { key: "j / k", description: "Select next / previous project" },
-                    { key: "Enter", description: "Open selection; in filter, open first match; in path field, set path" },
-                    { key: "/ / i", description: "Edit project filter (insert mode)" },
-                    { key: "q / Escape", description: "Close chooser (Escape leaves a text field first)" },
-                    { key: "", description: "Discussion chat" },
-                    { key: "i", description: "Edit the message (insert mode)" },
-                    { key: "Enter / Shift+Enter", description: "Send the message / insert a newline" },
-                    { key: "q / Escape", description: "Close the chat (Escape leaves the message field first)" },
-                    { key: "", description: "Keyboard help" },
-                    { key: "? (Shift+/) / F1 / q / Escape", description: "Close help before any other overlay" }
-                  ]
+                  model: PanelNavigation.helpRows()
 
                   delegate: Row {
                     id: helpRow
@@ -3098,6 +3107,18 @@ Item {
 
 
 
+  // An empty tab until its view moves out of Overview.
+  component TabPlaceholder: Text {
+    required property string tab
+    anchors.fill: parent
+    visible: root.currentTab === tab
+    text: PanelNavigation.tabLabel(tab, 0) + " is still on the Overview tab while the panel is being split into views."
+    wrapMode: Text.Wrap
+    color: root.mutedForeground
+    font.family: root.fontFamily
+    font.pixelSize: root.fs(11)
+  }
+
   component CadenceButton: PanelButton {
     id: cadenceButton
     required property string role
@@ -3123,5 +3144,7 @@ Item {
     accent: root.accent
     fontFamily: root.fontFamily
     fontSize: root.fs(11)
+    horizontalPadding: Style.space(18)
+    verticalPadding: Style.space(10)
   }
 }

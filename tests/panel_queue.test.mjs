@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { installGuards } from './panel_guards.mjs';
 
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const head = qml.match(/readonly property var queueHead: (.+)/)[1];
@@ -10,6 +11,10 @@ const start = qml.indexOf('  function canMoveQueueGoal(');
 const end = qml.indexOf('  readonly property string phase:', start);
 const button = qml.slice(qml.indexOf('id: startQueueButton'), qml.indexOf('id: queueList'));
 const enabled = button.match(/enabled: (.+)/)[1];
+// The button reads the shared guard; evaluate Panel.qml's guard binding for a root state.
+const panelRoot = state => installGuards(qml, {phase: 'idle', revisePending: false, chatPending: false,
+  plan: null, goalEnhancePending: false, goalField: {text: ''}, feedbackField: {text: ''},
+  questionField: {text: ''}, ...state});
 
 test('Start queue can resume the first paused goal, including after reload', () => {
   for (const status of ['blocked', 'failed', 'running', 'planning', 'awaiting_approval', 'unknown']) {
@@ -30,13 +35,13 @@ test('Start queue remains available for a stopped goal and cannot interrupt acti
   assert.match(button, /onClicked: root.act\("\/api\/queue\/start"\)/);
   for (const status of ['queued', 'blocked', 'failed', 'running', 'planning', 'awaiting_approval']) {
     const context = {queueHead: {status}};
-    const root = {hasQueuedGoals: vm.runInNewContext(ready, context), engineOnline: true,
+    const state = {hasQueuedGoals: vm.runInNewContext(ready, context), engineOnline: true,
       editingPlan: false, busy: false, queueActive: false};
-    assert.equal(vm.runInNewContext(enabled, {root}), true, status);
+    assert.equal(vm.runInNewContext(enabled, {root: panelRoot(state)}), true, status);
     for (const key of ['editingPlan', 'busy', 'queueActive']) {
-      assert.equal(vm.runInNewContext(enabled, {root: {...root, [key]: true}}), false, key);
+      assert.equal(vm.runInNewContext(enabled, {root: panelRoot({...state, [key]: true})}), false, key);
     }
-    assert.equal(vm.runInNewContext(enabled, {root: {...root, engineOnline: false}}), false);
+    assert.equal(vm.runInNewContext(enabled, {root: panelRoot({...state, engineOnline: false})}), false);
   }
 });
 

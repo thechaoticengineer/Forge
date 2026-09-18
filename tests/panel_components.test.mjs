@@ -52,6 +52,11 @@ test('root and extracted views share one button implementation', () => {
   assert.doesNotMatch(panel, /component PanelButton: Rectangle/);
   assert.match(button, /property bool enabled: true/);
   assert.match(button, /enabled: button\.enabled/);
+  // qs-free so the qs-free views load it under qmltestrunner; callers pass the shell padding.
+  assert.doesNotMatch(button, /^\s*import\s+(Quickshell|qs\.)/m);
+  assert.match(button, /property real horizontalPadding: 18/);
+  assert.match(button, /property real verticalPadding: 10/);
+  assert.match(panel, /component PanelButton: PanelViewButton \{[\s\S]*?horizontalPadding: Style\.space\(18\)\n\s*verticalPadding: Style\.space\(10\)/);
 });
 
 test('Panel hosts its content on a StackView page', () => {

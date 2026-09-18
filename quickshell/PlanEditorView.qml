@@ -751,5 +751,7 @@ Column {
     accent: view.accent
     fontFamily: view.fontFamily
     fontSize: view.fs(11)
+    horizontalPadding: Style.space(18)
+    verticalPadding: Style.space(10)
   }
 }
