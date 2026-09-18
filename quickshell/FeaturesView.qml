@@ -20,16 +20,18 @@ Rectangle {
   required property bool pending
   required property string errorText
   required property var rows
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property color success
-  required property string fontFamily
-  required property real fontSize10
-  required property real fontSize11
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property color success: theme ? theme.success : "#4faf72"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize10: theme ? theme.fontSize10 : 10
+  property real fontSize11: theme ? theme.fontSize11 : 11
   property alias listView: featuresList
 
   // M2: per-slug spec status/review metadata, the current chat/review

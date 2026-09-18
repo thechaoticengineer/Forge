@@ -115,7 +115,7 @@ function panelContext(st = stage([full('a')]), p = plan) {
     reviewViews:{},reviewViewVersion:0,stageReviewBlocks:{},expandedStageId:-1,editingPlan:false,calls:[],refreshes:0,refresh(){this.refreshes++}};
   ctx.root=ctx;
   ctx.api=(method,path,body,done,scoped)=>ctx.calls.push({method,path,done,scoped});
-  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  function reviewGateText(')),ctx);
+  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewScope('),panel.indexOf('  function stageActivity(')),ctx);
   return ctx;
 }
 test('stage prose identity survives publications while review identity remains snapshot scoped', () => {
@@ -165,8 +165,10 @@ test('actual Panel handlers load lazily, cache completed text, restart changed s
 });
 
 test('stage field wiring preserves each original, full prose, review previews, locks, and header-only parent expansion', () => {
-  const ctx={};
-  vm.runInNewContext(panel.slice(panel.indexOf('  function reviewGateText('),panel.indexOf('  function reviewRoundLabel(')),ctx);
+  // The review field presentation moved from Panel.qml to ReviewPresentation.js.
+  const ctx={ReviewView:review,UsageFormat:{}};
+  vm.runInNewContext(read('UsageFormat.js'),ctx.UsageFormat);
+  vm.runInNewContext(read('ReviewPresentation.js').replace(/^\.import .*$/gm,''),ctx);
   const v=full('a'), fields=ctx.reviewFields(v);
   assert.deepEqual(Array.from(fields,f=>f.text),[...v.issues,...v.notes,...v.checks]);
   const card=planEditor.slice(planEditor.indexOf('id: stageRow'),planEditor.indexOf('id: stageEditor'));

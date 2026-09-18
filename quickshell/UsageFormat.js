@@ -40,9 +40,41 @@ function quotaSummary(quota) {
     return rows.join("\n")
 }
 
+// One line of remaining quota per window, for Overview; Settings shows the details.
+function quotaLine(quota) {
+    const windows = quota && quota.status !== "pending" && quota.status !== "unavailable" ? quota.windows || [] : []
+    if (!windows.length) return quotaSummary(quota).split("\n")[0]
+    return windows.map(function(window) {
+        const expired = window.resets_unix && window.resets_unix * 1000 <= Date.now()
+        return window.name + " " + (expired ? "awaiting refresh" : typeof window.used_percent === "number"
+            ? Math.max(0, 100 - window.used_percent).toFixed(0) + "% left" : "unknown")
+    }).join(" · ") + (quota.status === "stale" ? " · previous reading" : "")
+}
+
 function usageSummary(usage) {
     return usageTools(usage).map(function(tool) {
         return tool + " " + formatTokens(usage[tool].total_tokens) + " tok"
+    }).join(" · ")
+}
+
+// Overview's one-line status: while busy the old now-working progress text
+// (N/M stages committed · run Xm Ys · usage), while idle the plan or last run.
+function overviewSummary(state, plan, busy, now) {
+    const stages = plan && plan.stages ? plan.stages : []
+    const committed = stages.filter(function(stage) { return stage.status === "committed" }).length
+    const phase = state ? state.phase : ""
+    const usage = usageSummary(plan ? plan.usage : null)
+    if (busy) {
+        const started = state !== null && state.run_started_unix > 0
+        const seconds = started ? Math.max(0, Math.floor(now - state.run_started_unix)) : 0
+        return [phase !== "planning" ? committed + "/" + stages.length + " stages committed" : "",
+            started ? "run " + Math.floor(seconds / 60) + "m " + (seconds % 60) + "s" : "",
+            usage].filter(function(part) { return part !== "" }).join(" · ")
+    }
+    if (!plan) return ""
+    return [(committed > 0 || plan.status === "done" ? "Last run · " : "Plan · ") + (plan.status || phase),
+        committed + "/" + stages.length + " stages committed", usage].filter(function(part) {
+        return part !== ""
     }).join(" · ")
 }
 

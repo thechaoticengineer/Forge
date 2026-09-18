@@ -10,10 +10,12 @@ import qs.Commons
 import qs.Ui
 import "DetailView.js" as DetailView
 import "ReviewView.js" as ReviewView
+import "ReviewPresentation.js" as ReviewPresentation
 import "PlanReview.js" as PlanReview
 import "PanelDetails.js" as PanelDetails
 import "ModelRouting.js" as ModelRouting
 import "UsageFormat.js" as UsageFormat
+import "CataloguePresentation.js" as CataloguePresentation
 import "GoalEnhancement.js" as GoalEnhancement
 import "Discussion.js" as Discussion
 import "PlanEdit.js" as PlanEdit
@@ -123,6 +125,12 @@ Item {
 
   // Font size in design pixels; Style.fontPx takes a multiplier of the 12px base.
   function fs(px) { return Style.fontPx(px / 12) }
+  // The palette and font sizes every view takes as its theme.
+  readonly property var theme: ({
+    foreground: foreground, mutedForeground: mutedForeground, background: background, surface: surface,
+    accent: accent, urgent: urgent, success: success, working: working, info: info, fontFamily: fontFamily,
+    fontSize10: fs(10), fontSize11: fs(11), fontSize12: fs(12)
+  })
 
   readonly property var plan: engineState ? engineState.plan : null
   readonly property var architecture: engineState && engineState.architecture ? engineState.architecture : null
@@ -234,36 +242,6 @@ Item {
       reviewer: current.reviewer === "per_plan" ? "per_plan" : "per_stage"}
     cadence[role] = cadence[role] === "per_plan" ? "per_stage" : "per_plan"
     act("/api/settings", {review_cadence: cadence})
-  }
-
-  function fixCommitsText(review) {
-    const fixes = review && Array.isArray(review.fixes) ? review.fixes : []
-    if (fixes.length === 0) return ""
-    const lines = fixes.map(function(fix) {
-      const subject = typeof fix.message === "string" ? fix.message.split("\n")[0] : ""
-      return "  round " + fix.round + " · " + (fix.sha || "—") + (subject ? " · " + subject : "")
-    })
-    const total = typeof review.fix_count === "number" ? review.fix_count : fixes.length
-    return "\nFix commits (" + total + "):\n" + lines.join("\n")
-      + (review.fixes_truncated ? "\n  …" : "")
-  }
-
-  function planReviewStatusText(review) {
-    if (!review) return ""
-    const gate = review.gate || {}, roles = gate.roles || {}
-    function outcome(role) {
-      const value = roles[role]
-      return value === "not_required" ? "review not required"
-        : value === "deferred" ? "deferred to the plan review" : value || "unavailable"
-    }
-    const round = typeof review.rounds === "number" ? review.rounds : "—"
-    const maximum = typeof review.budget === "number" ? review.budget + 1 : "—"
-    return "Plan review: " + (review.status || "unavailable")
-      + " · round " + round + " of " + maximum
-      + "\nCurrent gate: " + (gate.status || "unavailable")
-      + "\nArchitect: " + outcome("architect") + " · Independent: " + outcome("reviewer")
-      + fixCommitsText(review)
-      + (review.fix_sha ? "\nFinal fix commit: " + review.fix_sha : "")
   }
 
   property bool chooserOpen: false
@@ -393,20 +371,7 @@ Item {
         return
       }
       root.catalogueAiReady = JSON.stringify(resp.policy, null, 2)
-      root.catalogueAiMessage = "AI tier suggestions — review and save to use them.\n" + resp.summary
-        + (resp.sources && resp.sources.length ? "\n" + resp.sources.map(function(s) {
-          return s.provider + ": " + s.status + " · " + s.url
-        }).join("\n") : "")
-        + (resp.warnings && resp.warnings.length ? "\n" + resp.warnings.join("\n") : "")
-        + (resp.cost_evidence && resp.cost_evidence.length ? "\n" + resp.cost_evidence.map(function(c) {
-          return c.provider + "/" + c.model + ": cost preference "
-            + (c.relative_cost_preference === null ? "unknown" : c.relative_cost_preference)
-            + (c.source_url ? " · standard API USD/1M tokens input " + c.input_per_million
-              + ", output " + c.output_per_million + " · " + c.source_url : "")
-        }).join("\n") : "")
-        + (resp.reasons && resp.reasons.length ? "\n" + resp.reasons.map(function(r) {
-          return r.provider + "/" + r.model + ": " + r.rationale
-        }).join("\n") : "")
+      root.catalogueAiMessage = CataloguePresentation.suggestionMessage(resp)
       if (catalogueEditorView.editor.text === root.catalogueAiSent) root.applyCatalogueSuggestion()
     }, true)
   }
@@ -432,6 +397,9 @@ Item {
   property alias feedbackField: planView.feedbackField
   property alias questionField: planView.questionField
   property alias chatList: planView.chatList
+  // The Overview goal field; drafts and enhancement undo keep driving it by name.
+  property alias goalField: overviewView.goalField
+  property alias goalFlick: overviewView.goalFlick
   readonly property bool insertMode: goalField.activeFocus
     || feedbackField.activeFocus || questionField.activeFocus || discussionView.input.activeFocus
     || projectChooser.filterField.activeFocus || projectChooser.manualField.activeFocus || catalogueEditorView.editor.activeFocus
@@ -1245,178 +1213,13 @@ Item {
     setStageReviewBlock(current, "")
     if (range) loadStageReviews(current.id, range.cursor, range.end)
   }
-  function stageReviewHasSelection(item) {
-    if (!item) return false
-    if (item.stageProseField === true && item.hasSelection) return true
-    return Array.from(item.children || []).some(function(child) { return root.stageReviewHasSelection(child) })
-  }
-  function stageReviewHasHeldPreview(presentation, view) {
-    if (stageReviewIncompleteRange(view)) return false
-    for (let i = 0; i < presentation.count; i++) {
-      if (!presentation.get(i).record.complete) return true
-    }
-    return false
-  }
-  function reconcileStageReviewPresentation(stage, presentation, repeater) {
-    // Presentation is separate from ReviewView's current verification authority.
-    // A selected original stays in its existing editor, with its source scope;
-    // it never makes a new scope's preview complete or suppresses verification.
-    const view = reviewView(stage), scope = view.scope.key, detailScope = stageDetailScope(stage)
-    if (presentation.count && presentation.get(0).detailScope !== detailScope) presentation.clear()
-    const desired = []
-    view.rows.forEach(function(row) {
-      const identity = ReviewView.identity(row.verdict)
-      let found = -1
-      for (let i = 0; i < presentation.count; i++) {
-        const entry = presentation.get(i)
-        if (desired.indexOf(entry.token) >= 0) continue
-        // A selected preview must not hide a newly available complete record.
-        if (!entry.record.complete && row.complete && stageReviewHasSelection(repeater.itemAt(i))) continue
-        if ((entry.sourceScope === scope && entry.record.position === row.position)
-          || (identity && identity === ReviewView.identity(entry.record.verdict))) { found = i; break }
-      }
-      if (found < 0) {
-        const token = JSON.stringify([scope, row.position, row.complete])
-        presentation.append({token: token, detailScope: detailScope, sourceScope: scope, record: row})
-        desired.push(token)
-      } else {
-        const entry = presentation.get(found)
-        desired.push(entry.token)
-        if (!stageReviewHasSelection(repeater.itemAt(found))
-          && (entry.sourceScope !== scope || (!entry.record.complete && row.complete))) {
-          presentation.setProperty(found, "record", row)
-          presentation.setProperty(found, "sourceScope", scope)
-        }
-      }
-    })
-    for (let i = presentation.count - 1; i >= 0; i--) {
-      if (desired.indexOf(presentation.get(i).token) < 0 && !stageReviewHasSelection(repeater.itemAt(i)))
-        presentation.remove(i)
-    }
-    // Reorder by current history without destroying existing delegates/editors.
-    // Unmatched selected originals remain at the end, explicitly source-labelled.
-    for (let i = 0; i < desired.length; i++) {
-      for (let j = i; j < presentation.count; j++) {
-        if (presentation.get(j).token === desired[i]) {
-          if (i !== j) presentation.move(j, i, 1)
-          break
-        }
-      }
-    }
-  }
-
-
-
-  function reviewGateText(stage) {
-    const gate = stage.review_gate || {}
-    const policy = stage.review_policy || {}
-    const roles = gate.roles || {}
-    function outcome(role) {
-      return roles[role] === "deferred" ? "deferred to the plan review"
-        : roles[role] === "not_required" ? "review not required" : roles[role] || "pending"
-    }
-    const status = gate.status === "deferred"
-      ? (stage.status === "committed" ? "deferred · committed under a deferred review policy"
-        : "deferred · awaiting commit under a deferred review policy") : gate.status || "pending"
-    return "Review policy: " + (policy.scope || "pending")
-      + " · gate: " + status
-      + "\nArchitect: " + outcome("architect")
-      + " · Independent: " + outcome("reviewer")
-  }
-
-  function reviewStrings(values) {
-    const strings = []
-    // Nested ListView data may be a QML sequence rather than a JS Array.
-    if (values && typeof values !== "string" && typeof values.length === "number") {
-      for (let i = 0; i < values.length; i++) {
-        if (typeof values[i] === "string") strings.push(values[i])
-      }
-    }
-    return strings
-  }
-
-  function reviewFields(verdict) {
-    const fields = []
-    for (const kind of ["issues", "notes", "checks"]) {
-      reviewStrings(verdict[kind]).forEach(function(text, i) {
-        const label = kind === "issues" ? "Change request" : kind === "checks" ? "Verified check"
-          : verdict.approved === true ? "Legacy optional note" : "Legacy note (change request)"
-        fields.push({kind: kind, label: label + " " + (i + 1), text: text})
-      })
-    }
-    return fields
-  }
-
-  function stageReviews(stage) {
-    const entries = []
-    const saved = stage.reviews || []
-    for (let i = 0; i < saved.length; i++) {
-      if (saved[i] && typeof saved[i] === "object")
-        entries.push({ verdict: saved[i], round: saved[i].round })
-    }
-    if (entries.length === 0 && stage.last_verdict) {
-      // A live round describes current work, not the older fallback verdict.
-      // Wrap records for display only; never fill in or rewrite saved history.
-      entries.push({ verdict: stage.last_verdict, round: stage.last_verdict.round
-        || (stage.status !== "in_progress" ? stage.rounds : null) })
-    }
-    return entries
-  }
-
-  function reviewDecision(verdict) {
-    const issues = reviewStrings(verdict.issues)
-    const notes = reviewStrings(verdict.notes)
-    const requests = issues.concat(notes)
-      .filter(function(request, index, all) { return all.indexOf(request) === index })
-    const clean = verdict.approved === true && issues.length === 0 && notes.length === 0
-    const optionalNotes = verdict.approved === true && issues.length === 0 && notes.length > 0
-    const label = clean ? "approved"
-      : optionalNotes ? "approved with optional notes"
-      : verdict.approved === true ? "legacy approval with change requests" : "changes requested"
-    return { clean: clean, optionalNotes: optionalNotes,
-      label: label + (clean || optionalNotes ? "" : " · " + requests.length
-      + (requests.length === 1 ? " request" : " requests")) }
-  }
-
-  function reviewRoundLabel(entry) {
-    const round = UsageFormat.nonNegativeInt(entry.round)
-    return round !== null && round > 0 ? "round " + round : "round unknown"
-  }
-
-  function reviewTimestamp(verdict) {
-    const unix = UsageFormat.nonNegativeInt(verdict.unix)
-    return unix === null ? "" : new Date(unix * 1000).toISOString()
-  }
-
   function stageActivity(stage) {
     if (!engineState || !busy || stage.status !== "in_progress"
         || stage.id !== engineState.current_stage) return ""
     const step = engineState.current_step || ""
     if (!step) return ""
     const activity = step.indexOf("fixing") === 0 ? "fixing for review" : step
-    return "now: " + activity + " · " + reviewRoundLabel({ round: stage.rounds })
-  }
-
-  function chooserRows(data, filter) {
-    if (!data) return []
-    const f = filter.toLowerCase()
-    const rows = []
-    const local = (data.local || []).filter(function(p) {
-      return f === "" || p.name.toLowerCase().indexOf(f) !== -1
-    })
-    if (local.length > 0) rows.push({ kind: "header", label: "Local" })
-    local.forEach(function(p) { rows.push({ kind: "local", name: p.name, path: p.path }) })
-    const remote = (data.remote || []).filter(function(r) {
-      return f === "" || r.full_name.toLowerCase().indexOf(f) !== -1
-    })
-    if (remote.length > 0 || data.remote_error) rows.push({ kind: "header", label: "GitHub" })
-    if (data.remote_error) rows.push({ kind: "note", label: data.remote_error })
-    remote.forEach(function(r) {
-      rows.push({ kind: "remote", name: r.full_name, cloned: r.cloned,
-                  isPrivate: r.private })
-    })
-    rows.push({ kind: "path", label: "path…" })
-    return rows
+    return "now: " + activity + " · " + ReviewPresentation.reviewRoundLabel({ round: stage.rounds })
   }
 
   function chooseRow(row) {
@@ -1548,28 +1351,12 @@ Item {
           agentOutput.reportList.captureReading()
         }
 
-        function scrollOutput(direction) {
-          const view = root.liveTab ? agentOutput.liveOutput : root.reportsVisible ? agentOutput.reportList : agentOutput.historyList
-          view.cancelFlick()
-          if (view !== agentOutput.reportList) view.followTail = false
-          const top = view.originY
-          const bottom = top + Math.max(0, view.contentHeight - view.height)
-          view.contentY = Math.max(top, Math.min(bottom,
-            view.contentY + direction * view.height / 2))
-          if (view !== agentOutput.reportList && direction > 0 && view.contentY >= bottom) {
-            view.followTail = true
-            view.scrollToTail()
-          }
-          if (view !== agentOutput.reportList) view.captureReading()
-          if (view === agentOutput.reportList) agentOutput.reportList.captureReading()
-        }
-
         // The scrollable area of the current tab for Page Up/Down and Home/End.
         function tabScroller() {
           return root.currentTab === "architecture" ? architectureView
             : root.currentTab === "queue" ? queueView.listView
             : root.currentTab === "plan" ? planView
-            : root.currentTab === "settings" ? settingsView : panelScroll
+            : root.currentTab === "settings" ? settingsView : overviewView
         }
 
         // j/k, gg/G and Enter act on the Settings rows while Settings is shown.
@@ -1588,13 +1375,6 @@ Item {
             settingsView.activateSelection()
           else return false
           return true
-        }
-
-        function scrollDiff(amount) {
-          diffView.listView.cancelFlick()
-          const top = diffView.listView.originY
-          const bottom = top + Math.max(0, diffView.listView.contentHeight - diffView.listView.height)
-          diffView.listView.contentY = Math.max(top, Math.min(bottom, diffView.listView.contentY + amount))
         }
 
         Keys.onPressed: event => {
@@ -1642,11 +1422,11 @@ Item {
               }
             } else if (event.modifiers === Qt.ControlModifier) {
               if (event.key === Qt.Key_D || event.key === Qt.Key_U)
-                scrollDiff((event.key === Qt.Key_D ? 1 : -1) * diffView.listView.height / 2)
+                diffView.scrollBy((event.key === Qt.Key_D ? 1 : -1) * diffView.listView.height / 2)
             } else if (event.modifiers === Qt.NoModifier) {
               if (event.key === Qt.Key_Q) root.diffOpen = false
               else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
-                scrollDiff(event.key === Qt.Key_J ? 40 : -40)
+                diffView.scrollBy(event.key === Qt.Key_J ? 40 : -40)
               else if (event.key === Qt.Key_G) {
                 if (prefix === "g") {
                   diffView.listView.cancelFlick()
@@ -1714,8 +1494,7 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.NoModifier) {
             root.currentTab = "overview"
-            goalField.forceActiveFocus()
-            panelScroll.reveal(goalFlick.parent)
+            overviewView.focusGoal()
             event.accepted = true
           } else if (event.key === Qt.Key_I && event.modifiers === Qt.ShiftModifier) {
             // The feedback field lives on Plan.
@@ -1745,10 +1524,10 @@ Item {
                        && (event.key === Qt.Key_D || event.key === Qt.Key_U)) {
               // Output keys act on Activity, the view that shows the output.
               root.currentTab = "activity"
-              scrollOutput(event.key === Qt.Key_D ? 1 : -1)
+              activityView.scrollOutput(event.key === Qt.Key_D ? 1 : -1)
               event.accepted = true
             } else if (event.modifiers === Qt.NoModifier) {
-              // Keep action guards identical to their PanelButton.enabled bindings.
+              // Keep action guards identical to their buttons: both read root.guards.
               if (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp) {
                 const scroller = tabScroller()
                 const step = event.key === Qt.Key_PageDown ? 1 : -1
@@ -1874,18 +1653,7 @@ Item {
             stepText: root.stepText
             backgroundBusy: root.backgroundBusy
             activeProjectCount: root.activeProjectCount
-            foreground: root.foreground
-            mutedForeground: root.mutedForeground
-            background: root.background
-            surface: root.surface
-            accent: root.accent
-            urgent: root.urgent
-            success: root.success
-            working: root.working
-            fontFamily: root.fontFamily
-            fontSize10: root.fs(10)
-            fontSize11: root.fs(11)
-            fontSize12: root.fs(12)
+            theme: root.theme
             titleFontSize: root.fs(18)
             spacing: Style.space(10)
             onProjectSelected: path => root.act("/api/project/select", { path: path })
@@ -1903,18 +1671,7 @@ Item {
             anchors.rightMargin: Style.space(16)
             currentTab: root.currentTab
             queueCount: root.queue.length
-            foreground: root.foreground
-            mutedForeground: root.mutedForeground
-            background: root.background
-            surface: root.surface
-            accent: root.accent
-            urgent: root.urgent
-            success: root.success
-            working: root.working
-            fontFamily: root.fontFamily
-            fontSize10: root.fs(10)
-            fontSize11: root.fs(11)
-            fontSize12: root.fs(12)
+            theme: root.theme
             onTabRequested: id => root.currentTab = id
           }
 
@@ -1958,15 +1715,8 @@ Item {
               stageActivity: root.stageActivity
               stageDetailScope: root.stageDetailScope
               reviewView: root.reviewView
-              reviewGateText: root.reviewGateText
-              reviewDecision: root.reviewDecision
-              reviewFields: root.reviewFields
-              reviewRoundLabel: root.reviewRoundLabel
-              reviewTimestamp: root.reviewTimestamp
               stageReviewIncompleteRange: root.stageReviewIncompleteRange
-              stageReviewHasHeldPreview: root.stageReviewHasHeldPreview
               ensureStageReviewsLoaded: root.ensureStageReviewsLoaded
-              reconcileStageReviewPresentation: root.reconcileStageReviewPresentation
               chat: root.chat
               chatExpanded: root.chatExpanded
               chatPending: root.chatPending
@@ -1976,15 +1726,7 @@ Item {
               chatMaxHeight: Style.space(96)
               horizontalPadding: Style.space(18)
               verticalPadding: Style.space(10)
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              working: root.working
-              fontFamily: root.fontFamily
+              theme: root.theme
               // The same calls the old Overview buttons made.
               onActionRequested: id => {
                 if (id === "approve") root.act("/api/approve")
@@ -2036,18 +1778,7 @@ Item {
               spacing: Style.space(8)
               horizontalPadding: Style.space(18)
               verticalPadding: Style.space(10)
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              working: root.working
-              fontFamily: root.fontFamily
-              fontSize10: root.fs(10)
-              fontSize11: root.fs(11)
-              fontSize12: root.fs(12)
+              theme: root.theme
               // The same calls the old settings buttons made.
               onSettingActivated: key => {
                 if (key === "planner" || key === "architect" || key === "implementer") root.cycleTool(key)
@@ -2097,17 +1828,7 @@ Item {
               expandedReportKey: root.expandedReportKey
               now: root.agentNow
               detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              working: root.working
-              fontFamily: root.fontFamily
-              fontSize10: root.fs(10)
-              fontSize11: root.fs(11)
+              theme: root.theme
               onLiveTabRequested: live => root.liveTab = live
               onHistoryFilterRequested: filter => root.historyFilter = filter
               onReportSelected: key => root.selectedReportKey = key
@@ -2132,17 +1853,8 @@ Item {
               planReviewScope: root.planReviewScope
               planReviewExpanded: root.planReviewExpanded
               detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-              planReviewStatusText: root.planReviewStatusText
               scrollBarSpace: Style.space(16)
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              fontFamily: root.fontFamily
-              fontSize11: root.fs(11)
-              fontSize12: root.fs(12)
+              theme: root.theme
               onPlanReviewExpansionRequested: expanded => root.planReviewExpanded = expanded
               onPlanReviewLoadRequested: root.loadPlanReviewRequests()
               onLeaveRequested: keyHandler.forceActiveFocus()
@@ -2165,16 +1877,7 @@ Item {
               activity: root.featureActivity
               selectedSlug: root.selectedFeatureSlug
               detailState: root.featureDetailState
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              fontFamily: root.fontFamily
-              fontSize10: root.fs(10)
-              fontSize11: root.fs(11)
+              theme: root.theme
               onCloseRequested: root.closeFeatures()
               onRefreshRequested: root.openFeatures()
               onOpenRequested: feature => root.openFeatureInEditor(feature)
@@ -2201,18 +1904,7 @@ Item {
               spacing: Style.space(8)
               horizontalPadding: Style.space(18)
               verticalPadding: Style.space(10)
-              foreground: root.foreground
-              mutedForeground: root.mutedForeground
-              background: root.background
-              surface: root.surface
-              accent: root.accent
-              urgent: root.urgent
-              success: root.success
-              working: root.working
-              fontFamily: root.fontFamily
-              fontSize10: root.fs(10)
-              fontSize11: root.fs(11)
-              fontSize12: root.fs(12)
+              theme: root.theme
               onStartRequested: root.act("/api/queue/start")
               onMoveRequested: (id, dir) => root.act("/api/queue/move", { id: id, dir: dir })
               onRemoveRequested: id => root.act("/api/queue/remove", { id: id })
@@ -2223,334 +1915,74 @@ Item {
             }
           }
 
-          // Overview: for now the former page minus the header, project tabs and
-          // the views that moved to the Activity, Architecture, Features and Queue tabs.
-          Flickable {
-            id: panelScroll
-            visible: root.currentTab === "overview"
+          // ------------------------------------------------ overview
+          OverviewView {
+            id: overviewView
+
             anchors.fill: tabArea
-            clip: true
-            contentWidth: width
-            contentHeight: panelColumn.implicitHeight
-            flickableDirection: Flickable.VerticalFlick
-            boundsBehavior: Flickable.StopAtBounds
-            readonly property real maximumY: Math.max(0, contentHeight - height)
-            function reveal(item) {
-              const top = item.mapToItem(contentItem, 0, 0).y
-              if (top < contentY || top + item.height > contentY + height)
-                contentY = Math.max(0, Math.min(maximumY, top))
-            }
-            ScrollBar.vertical: ScrollBar {
-              policy: ScrollBar.AsNeeded
-            }
-
-          Column {
-            id: panelColumn
-            width: panelScroll.width - Style.space(16)
-            spacing: Style.space(10)
-
-            // ------------------------------------------------ now working
-            Rectangle {
-              id: agentCard
-              readonly property var stages: root.plan && root.plan.stages ? root.plan.stages : []
-              readonly property var currentStage: stages.find(function(stage) {
-                return root.engineState && stage.id === root.engineState.current_stage
-              })
-              readonly property int committedStages: stages.filter(function(stage) {
-                return stage.status === "committed"
-              }).length
-              readonly property int runSeconds: root.engineState && root.engineState.run_started_unix > 0
-                ? Math.max(0, Math.floor(root.agentNow - root.engineState.run_started_unix)) : 0
-
-              visible: root.busy
-              width: parent.width
-              height: visible ? workingSummary.implicitHeight + Style.space(16) : 0
-              color: root.surface
-              radius: 4
-
-              Column {
-                id: workingSummary
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.margins: Style.space(8)
-                spacing: Style.space(4)
-                PanelDetail {
-                  width: parent.width
-                  originalText: root.engineState ? root.engineState.goal : ""
-                  metadata: "Goal"
-                }
-                Row {
-                  width: parent.width
-                  spacing: Style.space(8)
-                  Text {
-                    width: parent.width - (workingStep.visible ? workingStep.width + parent.spacing : 0)
-                    text: root.phase === "planning" ? "planning…"
-                      : root.engineState && root.engineState.current_stage !== null
-                        ? "stage " + root.engineState.current_stage
-                          + (agentCard.currentStage ? " · " + agentCard.currentStage.title : "")
-                        : "now working"
-                    textFormat: Text.PlainText
-                    color: root.working
-                    elide: Text.ElideRight
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Text {
-                    id: workingStep
-                    visible: root.phase !== "planning" && text !== ""
-                    width: Math.min(implicitWidth, parent.width * 0.4)
-                    text: root.currentActivity || (root.engineState ? root.engineState.current_step : "")
-                    textFormat: Text.PlainText
-                    color: root.working
-                    elide: Text.ElideRight
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                }
-                Text {
-                  readonly property string planUsage: UsageFormat.usageSummary(root.plan ? root.plan.usage : null)
-                  visible: root.phase !== "planning"
-                    || (root.engineState !== null && root.engineState.run_started_unix > 0)
-                  width: parent.width
-                  text: (root.phase !== "planning"
-                      ? agentCard.committedStages + "/" + agentCard.stages.length + " stages committed" : "")
-                    + (root.engineState && root.engineState.run_started_unix > 0
-                      ? (root.phase !== "planning" ? " · " : "")
-                        + "run " + Math.floor(agentCard.runSeconds / 60) + "m "
-                        + (agentCard.runSeconds % 60) + "s" : "")
-                    + (planUsage ? " · " + planUsage : "")
-                  textFormat: Text.PlainText
-                  color: root.mutedForeground
-                  wrapMode: planUsage ? Text.Wrap : Text.NoWrap
-                  elide: planUsage ? Text.ElideNone : Text.ElideRight
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(11)
-                }
-                Row {
-                  visible: root.agentActive
-                  width: parent.width
-                  spacing: Style.space(10)
-                  Text {
-                    id: agentSummary
-                    width: Math.max(0, parent.width - agentTime.width - parent.spacing)
-                    text: root.agentActive ? root.agent.role + " · " + root.agent.tool
-                      + (root.agent.model ? " · " + root.agent.model : "") : ""
-                    textFormat: Text.PlainText
-                    color: root.working
-                    elide: Text.ElideRight
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                  Text {
-                    id: agentTime
-                    text: root.agentActive ? root.agentElapsed() + " · " + root.agent.lines + " lines" : ""
-                    textFormat: Text.PlainText
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(11)
-                  }
-                }
-                PanelDetail {
-                  // The state heartbeat's last_line is bounded to 200 characters.
-                  // Full-text actions must use the complete retained feed instead.
-                  visible: root.agentActive && liveEntries.count > 0
-                  scope: JSON.stringify([root.lastProject, root.projectViewRevision, root.agentSession])
-                  width: parent.width
-                  originalText: liveEntries.count > 0 ? liveEntries.get(liveEntries.count - 1).originalText : ""
-                  metadata: "Latest retained output"
-                  error: liveEntries.count > 0 && (liveEntries.get(liveEntries.count - 1).kind === "error"
-                    || liveEntries.get(liveEntries.count - 1).stream === "stderr")
-                }
+            visible: root.currentTab === "overview"
+            engineState: root.engineState
+            plan: root.plan
+            phase: root.phase
+            busy: root.busy
+            agent: root.agent
+            agentActive: root.agentActive
+            agentElapsedText: root.agentElapsed()
+            latestOutputText: root.agentActive ? root.agent.last_line || "" : ""
+            liveEntries: liveEntries
+            runSummaryText: UsageFormat.overviewSummary(root.engineState, root.plan, root.busy, root.agentNow)
+            actions: PanelActions.overviewActions(root.guardFlags, root.guards)
+            goalEnhanceStatus: root.goalEnhancePending ? "enhancing the description…"
+              : root.goalEnhanceError !== "" ? root.goalEnhanceError
+              : root.goalEnhanceReady !== "" ? "AI rewrite ready — press Apply AI description" : ""
+            goalEnhanceError: root.goalEnhanceError !== ""
+            canApplyEnhancement: root.goalEnhanceReady !== ""
+            canUndoEnhancement: root.goalEnhanceUndo !== ""
+            discussionStatus: root.discussionPending ? "Forge is replying…" : root.discussionError
+            discussionError: root.discussionError !== ""
+            discussionCount: root.discussion.length
+            diffEnabled: root.guards.diff
+            hasReports: root.hasReports
+            limitsSummaryText: UsageFormat.quotaLine(root.engineState ? root.engineState.claude_quota : null)
+            now: root.agentNow
+            selectedStageIndex: root.selectedStageIndex
+            spacing: Style.space(8)
+            horizontalPadding: Style.space(18)
+            verticalPadding: Style.space(10)
+            scrollBarSpace: Style.space(16)
+            theme: root.theme
+            // The same calls the old Overview buttons made.
+            onActionRequested: id => {
+              if (id === "createPlan") root.act("/api/plan", { goal: goalField.text })
+              else if (id === "discuss") root.openDiscussion()
+              else if (id === "enhance") root.enhanceGoal()
+              else if (id === "applyEnhancement") root.applyGoalEnhancement()
+              else if (id === "undoEnhancement") root.undoGoalEnhancement()
+              else if (id === "addToQueue") {
+                root.act("/api/queue/add", { goal: goalField.text })
+                goalField.text = ""
+              }
+              else if (id === "approve") root.act("/api/approve")
+              else if (id === "run") root.act("/api/run")
+              else if (id === "editPlan") root.beginPlanEdit()
+              else if (id === "stop") root.act("/api/stop")
+              else if (id === "diff") root.openDiff()
+              else if (id === "reports") {
+                root.currentTab = "activity"
+                root.liveTab = false
+                if (root.hasReports) root.historyFilter = "reports"
               }
             }
-
-            // ---------------------------------------------------- goal
-            Rectangle {
-              width: parent.width
-              height: Math.min(Math.max(Style.space(52),
-                goalField.contentHeight + Style.space(16)), Style.space(140))
-              color: root.surface
-              radius: 4
-              border.width: 1
-              border.color: goalField.activeFocus
-                ? root.accent : Qt.darker(root.foreground, 3)
-              Flickable {
-                id: goalFlick
-                anchors.fill: parent
-                anchors.margins: Style.space(6)
-                clip: true
-                contentWidth: goalField.width
-                contentHeight: goalField.height
-                flickableDirection: Flickable.VerticalFlick
-                boundsBehavior: Flickable.StopAtBounds
-
-                function ensureCursorVisible() {
-                  const cursor = goalField.cursorRectangle
-                  if (contentY > cursor.y)
-                    contentY = cursor.y
-                  else if (contentY + height < cursor.y + cursor.height)
-                    contentY = cursor.y + cursor.height - height
-                  contentY = Math.max(0, Math.min(contentY, contentHeight - height))
-                }
-
-                onHeightChanged: Qt.callLater(ensureCursorVisible)
-                onContentHeightChanged: Qt.callLater(ensureCursorVisible)
-
-                TextEdit {
-                  id: goalField
-                  Keys.onPressed: event => {
-                    if (event.key === Qt.Key_F1) {
-                      root.helpOpen = true
-                      keyHandler.forceActiveFocus()
-                      event.accepted = true
-                    }
-                  }
-                  Keys.onEscapePressed: event => {
-                    keyHandler.forceActiveFocus()
-                    event.accepted = true
-                  }
-                  width: goalFlick.width
-                  height: Math.max(contentHeight, goalFlick.height)
-                  wrapMode: TextEdit.Wrap
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: root.fs(12)
-                  onCursorRectangleChanged: goalFlick.ensureCursorVisible()
-                  Text {
-                    visible: goalField.text === "" && !goalField.activeFocus
-                    text: "Describe a goal, or leave empty and press Refactor plan for suggestions"
-                    color: root.mutedForeground
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fs(12)
-                  }
-                }
-              }
+            onOpenTab: id => root.currentTab = id
+            // A stage row opens Plan with that stage selected and expanded.
+            onStageRequested: index => {
+              keyHandler.selectStage(index)
+              root.expandedStageId = root.displayedStages[index].id
             }
-
-            Text {
-              width: parent.width
-              visible: text !== ""
-              text: root.goalEnhancePending ? "enhancing the description…"
-                : root.goalEnhanceError !== "" ? root.goalEnhanceError
-                : root.goalEnhanceReady !== "" ? "AI rewrite ready — press Apply AI description" : ""
-              textFormat: Text.PlainText
-              color: root.goalEnhanceError !== "" ? root.urgent : root.mutedForeground
-              wrapMode: Text.Wrap
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
-            }
-
-            Flow {
-              width: parent.width
-              spacing: Style.space(8)
-              PanelButton {
-                id: createPlanButton
-                label: "Create plan"
-                primary: true
-                enabled: root.guards.createPlan
-                onClicked: root.act("/api/plan", { goal: goalField.text })
-              }
-              PanelButton {
-                id: enhanceGoalButton
-                label: "Enhance with AI"
-                enabled: root.guards.enhance
-                onClicked: root.enhanceGoal()
-              }
-              PanelButton {
-                label: "Apply AI description"
-                visible: root.goalEnhanceReady !== ""
-                onClicked: root.applyGoalEnhancement()
-              }
-              PanelButton {
-                label: "Undo enhance"
-                visible: root.goalEnhanceUndo !== ""
-                onClicked: root.undoGoalEnhancement()
-              }
-              PanelButton {
-                label: "Refactor plan"
-                enabled: root.guards.refactor
-                onClicked: root.act("/api/plan", { mode: "refactor", goal: goalField.text })
-              }
-              PanelButton {
-                label: "Add to queue"
-                enabled: root.guards.addToQueue
-                onClicked: {
-                  root.act("/api/queue/add", { goal: goalField.text })
-                  goalField.text = ""
-                }
-              }
-              PanelButton {
-                id: approvePlanButton
-                label: "Plan is OK — approve"
-                enabled: root.guards.approve
-                onClicked: root.act("/api/approve")
-              }
-              PanelButton {
-                id: runPlanButton
-                label: "Start implementing"
-                primary: true
-                enabled: root.guards.run
-                onClicked: root.act("/api/run")
-              }
-              PanelButton {
-                label: "Stop"
-                enabled: root.guards.stop
-                onClicked: root.act("/api/stop")
-              }
-              PanelButton {
-                id: editPlanButton
-                label: "Edit plan"
-                visible: !root.editingPlan
-                enabled: root.guards.editPlan
-                onClicked: root.beginPlanEdit()
-              }
-              PanelButton {
-                label: "Discard plan"
-                enabled: root.guards.discard
-                onClicked: root.act("/api/reset_plan")
-              }
-              PanelButton {
-                label: "View diff"
-                enabled: root.guards.diff
-                onClicked: root.openDiff()
-              }
-              PanelButton {
-                label: "Features"
-                enabled: root.guards.features
-                onClicked: root.openFeatures()
-              }
-              PanelButton {
-                label: "Update Forge"
-                enabled: root.guards.update
-                onClicked: root.act("/api/self_update")
-              }
-            }
-
-            // Entry point for the discussion; the chat itself is a stack page.
-            Row {
-              width: parent.width
-              spacing: Style.space(8)
-              PanelButton {
-                id: discussionButton
-                label: "Discuss before planning"
-                  + (root.discussion.length > 0 ? " (" + root.discussion.length + ")" : "")
-                onClicked: root.openDiscussion()
-              }
-              Text {
-                width: Math.max(0, parent.width - discussionButton.width - parent.spacing)
-                anchors.verticalCenter: discussionButton.verticalCenter
-                visible: text !== ""
-                text: root.discussionPending ? "Forge is replying…" : root.discussionError
-                textFormat: Text.PlainText
-                color: root.discussionError !== "" ? root.urgent : root.mutedForeground
-                wrapMode: Text.Wrap
-                font.family: root.fontFamily
-                font.pixelSize: root.fs(11)
-              }
-            }
-
-          }
+            onOverflowRequested: overflowMenu.open = true
+            onCopyRequested: original => Quickshell.clipboardText = original
+            onHelpRequested: root.helpOpen = true
+            onLeaveRequested: keyHandler.forceActiveFocus()
           }
 
           // Errors stay visible on every tab, just above the hint line.
@@ -2604,18 +2036,7 @@ Item {
             anchors.rightMargin: Style.space(16)
             width: Style.space(220)
             items: PanelActions.overflowItems(root.guardFlags)
-            foreground: root.foreground
-            mutedForeground: root.mutedForeground
-            background: root.background
-            surface: root.surface
-            accent: root.accent
-            urgent: root.urgent
-            success: root.success
-            working: root.working
-            fontFamily: root.fontFamily
-            fontSize10: root.fs(10)
-            fontSize11: root.fs(11)
-            fontSize12: root.fs(12)
+            theme: root.theme
             // The same calls the old buttons made.
             onItemChosen: id => {
               if (id === "update") root.act("/api/self_update")
@@ -2648,15 +2069,7 @@ Item {
         canSend: root.discussionCanSend
         canPlan: root.discussionCanPlan
         canClear: root.discussionCanClear
-        foreground: root.foreground
-        mutedForeground: root.mutedForeground
-        background: root.background
-        surface: root.surface
-        accent: root.accent
-        urgent: root.urgent
-        fontFamily: root.fontFamily
-        fontSize11: root.fs(11)
-        fontSize12: root.fs(12)
+        theme: root.theme
         onSendRequested: message => root.sendDiscussionMessage(message)
         onPlanRequested: root.planFromDiscussion()
         onClearRequested: root.clearDiscussion()
@@ -2683,15 +2096,7 @@ Item {
         details: root.catalogueDetails
         draft: root.catalogueDraft
         detailScope: JSON.stringify([root.lastProject, root.projectViewRevision, (root.plan || {}).plan_id || ""])
-        foreground: root.foreground
-        mutedForeground: root.mutedForeground
-        background: root.background
-        surface: root.surface
-        accent: root.accent
-        urgent: root.urgent
-        fontFamily: root.fontFamily
-        fontSize10: root.fs(10)
-        fontSize11: root.fs(11)
+        theme: root.theme
         onCloseRequested: root.catalogueOpen = false
         onSuggestRequested: root.suggestCatalogue()
         onApplyRequested: root.applyCatalogueSuggestion()
@@ -2714,17 +2119,7 @@ Item {
         pending: root.diffPending
         diffText: root.diffText
         errorText: root.diffError
-        foreground: root.foreground
-        mutedForeground: root.mutedForeground
-        background: root.background
-        surface: root.surface
-        accent: root.accent
-        urgent: root.urgent
-        success: root.success
-        info: root.info
-        fontFamily: root.fontFamily
-        fontSize10: root.fs(10)
-        fontSize11: root.fs(11)
+        theme: root.theme
         onCloseRequested: root.diffOpen = false
         onRefreshRequested: root.refreshDiff()
         onLeaveRequested: keyHandler.forceActiveFocus()
@@ -2738,18 +2133,8 @@ Item {
         anchors.fill: parent
         open: root.chooserOpen
         manualEntry: root.manualEntry
-        rowsForFilter: filter => root.chooserRows(root.projectsData, filter)
-        foreground: root.foreground
-        mutedForeground: root.mutedForeground
-        background: root.background
-        surface: root.surface
-        accent: root.accent
-        urgent: root.urgent
-        success: root.success
-        fontFamily: root.fontFamily
-        fontSize10: root.fs(10)
-        fontSize11: root.fs(11)
-        fontSize12: root.fs(12)
+        projectsData: root.projectsData
+        theme: root.theme
         onCloseRequested: root.chooserOpen = false
         onRowChosen: row => root.chooseRow(row)
         onManualPathRequested: path => {
@@ -2762,125 +2147,16 @@ Item {
       }
 
       // ------------------------------------------------ keyboard help
-      Rectangle {
-        visible: root.helpOpen
+      KeyboardHelp {
         anchors.fill: parent
         z: 10
-        color: Qt.rgba(0, 0, 0, 0.55)
-        MouseArea {
-          anchors.fill: parent
-          onClicked: root.helpOpen = false
-          onWheel: wheel => { wheel.accepted = true }
-        }
-
-        Rectangle {
-          anchors.centerIn: parent
-          width: parent.width * 0.92
-          height: parent.height * 0.9
-          radius: 6
-          color: root.surface
-          border.width: 1
-          border.color: Qt.darker(root.foreground, 3)
-          MouseArea {
-            anchors.fill: parent
-            onWheel: wheel => { wheel.accepted = true }
-          }
-
-          Column {
-            anchors.fill: parent
-            anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-
-            Text {
-              text: "Keyboard · :help"
-              color: root.accent
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(16)
-              font.bold: true
-            }
-
-            Text {
-              width: parent.width
-              text: "Normal mode uses shortcuts. Focus a text field for insert mode; Escape returns to normal. Actions follow the buttons’ enabled state."
-              wrapMode: Text.Wrap
-              color: root.mutedForeground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(11)
-            }
-
-            Flickable {
-              id: helpList
-              width: parent.width
-              height: parent.height - y - helpFooter.height - parent.spacing
-              contentWidth: width
-              contentHeight: helpRows.height
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              onVisibleChanged: if (visible) contentY = 0
-
-              Column {
-                id: helpRows
-                width: helpList.width
-                spacing: Style.space(5)
-
-                Repeater {
-                  model: PanelNavigation.helpRows()
-
-                  delegate: Row {
-                    id: helpRow
-                    required property var modelData
-                    readonly property bool heading: modelData.key === ""
-                    width: helpRows.width
-                    spacing: Style.space(10)
-
-                    Text {
-                      visible: !helpRow.heading
-                      width: helpRows.width * 0.36
-                      text: helpRow.modelData.key
-                      wrapMode: Text.Wrap
-                      color: root.accent
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                    }
-                    Text {
-                      width: helpRow.heading ? helpRows.width
-                        : helpRows.width * 0.64 - helpRow.spacing
-                      topPadding: helpRow.heading ? Style.space(6) : 0
-                      text: helpRow.modelData.description
-                      wrapMode: Text.Wrap
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.fs(11)
-                      font.bold: helpRow.heading
-                    }
-                  }
-                }
-              }
-            }
-
-            Text {
-              id: helpFooter
-              width: parent.width
-              text: "Scroll for more · Uppercase keys use Shift · ? (Shift+/) / F1 / q / Escape closes help"
-              wrapMode: Text.Wrap
-              color: root.mutedForeground
-              font.family: root.fontFamily
-              font.pixelSize: root.fs(10)
-            }
-          }
-        }
+        visible: root.helpOpen
+        model: PanelNavigation.helpRows()
+        spacing: Style.space(8)
+        theme: root.theme
+        titleFontSize: root.fs(16)
+        onCloseRequested: root.helpOpen = false
       }
     }
-  }
-
-  component PanelButton: PanelViewButton {
-    foreground: root.foreground
-    background: root.background
-    surface: root.surface
-    accent: root.accent
-    fontFamily: root.fontFamily
-    fontSize: root.fs(11)
-    horizontalPadding: Style.space(18)
-    verticalPadding: Style.space(10)
   }
 }

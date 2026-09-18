@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import "PanelDetails.js" as PanelDetails
+import "ReviewPresentation.js" as ReviewPresentation
 
 // Interface: the Plan tab. It hosts the unchanged PlanEditorView plus the plan
 // actions that belong to Plan, the plan Q&A and the "what should be improved"
@@ -34,28 +35,23 @@ Flickable {
   required property var stageActivity
   required property var stageDetailScope
   required property var reviewView
-  required property var reviewGateText
-  required property var reviewDecision
-  required property var reviewFields
-  required property var reviewRoundLabel
-  required property var reviewTimestamp
   required property var stageReviewIncompleteRange
-  required property var stageReviewHasHeldPreview
   required property var ensureStageReviewsLoaded
-  required property var reconcileStageReviewPresentation
   required property var chat
   required property bool chatExpanded
   required property bool chatPending
   property string detailScope: ""
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property color success
-  required property color working
-  required property string fontFamily
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property color success: theme ? theme.success : "#4faf72"
+  property color working: theme ? theme.working : "#d5a542"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
   property real spacing: 8
   property real fieldPadding: 6
   property real chatMaxHeight: 96
@@ -87,6 +83,12 @@ Flickable {
   signal helpRequested
   signal leaveRequested
   signal detailInspected(var control)
+
+  // The review preview rows of a stage, reconciled against its current reviews.
+  function reconcileStageReviewPresentation(stage, presentation, repeater) {
+    ReviewPresentation.reconcileStageReviewPresentation(view.reviewView(stage), view.stageDetailScope(stage),
+      presentation, repeater)
+  }
 
   function reveal(item) {
     const top = item.mapToItem(contentItem, 0, 0).y
@@ -330,13 +332,13 @@ Flickable {
       stageActivity: view.stageActivity
       stageDetailScope: view.stageDetailScope
       reviewView: view.reviewView
-      reviewGateText: view.reviewGateText
-      reviewDecision: view.reviewDecision
-      reviewFields: view.reviewFields
-      reviewRoundLabel: view.reviewRoundLabel
-      reviewTimestamp: view.reviewTimestamp
+      reviewGateText: ReviewPresentation.reviewGateText
+      reviewDecision: ReviewPresentation.reviewDecision
+      reviewFields: ReviewPresentation.reviewFields
+      reviewRoundLabel: ReviewPresentation.reviewRoundLabel
+      reviewTimestamp: ReviewPresentation.reviewTimestamp
       stageReviewIncompleteRange: view.stageReviewIncompleteRange
-      stageReviewHasHeldPreview: view.stageReviewHasHeldPreview
+      stageReviewHasHeldPreview: ReviewPresentation.stageReviewHasHeldPreview
       ensureStageReviewsLoaded: view.ensureStageReviewsLoaded
       reconcileStageReviewPresentation: view.reconcileStageReviewPresentation
       foreground: view.foreground

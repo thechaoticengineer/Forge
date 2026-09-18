@@ -27,18 +27,20 @@ Flickable {
   property bool updateEnabled: engineOnline && !busy
   property bool changeProjectEnabled: engineOnline
   property string detailScope: ""
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  property color success: foreground
-  property color working: foreground
-  required property string fontFamily
-  property real fontSize10: 10
-  required property real fontSize11
-  required property real fontSize12
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property color success: theme ? theme.success : foreground
+  property color working: theme ? theme.working : foreground
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize10: theme ? theme.fontSize10 : 10
+  property real fontSize11: theme ? theme.fontSize11 : 11
+  property real fontSize12: theme ? theme.fontSize12 : 12
   property real spacing: 8
   property real horizontalPadding: 18
   property real verticalPadding: 10

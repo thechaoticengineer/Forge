@@ -70,6 +70,8 @@ settings_mapping = panel[panel.index('              onSettingActivated: key => {
 settings_mapping = settings_mapping[settings_mapping.index('{') + 1:settings_mapping.index('\n              }')]
 helpers += '  function settingActivated(key) {' + settings_mapping + '\n  }\n'
 helpers += between('  readonly property var planReview:', '  property bool chooserOpen:')
+# The plan review status text moved to PlanReview.js; ArchitectureView passes it in.
+helpers += '  function planReviewStatusText(review) { return PlanReview.planReviewStatusText(review) }\n'
 fragments = {
     'PLAN_REVIEW': block(architecture_view, 'id: planReviewSection', 'Column'),
     'CADENCE': '\n'.join(

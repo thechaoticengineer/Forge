@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Controls
+import "PlanReview.js" as PlanReview
 
 // Interface: the Architecture tab. The architecture card (context, guidance,
 // risks, decisions), the role token totals (tokens used per role) and the plan review status, fix
@@ -20,16 +21,17 @@ Flickable {
   required property string planReviewScope
   required property bool planReviewExpanded
   required property string detailScope
-  required property var planReviewStatusText
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property string fontFamily
-  required property real fontSize11
-  required property real fontSize12
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize11: theme ? theme.fontSize11 : 11
+  property real fontSize12: theme ? theme.fontSize12 : 12
   property real scrollBarSpace: 16
   readonly property bool empty: architectureReview.implicitHeight <= 0
 
@@ -74,7 +76,7 @@ Flickable {
     planReviewScope: view.planReviewScope
     planReviewExpanded: view.planReviewExpanded
     detailScope: view.detailScope
-    planReviewStatusText: view.planReviewStatusText
+    planReviewStatusText: PlanReview.planReviewStatusText
     foreground: view.foreground
     mutedForeground: view.mutedForeground
     background: view.background

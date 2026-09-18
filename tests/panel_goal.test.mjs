@@ -9,7 +9,11 @@ const slice = (start, end) => qml.slice(qml.indexOf(start), qml.indexOf(end));
 const goalCallbacks = slice('  function syncGoalEnhancement(', '  function revisePlan(');
 const stateHandler = slice('  onEngineStateChanged: {', '  onBusyChanged: {')
   .replace('onEngineStateChanged: {', 'function engineStateChanged() {');
-const enabled = qml.match(/id: enhanceGoalButton[\s\S]*?enabled: ([\s\S]*?)\n\s*onClicked:/)[1];
+const overview = readFileSync(new URL('../quickshell/OverviewView.qml', import.meta.url), 'utf8');
+const planView = readFileSync(new URL('../quickshell/PlanView.qml', import.meta.url), 'utf8');
+// Overview shows Enhance with AI only while overviewActions lists it, i.e. while its guard holds.
+assert.match(qml, /OverviewView \{[\s\S]*?actions: PanelActions\.overviewActions\(root\.guardFlags, root\.guards\)/);
+const enabled = 'root.guards.enhance';
 const navigation = readFileSync(new URL('../quickshell/PanelNavigation.js', import.meta.url), 'utf8');
 const defaults = Object.fromEntries([...qml.matchAll(/property (?:bool|int|string) (goalEnhance\w+): (.+)/g)]
   .map(([, key, value]) => [key, JSON.parse(value)]));
@@ -220,16 +224,27 @@ test('button enablement and enhanceGoal share every required guard', () => {
 });
 
 test('goal buttons, wrapping plain status and exact Shift+E shortcut are wired with lowercase e preserved', () => {
-  for (const [label, action] of [['Enhance with AI', 'enhanceGoal'], ['Apply AI description', 'applyGoalEnhancement'], ['Undo enhance', 'undoGoalEnhancement']])
-    assert.match(qml, new RegExp(`label: "${label}"[\\s\\S]*?onClicked: root\\.${action}\\(\\)`));
-  assert.match(qml, /visible: root.goalEnhanceReady !== ""/);
-  assert.match(qml, /visible: root.goalEnhanceUndo !== ""/);
-  const status = slice('          text: root.goalEnhancePending ?', '            id: createPlanButton');
-  for (const text of ['enhancing the description…', 'root.goalEnhanceError', 'AI rewrite ready — press Apply AI description',
-    'Text.PlainText', 'Text.Wrap', 'root.urgent', 'root.mutedForeground', 'root.fontFamily', 'root.fs(11)']) assert.ok(status.includes(text));
+  // The goal buttons moved to OverviewView; Panel.qml maps their action ids to the old calls.
+  for (const [label, id, action] of [['Enhance with AI', 'enhance', 'enhanceGoal'],
+    ['Apply AI description', 'applyEnhancement', 'applyGoalEnhancement'], ['Undo enhance', 'undoEnhancement', 'undoGoalEnhancement']]) {
+    assert.match(overview, new RegExp(`${id}: "${label}|label: "${label}"[\\s\\S]*?onClicked: view\\.actionRequested\\("${id}"\\)`));
+    assert.match(qml, new RegExp(`if \\(id === "${id}"\\) root\\.${action}\\(\\)`));
+  }
+  assert.match(qml, /canApplyEnhancement: root.goalEnhanceReady !== ""/);
+  assert.match(qml, /canUndoEnhancement: root.goalEnhanceUndo !== ""/);
+  assert.match(overview, /visible: view.canApplyEnhancement/);
+  assert.match(overview, /visible: view.canUndoEnhancement/);
+  const status = slice('            goalEnhanceStatus: root.goalEnhancePending ?', '            canApplyEnhancement:');
+  for (const text of ['enhancing the description…', 'root.goalEnhanceError', 'AI rewrite ready — press Apply AI description'])
+    assert.ok(status.includes(text));
+  const statusText = overview.slice(overview.indexOf('text: view.goalEnhanceStatus') - 80, overview.indexOf('text: view.goalEnhanceStatus') + 300);
+  for (const text of ['Text.PlainText', 'Text.Wrap', 'view.urgent', 'view.mutedForeground', 'view.fontFamily', 'view.fontSize11'])
+    assert.ok(statusText.includes(text), text);
   assert.match(qml, /event.key === Qt.Key_E && event.modifiers === Qt.ShiftModifier\) \{\s*root.enhanceGoal\(\)\s*event.accepted = true/);
   // The e shortcut shares the Edit plan button's guard.
-  assert.match(qml, /id: editPlanButton[\s\S]*?enabled: root\.guards\.editPlan\n/);
+  // Edit plan is shown on Plan (and Overview) only while that guard holds.
+  assert.match(planView, /id: editButton[\s\S]*?visible: !view\.editingPlan && view\.guards\.editPlan\n/);
+  assert.match(qml, /PlanView \{[\s\S]*?guards: root\.guards\n/);
   assert.match(qml, /event.modifiers === Qt.NoModifier\) \{[\s\S]*?event.key === Qt.Key_E\) \{\s*if \(root\.guards\.editPlan\) root.beginPlanEdit\(\)/);
   assert.match(qml, /model: PanelNavigation\.helpRows\(\)/);
   assert.match(navigation, /\{ key: "E", description: "Enhance the goal description with AI" \}/);

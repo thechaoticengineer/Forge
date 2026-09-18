@@ -81,7 +81,8 @@ function aiPanel() {
     catalogueEditor, catalogueEditorView:{editor:catalogueEditor},
     projectViewRevision:1,lastProject:'/project A',engineState:{},
     api(method,path,body,done) { calls.push({method,path,body,done}); }, refresh() {},
-    encodeURIComponent, JSON};
+    // The suggestion message text moved from Panel.qml to CataloguePresentation.js.
+    CataloguePresentation: context, encodeURIComponent, JSON};
   sandbox.root = sandbox;
   vm.runInNewContext(qml.slice(qml.indexOf('  function openCatalogue()'),
     qml.indexOf('  property bool helpOpen:')), sandbox);

@@ -5,8 +5,12 @@ import vm from 'node:vm';
 const qml = readFileSync(new URL('../quickshell/Panel.qml', import.meta.url), 'utf8');
 const planEditor = readFileSync(new URL('../quickshell/PlanEditorView.qml', import.meta.url), 'utf8');
 const architectureReview = readFileSync(new URL('../quickshell/ArchitectureReviewView.qml', import.meta.url), 'utf8');
+const read = name => readFileSync(new URL('../quickshell/' + name, import.meta.url), 'utf8');
+// The stage review presentation moved from Panel.qml to ReviewPresentation.js.
 const context = {};
-vm.runInNewContext(qml.slice(qml.indexOf('  function reviewGateText('), qml.indexOf('  function reviewRoundLabel(')), context);
+vm.runInNewContext(read('UsageFormat.js'), context.UsageFormat = {});
+vm.runInNewContext(read('ReviewView.js'), context.ReviewView = {});
+vm.runInNewContext(read('ReviewPresentation.js').replace(/^\.import .*$/gm, ''), context);
 test('documentation architect is explicitly not required, never approved', () => {
   const text = context.reviewGateText({review_policy:{scope:'ordinary_documentation',rationale:'Prose only'},review_gate:{status:'approved',roles:{architect:'not_required',reviewer:'approved'}}});
   assert.match(text,/Architect: review not required/); assert.match(text,/Independent: approved/);
@@ -45,8 +49,10 @@ test('deferred gates distinguish waiting for commit from a committed deferred po
     assert.doesNotMatch(text,/approved|pending|review not required/);
 });
 
+// The plan review status text moved from Panel.qml to PlanReview.js.
 const planHelpers = {};
 vm.runInNewContext(qml.slice(qml.indexOf('  function loadPlanReviewRequests('),qml.indexOf('  property bool chooserOpen:')),planHelpers);
+vm.runInNewContext(read('PlanReview.js'),planHelpers);
 const detailText = {};
 vm.runInNewContext(readFileSync(new URL('../quickshell/DetailText.js',import.meta.url),'utf8'),detailText);
 const history = {};

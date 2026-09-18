@@ -457,12 +457,16 @@ test('Panel derives discussionOpen from the stack and navigates through the page
 });
 
 test('the panel column keeps a discussion entry point that opens the chat page', () => {
-  const columnIndex = qml.indexOf('id: panelColumn');
-  const buttonIndex = qml.indexOf('id: discussionButton');
+  // The entry point moved from the old panel column to the Overview view's discuss action.
+  const overview = readFileSync(new URL('../quickshell/OverviewView.qml', import.meta.url), 'utf8');
+  const pageIndex = qml.indexOf('id: panelPage');
+  const viewIndex = qml.indexOf('OverviewView {');
   const hintIndex = qml.indexOf('id: keyboardHint');
-  assert.ok(columnIndex < buttonIndex && buttonIndex < hintIndex,
-    'the entry point sits inside the panel column');
-  assert.match(qml, /id: discussionButton[\s\S]*?onClicked: root\.openDiscussion\(\)/);
+  assert.ok(pageIndex < viewIndex && viewIndex < hintIndex,
+    'the entry point sits inside the panel page');
+  assert.match(overview, /discuss: "Discuss first"/);
+  assert.match(overview, /onClicked: view\.actionRequested\(modelData\)/);
+  assert.match(qml, /OverviewView \{[\s\S]*?if \(id === "discuss"\) root\.openDiscussion\(\)/);
 });
 
 test('the t shortcut opens the chat page instead of revealing an inline section', () => {

@@ -12,18 +12,21 @@ Rectangle {
 
   required property bool open
   required property bool manualEntry
-  required property var rowsForFilter
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property color success
-  required property string fontFamily
-  required property real fontSize10
-  required property real fontSize11
-  required property real fontSize12
+  // The /api/projects response the rows are built from.
+  required property var projectsData
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property color success: theme ? theme.success : "#4faf72"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize10: theme ? theme.fontSize10 : 10
+  property real fontSize11: theme ? theme.fontSize11 : 11
+  property real fontSize12: theme ? theme.fontSize12 : 12
   property alias chooserList: chooserList
   property alias filterField: filterField
   property alias manualField: manualField
@@ -34,6 +37,29 @@ Rectangle {
   signal helpRequested
   signal leaveRequested
   signal detailInspected(var control)
+
+  // Local and GitHub projects matching the filter, with section headers and the path row.
+  function chooserRows(data, filter) {
+    if (!data) return []
+    const f = filter.toLowerCase()
+    const rows = []
+    const local = (data.local || []).filter(function(p) {
+      return f === "" || p.name.toLowerCase().indexOf(f) !== -1
+    })
+    if (local.length > 0) rows.push({ kind: "header", label: "Local" })
+    local.forEach(function(p) { rows.push({ kind: "local", name: p.name, path: p.path }) })
+    const remote = (data.remote || []).filter(function(r) {
+      return f === "" || r.full_name.toLowerCase().indexOf(f) !== -1
+    })
+    if (remote.length > 0 || data.remote_error) rows.push({ kind: "header", label: "GitHub" })
+    if (data.remote_error) rows.push({ kind: "note", label: data.remote_error })
+    remote.forEach(function(r) {
+      rows.push({ kind: "remote", name: r.full_name, cloned: r.cloned,
+                  isPrivate: r.private })
+    })
+    rows.push({ kind: "path", label: "path…" })
+    return rows
+  }
 
   visible: open
   color: Qt.rgba(0, 0, 0, 0.55)
@@ -124,7 +150,7 @@ Rectangle {
         height: parent.height - y - (view.manualEntry ? Style.space(38) : 0)
         clip: true
         spacing: 2
-        model: view.rowsForFilter(filterField.text)
+        model: view.chooserRows(view.projectsData, filterField.text)
         currentIndex: -1
         onModelChanged: resetSelection()
 

@@ -50,3 +50,22 @@ function catalogueMetadataSummaryText(meta) {
             : " · no research yet")
         + (meta.store_error ? " · " + meta.store_error : "")
 }
+
+// The message shown with ready AI tier suggestions: summary, sources, warnings,
+// cost evidence and the reason for each model.
+function suggestionMessage(resp) {
+    return "AI tier suggestions — review and save to use them.\n" + resp.summary
+        + (resp.sources && resp.sources.length ? "\n" + resp.sources.map(function(s) {
+            return s.provider + ": " + s.status + " · " + s.url
+        }).join("\n") : "")
+        + (resp.warnings && resp.warnings.length ? "\n" + resp.warnings.join("\n") : "")
+        + (resp.cost_evidence && resp.cost_evidence.length ? "\n" + resp.cost_evidence.map(function(c) {
+            return c.provider + "/" + c.model + ": cost preference "
+                + (c.relative_cost_preference === null ? "unknown" : c.relative_cost_preference)
+                + (c.source_url ? " · standard API USD/1M tokens input " + c.input_per_million
+                    + ", output " + c.output_per_million + " · " + c.source_url : "")
+        }).join("\n") : "")
+        + (resp.reasons && resp.reasons.length ? "\n" + resp.reasons.map(function(r) {
+            return r.provider + "/" + r.model + ": " + r.rationale
+        }).join("\n") : "")
+}

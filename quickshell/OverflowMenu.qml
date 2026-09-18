@@ -12,18 +12,20 @@ Item {
   property var items: []
   property bool open: false
 
-  property color foreground: "white"
-  property color mutedForeground: "gray"
-  property color background: "black"
-  property color surface: "black"
-  property color accent: "orange"
-  property color urgent: "red"
-  property color success: "green"
-  property color working: "yellow"
-  property string fontFamily: "monospace"
-  property real fontSize10: 10
-  property real fontSize11: 11
-  property real fontSize12: 12
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "white"
+  property color mutedForeground: theme ? theme.mutedForeground : "gray"
+  property color background: theme ? theme.background : "black"
+  property color surface: theme ? theme.surface : "black"
+  property color accent: theme ? theme.accent : "orange"
+  property color urgent: theme ? theme.urgent : "red"
+  property color success: theme ? theme.success : "green"
+  property color working: theme ? theme.working : "yellow"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize10: theme ? theme.fontSize10 : 10
+  property real fontSize11: theme ? theme.fontSize11 : 11
+  property real fontSize12: theme ? theme.fontSize12 : 12
 
   signal itemChosen(string id)
 

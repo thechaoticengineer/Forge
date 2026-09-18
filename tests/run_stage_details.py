@@ -17,11 +17,17 @@ def between(start, end):
     offset = panel.index(start)
     return panel[offset:panel.index(end, offset)]
 
+plan_view = (repo / 'quickshell/PlanView.qml').read_text()
+
 helpers = between('  function revealDetail(', '  function reviewScope(')
-helpers += between('  function reviewScope(', '  function reviewGateText(')
-helpers += between('  function reviewGateText(', '  function reviewRoundLabel(')
-helpers += between('  function reviewRoundLabel(', '  function stageActivity(')
-helpers += between('  function stageActivity(', '  function chooserRows(')
+helpers += between('  function reviewScope(', '  function stageActivity(')
+# The review presentation helpers moved to ReviewPresentation.js; PlanView passes them
+# to the editor, wrapping the preview reconciliation with its own review view and scope.
+helpers += ''.join('  readonly property var %s: ReviewPresentation.%s\n' % pair
+                   for pair in re.findall(r'^      (\w+): ReviewPresentation\.(\w+)$', plan_view, re.M))
+reconcile = plan_view[plan_view.index('  function reconcileStageReviewPresentation('):plan_view.index('  function reveal(')]
+helpers += re.sub(r'\bview\.', 'root.', reconcile)
+helpers += between('  function stageActivity(', '  function chooseRow(')
 def editor_between(start, end):
     offset = plan_editor.index(start)
     return plan_editor[offset:plan_editor.index(end, offset)]
@@ -54,7 +60,8 @@ model = fixture_scope(model)
 properties = fixture_scope(properties)
 shortcut = shortcut.replace('planEditor.stageList', 'stageList')
 fixture = (repo / 'tests/stage_details_fixture.qml.in').read_text()
-fixture = fixture.replace('import QtTest', 'import QtTest\nimport "components/PanelDetails.js" as PanelDetails')
+fixture = fixture.replace('import QtTest', 'import QtTest\nimport "components/PanelDetails.js" as PanelDetails'
+                          '\nimport "components/ReviewPresentation.js" as ReviewPresentation')
 fixture = fixture.replace('// PANEL_HELPERS', helpers).replace('// PANEL_STAGE_CONTENT', content)
 fixture = fixture.replace('// PANEL_STAGE_PROPERTIES', properties)
 fixture = fixture.replace('// PANEL_STAGE_STATE', state).replace('// PANEL_STAGE_DELEGATE', delegate)
@@ -64,6 +71,7 @@ with tempfile.TemporaryDirectory(prefix='forge-stage-details-') as directory:
     path = Path(directory)
     (path / 'components').mkdir()
     for name in ('StageProse.qml', 'CompactDetail.qml', 'DetailFields.qml', 'DetailText.js', 'PanelDetails.js', 'ReviewView.js',
+                 'ReviewPresentation.js',
                  'ModelRouting.js', 'UsageFormat.js', 'PlanEdit.js'):
         shutil.copyfile(repo / 'quickshell' / name, path / 'components' / name)
     (path / 'tst_stage.qml').write_text(fixture)

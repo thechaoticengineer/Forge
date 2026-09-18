@@ -77,3 +77,34 @@ function finish(view, response, status) {
     }
     return fail('Complete requests were not found for this plan review gate. Retry full text.')
 }
+
+// The plan review status block of the Architecture tab.
+function fixCommitsText(review) {
+    const fixes = review && Array.isArray(review.fixes) ? review.fixes : []
+    if (fixes.length === 0) return ""
+    const lines = fixes.map(function(fix) {
+        const subject = typeof fix.message === "string" ? fix.message.split("\n")[0] : ""
+        return "  round " + fix.round + " · " + (fix.sha || "—") + (subject ? " · " + subject : "")
+    })
+    const total = typeof review.fix_count === "number" ? review.fix_count : fixes.length
+    return "\nFix commits (" + total + "):\n" + lines.join("\n")
+        + (review.fixes_truncated ? "\n  …" : "")
+}
+
+function planReviewStatusText(review) {
+    if (!review) return ""
+    const gate = review.gate || {}, roles = gate.roles || {}
+    function outcome(role) {
+        const value = roles[role]
+        return value === "not_required" ? "review not required"
+            : value === "deferred" ? "deferred to the plan review" : value || "unavailable"
+    }
+    const round = typeof review.rounds === "number" ? review.rounds : "—"
+    const maximum = typeof review.budget === "number" ? review.budget + 1 : "—"
+    return "Plan review: " + (review.status || "unavailable")
+        + " · round " + round + " of " + maximum
+        + "\nCurrent gate: " + (gate.status || "unavailable")
+        + "\nArchitect: " + outcome("architect") + " · Independent: " + outcome("reviewer")
+        + fixCommitsText(review)
+        + (review.fix_sha ? "\nFinal fix commit: " + review.fix_sha : "")
+}

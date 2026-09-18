@@ -56,15 +56,18 @@ test('moved views reuse shared prose and detail components', () => {
 
 test('root and extracted views share one button implementation', () => {
   const button = read('PanelViewButton.qml');
-  assert.match(panel, /component PanelButton: PanelViewButton/);
-  assert.doesNotMatch(panel, /component PanelButton: Rectangle/);
+  // The Overview buttons moved from Panel.qml's PanelButton into OverviewView.qml.
+  const overview = read('OverviewView.qml');
+  assert.match(overview, /component OverviewButton: PanelViewButton/);
+  assert.doesNotMatch(panel + overview, /component \w*Button: Rectangle/);
   assert.match(button, /property bool enabled: true/);
   assert.match(button, /enabled: button\.enabled/);
   // qs-free so the qs-free views load it under qmltestrunner; callers pass the shell padding.
   assert.doesNotMatch(button, /^\s*import\s+(Quickshell|qs\.)/m);
   assert.match(button, /property real horizontalPadding: 18/);
   assert.match(button, /property real verticalPadding: 10/);
-  assert.match(panel, /component PanelButton: PanelViewButton \{[\s\S]*?horizontalPadding: Style\.space\(18\)\n\s*verticalPadding: Style\.space\(10\)/);
+  assert.match(overview, /component OverviewButton: PanelViewButton \{[\s\S]*?horizontalPadding: view\.horizontalPadding\n\s*verticalPadding: view\.verticalPadding/);
+  assert.match(panel, /OverviewView \{[\s\S]*?horizontalPadding: Style\.space\(18\)\n\s*verticalPadding: Style\.space\(10\)/);
 });
 
 test('Panel hosts its content on a StackView page', () => {
@@ -75,7 +78,8 @@ test('Panel hosts its content on a StackView page', () => {
 
   const stackIndex = panel.indexOf('StackView {');
   const pageIndex = panel.indexOf('id: panelPage');
-  const scrollIndex = panel.indexOf('id: panelScroll');
+  // The page content: the Overview view took the old panelScroll column's place.
+  const scrollIndex = panel.indexOf('OverviewView {');
   const hintIndex = panel.indexOf('id: keyboardHint');
   const catalogueIndex = panel.indexOf('CatalogueEditor {');
   assert.ok(stackIndex >= 0 && pageIndex >= 0 && scrollIndex >= 0

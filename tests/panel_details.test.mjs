@@ -11,7 +11,8 @@ const reportsView = read('ReportsView.qml');
 // The settings and plan surfaces moved into their tab views.
 const settingsView = read('SettingsView.qml');
 const planView = read('PlanView.qml');
-const markup = panel + architectureView + catalogueView + diffView + reportsView + settingsView + planView;
+const overviewView = read('OverviewView.qml');
+const markup = panel + architectureView + catalogueView + diffView + reportsView + settingsView + planView + overviewView;
 vm.runInNewContext(read('PanelDetails.js'), fields);
 vm.runInNewContext(read('DetailText.js'), preview);
 for (const helper of ['ModelRouting.js','ReportFormat.js','UsageFormat.js','CataloguePresentation.js'])
@@ -105,8 +106,10 @@ test('100-report navigation uses short cached keys without serializing full reco
 test('remaining Panel surfaces use complete sources while inputs and structured diff retain editing/viewing behavior',()=>{
   for(const name of ['architectureDetails','providerDetails','catalogueOptions','catalogueMetadata','catalogueSources','chatDetails','reportGoal','reportDetails'])
     assert.ok(markup.includes('objectName: "'+name+'"'),name);
-  assert.match(panel,/originalText: liveEntries.count > 0 \? liveEntries.get\(liveEntries.count - 1\).originalText/);
-  assert.ok(!panel.includes('originalText: root.agentActive ? root.agent.last_line'));
+  // The latest retained output moved to the Overview now-working card.
+  assert.match(overviewView,/originalText: liveEntries.count > 0 \? liveEntries.get\(liveEntries.count - 1\).originalText/);
+  assert.ok(!(panel + overviewView).includes('originalText: root.agentActive ? root.agent.last_line'));
+  assert.match(panel,/OverviewView \{[\s\S]*?liveEntries: liveEntries\n/);
   for(const id of ['goalField','catalogueEditor','questionField','feedbackField']) assert.ok(markup.includes('id: '+id));
   assert.match(diffView,/model: view.diffText === "" \? \[\] : view.diffText.split\("\\n"\)/);
   const report=reportsView.slice(reportsView.indexOf('id: reportRow'),reportsView.indexOf('id: keyboardHint'));

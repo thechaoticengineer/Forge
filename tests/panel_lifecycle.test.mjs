@@ -37,7 +37,7 @@ test('pending recovery and current gates take precedence over old approval in pa
 });
 
 const cadence = {};
-vm.runInNewContext(panel.slice(panel.indexOf('  function reviewCadenceLabel('),panel.indexOf('  function planReviewStatusText(')),cadence);
+vm.runInNewContext(panel.slice(panel.indexOf('  function reviewCadenceLabel('),panel.indexOf('  property bool chooserOpen:')),cadence);
 test('cadence controls toggle only their role and post both normalized keys',()=>{
   for(const current of [{architect:'per_stage',reviewer:'per_plan'}, {architect:'per_plan',reviewer:'per_stage'},
     {architect:'unknown'}, undefined]) for(const role of ['architect','reviewer']) {

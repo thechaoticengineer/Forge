@@ -23,17 +23,19 @@ Item {
   required property string expandedReportKey
   required property real now
   required property string detailScope
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property color success
-  required property color working
-  required property string fontFamily
-  required property real fontSize10
-  required property real fontSize11
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property color success: theme ? theme.success : "#4faf72"
+  property color working: theme ? theme.working : "#d5a542"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize10: theme ? theme.fontSize10 : 10
+  property real fontSize11: theme ? theme.fontSize11 : 11
   property alias output: agentOutput
 
   signal liveTabRequested(bool live)
@@ -43,6 +45,26 @@ Item {
   signal leaveRequested
   signal detailRevealed(var control)
   signal detailInspected(var control)
+
+  // Ctrl+d / Ctrl+u: half a page in the shown list; the live and history lists
+  // follow their tail again when scrolled to the bottom.
+  function scrollOutput(direction) {
+    // Indexed from a list, so the linter does not narrow the three list types to Flickable.
+    const view = [agentOutput.liveOutput, agentOutput.reportList, agentOutput.historyList][
+      activity.liveTab ? 0 : activity.reportsVisible ? 1 : 2]
+    view.cancelFlick()
+    if (view !== agentOutput.reportList) view.followTail = false
+    const top = view.originY
+    const bottom = top + Math.max(0, view.contentHeight - view.height)
+    view.contentY = Math.max(top, Math.min(bottom,
+      view.contentY + direction * view.height / 2))
+    if (view !== agentOutput.reportList && direction > 0 && view.contentY >= bottom) {
+      view.followTail = true
+      view.scrollToTail()
+    }
+    if (view !== agentOutput.reportList) view.captureReading()
+    if (view === agentOutput.reportList) agentOutput.reportList.captureReading()
+  }
 
   AgentOutputView {
     id: agentOutput

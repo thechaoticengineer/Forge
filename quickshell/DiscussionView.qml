@@ -21,15 +21,17 @@ Rectangle {
   required property bool canSend
   required property bool canPlan
   required property bool canClear
-  required property color foreground
-  required property color mutedForeground
-  required property color background
-  required property color surface
-  required property color accent
-  required property color urgent
-  required property string fontFamily
-  required property real fontSize11
-  required property real fontSize12
+  // Palette and font sizes; Panel.qml passes its shared theme object.
+  property var theme: null
+  property color foreground: theme ? theme.foreground : "#dddddd"
+  property color mutedForeground: theme ? theme.mutedForeground : "#aaaaaa"
+  property color background: theme ? theme.background : "#202020"
+  property color surface: theme ? theme.surface : "#282828"
+  property color accent: theme ? theme.accent : "#6699ff"
+  property color urgent: theme ? theme.urgent : "#ff6666"
+  property string fontFamily: theme ? theme.fontFamily : "monospace"
+  property real fontSize11: theme ? theme.fontSize11 : 11
+  property real fontSize12: theme ? theme.fontSize12 : 12
 
   property alias input: messageInput
 
