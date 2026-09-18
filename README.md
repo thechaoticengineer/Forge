@@ -1686,10 +1686,18 @@ configured effort fallback described above; Forge never translates effort names
 between providers.
 
 The planner inspects the repository and returns a candidate JSON plan. The
-architect receives the goal, full candidate and repository observations before
-publication, and returns a structured checkpoint, decisions/supersessions,
-guidance and unresolved risks tagged with the expected plan ID and revision.
-Forge validates the complete output and publishes plan and context together.
+architect receives a work-status context rather than the plan document: the
+goal, the checkpoint, one compact entry per stage (id, title, status,
+dependencies and a short outcome summary), the full design (instructions,
+acceptance, commit, dependencies and any model constraint/proposal) of only
+the stages the turn must act on, and the paths it is told to inspect itself
+for anything else -- the architecture events log, the plan file (and an
+unpublished candidate file when one exists), and the repository, with the
+prompt instructing it to use `git log` and `git diff` there rather than assume
+omitted detail does not exist. It returns a structured checkpoint,
+decisions/supersessions, guidance and unresolved risks tagged with the
+expected plan ID and revision. Forge validates the complete output and
+publishes plan and context together.
 Architect guidance is included in implementation and fix prompts. A reviewer
 may supply a nonempty `architecture_context_gap` (at most 2,000 bytes) in a
 rejected verdict to request refreshed guidance before a fix. Ordinary fix rounds,

@@ -518,7 +518,66 @@ fn concurrent_turns_are_serialized_and_stale_work_does_not_spend_another_turn() 
 }
 
 #[test]
-fn recovery_prompts_keep_full_design_without_repeating_review_transcripts() {
+fn architect_context_sends_work_status_and_required_design_without_bookkeeping() {
+    let f = Fixture::new();
+    let mut candidate = f.plan();
+    for stage in candidate["stages"].as_array_mut().unwrap() {
+        stage["model_agreement"] = json!({"actor":"architect","dialogue":[{"text":"BOOKKEEPING_DIALOGUE_MARKER"}]});
+        stage["model_invocations"] = json!([{"role":"implementer","output":"BOOKKEEPING_INVOCATION_MARKER"}]);
+        stage["reassessment"] = json!({"pending":false,"history":[{"reason":"BOOKKEEPING_REASSESSMENT_MARKER"}]});
+        stage["reviews"] = json!([{"approved":true,"notes":"BOOKKEEPING_REVIEW_MARKER"}]);
+        stage["last_verdict"] = json!({"status":"approved","notes":"BOOKKEEPING_VERDICT_MARKER"});
+        stage["usage"] = json!({"codex":{"input_tokens":99999,"marker":"BOOKKEEPING_USAGE_MARKER"}});
+    }
+    candidate["usage"] = json!({"codex":{"input_tokens":12345,"marker":"BOOKKEEPING_PLAN_USAGE_MARKER"}});
+    f.ctx.architect_publish(candidate, None, "initial").unwrap();
+    let requests = f.requests();
+    let prompt = requests.last().unwrap()["prompt"].as_str().unwrap();
+    // Goal, one compact entry per stage and the readable source paths.
+    assert!(prompt.contains("preserve contracts"));
+    assert!(prompt.contains("\"id\":1"));
+    assert!(prompt.contains("\"id\":2"));
+    assert!(prompt.contains("\"paths\""));
+    assert!(prompt.contains("architecture_events"));
+    assert!(prompt.contains("\"repository\""));
+    // Both stages need guidance on the very first turn, so both get full design.
+    assert!(prompt.contains("define interface"));
+    assert!(prompt.contains("compatible API"));
+    assert!(prompt.contains("consume interface"));
+    assert!(prompt.contains("renders"));
+    // The architect is told to inspect sources itself rather than assume
+    // omitted detail does not exist.
+    assert!(prompt.contains("git log") && prompt.contains("git diff"));
+    for marker in [
+        "BOOKKEEPING_DIALOGUE_MARKER", "BOOKKEEPING_INVOCATION_MARKER", "BOOKKEEPING_REASSESSMENT_MARKER",
+        "BOOKKEEPING_REVIEW_MARKER", "BOOKKEEPING_VERDICT_MARKER", "BOOKKEEPING_USAGE_MARKER",
+        "BOOKKEEPING_PLAN_USAGE_MARKER", "\"model_agreement\"", "\"model_invocations\"", "\"reassessment\"",
+        "\"reviews\"", "\"last_verdict\"", "\"usage\"",
+    ] {
+        assert!(!prompt.contains(marker), "unexpected bookkeeping leak: {marker}");
+    }
+}
+
+#[test]
+fn architect_context_gives_non_required_stages_only_compact_entries() {
+    let f = Fixture::new();
+    let plan = f.initial();
+    f.ctx.architect_publish(f.revision(&plan), Some(&plan), "revision").unwrap();
+    let requests = f.requests();
+    let prompt = requests.last().unwrap()["prompt"].as_str().unwrap();
+    // Stage 2 (UI)'s instructions changed, so it alone needs fresh guidance
+    // and gets its full design in the turn.
+    assert!(prompt.contains("consume interface with explicit errors"));
+    assert!(prompt.contains("\"id\":2"));
+    // Stage 1 (API) is untouched: it contributes only its compact status
+    // entry, never its instructions or acceptance text.
+    assert!(prompt.contains("\"id\":1"));
+    assert!(!prompt.contains("define interface"));
+    assert!(!prompt.contains("compatible API"));
+}
+
+#[test]
+fn recovery_prompts_keep_compact_status_without_repeating_review_transcripts() {
     let f = Fixture::new();
     let mut p = f.initial();
     let cp = f.cp(&p);
@@ -534,6 +593,8 @@ fn recovery_prompts_keep_full_design_without_repeating_review_transcripts() {
         .join(p["plan_id"].as_str().unwrap())
         .join("architect-pending.json");
     fs::write(pending, b"interrupted marker").unwrap();
+    // Nothing about the stages' design changed, so recovery needs no fresh
+    // guidance; the turn gets only compact status, not the stages' full design.
     let recovered = f
         .ctx
         .architect_publish(p.clone(), Some(&p), "restart")
@@ -541,8 +602,10 @@ fn recovery_prompts_keep_full_design_without_repeating_review_transcripts() {
     let requests = f.requests();
     let prompt = requests.last().unwrap()["prompt"].as_str().unwrap();
     assert!(!prompt.contains("historical-review-body"));
-    assert!(prompt.contains("define interface"));
-    assert!(prompt.contains("compatible API"));
+    assert!(prompt.contains("\"title\":\"API\""));
+    assert!(prompt.contains("\"title\":\"UI\""));
+    assert!(!prompt.contains("define interface"));
+    assert!(!prompt.contains("compatible API"));
     assert!(prompt.len() < 20000);
     assert_eq!(recovered["stages"][0]["reviews"], p["stages"][0]["reviews"]);
 }

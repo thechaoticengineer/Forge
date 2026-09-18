@@ -262,6 +262,38 @@ fn apply_turn(
     Ok((next, records))
 }
 
+/// A bounded textual summary of a stage's outcome for the architect's compact
+/// per-stage entry: the committed sha, the review gate status, and an excerpt
+/// of the implementer outcome (or, once a stage's own record ages out, the
+/// matching checkpoint execution outcome) -- never the record itself.
+fn stage_outcome(stage: &Value, execution_outcomes: &[Value]) -> Option<String> {
+    let sha = stage["sha"].as_str().filter(|s| !s.is_empty());
+    let review_status = stage["review_gate"]["status"].as_str().filter(|s| !s.is_empty());
+    let detail = if !stage["implementer_outcome"].is_null() {
+        Some(stage["implementer_outcome"].to_string())
+    } else {
+        execution_outcomes
+            .iter()
+            .find(|o| o["stage_id"] == stage["id"])
+            .map(|o| o.to_string())
+    };
+    if sha.is_none() && review_status.is_none() && detail.is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(sha) = sha {
+        parts.push(format!("sha={sha}"));
+    }
+    if let Some(status) = review_status {
+        parts.push(format!("review_gate={status}"));
+    }
+    if let Some(detail) = detail {
+        let bounded: String = detail.chars().take(500).collect();
+        parts.push(bounded);
+    }
+    Some(parts.join(" "))
+}
+
 impl Ctx {
     fn decision_context(
         &self,
@@ -464,23 +496,45 @@ impl Ctx {
                 }
             }
             let observations = self.git(&["status", "--short"]).unwrap_or_else(|e| e);
-            // Keep the complete design/acceptance plan, without copying unbounded
-            // review transcripts and token accounting into every provider turn.
-            let mut context_plan = candidate.clone();
-            for key in ["architecture", "usage", "planner_usage", "role_usage", "plan_review"] {
-                context_plan.as_object_mut().unwrap().remove(key);
+            // A work-status context, not a plan clone: bookkeeping (selection,
+            // agreement, proposal inputs, reassessment, invocations, reviews,
+            // usage) never enters the turn, and only the stages that actually
+            // need guidance or routing contribute their design fields, so the
+            // turn stays flat as the plan grows.
+            let execution_outcomes = cp["execution_outcomes"].as_array().cloned().unwrap_or_default();
+            let stages: Vec<Value> = candidate["stages"].as_array().unwrap().iter().map(|stage| {
+                let mut entry = json!({"id":stage["id"],"title":stage["title"],"status":stage["status"]});
+                if let Some(depends_on) = stage.get("depends_on") { entry["depends_on"] = depends_on.clone(); }
+                if let Some(outcome) = stage_outcome(stage, &execution_outcomes) { entry["outcome"] = json!(outcome); }
+                entry
+            }).collect();
+            let mut needs_detail: BTreeSet<i64> = required.iter().copied().collect();
+            needs_detail.extend(routing_ids.iter().copied());
+            let stage_details: Vec<Value> = candidate["stages"].as_array().unwrap().iter()
+                .filter(|stage| stage["id"].as_i64().is_some_and(|id| needs_detail.contains(&id)))
+                .map(|stage| {
+                    let mut detail = json!({"id":stage["id"],"title":stage["title"],"instructions":stage["instructions"],
+                        "acceptance":stage["acceptance"],"commit":stage["commit"]});
+                    if let Some(depends_on) = stage.get("depends_on") { detail["depends_on"] = depends_on.clone(); }
+                    if !stage["model_constraint"].is_null() { detail["model_constraint"] = stage["model_constraint"].clone(); }
+                    if !stage["model_proposal"].is_null() { detail["model_proposal"] = stage["model_proposal"].clone(); }
+                    detail
+                }).collect();
+            let mut paths = json!({
+                "architecture_events": dir.join("events.jsonl"),
+                "plan": format!("{}/plan.json", crate::app::FORGE_DIR),
+                "repository": self.project(),
+            });
+            if self.forge_path("plan-candidate.json").exists() {
+                paths["candidate"] = json!(format!("{}/plan-candidate.json", crate::app::FORGE_DIR));
             }
-            for stage in context_plan["stages"].as_array_mut().unwrap() {
-                for key in ["reviews", "last_verdict", "usage"] {
-                    stage.as_object_mut().unwrap().remove(key);
-                }
-            }
-            let context = json!({"plan":context_plan,"checkpoint":crate::architecture::prompt_checkpoint(&cp),"decisions":included,
-                "history_path":dir.join("events.jsonl"),"repository_observations":observations,
+            let context = json!({"goal":candidate["goal"],"plan_id":candidate["plan_id"],"revision":candidate["revision"],
+                "checkpoint":crate::architecture::prompt_checkpoint(&cp),"decisions":included,
+                "stages":stages,"stage_details":stage_details,"paths":paths,"repository_observations":observations,
                 "unfinished_diff_preview":self.git(&["diff","HEAD","--",".",":(exclude).forge"]).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>(),
                 "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
             let mut prompt = format!(
-                "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved completed interfaces exactly, and preserve every saved constraint unless you explicitly retire it; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Use the history_path to retrieve omitted or relevant decision details. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[],\"retired_constraints\":[]}}\nSupply guidance for every required_stage_id. checkpoint.constraints and checkpoint.completed_interfaces are arrays of strings, not objects. resolved_risks is an array of exact existing unresolved-risk IDs from the supplied checkpoint/history, never descriptions or newly invented IDs; use [] when no existing risk can be resolved. New findings belong in unresolved_risks as objects with id and text. retired_constraints is how a saved constraint stops applying: each entry is {{\"text\":\"the exact saved constraint\",\"reason\":\"why it no longer applies\"}}, the text must be omitted from checkpoint.constraints in the same turn, and it must match a saved constraint exactly. Retire a constraint that a later revision made false, such as one naming a stage number that now holds different work, instead of reporting the contradiction and leaving it in place; use [] when every saved constraint still applies. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
+                "You are this plan's persistent architect. Inspect repository code as needed. You MUST NOT implement, write files, commit, push, or alter acceptance criteria. The engine alone publishes validated output. Preserve saved completed interfaces exactly, and preserve every saved constraint unless you explicitly retire it; explicitly resolve risks by ID. Propose decisions with unique alphanumeric/hyphen IDs and supersessions of existing IDs. Context is a work status, not the plan document: stages carries one compact entry per stage and stage_details carries full design only for required_stage_ids/required_model_stage_ids. Whenever you need detail this prompt omits, such as a non-required stage's instructions, past decisions, or what changed, you MUST inspect it yourself: read paths.architecture_events for decision/history detail, paths.plan (and paths.candidate when present) for the authoritative plan, and paths.repository with `git log` and `git diff` for code and history; never assume omitted detail does not exist. Return ONLY JSON, no fences, with this exact shape:\n{{\"version\":1,\"plan_id\":{},\"revision\":{},\"checkpoint\":{{\"summary\":\"bounded architectural context\",\"constraints\":[],\"completed_interfaces\":[]}},\"decisions\":[{{\"id\":\"unique-id\",\"stage_id\":null,\"summary\":\"decision\",\"rationale\":\"why\",\"alternatives\":[{{\"description\":\"alternative\",\"tradeoffs\":\"tradeoffs\"}}],\"supersedes\":null}}],\"guidance\":[{{\"stage_id\":1,\"text\":\"concrete guidance\"}}],\"unresolved_risks\":[{{\"id\":\"risk-id\",\"text\":\"risk\"}}],\"resolved_risks\":[],\"retired_constraints\":[]}}\nSupply guidance for every required_stage_id. checkpoint.constraints and checkpoint.completed_interfaces are arrays of strings, not objects. resolved_risks is an array of exact existing unresolved-risk IDs from the supplied checkpoint/history, never descriptions or newly invented IDs; use [] when no existing risk can be resolved. New findings belong in unresolved_risks as objects with id and text. retired_constraints is how a saved constraint stops applying: each entry is {{\"text\":\"the exact saved constraint\",\"reason\":\"why it no longer applies\"}}, the text must be omitted from checkpoint.constraints in the same turn, and it must match a saved constraint exactly. Retire a constraint that a later revision made false, such as one naming a stage number that now holds different work, instead of reporting the contradiction and leaving it in place; use [] when every saved constraint still applies. Empty decisions/risks are allowed. Keep summary <=8000 bytes, each constraint/interface/risk <=1000 bytes and guidance <=4000 bytes; total output <=48 KiB. Context:\n{context}",
                 candidate["plan_id"], candidate["revision"]
             );
             prompt.push_str(&format!("\n{}\n{}\nEvaluate exactly required_model_stage_ids: {:?}. Include model_evaluations in the complete architect output.", self.stage_selection_prompt(&candidate, &routing_ids)?, crate::routing::EVALUATION_CONTRACT, routing_ids));

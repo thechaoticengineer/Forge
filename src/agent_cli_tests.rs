@@ -261,14 +261,14 @@ fn codex_stream_model_takes_precedence_over_rollout_fallback() {
 fn architect_publishes_with_codex_rollout_model_and_retains_plan_on_substitution() {
     let answer = r#"
 context = json.JSONDecoder().raw_decode(sys.argv[-1].split('Context:\n', 1)[1])[0]
-plan = context['plan']
-answer = json.dumps({'version':1,'plan_id':plan['plan_id'],'revision':plan['revision'],
+details = {s['id']: s for s in context['stage_details']}
+answer = json.dumps({'version':1,'plan_id':context['plan_id'],'revision':context['revision'],
     'checkpoint':{'summary':'Preserve contracts.','constraints':[],'completed_interfaces':[]},
     'decisions':[],'guidance':[{'stage_id':i,'text':'Check interfaces.'} for i in context['required_stage_ids']],
     'unresolved_risks':[],'resolved_risks':[],
-    'model_evaluations':[dict(stage_id=s['id'],agree=True,rationale='Checked interfaces.',
-        **{k:s['model_proposal'][k] for k in ('risk','complexity','task')})
-        for s in plan['stages'] if s['id'] in context['required_model_stage_ids']]})
+    'model_evaluations':[dict(stage_id=sid,agree=True,rationale='Checked interfaces.',
+        **{k:details[sid]['model_proposal'][k] for k in ('risk','complexity','task')})
+        for sid in context['required_model_stage_ids']]})
 "#;
     let fixture = Cli::new("codex", &format!("{answer}\n{}", codex_rollout_script("exact-model")));
     {
@@ -312,14 +312,14 @@ if Path('exhausted').exists() and 'fable' in model:
     print(json.dumps({'type':'result','subtype':'error_during_execution','is_error':True,'result':"You've reached your Fable limit. Switch to another model."}))
     sys.exit(1)
 context = json.JSONDecoder().raw_decode(sys.argv[-1].split('Context:\n',1)[1])[0]
-plan = context['plan']
-answer = {'version':1,'plan_id':plan['plan_id'],'revision':plan['revision'],
+details = {s['id']: s for s in context['stage_details']}
+answer = {'version':1,'plan_id':context['plan_id'],'revision':context['revision'],
     'checkpoint':{'summary':'Preserve contracts.','constraints':[],'completed_interfaces':[]},
     'decisions':[],'guidance':[{'stage_id':i,'text':'Check interfaces.'} for i in context['required_stage_ids']],
     'unresolved_risks':[],'resolved_risks':[],
-    'model_evaluations':[dict(stage_id=s['id'],agree=True,rationale='Checked interfaces.',
-        **{k:s['model_proposal'][k] for k in ('risk','complexity','task')})
-        for s in plan['stages'] if s['id'] in context['required_model_stage_ids']]}
+    'model_evaluations':[dict(stage_id=sid,agree=True,rationale='Checked interfaces.',
+        **{k:details[sid]['model_proposal'][k] for k in ('risk','complexity','task')})
+        for sid in context['required_model_stage_ids']]}
 session = resumed or str(uuid.uuid4())
 print(json.dumps({'type':'system','subtype':'init','session_id':session,'model':model}))
 print(json.dumps({'type':'result','subtype':'success','session_id':session,'structured_output':answer}))
