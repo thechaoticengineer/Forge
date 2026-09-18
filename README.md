@@ -2149,8 +2149,16 @@ version. Qt tool locations depend on the distribution. QML parsing and JavaScrip
 helper tests are separate from the isolated Qt runtime fixtures above.
 Standalone `qmllint` cannot fully resolve the runtime `qs.Commons`/`qs.Ui` imports
 and reports the resulting unresolved widget types, plus an existing `enabled`
-property shadow warning. Live shell rendering is not validated because that would
-require loading changes into the running Omarchy instance.
+property shadow warning. None of these commands renders the panel inside the live
+Omarchy shell, because that would require loading the changes into the running
+Omarchy instance. To check the layout, render the working tree offscreen instead.
+Create a temporary directory with a `shell.qml` that instantiates
+`quickshell/Panel.qml`, and symlink `Commons`, `Ui` and `services` in it to
+`/usr/share/omarchy/shell/*`. Then run
+`QT_QPA_PLATFORM=offscreen quickshell -p <dir>` and call `grabToImage` on the
+window's content item. Point `apiBase` at a local stub, not at the engine's port,
+so the harness cannot send actions. The panel redesign M1 renders made this way are
+recorded in `docs/features/panel-redesign/milestones.md`.
 
 HTTP worker fixtures have a five-second deadline. On a loaded machine or in a
 review sandbox, use `cargo test --offline -- --test-threads=2` to reduce test
