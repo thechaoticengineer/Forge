@@ -267,6 +267,7 @@ Flickable {
             event.accepted = true
           }
           Text {
+            anchors.verticalCenter: parent.verticalCenter
             visible: feedbackField.text === "" && !feedbackField.activeFocus
             text: "what should be improved…"
             color: view.mutedForeground
@@ -333,6 +334,7 @@ Flickable {
               event.accepted = true
             }
             Text {
+              anchors.verticalCenter: parent.verticalCenter
               visible: questionField.text === "" && !questionField.activeFocus
               text: "ask about this plan…"
               color: view.mutedForeground

@@ -814,8 +814,8 @@ token totals per tool. Expand a task to see commit SHAs and messages, input/outp
 counts, call counts, model totals, separate planner and role usage, architecture,
 routing reasons and recorded review gates. Older reports without these fields
 remain readable with the available fields. The reports
-filter appears once reports exist. The plan header and expanded stage rows
-also show token summaries when available.
+filter appears once reports exist. The plan header and the stage detail Output
+sub-tab also show token summaries when available.
 
 ## Queue
 
@@ -1089,14 +1089,43 @@ taller than the window. The design and scenarios are in
 - **Overview:** the goal, the phase's actions and a status summary. While Forge is
   busy it shows a "now working" card (stage, role, tool, model, elapsed time,
   latest output line), a one-line progress summary, one compact line per stage
-  (click to open it in Plan) and **Stop**. While idle it shows the goal field with
+  (click or Enter opens its stage detail page) and **Stop**. A blocked or failed
+  stage is shown as one line right under the goal with its status and reason
+  (`! stage 3 · title · blocked — fix rounds exhausted ›`); clicking it opens that
+  stage's detail page. It is shown while idle too. While idle it shows the goal field with
   **Create plan**, **Discuss first**, **Enhance with AI** and **Add to queue**, a
   short last-run card and the one-line quota summary. Only actions that are enabled
   in the current phase are shown as buttons; the others stay reachable from their
   own view or the `⋯` menu.
-- **Plan:** the stage list with plan editing, the plan Q&A and the “what should be
-  improved” feedback field with **Improve with AI**, plus **Approve**, **Start**
-  and **Edit plan** while they apply.
+- **Plan:** a summary line (`N stages · M committed · review: per plan`) with
+  **Approve**, **Start**, **Edit plan** and **Q&A** while they apply, then one line
+  per stage: status icon, number and title, commit hash (or status or current
+  activity) and duration, then `›`. These are the same rows the busy Overview uses.
+  Clicking a row, or pressing Enter / `o` / Space on the selected one, opens its
+  stage detail page. Routing, model and review policy are not shown on the list.
+  Below the rows, a one-line **plan review strip** shows the verdict, round
+  `n of budget + 1` and the architect and independent outcomes
+  (`Plan review · approved · round 2 of 4 · architect ✓ independent ✓`); clicking it
+  opens the plan review details in Architecture. Then come the “what should be
+  improved” feedback field with **Improve with AI** and the plan Q&A. Plan editing
+  (`e`), plan Q&A and feedback stay in Plan; while editing, the editor replaces the
+  compact rows, with committed stages locked.
+- **Stage detail:** its own page, pushed over Plan with the header and tab bar
+  kept in place. A breadcrumb `‹ Plan / 3. Title` returns to Plan, and `‹ 2 · 4 ›`
+  steps to the previous / next stage. A status line shows the status, commit hash,
+  activity, elapsed time and the routing summary. The sub-tabs hold everything an
+  expanded stage card used to show: **Instructions** (instructions, the proposed
+  commit message, **View diff**, **Live output ›** and **Copy**), **Acceptance**
+  (acceptance criteria), **Review** (review policy, architect and independent
+  outcomes, the review-policy rationale and the historical reviews with **Load older
+  reviews** and **Retry reviews**), **Routing** (model status, the planner and
+  architect rationale and **Model agreement and routing details**) and **Output**
+  (current activity, token usage and **Live output ›**). `[` / `]` move to the
+  previous / next stage, `h` / `l` switch sub-tabs, and `q`, `Escape` or the
+  breadcrumb return to Plan with that stage selected and Plan's scroll position
+  unchanged. Choosing another tab, or `g` then a tab key, leaves the page first.
+  Polling updates the status in place and never closes the page unless the project
+  changes or the stage disappears.
 - **Activity:** Live, History and Reports with their filters, using the full
   height of the view.
 - **Architecture:** the architecture card, role token totals, and the plan review
@@ -1105,12 +1134,13 @@ taller than the window. The design and scenarios are in
 - **Queue:** the queue with **Start queue**, ↑, ↓ and ×.
 - **Settings:** planner, architect, implementer, reviewer, automatic routing,
   architect review, reviewer review, push at end and auto-approve as label/value
-  rows that cycle on click; the quota and model catalogue summaries with their
-  errors, **Model settings & options**, **Refresh models**, **Cancel refresh**,
+  rows that cycle on click; one compact line per quota window (`Claude · 5h 65%
+  remaining · resets Sat 02:17`, with the full text in a tooltip and under
+  **▸ details**) and the model catalogue summary with its errors, **Model settings & options**, **Refresh models**, **Cancel refresh**,
   **Refresh Claude limits**, **Update Forge** and **Change project**.
 
-Pushed pages (discussion chat, model settings, diff viewer, project chooser and
-keyboard help) sit on top of the current tab; closing one returns to the same tab
+Pushed pages (stage detail, discussion chat, model settings, diff viewer, project
+chooser and keyboard help) sit on top of the current tab; closing one returns to the same tab
 with its selection and scroll position intact. The bottom hint line names the
 current view's keys.
 
@@ -1122,7 +1152,7 @@ posting both cadence keys. They are disabled offline;
 Tab, Space and Enter operate them, and Escape returns to panel shortcuts.
 The new value applies to fresh attempts, not an already captured stage gate.
 
-Each stage shows its **review policy**, **architect and independent outcomes**,
+Each stage's detail page shows its **review policy**, **architect and independent outcomes**,
 and **current aggregate gate**. Each reviewed stage also has a **historical review** chip showing its own
 round and decision: a clean `approved`, amber `approved with optional notes`
 for saved `approved: true` records with no issues and nonempty notes, or a red
@@ -1141,7 +1171,7 @@ A deferred role displays **deferred to the plan review**. A fully deferred gate
 distinguishes **awaiting commit under a deferred review policy** from
 **committed under a deferred review policy**, without presenting either as an
 approval. Plan review appears separately beside the architecture area, outside
-the stage cards, with phase status, current gate, round `n of budget + 1`,
+the stage rows (summarised on Plan by the plan review strip), with phase status, current gate, round `n of budget + 1`,
 architect/independent outcomes, each fix round's commit SHA and subject, and any
 final fix commit SHA. Its role-tagged requests
 expand to complete, wrapping, selectable plain text with **Copy full text**.
@@ -1150,19 +1180,19 @@ architecture history and matches the exact plan, attempt, round, policy,
 snapshot and role identities. Until retrieval succeeds, including after a load
 failure, the shortened preview remains labelled and full selection/copy stays
 unavailable; the detail offers retry. This uses disclosure-driven retrieval
-without increasing polling or page caps. Stage cards retain their single header
-disclosure and existing keyboard behavior.
+without increasing polling or page caps.
 
-Expand a stage to read complete, wrapping, selectable review text: summaries,
+Open a stage's detail page and choose **Review** to read complete, wrapping,
+selectable review text: summaries,
 change requests, notes and checks under `verified:`, with recorded round, decision
-and timestamp (UTC). Ctrl+C copies the exact selection. Opening automatically
+and timestamp (UTC). Ctrl+C copies the exact selection. Opening the Review sub-tab automatically
 loads completion for shortened records; until verified, their summaries remain
 explicitly labelled previews and selectable. A loading failure or unverifiable
 history appears as one group status line with **Retry reviews**. Automatic loading
-stays suppressed through polling, execution publications and collapse/re-expand
-until Retry or the applicable project, visit, plan, revision or stage scope reset.
-Collapsed cards initiate no automatic load, but an already-started chain may
-finish its pages after collapse. Complete records do not reload on reopening.
+stays suppressed through polling, execution publications and closing/reopening the
+page until Retry or the applicable project, visit, plan, revision or stage scope
+reset. A closed page initiates no automatic load, but an already-started chain may
+finish its pages after it closes. Complete records do not reload on reopening.
 **Load older reviews** pages eight at a time; Retry and older-page loading are
 group actions, with no per-review Expand, Load or Copy controls.
 Earlier requests remain visible after final approval. Expanded history uses
@@ -1191,34 +1221,33 @@ Report expansion and its individual text expansions remain separate.
 Statuses, errors, quota warnings, metadata and actions stay visible. Goal/plan/
 model-policy editors, structured diffs and keyboard help keep their existing uses.
 
-Read-only plan stage cards have exactly one disclosure toggle in the header;
-Enter / o / Space on the selected stage expands or collapses the same whole card.
-Collapsed cards show only the header and short wrapping status lines: stage
+Plan rows are one line each; Enter / `o` / Space on the selected stage (or a click)
+opens its stage detail page. The page's status line and sub-tabs show the stage
 status and sha, current activity, review policy and gate, the latest historical
 review line, elapsed time, model identity/effort, availability verification, tier
 provenance, and routing or block errors. There are no preview lines, per-field
-Expand controls or editors. Expanded cards show Commit, all model-agreement
+Expand controls or editors. The sub-tabs show Commit, all model-agreement
 rationale (including routing-history rationale), review-policy rationale,
 Instructions, Acceptance criteria and historical reviews as complete, wrapping,
 selectable plain text, with no per-field controls. Ctrl+C copies the exact
 selected original text, including whitespace and CR/CRLF line endings. The single
-permitted extra toggle, **Model agreement and routing details**, reveals only
-risk, constraint, cost qualification, routing price, agreement id and latest
-invocation; rationale remains visible whenever the card is expanded. Committed
-stages remain read-only during plan editing.
+permitted extra toggle, **Model agreement and routing details** on the Routing
+sub-tab, reveals only risk, constraint, cost qualification, routing price,
+agreement id and latest invocation; rationale remains visible whenever the
+sub-tab is shown. Committed stages remain read-only during plan editing.
 
-An expanded card holds stage prose at the snapshot taken when it opened, so
+An open detail page holds stage prose at the snapshot taken when it opened, so
 polling cannot rebind an open editor or destroy a selection; status lines keep
-updating. Newer prose appears on collapse/re-expand or a project, project visit,
-plan, revision or stage scope change. Review presentation separately retains
+updating. Newer prose appears after closing and reopening the page or on a
+project, project visit, plan, revision or stage scope change. Review presentation separately retains
 selected originals, labelled when held from an earlier publication, without
 making them verified in the current review scope. A selected preview stays
 labelled while its completed record appears separately; releasing the selection
-allows reconciliation. Collapse/re-expand or a stage scope reset clears held
+allows reconciliation. Closing the page or a stage scope reset clears held
 review presentation.
 
 Inspecting chat or output suspends following new messages. Polling preserves
-unchanged selections and open text; changed fields refresh on collapse. An open
+unchanged selections and open text; changed fields refresh on collapse (for stage prose: on closing and reopening the detail page). An open
 field removed from the current snapshot stays labelled **previously shown** until
 collapsed.
 Legacy unstructured logs remain accessible as a single full-text entry: old
@@ -1284,7 +1313,7 @@ view that shows their target and select that view: stage keys select Plan, and
 | `Escape` | Leave a text field, close the top overlay, or cancel plan editing |
 | `j` / `k` | Select next / previous stage (a row on Settings, a report in Reports) |
 | `gg` / `G` | Select first / last stage |
-| `Enter` / `o` / `Space` | Expand or collapse the whole selected stage card; focus its title when editing |
+| `Enter` / `o` / `Space` | Open the selected stage's detail page; focus its title when editing |
 | `Tab` | Toggle Live / History |
 | `h` / `l` | Select Live / History |
 | `Ctrl+d` / `Ctrl+u` | Scroll Live / History half a page down / up |
@@ -1303,6 +1332,17 @@ view that shows their target and select that view: stage keys select Plan, and
 | `d` | Open uncommitted diff |
 | `c` | Change project |
 | `f` | Open the Features tab |
+| `?` (`Shift+/`) / `F1` | Open keyboard help |
+
+#### Stage detail
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Previous / next stage (a `[ ]` press here does not switch tabs) |
+| `h` / `l` | Previous / next sub-tab: Instructions · Acceptance · Review · Routing · Output |
+| `q` / `Escape` | Back to Plan with the stage selected |
+| `g` then a tab key | Leave the page and go to that tab |
+| `d` / `x` | View diff / stop, with their usual guards |
 | `?` (`Shift+/`) / `F1` | Open keyboard help |
 
 #### Diff viewer
@@ -1960,9 +2000,9 @@ substitution. Every handoff includes the saved architecture summary, decisions,
 guidance, constraints, completed interfaces, outstanding findings and worktree/
 diff context, and directs a replacement agent to inspect and preserve partial work.
 
-Collapsed stage cards show the required tier and deferred model selection before
-execution. After launch they also show the captured model and actual invocations. Expanding
-the card shows all model-agreement rationale, including both selection reasons
+A stage's detail page shows the required tier and deferred model selection before
+execution (status line and Routing sub-tab). After launch it also shows the captured model
+and actual invocations. The Routing sub-tab shows all model-agreement rationale, including both selection reasons
 and retained routing-history rationale. Its single extra **Model agreement and
 routing details** toggle reveals risk classification, constraints, cost
 qualification, routing price, agreement id and latest invocation only.

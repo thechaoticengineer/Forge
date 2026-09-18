@@ -259,6 +259,16 @@ Item {
           }
         }
 
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          visible: page.hasPrevious && page.hasNext
+          text: "·"
+          textFormat: Text.PlainText
+          color: page.mutedForeground
+          font.family: page.fontFamily
+          font.pixelSize: page.fontSize11
+        }
+
         Item {
           id: nextStage
 

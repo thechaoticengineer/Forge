@@ -1,8 +1,8 @@
 # Scenarios
 
-**Status: M1 scenarios (S1-S6, S8-S11 and S16-S22) are implemented and have executable business tests; M2 scenarios (S7, S12-S15 and S23) are planned.**
+**Status: all scenarios are implemented and have executable business tests. M1 covers S1-S6, S8-S11 and S16-S22; M2 covers S7, S12-S15 and S23.**
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. The panel window is the default 760×760 unless a scenario says otherwise. Mockups are in `design/`. The M1 scenarios are verified by business tests in `tests/panel_redesign_m1.test.mjs` (source and pure-JS contracts of `Panel.qml`, `PanelNavigation.js`, `PanelActions.js` and the view files) and the QML tests `tests/qml/tst_panel_shell.qml` (S1, S2, S10, S11), `tst_panel_overview.qml` (S4-S6), `tst_panel_settings.qml` (S8, S9) and `tst_panel_queue.qml` (S18); each scenario below names its tests. Scenarios S19-S21 were additionally exercised against a running offscreen panel.
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. The panel window is the default 760×760 unless a scenario says otherwise. Mockups are in `design/`. The M1 scenarios are verified by business tests in `tests/panel_redesign_m1.test.mjs` (source and pure-JS contracts of `Panel.qml`, `PanelNavigation.js`, `PanelActions.js` and the view files) and the QML tests `tests/qml/tst_panel_shell.qml` (S1, S2, S10, S11), `tst_panel_overview.qml` (S4-S6), `tst_panel_settings.qml` (S8, S9) and `tst_panel_queue.qml` (S18). The M2 scenarios are verified by `tests/panel_redesign_m2.test.mjs` (pure-JS contracts of `PanelNavigation.js`, `StagePresentation.js`, `PlanReview.js` and `UsageFormat.js`, and source contracts of `Panel.qml`, `PlanView.qml`, `PlanEditorView.qml` and `StageDetailPage.qml`) and the QML tests `tst_panel_overview_attention.qml` (S7), `tst_panel_plan.qml` (S12), `tst_panel_stage_detail.qml` (S13, S14) and `tst_panel_settings_compact.qml` (the Settings quota polish); each scenario below names its tests. Scenarios S19-S21 were additionally exercised against a running offscreen panel, and M2 was checked visually at 760×760 against the mockups (see `milestones.md`).
 
 ## S1: The header and tab bar are always visible
 
@@ -51,6 +51,7 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: a stage is blocked or failed
 - When: the user views Overview
 - Then: that stage is shown at the top of Overview with its status and reason, and clicking it opens its stage detail page
+- Implemented (M2): `tests/qml/tst_panel_overview_attention.qml`, `tests/panel_redesign_m2.test.mjs`
 
 ## S8: Settings holds every run and agent setting
 
@@ -85,24 +86,28 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: a plan with committed, running and pending stages
 - When: the user opens Plan
 - Then: each stage takes one line with status icon, number and title, commit hash or status, and duration, and a one-line plan review strip summarizes the review verdict and round
+- Implemented (M2): `tests/qml/tst_panel_plan.qml`, `tests/panel_redesign_m2.test.mjs`
 
 ## S13: Clicking a stage opens its detail page
 
 - Given: Plan is open with stage 2 selected
 - When: the user clicks stage 3, or selects it with `j` and presses Enter
 - Then: a stage detail page opens showing a breadcrumb back to Plan, the stage status line, and sub-tabs Instructions, Acceptance, Review, Routing and Output, which together hold everything the inline expanded stage showed before the redesign
+- Implemented (M2): `tests/qml/tst_panel_stage_detail.qml`, `tests/panel_redesign_m2.test.mjs`; the retargeted `tests/panel_review_details.test.mjs`, `tests/panel_review.test.mjs`, `tests/panel_routing.test.mjs`, `tests/panel_components.test.mjs` and `tests/run_stage_details.py` keep the moved review, routing and prose details covered
 
 ## S14: Stage detail navigation keeps position
 
 - Given: the stage detail page of stage 3 is open after scrolling Plan
 - When: the user presses `]` to move to stage 4, then Escape
 - Then: `]` moves between stages rather than tabs while stage detail is open, stage 4's detail is shown, and Escape returns to Plan with stage 4 selected and the earlier scroll position intact
+- Implemented (M2): `tests/qml/tst_panel_stage_detail.qml`, `tests/panel_redesign_m2.test.mjs`
 
 ## S15: Plan editing, Q&A and feedback live in Plan
 
 - Given: a plan is ready
 - When: the user presses `e`, edits a stage and saves, then asks a question in Plan Q&A, then submits feedback with Improve with AI
 - Then: each works as before the redesign and stays inside the Plan view
+- Implemented (M2): `tests/panel_redesign_m2.test.mjs`; the unchanged `tests/panel_plan_edit.test.mjs` keeps the editing behavior covered
 
 ## S16: Activity uses the full view
 
@@ -158,3 +163,4 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: milestone M2 is complete
 - When: the `quickshell/` directory is inspected
 - Then: the stage detail page is a separate QML file, `Panel.qml` stays under 1,800 lines, and all `node --test tests/*.test.mjs`, `qmltestrunner -input tests/qml` and `cargo test` checks pass
+- Implemented (M2): `tests/panel_redesign_m2.test.mjs`
