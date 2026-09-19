@@ -72,7 +72,7 @@ shortcut = between('              } else if (event.key === Qt.Key_Return', '    
 shortcut = shortcut.replace('              } else if', '              if', 1) + '                event.accepted = true\n              }\n'
 shortcut = shortcut.replace('planEditor.stageList', 'stageList')
 # The keyHandler's stage detail branch comes before the shortcut, as in Panel.qml.
-detail_keys = between('          } else if (root.stageDetailOpen', '          } else if (features.featuresOpen)')
+detail_keys = between('          } else if (root.stageDetailOpen', '          } else if (features.featurePageOpen')
 detail_keys = detail_keys.replace('          } else if', '          if', 1)
 keys = detail_keys + '          } else {\n' + shortcut + '          }\n'
 # Panel.qml's own page instance. The StackView sizes and shows it in the panel; the
