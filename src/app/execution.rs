@@ -348,6 +348,48 @@ impl Ctx {
         self.publish_completed_run(&mut plan, count)
     }
 
+    /// Records a completed milestone plan in its feature state (S34): the link
+    /// becomes `completed` with the reviewed commit range. Runtime metadata
+    /// only; the repository is not touched, and a failed write is logged
+    /// without affecting the approved run.
+    fn record_feature_completion(&self, plan: &Value) {
+        let feature = &plan["feature"];
+        if !feature.is_object() {
+            return;
+        }
+        let slug = feature["slug"].as_str().unwrap_or("");
+        let milestone = feature["milestone"].as_str().unwrap_or("");
+        let plan_id = plan["plan_id"].as_str().unwrap_or("");
+        let result = self.completed_commit_range(plan).and_then(|(base, head)|
+            crate::feature_state::complete_plan_link(self, slug, milestone, plan_id, &base, &head));
+        match result {
+            Ok(()) => self.log_event("features", &format!("feature {slug} {milestone} plan {plan_id} completed")),
+            Err(error) => self.log_event("error",
+                &format!("could not record completion of feature {slug} {milestone} plan {plan_id}: {error}")),
+        }
+    }
+
+    /// The completed plan's commit range: the plan-review base, or for a plan
+    /// reviewed per stage only the first stage's base, derived as
+    /// `plan_review_base` does; the head is the finalized HEAD.
+    fn completed_commit_range(&self, plan: &Value) -> Result<(String, String), String> {
+        let base = match plan["plan_review"]["base"].as_str().filter(|s| !s.is_empty()) {
+            Some(base) => base.to_string(),
+            None => {
+                let first = plan["stages"].get(0).ok_or("plan has no stages")?;
+                match first["attempt_head"].as_str().filter(|s| !s.is_empty()) {
+                    Some(base) => base.to_string(),
+                    None => {
+                        let sha = first["sha"].as_str().filter(|s| !s.is_empty())
+                            .ok_or("first stage has neither attempt_head nor sha")?;
+                        self.git(&["rev-parse", "--verify", &format!("{sha}^{{commit}}^")])?
+                    }
+                }
+            }
+        };
+        Ok((base, self.git(&["rev-parse", "HEAD"])?))
+    }
+
     /// Recover committed work and reuse architectural guidance only for matching saved inputs.
     fn recover_execution_plan(&self) -> Result<Value, String> {
         self.recover_committed_stages()?;
@@ -423,6 +465,7 @@ impl Ctx {
         }
         plan["status"] = json!("done");
         self.save_plan(plan)?;
+        self.record_feature_completion(plan);
         if self.app.settings.lock().unwrap()["auto_push"].as_bool() == Some(true) {
             self.set_step(None, "pushing");
             match self.git(&["push", "-u", "origin", "HEAD"]) {

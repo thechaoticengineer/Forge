@@ -478,6 +478,41 @@ pub(crate) fn set_plan_link_status(
     })
 }
 
+/// Marks a milestone plan's link `completed` with its commit range (S34).
+/// The link is the latest one of `milestone` carrying `plan_id`, or else the
+/// latest `planned` one. A link that is already completed keeps its first
+/// completion, so a repeated completion changes nothing.
+pub(crate) fn complete_plan_link(
+    ctx: &Ctx,
+    slug: &str,
+    milestone: &str,
+    plan_id: &str,
+    base: &str,
+    head: &str,
+) -> Result<(), String> {
+    update(ctx, slug, |state| {
+        let plans = plans_mut(state);
+        let index = plans
+            .iter()
+            .rposition(|link| link["milestone"] == json!(milestone) && link["plan_id"] == json!(plan_id))
+            .or_else(|| {
+                plans
+                    .iter()
+                    .rposition(|link| link["milestone"] == json!(milestone) && link["status"] == json!("planned"))
+            })
+            .ok_or_else(|| format!("no plan link for {slug} {milestone} plan {plan_id}"))?;
+        let link = &mut plans[index];
+        if link["status"] == json!("completed") {
+            return Ok(());
+        }
+        link["status"] = json!("completed");
+        link["plan_id"] = json!(plan_id);
+        link["completed_unix"] = json!(crate::util::unix_timestamp());
+        link["commit_range"] = json!({"base": base, "head": head});
+        Ok(())
+    })
+}
+
 // ---------------------------------------------------------------- creation
 
 /// Creates `docs/features/<slug>/` from `docs/features/_template/` with the

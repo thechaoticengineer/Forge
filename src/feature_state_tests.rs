@@ -4,7 +4,7 @@
 //! business tests in src/feature_spec_m2_tests.rs.
 
 use crate::feature_state::{
-    Snapshot, append_plan_link, approved_scenario_ids, content_hash, create, default_state,
+    Snapshot, append_plan_link, approved_scenario_ids, complete_plan_link, content_hash, create, default_state,
     latest_plan_link, load, plan_link_view, set_plan_link_status, snapshot, spec_status,
     state_path, update, validate_slug, validate_title,
 };
@@ -434,6 +434,50 @@ fn plan_links_move_from_planning_to_planned_or_failed_on_the_latest_link() {
     assert_eq!(view["plan_id"], "plan-2");
     assert_eq!(view["commit_range"], Value::Null);
     assert_eq!(latest_plan_link(&state, "M2"), Value::Null);
+}
+
+#[test]
+fn completing_a_plan_link_matches_the_plan_id_falls_back_to_planned_and_is_idempotent() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    let feature = json!({"slug": "demo", "milestone": "M1", "title": "Alpha",
+        "scenario_ids": ["S1"], "folder": "docs/features/demo/"});
+
+    // Nothing to complete is reported, not invented.
+    let error = complete_plan_link(ctx, "demo", "M1", "plan-1", "b", "h").unwrap_err();
+    assert!(error.contains("M1") && error.contains("plan-1"), "error was {error}");
+
+    append_plan_link(ctx, &feature, "Implement M1").unwrap();
+    set_plan_link_status(ctx, "demo", "M1", "planned", Some("plan-1"), None).unwrap();
+    append_plan_link(ctx, &feature, "Implement M1").unwrap();
+    set_plan_link_status(ctx, "demo", "M1", "failed", None, Some("planner broke")).unwrap();
+
+    // The link carrying the plan ID wins over a later link of the milestone.
+    complete_plan_link(ctx, "demo", "M1", "plan-1", "base1", "head1").unwrap();
+    let state = load(ctx, "demo").unwrap();
+    let plans = state["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0]["status"], "completed");
+    assert_eq!(plans[0]["commit_range"], json!({"base": "base1", "head": "head1"}));
+    assert!(plans[0]["completed_unix"].as_i64().unwrap() > 0);
+    assert_eq!(plans[1]["status"], "failed");
+
+    // A repeated completion changes nothing.
+    let before = fs::read(state_path(ctx, "demo")).unwrap();
+    complete_plan_link(ctx, "demo", "M1", "plan-1", "other", "other").unwrap();
+    assert_eq!(fs::read(state_path(ctx, "demo")).unwrap(), before);
+
+    // Without a plan ID match, the latest planned link of the milestone is used.
+    append_plan_link(ctx, &feature, "Implement M1").unwrap();
+    set_plan_link_status(ctx, "demo", "M1", "planned", Some("plan-3"), None).unwrap();
+    complete_plan_link(ctx, "demo", "M1", "plan-x", "base3", "head3").unwrap();
+    let state = load(ctx, "demo").unwrap();
+    let plans = state["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 3);
+    assert_eq!(plans[2]["status"], "completed");
+    assert_eq!(plans[2]["plan_id"], "plan-x");
+    assert_eq!(plan_link_view(&state, "M1")["commit_range"], json!({"base": "base3", "head": "head3"}));
+    assert_eq!(plans[0]["commit_range"], json!({"base": "base1", "head": "head1"}));
 }
 
 #[test]

@@ -1188,6 +1188,67 @@ fn s34_completed_milestone_plan_records_range_and_makes_no_commit_after_approval
 }
 
 #[test]
+fn s34_per_stage_reviewed_milestone_plan_records_the_first_stage_base() {
+    // S34: without a deferred plan review the range starts at the first stage's base
+    let env = Env::ready();
+    env.set("review_cadence", json!({"architect": "per_stage", "reviewer": "per_stage"}));
+    env.plan_m1(milestone_plan(&["S1", "S2"]));
+    let base = env.head();
+    env.approve_and_run();
+
+    let plan = env.ctx().load_plan().unwrap();
+    assert_eq!(plan["status"], "done", "plan was {plan}");
+    assert!(!plan["plan_review"].is_object(), "no plan review is deferred: {}", plan["plan_review"]);
+    let state = env.state(SLUG);
+    let link = &state["plans"][0];
+    assert_eq!(link["status"], "completed", "link was {link}");
+    assert_eq!(link["plan_id"], plan["plan_id"], "link was {link}");
+    assert!(link["completed_unix"].as_i64().is_some_and(|t| t > 0), "link was {link}");
+    assert_eq!(link["commit_range"], json!({"base": base, "head": env.head()}), "link was {link}");
+    assert_eq!(state["plans"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn s34_blocked_plan_review_records_no_completion() {
+    // S34: only an approved plan records its completion
+    let env = Env::ready();
+    env.per_plan();
+    env.set("max_fix_rounds", json!(0));
+    env.plan_m1(milestone_plan(&["S1", "S2"]));
+    let before = env.state_bytes(SLUG);
+    env.set("mock_verdicts", json!([{"approved": false, "issues": ["Not done"]}]));
+    env.approve_and_run();
+
+    let plan = env.ctx().load_plan().unwrap();
+    assert_ne!(plan["status"], "done", "plan was {plan}");
+    assert_eq!(plan["plan_review"]["status"], "blocked", "plan review was {}", plan["plan_review"]);
+    assert_eq!(env.state_bytes(SLUG), before, "a blocked plan must not write feature state");
+    assert_eq!(env.state(SLUG)["plans"][0]["status"], "planned");
+}
+
+#[test]
+fn s34_unwritable_feature_state_is_logged_without_failing_the_completed_plan() {
+    // S34: completion is runtime metadata; a failed write never undoes the run
+    let env = Env::ready();
+    env.per_plan();
+    env.plan_m1(milestone_plan(&["S1", "S2"]));
+    fs::write(env.state_path(SLUG), "not json").unwrap();
+    env.approve_and_run();
+
+    let plan = env.ctx().load_plan().unwrap();
+    assert_eq!(plan["status"], "done", "plan was {plan}");
+    assert_eq!(plan["plan_review"]["status"], "approved", "plan review was {}", plan["plan_review"]);
+    assert_eq!(env.head(), plan["plan_review"]["finalization"]["head"].as_str().unwrap());
+    let history = fs::read_to_string(env.test.path.join(".forge/history.jsonl")).unwrap();
+    let plan_id = plan["plan_id"].as_str().unwrap();
+    assert!(
+        history.lines().any(|line| line.contains("\"kind\":\"error\"")
+            && line.contains(SLUG) && line.contains(plan_id) && line.contains("completion")),
+        "an error naming the feature and plan must be logged: {history}"
+    );
+}
+
+#[test]
 fn s34_planner_prompt_states_the_final_stage_rule() {
     // S34: the planner writes a final stage that marks the milestone implemented
     let env = Env::ready();
