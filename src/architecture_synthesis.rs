@@ -174,7 +174,6 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
 /// retired:[{id, reason}]}`: the engine derives every ID, and a retirement
 /// copies its text from `old`. `source` is {plan_id, checkpoint, sha, goal,
 /// unix}; its goal is cut to the entry byte limit.
-#[cfg_attr(not(test), allow(dead_code))] // The architect synthesis turn is its production caller.
 pub(crate) fn build(output: &Value, old: Option<&Value>, mut source: Value) -> Result<Value, String> {
     only_keys(output, &["constraints", "interfaces", "decisions", "retired"], "synthesis output")?;
     let mut doc = json!({"version": VERSION});
@@ -217,7 +216,6 @@ pub(crate) fn load(root: &Path) -> Result<Option<Value>, String> {
 
 /// Replaces the stored synthesis atomically after validating `doc` against
 /// it. The caller holds the persistence lock.
-#[cfg_attr(not(test), allow(dead_code))] // The architect synthesis turn is its production caller.
 pub(crate) fn save(root: &Path, doc: &Value) -> Result<(), String> {
     let old = load(root)?;
     validate(doc, old.as_ref())?;
@@ -337,7 +335,6 @@ impl Ctx {
     }
 
     /// Validates and replaces the stored synthesis under the persistence lock.
-    #[cfg_attr(not(test), allow(dead_code))] // The architect synthesis turn is its production caller.
     pub(crate) fn save_project_synthesis(&self, doc: &Value) -> Result<(), String> {
         let _guard = self.session.persistence_lock.lock().unwrap();
         save(&self.forge_path(""), doc)

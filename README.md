@@ -802,6 +802,53 @@ The synthesis is a separate prompt field. It never enters a checkpoint's
 The note tells every receiving role that the synthesis is advisory, recorded at
 `source.sha`, and must be checked against the repository code before use.
 
+#### Synthesis turn
+
+The architect writes what holds in one short synthesis turn:
+
+- **When.** A plan that reaches done is saved with status `done` (and pushed,
+  when `auto_push` is on), and its run report is written. Then, before the queue
+  moves on to the next goal, the architect takes the synthesis turn. The panel
+  shows it as the step **synthesizing architecture**, and the step is cleared
+  afterwards. The run's completion message is logged after the turn.
+- **Input.** The prompt is small: the previous synthesis (or none), the source
+  plan's compact prompt view of its checkpoint, its goal and a stage list of
+  `{id, title, status, sha}`, the limits and the keep-or-retire rule. The
+  architect inspects the repository and the plan's architecture events itself
+  when it needs detail. It returns only
+  `{"constraints":[…], "interfaces":[…], "decisions":[…], "retired":[{id, reason}]}`.
+  Every previous entry is restated with identical text or retired with a
+  reason, and entries are merged to fit the limits. The engine derives the IDs,
+  validates the result as described above and replaces the file atomically. An
+  invalid output gets one correction.
+- **Session.** The turn resumes the plan's architect session with the architect
+  bootstrap provider and model. When that is impossible (no session, another
+  provider or model, a checkpoint that needs recovery) or the resume fails, one
+  fresh session gets the same compact input. The source is
+  `{plan_id, checkpoint, sha, goal, unix}`, where `sha` is the plan's last
+  committed stage (HEAD only when no stage has a sha). Token usage counts
+  towards the session's architect usage and is logged; the finished plan is not
+  rewritten.
+- **Failure.** A provider error, an invalid output or a failed write keeps the
+  previous `synthesis.json` byte for byte and logs an `architecture` event
+  `synthesis failed: <error>; previous synthesis kept`. The plan status, phase,
+  run report and queue progress never depend on the turn.
+- **Catch-up.** When a new plan identity takes its first architect turn, Forge
+  looks at the previous plan: the saved plan when it has another identity, or
+  otherwise the plan the last reset put aside. Reset and archiving record that
+  plan in `.forge/architecture/previous-plan.json` (`{plan_id, checkpoint}`),
+  and the plan is read from its archived checkpoint bundle. When that plan has
+  committed stages and was never synthesized (a missed turn, or a blocked, reset
+  or abandoned plan), the synthesis runs once from its checkpoint before the
+  new plan's architect turn, which then already sees the result. A failure is
+  logged and does not block the new plan.
+- **No duplicates.** `.forge/architecture/synthesis-state.json` records
+  `last_attempted_plan_id` durably before every turn. A plan is skipped when
+  the stored synthesis's `source.plan_id` or `last_attempted_plan_id` names it,
+  so a failed turn is not retried. Plans without committed stages are never
+  synthesized. Reset and archiving leave `synthesis.json` and
+  `synthesis-state.json` alone.
+
 ### Asking about the plan
 
 Type a question about the current plan into the field beside **Plan Q&A**
@@ -938,6 +985,9 @@ An unresolved blocker stops the same goal again. Start is disabled while the
 project is busy or the queue is already active.
 Approving or running a saved plan for a later queued goal cannot bypass this order.
 
+Between goals, a completed goal's plan gets its architect synthesis turn
+(**synthesizing architecture**, see [Synthesis turn](#synthesis-turn)) before
+the next goal starts; its failure never stops the queue.
 Successfully completed goals are removed from the queue automatically.
 Failed or blocked goals stay visible until you dismiss them with their
 **×** remove button on the Queue tab. Removing a failed or blocked goal explicitly

@@ -16,6 +16,7 @@ pub(crate) const IMPLEMENTER: &str = "implementer";
 pub(crate) const FIXER: &str = "fixer";
 pub(crate) const PLANNER_CHAT: &str = "planner_chat";
 pub(crate) const ROUTING_RECONCILIATION: &str = "routing_reconciliation";
+pub(crate) const ARCHITECTURE_SYNTHESIS: &str = "architecture_synthesis";
 
 impl Ctx {
     /// Records one provider prompt. `role` is the provider role that receives

@@ -369,6 +369,9 @@ impl Ctx {
             let mut cp = if let Some(p) = previous.filter(|p| p.get("architecture").is_some()) {
                 store.checkpoint(p)?
             } else {
+                // A new plan identity: synthesize a previous plan that never
+                // began a synthesis turn, so this turn already sees the result.
+                self.catch_up_synthesis(old.as_ref(), &candidate);
                 checkpoint_default()
             };
             if candidate["plan_id"].is_null() {

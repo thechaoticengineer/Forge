@@ -252,7 +252,9 @@ fn depends_on(id: i64) -> Vec<i64> {
 // 1,048,576 characters: a string never has fewer bytes than characters, so a
 // byte cap of 256 KiB guarantees it with a wide margin. Measured on the
 // fixtures below, the largest prompts (the first architect publish, planner
-// chat and routing reconciliation) are about 64-68 KB.
+// chat and routing reconciliation) are about 64-68 KB. The architect
+// synthesis turn at plan completion runs once per plan and is held to the
+// same cap.
 const PROMPT_MAX_BYTES: usize = 256 * 1024;
 // Roles that repeat across stages (architect publish, stage review,
 // implementer, fixer, planner chat, routing reconciliation) may grow by at
@@ -467,6 +469,8 @@ fn every_role_prompt_stays_bounded_across_an_eight_stage_plan() {
     for kind in ["architect_publish", "implementer", "fixer", "planner_chat", "routing_reconciliation"] { run.assert_captured(kind, None); }
     run.assert_captured("stage_review", Some("reviewer"));
     run.assert_captured("stage_review", Some("architect"));
+    // The completed plan's architect synthesis turn, under the same cap.
+    run.assert_captured("architecture_synthesis", Some("architect"));
     assert_eq!(run.of("planner_chat").len(), LINKED_STAGES as usize + 1);
 
     run.assert_absolute_cap();
@@ -489,7 +493,7 @@ fn plan_review_and_plan_fix_prompts_stay_bounded_across_an_eight_stage_plan() {
     let mut run = Run::new(f, verdicts, vec![]);
     for id in 1..=LINKED_STAGES { run.stage(id); }
 
-    for kind in ["architect_publish", "implementer", "planner_chat", "plan_review", "plan_fix"] { run.assert_captured(kind, None); }
+    for kind in ["architect_publish", "implementer", "planner_chat", "plan_review", "plan_fix", "architecture_synthesis"] { run.assert_captured(kind, None); }
     run.assert_captured("plan_review", Some("reviewer"));
     run.assert_captured("plan_review", Some("architect"));
     assert!(run.of("plan_review").len() >= 2, "plan review must run again after PLAN_FIX; samples {:?}",

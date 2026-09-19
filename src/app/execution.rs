@@ -514,6 +514,9 @@ impl Ctx {
         writeln!(f, "{report}").and_then(|_| f.sync_all())
             .and_then(|_| fs::File::open(self.forge_path("")).and_then(|dir| dir.sync_all()))
             .map_err(|e| format!("run report: {e}"))?;
+        // The plan is durably done and reported; the advisory synthesis turn
+        // runs before the queue moves on, and its failure changes none of that.
+        self.synthesize_completed_plan();
         let text = crate::reports::completion_message(&report);
         self.log_event("run", &text);
         Ok(())

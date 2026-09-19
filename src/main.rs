@@ -22,6 +22,7 @@ mod durable_json;
 mod architecture;
 mod prompt_view;
 mod architecture_synthesis;
+mod architecture_synthesis_turn;
 #[cfg(test)]
 mod prompt_capture;
 mod architect;

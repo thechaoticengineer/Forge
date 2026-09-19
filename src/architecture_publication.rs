@@ -5,6 +5,9 @@ use crate::util::unix_timestamp;
 use std::fs::OpenOptions;
 use std::io::Write;
 
+/// Locator of the last archived plan: {version, plan_id, checkpoint}.
+pub(crate) const PREVIOUS_PLAN: &str = "previous-plan.json";
+
 impl Store {
     /// Persist an inactive contract record; callers supply a checkpoint-forked
     /// session reference separately. This never invokes a provider or changes gates.
@@ -261,12 +264,37 @@ impl Store {
         }
         Ok(logical_plan)
     }
+    /// Archives a plan identity and points `previous-plan.json` at it, durably
+    /// and before the caller replaces or removes `plan.json`, so the next plan
+    /// can find the archived plan. The project synthesis and its attempt
+    /// marker are never touched.
     fn archive(&self, plan: &Value) -> Result<(), String> {
         self.checkpoint(plan)?;
-        let dir = self.directory(plan["plan_id"].as_str().ok_or("missing identity")?)?;
-        let bundle = read_json(&dir.join("checkpoints").join(format!("{}.json",
-            plan["architecture"]["checkpoint"].as_str().ok_or("missing checkpoint")?)))?;
-        publish_pretty(&dir.join("archived.json"), &bundle["plan"])
+        let id = plan["plan_id"].as_str().ok_or("missing identity")?;
+        let dir = self.directory(id)?;
+        let token = plan["architecture"]["checkpoint"].as_str().ok_or("missing checkpoint")?;
+        let bundle = read_json(&dir.join("checkpoints").join(format!("{token}.json")))?;
+        publish_pretty(&dir.join("archived.json"), &bundle["plan"])?;
+        publish_pretty(&self.root.join("architecture").join(PREVIOUS_PLAN),
+            &json!({"version": VERSION, "plan_id": id, "checkpoint": token}))
+    }
+
+    /// The plan the last archive or reset put aside, with its checkpoint, read
+    /// from its archived checkpoint bundle. `previous-plan.json` is only a
+    /// locator; None when there is none.
+    pub(crate) fn previous_plan(&self) -> Result<Option<(Value, Value)>, String> {
+        let path = self.root.join("architecture").join(PREVIOUS_PLAN);
+        if !path.exists() { return Ok(None); }
+        let pointer = read_json(&path)?;
+        let id = pointer["plan_id"].as_str().ok_or("invalid previous plan pointer")?;
+        let token = pointer["checkpoint"].as_str().filter(|t| safe_id(t)).ok_or("invalid previous plan pointer")?;
+        let bundle = read_json(&self.directory(id)?.join("checkpoints").join(format!("{token}.json")))?;
+        let plan = bundle["plan"].clone();
+        if plan["plan_id"] != id || plan["architecture"]["checkpoint"] != token {
+            return Err("previous plan pointer does not match its checkpoint bundle".into());
+        }
+        let cp = self.checkpoint(&plan)?;
+        Ok(Some((plan, cp)))
     }
     pub(crate) fn reset(&self) -> Result<(), String> {
         if let Some(plan) = self.load()? {
