@@ -27,6 +27,12 @@ Item {
   property var featureDetailState: null
   // The latest refused "Plan milestone" request: {slug, milestone, message}.
   property var planRefusal: null
+  // The read-only content of the feature page (GET /api/features/content),
+  // the slug it was loaded for, and its loading state.
+  property var featureContent: null
+  property string featureContentSlug: ""
+  property bool featureContentPending: false
+  property string featureContentError: ""
 
   // A project switch drops the previous project's list and selection.
   function reset() {
@@ -38,6 +44,10 @@ Item {
     selectedFeatureSlug = ""
     featureDetailState = null
     planRefusal = null
+    featureContent = null
+    featureContentSlug = ""
+    featureContentPending = false
+    featureContentError = ""
   }
 
   // Shows the Features tab and loads its list.
@@ -97,6 +107,29 @@ Item {
         root.featureDetailState = resp
       } else {
         root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  // Loads the documents, scenarios, milestones and designs of one feature for
+  // its page. The previous feature's content is dropped at once; reloading the
+  // same feature keeps what is shown until the answer arrives.
+  function loadFeatureContent(slug) {
+    const revision = projectViewRevision
+    if (root.featureContentSlug !== slug) root.featureContent = null
+    root.featureContentSlug = slug
+    root.featureContentPending = true
+    root.featureContentError = ""
+    api("GET", "/api/features/content?project=" + encodeURIComponent(root.lastProject)
+      + "&slug=" + encodeURIComponent(slug), null, function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (root.featureContentSlug !== slug) return
+      root.featureContentPending = false
+      if (status === 200 && resp && typeof resp === "object") {
+        root.featureContent = resp
+      } else {
+        root.featureContent = null
+        root.featureContentError = Features.errorMessage(resp)
       }
     }, true)
   }
