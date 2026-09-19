@@ -1,8 +1,8 @@
 # Milestones
 
-**Status: M1, M2 and M4 are implemented; M3 and M5 are planned.**
+**Status: M1, M2, M3 and M4 are implemented; M5 is planned.**
 
-The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9), M2's scenarios (S10-S19) and M4's scenarios (S20-S26) have executable business tests; M3's scenarios (S27-S35) are written and planned. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
+The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9), M2's scenarios (S10-S19), M3's scenarios (S27-S35) and M4's scenarios (S20-S26) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
 
 ## M1: Format and discovery
 
@@ -24,10 +24,12 @@ Business tests: src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_s
 
 ## M3: Feature to plans
 
-Not yet implemented. Planning an approved milestone from the panel; supplying compact feature context to the planner, architect and reviewers; a failing-tests-first first stage in each milestone's plan; scenario coverage required during plan review; `Business tests:` lines as the registry of business tests, which every plan keeps passing; business test changes surfaced to reviewers; a completed plan marks its milestone implemented.
+Planning an approved milestone from the panel; supplying compact feature context to the planner, architect and reviewers; a failing-tests-first first stage in each milestone's plan; scenario coverage required during plan review; `Business tests:` lines as the registry of business tests, which every plan keeps passing; business test changes surfaced to reviewers; a completed plan marks its milestone implemented.
 
-Status: planned
+Status: implemented
 Covers: S27, S28, S29, S30, S31, S32, S33, S34, S35
+
+Business tests: src/feature_spec_m3_tests.rs (S27-S35) and tests/panel_feature_plan.test.mjs (panel parts of S27-S28)
 
 ## M4: pen.dev integration
 

@@ -5,7 +5,7 @@ building software — including Forge itself — with almost no ceremony.
 
 Rust engine + Quickshell (Omarchy) panel.
 
-A feature-spec planning workflow is documented in [docs/features/](docs/features/README.md); milestones M1, M2 and M4 are implemented by the engine, and M3 and M5 remain planned.
+A feature-spec planning workflow is documented in [docs/features/](docs/features/README.md); milestones M1 to M4 are implemented by the engine, and M5 remains planned.
 
 ## The loop
 
@@ -863,7 +863,8 @@ engine discover and validate feature folders and expose them through a read-only
 Milestone M2 adds the spec phase: creating a feature from the template, a read-only co-authoring agent
 whose proposed file changes the engine validates and writes, an architect spec review, and spec and
 scenario approvals bound to a Git commit and a content hash. Milestone M4 adds pen.dev integration for
-UI mockups in feature specifications. Milestones M3 (feature to plans) and M5 (panel viewer) remain
+UI mockups in feature specifications. Milestone M3 plans an approved milestone as a Forge plan and
+registers business tests that every later plan keeps passing. Milestone M5 (panel viewer) remains
 planned.
 
 ```
@@ -876,10 +877,17 @@ Each feature keeps its M1 fields — `slug` (the folder name under `docs/feature
 fenced code blocks, or the slug if there is none), `path` (the feature folder's absolute path),
 `status` (`"valid"` or `"invalid"`) and `reasons` (validation errors — missing or unreadable required
 files, malformed or duplicate scenario IDs, unknown scenario IDs in `Covers:` lines, malformed or
-repeated `Status:` lines — empty when valid) — plus the milestone progress read from `milestones.md`:
+repeated `Status:` lines, and malformed or repeated `Business tests:` lines or missing registered files —
+empty when valid) — plus the milestone progress read from `milestones.md`:
 
-- `milestones`: `[{"id": "M1", "title", "status": "implemented"|"planned"}, ...]`, one per `## ` heading,
-  from its `Status:` line (a milestone without one is `planned`).
+- `milestones`: `[{"id": "M1", "title", "status": "implemented"|"planned", "covers", "business_tests",
+  "plan"}, ...]`, one per `## ` heading, from its `Status:` line (a milestone without one is `planned`).
+  `covers` is the milestone's scenario IDs in order (`[]` for `Covers: none yet`). `business_tests` is its
+  registered business test files, as repository-relative paths in order without duplicates, parsed from
+  its `Business tests:` line (see [the registry grammar](docs/features/README.md#business-test-registry)).
+  `plan` is `null` for a milestone that was never planned, otherwise the latest plan link for it:
+  `{"status": "planning"|"planned"|"failed"|"completed", "plan_id", "started_unix", "completed_unix",
+  "commit_range": {"base", "head"}|null}`.
 - `progress`: `"implemented"` when every milestone is implemented, `"in progress"` when some are, and
   `"planned"` otherwise. It is independent of `spec_status`.
 
@@ -998,13 +1006,72 @@ The folder is hashed again after `scenarios.md` is read and before the approval 
 that lands while the endpoint runs is refused with `feature changed during approval` rather than
 recorded: the stored `scenario_ids` and `content_hash` always describe the same content.
 
+```
+POST /api/features/plan {"project"?, "slug", "milestone"}
+```
+
+Plans one milestone of an approved feature (S27, S28). Every refusal is decided before any agent starts
+and leaves `.forge/plan.json` and `.forge/features/<slug>.json` untouched. HTTP 400 for an invalid slug
+or a missing milestone ID; 404 for an unknown feature or an unknown milestone; 409 with an `error`
+reason when the feature is invalid (with its `reasons`), when its `spec_status` is not
+`"scenarios approved"` for its current content, when the milestone is already implemented or has
+`Covers: none yet`, when it covers a scenario ID that is not among the approved `scenario_ids` (the IDs
+are named), and `{"error":"busy"}` while the engine is busy with a plan or the queue is active.
+
+Otherwise the engine builds the goal itself — `Implement milestone <M> (<milestone title>) of the
+feature <feature title> specified in docs/features/<slug>/, covering scenarios <IDs>.` — records a plan
+link with status `planning` in the feature's runtime state, and starts planning in the background exactly
+as `POST /api/plan` does. Returns 200 `{"ok": true, "goal"}`; follow the plan through `GET /api/state`. A
+failed write of the plan link releases the engine and returns 500 without starting anything. Planning
+does not start execution and does not add the milestone to the queue.
+
+The resulting plan carries a top-level `feature` object `{"slug", "milestone", "title",
+"scenario_ids"}`. Only plans started by this endpoint have one: a `feature` key supplied by the planner
+is removed, and goal, discussion, refactor and queue plans carry no feature context and write no feature
+state (S35). For a milestone plan the planner, architect and reviewers receive a compact feature
+reference — the folder `docs/features/<slug>/`, the milestone ID and title, the covered scenario IDs and
+the rules below, never the contents of the feature's files. The planner must make the first stage turn
+every covered scenario into an executable test named after its scenario ID that fails before
+implementation and name every covered ID in that stage's instructions or acceptance; a plan that misses
+an ID goes back to the planner through the shared response-correction budget. The final stage sets the
+milestone's `Status: implemented` and its `Business tests:` line, so those edits are part of the
+reviewed commit range. Plan review of a milestone plan adds one criterion per covered ID — `an
+executable test traceable to <ID> exists and passes` — to the criteria to evidence, so an unverified
+scenario prevents approval. After the plan review approves (or the plan completes with per-stage review
+only) the engine only records the link as `completed` with its commit range; it makes no repository
+change after approval (S34).
+
+Business test rules for every plan (S32, S33): when any feature registers business test files on
+`Business tests:` lines, the stage and plan reviewers and architect reviews of every plan — milestone or
+not — receive the sorted list of registered files of all features and must run them with the matching
+project command and record them in the project checks; a failing business test prevents approval. The
+engine lists the registered files that a stage diff (from the stage's attempt head to the working tree)
+or a plan diff (from the plan review base, covering plan-fix rounds) modifies, deletes or renames; the
+reviewers reject the change unless it only adds tests or implements a scenario change approved in the
+feature spec. The engine never blocks such a diff itself. Implementer, fixer and plan-fixer prompts say
+that a conflict with an approved scenario is escalated to the architect as an architectural context gap
+and is never resolved by changing, skipping, weakening or deleting the business test. With no registered
+business tests and no milestone feature context, these prompts are unchanged.
+
 #### Feature runtime state
 
-Reviews, approvals and the co-authoring chat transcript are runtime state, stored at
+Reviews, approvals, the co-authoring chat transcript and milestone plan links are runtime state, stored at
 `.forge/features/<slug>.json` inside the project, never under `docs/features/`. A missing file means the
-defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[], "architect_session":null}`.
-Reviews and approvals are append-only: a later review or approval never removes an earlier one, so the
-full history survives every later change. The file is written through the engine's durable-publish
+defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[], "architect_session":null,
+"plans":[]}`. A file written before milestone M3 has no `plans` key: it is read with `plans` defaulted
+to `[]` and is not rewritten by the read; if `plans` is present it must be an array. Reviews and
+approvals are append-only: a later review or approval never removes an earlier one, so the full history
+survives every later change.
+
+`plans` holds one link per `POST /api/features/plan` that started, in order: `{"milestone", "title",
+"goal", "scenario_ids", "started_unix", "status", "plan_id", "error"?, "completed_unix", "commit_range"}`.
+`status` is `"planning"` from the request until the plan is published, then `"planned"` (with the
+published `plan_id`) or `"failed"` (with an `error`), and `"completed"` once the plan review approved the
+plan (or the plan finished with per-stage review only), when the engine sets `completed_unix` and
+`commit_range` `{"base", "head"}` — the first commit under review and the finalized HEAD. `plan_id` and
+`completed_unix` are `null` and `commit_range` is `null` until then. Recording completion is idempotent
+and best effort: a failed write is logged and never fails the finished run. A milestone's `plan` in
+`GET /api/features` is its latest link. The file is written through the engine's durable-publish
 protocol (temp file, fsync, rename), so an interrupted write never leaves invalid JSON and a stray temp
 file next to it is ignored on read; a file that exists but is unreadable or structurally wrong is
 reported as an error rather than silently reset, since resetting it would discard approval history.
@@ -1030,7 +1097,11 @@ latest architect review's verdict (approved or changes requested, with its summa
 questions) and the co-authoring chat transcript — send a message to the co-authoring agent, request an
 architect spec review, and approve the spec and then the scenarios once each becomes allowed. Engine
 refusals (invalid slug or title, an unapproved or stale review, a busy engine, and so on) are shown
-inline in the list.
+inline in the list. The detail also lists the feature's milestones with their status and plan status
+(`planning`, `planned`, `failed` or `completed`, from `plan` in `GET /api/features`). Each planned
+milestone that covers scenarios has a **Plan milestone** action, enabled only while the feature is
+`scenarios approved`; it calls `POST /api/features/plan`, shows a refusal reason inline under that
+milestone, and on success switches to the Plan tab.
 
 #### pen.dev integration (M4)
 
