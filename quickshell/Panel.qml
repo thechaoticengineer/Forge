@@ -256,6 +256,9 @@ Item {
     lastProject: root.lastProject
     projectViewRevision: root.projectViewRevision
     active: window.visible
+    pageStack: panelStack
+    page: featurePage
+    focusItem: keyHandler
   }
 
   CatalogueController {
@@ -688,6 +691,7 @@ Item {
   function selectTab(id) {
     if (stageDetailOpen) closeStageDetail()
     if (discussionOpen) closeDiscussion()
+    features.closeFeaturePage()
     currentTab = id
   }
 
@@ -1040,10 +1044,14 @@ Item {
               else if (event.key === Qt.Key_D) { if (root.guards.diff) root.openDiff() }
               else if (event.key === Qt.Key_X) { if (root.guards.stop) root.act("/api/stop") }
             }
+          } else if (features.featurePageOpen && !(prefix === "g" && viewTab !== "")) {
+            event.accepted = true
+            if (question) root.helpOpen = true
+            else if (featurePage.handleKey(event) === "" && event.key === Qt.Key_G && event.modifiers === Qt.NoModifier) pendingKey = "g"
           } else if (features.featuresOpen) {
             // The Features tab while no page is pushed on top of it.
             event.accepted = true
-            if (viewTab !== "") root.currentTab = viewTab
+            if (viewTab !== "") root.selectTab(viewTab)
             else if (question) root.helpOpen = true
             else pendingKey = featuresView.handleKey(event)
           } else if (question) {
@@ -1446,6 +1454,7 @@ Item {
               onCloseRequested: features.closeFeatures()
               onRefreshRequested: features.openFeatures()
               onOpenRequested: feature => features.openFeatureInEditor(feature)
+              onPageRequested: feature => features.openFeaturePage(feature)
               onCreateRequested: (slug, title) => features.createFeature(slug, title)
               onChatRequested: (feature, message) => features.sendFeatureChat(feature, message)
               onReviewRequested: feature => features.requestFeatureReview(feature)
@@ -1578,7 +1587,7 @@ Item {
           anchors.bottom: parent.bottom
           anchors.margins: Style.space(16)
           text: PanelNavigation.hintText(root.stageDetailOpen ? "stageDetail"
-            : root.discussionOpen ? "discussion" : root.currentTab, root.insertMode)
+            : features.featurePageOpen ? "featurePage" : root.discussionOpen ? "discussion" : root.currentTab, root.insertMode)
           elide: Text.ElideRight
           color: root.mutedForeground
           font.family: root.fontFamily
@@ -1688,6 +1697,22 @@ Item {
         onLeaveRequested: keyHandler.forceActiveFocus()
         onDetailRevealed: control => root.revealDetail(control)
         onDetailInspected: control => root.inspectDetail(control)
+      }
+
+      // ---------------------------------------------------- feature page
+      // Pushed, popped and fed by the features controller; actions use its functions.
+      FeaturePage {
+        id: featurePage
+        visible: false
+        controller: features
+        margin: Style.space(16)
+        theme: root.theme
+        onBackRequested: features.closeFeaturePage()
+        onReviewRequested: feature => features.requestFeatureReview(feature)
+        onApproveSpecRequested: feature => features.approveFeatureSpec(feature)
+        onApproveScenariosRequested: feature => features.approveFeatureScenarios(feature)
+        onPlanMilestoneRequested: (feature, milestone) => features.planMilestone(feature, milestone)
+        onChatRequested: { features.closeFeaturePage(); featuresView.focusChatInput() }
       }
 
       // ------------------------------------------- model policy and options

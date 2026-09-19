@@ -1,11 +1,13 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import "Features.js" as Features
 
 // Interface: the feature specs list's state and API calls. The Features tab's
 // view (FeaturesView) binds to these properties; Panel.qml owns navigation and
 // passes host (currentTab, previousTab, api()), the project identity and whether
-// the window is shown. Non-visual.
+// the window is shown. It also opens and closes the feature page over the tab
+// views (like Panel's stage detail) so Panel.qml stays small. Non-visual.
 Item {
   id: root
 
@@ -33,9 +35,20 @@ Item {
   property string featureContentSlug: ""
   property bool featureContentPending: false
   property string featureContentError: ""
+  // The feature page is pushed on pageStack over its first item; focusItem (the
+  // key handler) regains focus when it closes. Panel.qml wires these three.
+  property var pageStack: null
+  property var page: null
+  property var focusItem: null
+  readonly property bool featurePageOpen: !!pageStack && !!page && pageStack.currentItem === page
+  readonly property var featurePageFeature: featureList.find(function(row) { return row.slug === selectedFeatureSlug }) || null
+  readonly property var featurePageSpec: featureSpecs[selectedFeatureSlug] || null
+  // A refused or failed action, shown inline on the page.
+  readonly property var featurePageRefusal: featuresError !== "" ? { message: featuresError } : null
 
   // A project switch drops the previous project's list and selection.
   function reset() {
+    closeFeaturePage()
     featureList = []
     featuresPending = false
     featuresError = ""
@@ -69,7 +82,37 @@ Item {
         root.featuresError = "Unable to load feature specs"
       }
       root.featuresOpen = host.currentTab === "features"
+      if (root.featurePageOpen) root.loadFeatureContent(root.selectedFeatureSlug)
     }, true)
+  }
+
+  // The page follows the Features tab: leaving the tab closes it.
+  onFeaturesOpenChanged: if (!featuresOpen) closeFeaturePage()
+
+  // Pushes the page for a feature, selects it and loads its content and state.
+  function openFeaturePage(feature) {
+    if (!feature || !pageStack || !page) return
+    root.selectFeature(feature)
+    root.featuresError = ""
+    root.loadFeatureContent(feature.slug)
+    root.loadFeatureState(feature.slug)
+    if (!featurePageOpen) {
+      page.subTab = "README"
+      pageStack.push(page, StackView.Immediate)
+    }
+    root.focusHandler()
+  }
+
+  // Pops back to the tab views; the selection is untouched.
+  function closeFeaturePage() {
+    if (featurePageOpen) pageStack.pop(null, StackView.Immediate)
+    root.focusHandler()
+  }
+
+  function focusHandler() {
+    if (!focusItem) return
+    focusItem.pendingKey = ""
+    focusItem.forceActiveFocus()
   }
 
   // Features is a tab now: closing it returns to the tab shown before, and
@@ -141,9 +184,13 @@ Item {
     api("GET", "/api/features?project=" + encodeURIComponent(root.lastProject), null, function(resp, status) {
       if (revision !== root.projectViewRevision) return
       if (status === 200 && resp && Array.isArray(resp.features)) {
+        const wasRunning = !!root.featureActivity && root.featureActivity.status === "running"
         root.featureList = Features.featureRows(resp)
         root.featureSpecs = Features.featureSpecsBySlug(resp)
         root.featureActivity = resp.activity || null
+        // A finished activity may have changed what the page shows.
+        if (wasRunning && !(resp.activity && resp.activity.status === "running") && root.featurePageOpen)
+          root.loadFeatureContent(root.selectedFeatureSlug)
         if (root.featureActivity && root.featureActivity.status === "failed")
           root.featuresError = root.featureActivity.error || "Feature activity failed"
       }

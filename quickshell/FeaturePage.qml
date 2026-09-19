@@ -19,18 +19,24 @@ import "Features.js" as Features
 Item {
   id: page
 
-  property var feature: null
-  property var spec: null
+  // The Features controller the page is hosted with (Panel.qml); its state feeds
+  // the properties below. Unset, each property is set directly (tests do).
+  property var controller: null
+  property var feature: controller ? controller.featurePageFeature : null
+  property var spec: controller ? controller.featurePageSpec : null
   // The GET /api/features/content response, or null while it loads.
-  property var content: null
-  property var detailState: null
+  property var content: controller ? controller.featureContent : null
+  property var detailState: controller ? controller.featureDetailState : null
   // The running feature activity ({slug, status}) or null.
-  property var activity: null
+  property var activity: controller ? controller.featureActivity : null
   // A refused request, {message}, shown inline; null clears it.
-  property var refusal: null
-  property bool pending: false
-  property string error: ""
+  property var refusal: controller ? controller.featurePageRefusal : null
+  property bool pending: controller ? controller.featureContentPending : false
+  property string error: controller ? controller.featureContentError : ""
   property string subTab: "README"
+  // Shows the latest architect verdict's summary, issues and questions inline.
+  property bool reviewDetailsOpen: false
+  readonly property var verdict: Features.reviewSummary(hasReview ? spec.latest_review : null)
   // Palette and font sizes; Panel.qml passes its shared theme object.
   property var theme: null
   property color foreground: theme ? theme.foreground : "#dddddd"
@@ -108,7 +114,10 @@ Item {
 
   // A different tab or feature starts at its top.
   onSubTabChanged: flick.contentY = 0
-  onFeatureChanged: flick.contentY = 0
+  onFeatureChanged: {
+    flick.contentY = 0
+    reviewDetailsOpen = false
+  }
 
   function requestAction(action) {
     if (!action.enabled || !page.feature) return
@@ -401,7 +410,10 @@ Item {
           objectName: "featurePageReviewDetails"
           label: "Review details"
           enabled: page.hasReview
-          onClicked: if (page.feature) page.reviewDetailsRequested(page.feature)
+          onClicked: if (page.feature) {
+            page.reviewDetailsOpen = !page.reviewDetailsOpen
+            page.reviewDetailsRequested(page.feature)
+          }
         }
       }
 
@@ -418,6 +430,56 @@ Item {
           color: page.mutedForeground
           font.family: page.fontFamily
           font.pixelSize: page.fontSize10
+        }
+      }
+
+      // ---- the latest verdict's details
+      Column {
+        objectName: "featurePageReviewDetailsBody"
+        visible: page.reviewDetailsOpen && page.verdict !== null
+        width: parent.width
+        spacing: 2
+
+        Text {
+          width: parent.width
+          text: page.verdict ? page.verdict.summary : ""
+          textFormat: Text.PlainText
+          wrapMode: Text.Wrap
+          color: page.foreground
+          font.family: page.fontFamily
+          font.pixelSize: page.fontSize10
+        }
+
+        Repeater {
+          model: page.verdict ? page.verdict.issues : []
+          delegate: Text {
+            required property string modelData
+
+            objectName: "featurePageVerdictIssue"
+            width: parent.width
+            text: "- " + modelData
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: page.urgent
+            font.family: page.fontFamily
+            font.pixelSize: page.fontSize10
+          }
+        }
+
+        Repeater {
+          model: page.verdict ? page.verdict.questions : []
+          delegate: Text {
+            required property string modelData
+
+            objectName: "featurePageVerdictQuestion"
+            width: parent.width
+            text: "? " + modelData
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            color: page.mutedForeground
+            font.family: page.fontFamily
+            font.pixelSize: page.fontSize10
+          }
         }
       }
 

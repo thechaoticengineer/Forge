@@ -60,6 +60,7 @@ Rectangle {
   signal closeRequested()
   signal refreshRequested()
   signal openRequested(var feature)
+  signal pageRequested(var feature)
   signal leaveRequested()
   signal createRequested(string slug, string title)
   signal chatRequested(var feature, string message)
@@ -116,7 +117,9 @@ Rectangle {
       if (event.key === Qt.Key_Q) view.closeRequested()
       else if (event.key === Qt.Key_J || event.key === Qt.Key_K)
         featuresList.moveSelection(event.key === Qt.Key_J ? 1 : -1)
-      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_O)
+      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+        featuresList.openPage()
+      else if (event.key === Qt.Key_O)
         featuresList.activateSelection()
       else if (event.key === Qt.Key_N) openNewFeatureForm()
       else if (event.key === Qt.Key_I) view.showImplemented = !view.showImplemented
@@ -349,9 +352,17 @@ Rectangle {
             currentIndex = (model || []).length > 0 ? 0 : -1
           }
 
+          // o opens the editor; Enter and a click open the feature page.
           function activateSelection() {
             const row = model && model[currentIndex]
             if (row) view.openRequested(row)
+          }
+
+          function openPage() {
+            const row = model && model[currentIndex]
+            if (!row) return
+            view.featureSelected(row)
+            view.pageRequested(row)
           }
 
           delegate: Rectangle {
@@ -372,6 +383,7 @@ Rectangle {
               onClicked: {
                 featuresList.currentIndex = featureRow.index
                 view.featureSelected(featureRow.modelData)
+                view.pageRequested(featureRow.modelData)
               }
             }
 

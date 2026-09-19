@@ -76,9 +76,10 @@ var viewHints = {
   plan: "j/k select stage · Enter open detail · e edit · I feedback",
   activity: "Tab/h/l live/history · 1-6 filter · Ctrl+d/u scroll · j/k report",
   architecture: "PgDn/PgUp scroll · Home/End",
-  features: "j/k select · Enter open · n new · c chat · v review · a approve · i implemented",
+  features: "j/k select · Enter page · o nvim · n new · c chat · v review · a approve · i implemented",
   queue: "PgDn/PgUp scroll · x stop · d diff · c project",
   settings: "j/k select · Enter toggle · c project · d diff",
+  featurePage: "h/l sub-tab · 1-5 pick · j/k scroll · q/Esc back to Features",
   stageDetail: "h/l sub-tab · [ ] prev/next stage · q/Esc back to Plan",
   discussion: "i message · Enter send · q/Esc close chat"
 }
@@ -87,7 +88,7 @@ function hintText(tab, insertMode) {
   if (insertMode) return "INSERT - Esc to normal mode"
   // On stage detail [ ] move between stages, so the view-switch text would be wrong there;
   // the discussion chat owns its keys, and the tab bar leaves it.
-  const views = tab === "discussion" ? "" : tab === "stageDetail" ? "g o/p/a/r/f/q/s switch views · "
+  const views = tab === "discussion" ? "" : tab === "stageDetail" || tab === "featurePage" ? "g o/p/a/r/f/q/s switch views · "
     : "g o/p/a/r/f/q/s or [ ] switch views · "
   return "NORMAL · " + views + (viewHints[tab] || viewHints.overview) + " · ? help"
 }
@@ -139,6 +140,8 @@ function helpRows() {
     { key: "", description: "Feature specs list" },
     { key: "j / k", description: "Select next / previous feature" },
     { key: "Enter / o", description: "Open the selected feature in nvim" },
+    { key: "Enter / click", description: "Feature list: open the selected feature's page instead (o keeps opening nvim)" },
+    { key: "h / l · 1-5", description: "Feature page: switch sub-tab · q / Escape go back to the list" },
     { key: "R", description: "Refresh the feature list" },
     { key: "n", description: "New feature (slug and title form)" },
     { key: "i", description: "Show / hide implemented features" },
