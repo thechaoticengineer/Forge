@@ -50,9 +50,15 @@ impl Ctx {
     pub(super) fn plan_with_busy_claim(&self, goal: &str, mode: &PlanMode) -> bool {
         let discussion = matches!(mode, PlanMode::Discussion { .. });
         let prompt = match mode {
-            PlanMode::Standard | PlanMode::Milestone { .. } => PLANNER_PROMPT
+            PlanMode::Standard => PLANNER_PROMPT
                 .replace("{goal}", goal)
                 .replace("{plan_path}", &format!("{FORGE_DIR}/plan-candidate.json")),
+            PlanMode::Milestone { feature } => {
+                let prompt = PLANNER_PROMPT
+                    .replace("{goal}", goal)
+                    .replace("{plan_path}", &format!("{FORGE_DIR}/plan-candidate.json"));
+                format!("{prompt}\n\n{}", crate::feature_context::feature_reference(feature).unwrap_or_default())
+            }
             PlanMode::Refactor { focus } => fill_template(REFACTOR_PROMPT, &[
                 ("{focus}", focus.as_str()), ("{plan_path}", ".forge/plan-candidate.json"),
             ]),
@@ -116,6 +122,11 @@ impl Ctx {
             ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
             ("{goal}", goal), ("{plan_path}", ".forge/plan-candidate.json"),
         ]);
+        let reference = crate::feature_context::feature_reference(&current_plan["feature"]);
+        let prompt = match &reference {
+            Some(reference) => format!("{prompt}\n\n{reference}"),
+            None => prompt,
+        };
         let result = self.generate_plan(&prompt, goal, false, Some(current_plan), None)
             .and_then(|plan| self.finalize_plan(plan, Some(current_plan), "revised"));
         if let Err(error) = result {
@@ -223,6 +234,9 @@ impl Ctx {
             Err(e) => return Err(format!("could not remove previous candidate: {e}")),
         }
         let prompt = format!("{prompt}\n{}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.", self.routing_prompt()?);
+        // A revision keeps its plan's feature record and its first-stage rule.
+        let plan_feature = feature.or_else(|| previous.map(|plan| &plan["feature"]))
+            .filter(|feature| feature.is_object());
         let reply = self.readonly_response("planner", &prompt, Some("plan-candidate.json"), |text| {
             let mut candidate: Value = crate::response::parse_json(json_payload(text))
                 .map_err(|e| format!("invalid candidate: {e}"))?;
@@ -240,6 +254,13 @@ impl Ctx {
             };
             let (draft, _) = prepare_candidate_draft(candidate, &resolved_goal, previous)?;
             crate::routing::validate_candidate_proposals(&draft)?;
+            // A committed first stage is history a revision can no longer change.
+            if let Some(feature) = plan_feature.filter(|_| draft["stages"][0]["status"] != "committed") {
+                let missing = crate::feature_context::missing_first_stage_ids(feature, &draft["stages"][0]);
+                if !missing.is_empty() {
+                    return Err(format!("first stage must name every covered scenario ID; missing: {}", missing.join(", ")));
+                }
+            }
             Ok(draft)
         })?;
         let mut plan = reply.value;

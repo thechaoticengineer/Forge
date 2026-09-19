@@ -150,6 +150,10 @@ impl Ctx {
             ("{base}", evidence["base"].as_str().unwrap_or("")),
             ("{plan_id}", plan["plan_id"].as_str().unwrap_or("")),
         ]);
+        let prompt = match crate::feature_context::feature_reference(&plan["feature"]) {
+            Some(reference) => format!("{prompt}\n{reference}"),
+            None => prompt,
+        };
         let turn = crate::architecture::identity();
         crate::durable_json::publish_pretty(
             &self.forge_path("architecture").join(plan["plan_id"].as_str().unwrap_or("")).join("architect-pending.json"),

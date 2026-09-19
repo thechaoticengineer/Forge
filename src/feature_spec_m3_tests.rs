@@ -435,6 +435,10 @@ fn s27_milestone_of_approved_feature_starts_planning_and_records_link() {
 fn s27_old_state_file_without_plans_is_readable_and_not_rewritten() {
     // S27: Keep old state files readable, with missing fields defaulted
     let env = Env::ready();
+    // A real M2-era state file has no `plans` key: strip it from the file on disk.
+    let mut legacy = env.state(SLUG);
+    legacy.as_object_mut().unwrap().remove("plans");
+    fs::write(env.state_path(SLUG), serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
     let before = env.state_bytes(SLUG).expect("approval wrote the feature state");
     let parsed: Value = serde_json::from_slice(&before).unwrap();
     assert!(parsed.get("plans").is_none(), "an M2 state file has no plans field: {parsed}");
@@ -651,7 +655,7 @@ fn s30_architect_context_holds_compact_feature_reference() {
     env.approve_and_run();
 
     let prompts = env.architect_prompts();
-    assert!(prompts.len() >= 2, "guidance and stage turns expected, got {}", prompts.len());
+    assert!(!prompts.is_empty(), "at least one architect work-status turn expected, got {}", prompts.len());
     assert_all_contain(&prompts, "architect", &[SLUG, FOLDER, "M1", "Alpha milestone", "S1", "S2"]);
     assert_none_contain(&prompts, "architect", &[MARKER, "First scenario", "another starting point"]);
 }

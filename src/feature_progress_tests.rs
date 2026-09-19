@@ -23,6 +23,12 @@ fn listed(test: &QueueTest, slug: &str) -> Value {
     resp["features"].as_array().unwrap().iter().find(|f| f["slug"] == slug).cloned().unwrap()
 }
 
+/// The id, title and status of each milestone, without its later-added keys.
+fn milestone_projection(feature: &Value) -> Value {
+    Value::Array(feature["milestones"].as_array().unwrap().iter()
+        .map(|m| json!({"id": m["id"], "title": m["title"], "status": m["status"]})).collect())
+}
+
 #[test]
 fn milestone_status_lines_drive_feature_progress() {
     let test = QueueTest::new(false);
@@ -35,7 +41,7 @@ fn milestone_status_lines_drive_feature_progress() {
     assert_eq!(done["status"], "valid", "reasons: {}", done["reasons"]);
     assert_eq!(done["progress"], "implemented");
     assert_eq!(
-        done["milestones"],
+        milestone_projection(&done),
         json!([
             {"id": "M1", "title": "First", "status": "implemented"},
             {"id": "M2", "title": "Second", "status": "implemented"},
@@ -50,7 +56,11 @@ fn milestone_status_lines_drive_feature_progress() {
     let fresh = listed(&test, "fresh");
     assert_eq!(fresh["status"], "valid", "reasons: {}", fresh["reasons"]);
     assert_eq!(fresh["progress"], "planned");
-    assert_eq!(fresh["milestones"], json!([{"id": "M1", "title": "First", "status": "planned"}]));
+    assert_eq!(milestone_projection(&fresh), json!([{"id": "M1", "title": "First", "status": "planned"}]));
+    // The milestone also carries its covered scenarios, registered tests and plan link.
+    assert_eq!(fresh["milestones"][0]["covers"], json!(["S1", "S2"]));
+    assert_eq!(fresh["milestones"][0]["business_tests"], json!([]));
+    assert_eq!(fresh["milestones"][0]["plan"], Value::Null);
 }
 
 #[test]

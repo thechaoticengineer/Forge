@@ -14,6 +14,7 @@ mod catalogue_process;
 mod metadata;
 mod features;
 mod feature_state;
+mod feature_context;
 mod agent;
 mod agent_log;
 mod durable_json;
