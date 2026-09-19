@@ -436,16 +436,20 @@ fn context_budget_error(bytes: usize, window: u64, percent: u64, provider: &str,
          a larger context, or shorten the pending plan"))
 }
 
-/// A pending reassessment holds the replaced agreement, whose input fingerprint a prompt never needs.
-fn pending_view(pending: &Value) -> Value {
+/// A pending reassessment holds the replaced agreement, which a prompt sees as
+/// the same compact agreement a checkpoint view shows, referencing
+/// `constraints` (the saved checkpoint's current constraints) by ID.
+fn pending_view(pending: &Value, constraints: &Value) -> Value {
     let mut view = pending.clone();
-    if view["old_agreement"].is_object() { view["old_agreement"] = crate::prompt_view::agreement(&pending["old_agreement"]); }
+    if view["old_agreement"].is_object() {
+        view["old_agreement"] = crate::prompt_view::agreement_view(&pending["old_agreement"], constraints);
+    }
     view
 }
 
-fn selection_plan(plan: &Value) -> Value {
+fn selection_plan(plan: &Value, constraints: &Value) -> Value {
     json!({"goal":plan["goal"],"plan_id":plan["plan_id"],"revision":plan["revision"],
-        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":pending_view(&s["reassessment"]["pending"]),"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
+        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":pending_view(&s["reassessment"]["pending"], constraints),"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
 }
 
 impl Ctx {
@@ -457,12 +461,20 @@ impl Ctx {
         });
         settings
     }
+    /// The saved checkpoint of `plan`'s identity, or null before one exists.
+    fn saved_checkpoint(&self, plan: &Value) -> Result<Value, String> {
+        Ok(self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
+            .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null))
+    }
+    /// Current constraints of the saved checkpoint, which compact agreements reference by ID.
+    fn saved_constraints(&self, plan: &Value) -> Result<Value, String> {
+        Ok(self.saved_checkpoint(plan)?["constraints"].clone())
+    }
     /// Worktree and escalation guidance for a routing turn. The saved
     /// checkpoint is included unless the caller's prompt already carries it.
     fn routing_handoff(&self, plan: &Value, include_checkpoint: bool) -> Result<String, String> {
         let checkpoint = if include_checkpoint {
-            let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
-                .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
+            let mut cp = self.saved_checkpoint(plan)?;
             if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
             format!("\nArchitecture checkpoint and referenced decisions: {}", crate::prompt_view::checkpoint_for(&cp, plan))
         } else { String::new() };
@@ -581,7 +593,7 @@ impl Ctx {
         if ids.is_empty() {
             return Ok(());
         }
-        let context_plan = selection_plan(plan);
+        let context_plan = selection_plan(plan, &self.saved_constraints(plan)?);
         let prompt = format!(
             "{}\nRead-only planner selection turn. Return ONLY {{\"proposals\":[{{\"stage_id\":1,\"proposal\":<model_proposal>}}]}} for exactly these IDs: {ids:?}. Plan: {context_plan}\nArchitect/engine feedback: {feedback}\nWhen engine_reason rejects an otherwise agreed proposal, preserve its agreed risk, complexity and task. For planning correct only the capability tier. Concrete model/provider/effort changes belong exclusively to execution reassessment. Do not reclassify work to evade the capability policy.",
             self.stage_selection_prompt(plan, ids)?
@@ -801,7 +813,7 @@ impl Ctx {
                     .map(|d| d["stage_id"].as_i64().unwrap())
                     .collect();
                 self.propose_routing(plan, &affected, &json!(disagreements))?;
-                let context_plan = selection_plan(plan);
+                let context_plan = selection_plan(plan, &cp["constraints"]);
                 let prompt = format!(
                     "{}\n{}\nPlan: {context_plan}\nSaved architecture: {}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
                     self.stage_selection_prompt(plan, &affected)?,

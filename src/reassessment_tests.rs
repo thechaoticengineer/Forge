@@ -103,6 +103,39 @@ fn repeated_concrete_failures_escalate_cheap_adequate_implementation_without_res
     assert!(h["architect_reason"].is_string());
 }
 #[test]
+fn reassessment_routing_prompts_show_the_replaced_agreement_compactly() {
+    let f = Fixture::new();
+    f.failures();
+    f.choose("codex", "large", "provider_default");
+    let p = f.run();
+    let old = &p["stages"][0]["reassessment"]["history"][0]["old_agreement"];
+    // Storage keeps the complete replaced agreement.
+    for key in ["dialogue", "policy_inputs", "architectural_constraints", "relevant_inputs"] {
+        assert!(!old[key].is_null(), "{key}");
+    }
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let requests: Vec<&str> = ["mock_routing_planner_requests", "mock_routing_architect_requests"].iter()
+        .flat_map(|key| settings[*key].as_array().unwrap().iter())
+        .map(|r| r["prompt"].as_str().unwrap()).collect();
+    let marker = "\"old_agreement\":";
+    let pending: Vec<Value> = requests.iter().filter_map(|p| p.find(marker).map(|at| {
+        serde_json::Deserializer::from_str(&p[at + marker.len()..]).into_iter::<Value>().next().unwrap().unwrap()
+    })).collect();
+    assert!(!pending.is_empty(), "a reassessment routing prompt carries the pending agreement");
+    for agreement in &pending {
+        let keys: Vec<&str> = agreement.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["architect_reason", "constraint_refs", "effective", "id", "planner_reason",
+            "retired_constraint_refs", "stage_id", "trigger", "valid"], "{agreement}");
+        assert_eq!(agreement["id"], old["id"]);
+    }
+    for prompt in requests {
+        for hidden in ["\"dialogue\"", "\"validated_proposal\"", "\"planner_bootstrap\"", "\"architect_bootstrap\"",
+            "\"architectural_constraints\"", "relevant_inputs"] {
+            assert!(!prompt.contains(hidden), "{hidden}: {prompt}");
+        }
+    }
+}
+#[test]
 fn supported_effort_is_preferred_and_no_selection_runs_on_unchanged_boundaries() {
     let f = Fixture::with_effort("low");
     let mut options = f.ctx.routing_options().unwrap();

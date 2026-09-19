@@ -1775,14 +1775,28 @@ fn reconciliation_prompt_carries_the_checkpoint_once_and_no_input_fingerprint() 
 }
 
 #[test]
-fn selection_plan_drops_the_input_fingerprint_of_a_pending_replaced_agreement() {
+fn selection_plan_shows_a_pending_replaced_agreement_as_a_compact_agreement() {
     let mut p = plan();
-    p["stages"][0]["reassessment"] = json!({"pending":{"kind":"capability","old_agreement":{"id":"a","validated_proposal":{"model":"m"},
+    let kept = json!("Keep the greeting pure");
+    let retired = json!("Log every greeting");
+    p["stages"][0]["reassessment"] = json!({"pending":{"kind":"capability","old_agreement":{"id":"a","stage_id":1,"valid":true,
+        "effective":{"provider":"codex","model":"m","native_effort":"high","extra":"x"},"planner_reason":"p","architect_reason":"r","trigger":"t",
+        "validated_proposal":{"model":"m"},"dialogue":[{"turn":1}],"policy_inputs":{"tier":"strong"},"provenance":{"source":"x"},
+        "planner_bootstrap":{"session":"s"},"architect_bootstrap":{"session":"s"},"architectural_constraints":[kept, retired],
         "relevant_inputs":{"instructions":"copied stage text"}}},"visited":[]});
-    let view = selection_plan(&p);
+    let view = selection_plan(&p, &json!([kept]));
     let old = &view["stages"][0]["reassessment"]["pending"]["old_agreement"];
-    assert_eq!(old, &json!({"id":"a","validated_proposal":{"model":"m"}}));
-    assert!(!view.to_string().contains("relevant_inputs"));
+    assert_eq!(old, &json!({"id":"a","stage_id":1,"valid":true,
+        "effective":{"provider":"codex","model":"m","native_effort":"high"},"planner_reason":"p","architect_reason":"r","trigger":"t",
+        "constraint_refs":[crate::prompt_view::constraint_id("Keep the greeting pure")],
+        "retired_constraint_refs":[crate::prompt_view::constraint_id("Log every greeting")]}));
+    assert_eq!(view["stages"][0]["reassessment"]["pending"]["kind"], "capability");
+    let text = view.to_string();
+    for hidden in ["relevant_inputs", "dialogue", "policy_inputs", "provenance", "validated_proposal",
+        "planner_bootstrap", "architect_bootstrap", "architectural_constraints"] {
+        assert!(!text.contains(hidden), "{hidden}: {text}");
+    }
     // The stored plan keeps the complete agreement.
-    assert!(p["stages"][0]["reassessment"]["pending"]["old_agreement"]["relevant_inputs"].is_object());
+    let stored = &p["stages"][0]["reassessment"]["pending"]["old_agreement"];
+    assert!(stored["relevant_inputs"].is_object() && stored["dialogue"].is_array() && stored["architectural_constraints"].is_array());
 }

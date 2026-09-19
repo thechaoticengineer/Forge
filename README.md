@@ -575,7 +575,9 @@ the trigger, and `constraint_refs` naming the constraint IDs it was made under.
 Constraints the checkpoint has since retired are listed as
 `retired_constraint_refs`. Dialogue, policy inputs, provenance, the validated
 proposal, bootstraps and the stored constraint copy stay in the architecture
-events (`events.jsonl`). Execution outcomes keep their stage, status, sha and
+events (`events.jsonl`). Routing prompts show the agreement a pending
+reassessment would replace in the same compact form, referencing the saved
+checkpoint's current constraints. Execution outcomes keep their stage, status, sha and
 round fields, and their review gate becomes a `review` summary: gate status,
 role states, the number of requests and the file holding the full review
 records (`.forge/plan.json` when no indexed review file exists). No prompt
