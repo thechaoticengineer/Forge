@@ -150,6 +150,11 @@ impl Ctx {
                 let skill = crate::pen::resolve_skill(&self.pen_search_path());
                 prompt.push_str(&crate::pen::editing_instructions(skill.as_deref()));
             }
+            let registered = crate::features::registered_business_tests(std::path::Path::new(self.project()));
+            if let Some(rules) = crate::feature_context::conflict_paragraph(&registered, &plan["feature"],
+                "finish through the engine outcome channel with status \"escalation\" and request kind \"scope\"") {
+                prompt.push_str(&rules);
+            }
         }
         Ok(prompt)
     }

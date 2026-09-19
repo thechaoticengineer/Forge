@@ -171,3 +171,11 @@ fn both_repository_features_are_valid_and_list_their_registered_files() {
     assert!(redesign.contains(&"tests/panel_redesign_m1.test.mjs".to_string()));
     assert!(redesign.contains(&"tests/qml/tst_panel_settings_compact.qml".to_string()));
 }
+
+#[test]
+fn declared_entries_include_missing_files_and_skip_malformed_ones() {
+    let text = "## M1: One\n\nBusiness tests: `tests/a.rs` (S1, and S2), tests/gone.rs and some words\n\n\
+        ```\nBusiness tests: tests/fenced.rs\n```\n\n## M2: Two\n\nBusiness tests: tests/a.rs and tests/b.mjs (S3)\n";
+    assert_eq!(features::declared_business_tests(text), ["tests/a.rs", "tests/gone.rs", "tests/b.mjs"]);
+    assert!(features::declared_business_tests("## M1: One\n\nStatus: planned\n").is_empty());
+}

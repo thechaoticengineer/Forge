@@ -37,17 +37,27 @@ fn subject(plan: &Value) -> Result<Value, String> {
     if stages.iter().any(|s| s["status"] != "committed") {
         return Err("plan review requires every stage committed; resume the pending stages".into());
     }
-    Ok(json!({"goal":plan["goal"],"revision":plan["revision"],"stages":stages.iter().map(|s|
+    let mut captured = json!({"goal":plan["goal"],"revision":plan["revision"],"stages":stages.iter().map(|s|
         json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],
             "commit":s["commit"],"sha":s["sha"],"attempt_head":s["attempt_head"],"attempt_id":s["attempt_id"],
             "review_policy":s["review_policy"],"implementer_provider":s["implementer_provider"],
-            "model_invocations":s["model_invocations"]})).collect::<Vec<_>>()}))
+            "model_invocations":s["model_invocations"]})).collect::<Vec<_>>()});
+    // Only milestone plans carry the key, so every other subject, including
+    // one captured before M3, stays byte-identical.
+    if plan["feature"].is_object() {
+        captured["feature"] = json!({"slug":plan["feature"]["slug"],"milestone":plan["feature"]["milestone"],
+            "scenario_ids":plan["feature"]["scenario_ids"]});
+    }
+    Ok(captured)
 }
 fn acceptance(subject: &Value) -> String {
-    subject["stages"].as_array().unwrap().iter().flat_map(|stage| {
+    let stages = subject["stages"].as_array().unwrap().iter().flat_map(|stage| {
         acceptance_criteria_items(stage["acceptance"].as_str().unwrap_or("")).into_iter().map(|line|
             format!("stage {} ({}): {line}", stage["id"], stage["title"].as_str().unwrap_or("")))
-    }).collect::<Vec<_>>().join("\n")
+    }).collect::<Vec<_>>().join("\n");
+    // One criterion per covered scenario ID (S31) flows through CRITERIA TO
+    // EVIDENCE, verdict normalization and plan evidence validation.
+    crate::feature_context::with_scenario_criteria(&stages, &subject["feature"])
 }
 fn providers(plan: &Value) -> Result<BTreeSet<String>, String> {
     let mut result = BTreeSet::new();
@@ -259,6 +269,11 @@ impl Ctx {
                 if stage_designs || changed_designs {
                     let skill = crate::pen::resolve_skill(&self.pen_search_path());
                     prompt.push_str(&crate::pen::editing_instructions(skill.as_deref()));
+                }
+                let registered = crate::features::registered_business_tests(std::path::Path::new(self.project()));
+                if let Some(rules) = crate::feature_context::conflict_paragraph(&registered, &plan["feature"],
+                    "surface it as an architectural context gap in your final response, as described above") {
+                    prompt.push_str(&rules);
                 }
                 let turn = crate::architecture::identity();
                 if !plan["plan_review"]["model_invocations"].is_array() { plan["plan_review"]["model_invocations"] = json!([]); }

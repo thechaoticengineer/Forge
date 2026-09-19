@@ -104,7 +104,7 @@ impl Ctx {
                     return Err("plan identity changed before review".into());
                 }
                 (self.stage_prompt(REVIEW_PROMPT, plan, &context_stage)?,
-                    context_stage["acceptance"].as_str().unwrap_or("").to_string(),
+                    self.stage_review_acceptance(plan, idx)?,
                     cp["guidance"][context_stage["id"].to_string()].clone(), context_stage["id"].as_i64())
             }
             ReviewScope::Plan => {
@@ -129,6 +129,26 @@ impl Ctx {
                 let designs: Vec<(String, Vec<String>)> =
                     files.iter().map(|f| (f.clone(), crate::pen::exported_pngs(root, f))).collect();
                 prompt.push_str(&crate::pen::reviewer_instructions(&designs));
+            }
+        }
+        // Business test rules (S31-S33) apply to every plan; each section is
+        // absent when it has nothing to say, so other prompts stay unchanged.
+        if let Some(reference) = crate::feature_context::feature_reference(&plan["feature"]) {
+            prompt.push('\n');
+            prompt.push_str(&reference);
+        }
+        let registered = crate::features::registered_business_tests(Path::new(self.project()));
+        if let Some(section) = crate::feature_context::registry_section(&registered) {
+            prompt.push_str(&section);
+        }
+        let diff_base = match scope {
+            ReviewScope::Stage(idx) => plan["stages"][idx]["attempt_head"].as_str(),
+            ReviewScope::Plan => plan["plan_review"]["base"].as_str(),
+        };
+        if let Some(diff_base) = diff_base {
+            let changed = self.changed_business_tests(diff_base, &registered)?;
+            if let Some(section) = crate::feature_context::changed_section(&changed) {
+                prompt.push_str(&section);
             }
         }
         if role == "architect" {
@@ -342,6 +362,51 @@ impl Ctx {
             }
         }
         Ok(verdict)
+    }
+
+    /// The acceptance a stage review evidences. For the final stage of a
+    /// milestone plan whose roles all review per stage, no plan review runs, so
+    /// the stage carries the scenario criteria (S31) instead. Review prompts,
+    /// mock reviews, normalization and commit revalidation all use this string.
+    pub(super) fn stage_review_acceptance(&self, plan: &Value, idx: usize) -> Result<String, String> {
+        let acceptance = plan["stages"][idx]["acceptance"].as_str().unwrap_or("");
+        let last = plan["stages"].as_array().is_some_and(|stages| stages.len() == idx + 1);
+        if last && plan["feature"].is_object() && self.deferred_plan_roles(plan)?.is_empty() {
+            return Ok(crate::feature_context::with_scenario_criteria(acceptance, &plan["feature"]));
+        }
+        Ok(acceptance.to_string())
+    }
+
+    /// Registered business test files that the diff from `base` to the working
+    /// tree (staged and unstaged) modifies, deletes or renames away (S33). The
+    /// engine discloses them to reviewers and never blocks the diff (D14).
+    pub(super) fn changed_business_tests(&self, base: &str, registered: &[String]) -> Result<Vec<String>, String> {
+        let output = self.git(&["diff", "--name-status", "-z", "-M", base, "--", ".", ":(exclude).forge"])?;
+        let affected = crate::feature_context::affected_paths(&output);
+        if affected.is_empty() { return Ok(Vec::new()); }
+        // A deleted or renamed file is no longer registered by discovery, so
+        // also count every file declared at the base or in the working tree.
+        let mut known: Vec<String> = registered.to_vec();
+        let feature_file = |path: &str| path.strip_prefix("docs/features/")
+            .and_then(|rest| rest.strip_suffix("/milestones.md"))
+            .is_some_and(|slug| !slug.is_empty() && !slug.contains('/') && !slug.starts_with('_'));
+        let listed = self.git(&["ls-tree", "-r", "--name-only", base, "--", "docs/features"])?;
+        for path in listed.lines().filter(|path| feature_file(path)) {
+            if let Ok(text) = self.git(&["show", &format!("{base}:{path}")]) {
+                known.extend(crate::features::declared_business_tests(&text));
+            }
+        }
+        let root = Path::new(self.project()).join("docs/features");
+        for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+            if let Ok(text) = fs::read_to_string(entry.path().join("milestones.md"))
+                && !entry.file_name().to_string_lossy().starts_with('_') {
+                known.extend(crate::features::declared_business_tests(&text));
+            }
+        }
+        let mut changed: Vec<String> = affected.into_iter().filter(|path| known.contains(path)).collect();
+        changed.sort();
+        changed.dedup();
+        Ok(changed)
     }
 
     fn mock_review(
@@ -947,7 +1012,7 @@ impl Ctx {
             if normalize_review_verdict(
                 &record.to_string(),
                 &identity,
-                stage["acceptance"].as_str().unwrap_or(""),
+                &self.stage_review_acceptance(plan, idx)?,
             )?["approved"]
                 != true
             {

@@ -350,11 +350,26 @@ pub(crate) fn discover(project_root: &Path) -> Vec<Feature> {
     features
 }
 
+/// Paths named by the `Business tests:` lines of a milestones.md text, whether
+/// or not the files exist, in order and without duplicates. Malformed entries
+/// are skipped. Lets reviews recognize a registered file a diff deleted or
+/// renamed away, which discovery no longer registers.
+pub(crate) fn declared_business_tests(milestones_md: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in lines_outside_fences(milestones_md) {
+        let Some(rest) = line.trim().strip_prefix("Business tests:") else { continue };
+        for path in split_registry_entries(rest.trim()).into_iter().filter_map(registry_path) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 /// Registered business test files of every discovered feature, sorted and
 /// deduplicated. Includes every entry that parsed to an existing file, even
 /// when its feature is invalid for another reason.
-// Not consumed yet: the reviewer prompts of a later M3 stage list these files.
-#[allow(dead_code)]
 pub(crate) fn registered_business_tests(project_root: &Path) -> Vec<String> {
     let mut files: Vec<String> = discover(project_root)
         .into_iter()
