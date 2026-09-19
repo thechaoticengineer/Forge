@@ -123,9 +123,9 @@ impl Ctx {
                 return Err("required architectural guidance is missing or stale".into());
             }
             prompt.push_str(&format!("\nARCHITECT GUIDANCE:\n{}\nSaved constraints: {}\nCompleted interfaces: {}\nOutstanding risks: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", guidance["text"].as_str().unwrap_or(""), cp["constraints"], cp["completed_interfaces"], cp["unresolved_risks"], current["plan_id"].as_str().unwrap_or("")));
-            let completed: Vec<Value> = current["stages"].as_array().unwrap().iter().filter(|s| s["status"] == "committed")
-                .map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"sha":s["sha"]})).collect();
-            prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes: {}\nRecent execution outcomes: {}\nRead the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), cp["execution_outcomes"]));
+            let completed = crate::prompt_view::committed_stages(&current, &cp, stage);
+            let outcomes = crate::prompt_view::checkpoint_for(&cp, &current)["execution_outcomes"].clone();
+            prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes (id, title, sha, outcome; acceptance only for stages this one depends on): {}\nRecent execution outcomes: {}\nRead full details of a completed stage with `git show <sha>` and from {FORGE_DIR}/plan.json. Read the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), outcomes));
             prompt.push_str(&format!("\n[implementer] Last validated outcome/escalation request: {}\n[engine] Latest routing handoff: {}\n", stage["implementer_outcome"], stage["reassessment"]["history"].as_array().and_then(|h| h.last()).map(|h| json!({"kind":h["kind"],"evidence":h["evidence"]})).unwrap_or(Value::Null)));
             let clarification = &stage["scope_clarification"];
             if clarification["source_inputs"] == crate::plan::stage_inputs(&current, idx) {

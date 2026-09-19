@@ -1753,6 +1753,7 @@ fn reconciliation_prompt_carries_the_checkpoint_once_and_no_input_fingerprint() 
     let stored = f.ctx.architecture_store().checkpoint(&p).unwrap();
     assert!(stored["guidance"]["1"]["relevant_inputs"].is_object());
     assert!(stored["agreements"]["1"]["relevant_inputs"].is_object());
+    assert!(stored["agreements"]["1"]["dialogue"].is_array() && stored["agreements"]["1"]["architectural_constraints"].is_array());
     let mut revised = p.clone();
     revised["stages"][0]["instructions"] = json!("Add a greeting and a farewell");
     f.set("mock_model_evaluations", json!([[evaluation(false, "standard", "standard")]]));
@@ -1764,8 +1765,12 @@ fn reconciliation_prompt_carries_the_checkpoint_once_and_no_input_fingerprint() 
     assert!(calls.len() >= 3, "the revision needs a first turn and a reconciliation");
     assert!(reconciliation.contains("Saved architecture:"), "{reconciliation}");
     assert_eq!(reconciliation.matches(SUMMARY).count(), 1, "{reconciliation}");
+    assert!(reconciliation.contains("\"constraint_ids\""), "{reconciliation}");
     for call in calls.iter().chain(settings["mock_routing_planner_requests"].as_array().unwrap()) {
-        assert!(!call["prompt"].as_str().unwrap().contains("relevant_inputs"));
+        let prompt = call["prompt"].as_str().unwrap();
+        for hidden in ["relevant_inputs", "review_gate", "architectural_constraints"] {
+            assert!(!prompt.contains(hidden), "{hidden}");
+        }
     }
 }
 

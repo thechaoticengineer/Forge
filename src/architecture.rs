@@ -32,11 +32,6 @@ const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 const EVENT_LIMIT: usize = 512 * 1024;
 const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 
-/// Provider-prompt view of a checkpoint; see [`crate::prompt_view::checkpoint`].
-pub(crate) fn prompt_checkpoint(checkpoint: &Value) -> Value {
-    crate::prompt_view::checkpoint(checkpoint)
-}
-
 fn read_json(path: &Path) -> Result<Value, String> {
     crate::durable_json::read_json(
         path,

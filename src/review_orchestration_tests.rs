@@ -1689,3 +1689,79 @@ fn plan_review_and_plan_fix_prompts_omit_input_fingerprints_but_keep_guidance() 
     assert!(prompts.iter().any(|(source, _)| source == "mock_fixer_prompts"));
     for (source, prompt) in prompts { assert!(!prompt.contains("relevant_inputs"), "{source}: {prompt}"); }
 }
+
+/// Three stages: 2 is independent of 1 and 3 depends only on 1, so stage 3's
+/// prompt keeps stage 1's acceptance and lists stage 2 without it.
+fn dependency_plan(f: &Fixture) {
+    let mut p = f.plan();
+    p["stages"][0]["acceptance"] = json!("ACCEPT-MARKER-ONE stage one works.");
+    for (id, title, marker, depends_on) in [(2, "Second stage", "ACCEPT-MARKER-TWO", json!([])), (3, "Third stage", "ACCEPT-MARKER-THREE", json!([1]))] {
+        let mut stage = p["stages"][0].clone();
+        stage["id"] = json!(id);
+        stage["title"] = json!(title);
+        stage["instructions"] = json!(format!("Do the {title} work."));
+        stage["acceptance"] = json!(format!("{marker} stage works."));
+        stage["commit"] = json!(format!("feat: {title}"));
+        stage["depends_on"] = depends_on;
+        p["stages"].as_array_mut().unwrap().push(stage);
+    }
+    p["stages"][0]["depends_on"] = json!([]);
+    f.ctx.save_plan(&p).unwrap();
+    f.setting("mock_edits", json!([{"one.rs":"fn one() {}\n"},{"two.rs":"fn two() {}\n"},{"three.rs":"fn three() {}\n"}]));
+}
+
+fn agent_prompt(f: &Fixture, role: &str, needle: &str) -> String {
+    let settings = f.ctx.app.settings.lock().unwrap();
+    settings["mock_agent_requests"].as_array().unwrap().iter()
+        .filter(|r| r["role"] == role).filter_map(|r| r["prompt"].as_str())
+        .find(|prompt| prompt.contains(needle)).unwrap_or_else(|| panic!("no {role} prompt for {needle}")).to_owned()
+}
+
+#[test]
+fn implementer_prompts_list_committed_stages_compactly_with_direct_dependency_acceptance() {
+    let f = Fixture::new("Implement feature", 0);
+    dependency_plan(&f);
+    f.setting("mock_verdicts", json!([clean(), clean(), clean()]));
+    let p = f.run();
+    assert!(p["stages"].as_array().unwrap().iter().all(|s| s["status"] == "committed"), "{p}");
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    let prompt = agent_prompt(&f, "implementer", "Do the Third stage work.");
+    let listing = prompt.split("Completed stage interfaces and verified outcomes").nth(1).unwrap();
+    // Stage 1 is a direct dependency: its acceptance stays in the completed-stage list.
+    let completed: Value = serde_json::from_str(listing.split_once(": ").unwrap().1.split_once("\nRecent execution outcomes").unwrap().0).unwrap();
+    let completed = completed.as_array().unwrap();
+    assert_eq!(completed.len(), 2, "{prompt}");
+    assert_eq!(completed[0]["acceptance"], "ACCEPT-MARKER-ONE stage one works.");
+    assert_eq!(completed[0]["sha"], p["stages"][0]["sha"]);
+    // Stage 2 is not: title, sha and outcome only.
+    assert_eq!(completed[1]["title"], "Second stage");
+    assert_eq!(completed[1]["sha"], p["stages"][1]["sha"]);
+    assert_eq!(completed[1]["outcome"]["status"], "committed");
+    assert!(completed[1].get("acceptance").is_none() && completed[1].get("instructions").is_none());
+    assert!(!prompt.contains("ACCEPT-MARKER-TWO"), "{prompt}");
+    assert!(!prompt.contains("Do the Second stage work."), "{prompt}");
+    assert!(prompt.contains("git show <sha>") && prompt.contains(".forge/plan.json"), "{prompt}");
+    assert!(prompt.contains("Saved constraints") && prompt.contains("Outstanding risks"));
+    // Storage keeps the complete outcome records the prompt summarises.
+    assert!(cp["execution_outcomes"][0]["review_gate"].is_object());
+    assert!(cp["execution_outcomes"][0]["acceptance"].is_string());
+}
+
+#[test]
+fn no_role_prompt_carries_a_review_gate() {
+    let f = Fixture::new("Implement feature", 1);
+    dependency_plan(&f);
+    f.setting("mock_verdicts", json!([reject("Fix the first stage"), clean(), clean(), clean()]));
+    let p = f.run();
+    assert!(p["stages"].as_array().unwrap().iter().all(|s| s["status"] == "committed"), "{p}");
+    f.ctx.chat_worker(&p, "What was decided?");
+    let stored = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(stored["execution_outcomes"][0]["review_gate"].is_object(), "storage keeps the full gate");
+    assert!(stored["agreements"]["1"]["dialogue"].is_array() && stored["agreements"]["1"]["relevant_inputs"].is_object());
+    let prompts = all_prompts(&f);
+    for role in ["implementer", "fixer", "chat"] {
+        assert!(prompts.iter().any(|(source, _)| source == &format!("mock_agent_requests:\"{role}\"")), "no {role} prompt");
+    }
+    assert!(prompts.iter().any(|(source, _)| source.starts_with("mock_architect_requests")), "no architect prompt");
+    for (source, prompt) in prompts { assert!(!prompt.contains("review_gate"), "{source}: {prompt}"); }
+}

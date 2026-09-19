@@ -5,16 +5,19 @@ use super::test_support::*;
     fn prompt_checkpoints_drop_input_fingerprints_and_keep_everything_else() {
         let inputs = json!({"instructions": "copied stage text"});
         let checkpoint = json!({"summary": "keep", "guidance": {"1": {"text": "g", "relevant_inputs": inputs}},
-            "agreements": {"1": {"dialogue": ["keep"], "relevant_inputs": inputs}},
+            "agreements": {"1": {"id": "a", "dialogue": ["drop"], "relevant_inputs": inputs}},
             "recent_decisions": [{"relevant_inputs": inputs}]});
-        let stripped = super::prompt_checkpoint(&checkpoint);
+        let stripped = crate::prompt_view::checkpoint_for(&checkpoint, &Value::Null);
         assert_eq!(stripped["guidance"]["1"], json!({"text": "g"}));
-        assert_eq!(stripped["agreements"]["1"], json!({"dialogue": ["keep"]}));
+        assert!(stripped["agreements"]["1"].get("dialogue").is_none());
+        assert!(stripped["agreements"]["1"].get("relevant_inputs").is_none());
         assert_eq!(stripped["summary"], "keep");
-        // Only the two record groups are rewritten; nothing else is inspected.
+        // Records outside guidance, agreements and outcomes are not rewritten.
         assert_eq!(stripped["recent_decisions"], checkpoint["recent_decisions"]);
         // A checkpoint without those groups gains no keys.
-        assert_eq!(super::prompt_checkpoint(&json!({"summary": "only"})), json!({"summary": "only"}));
+        assert_eq!(crate::prompt_view::checkpoint_for(&json!({"summary": "only"}), &Value::Null), json!({"summary": "only"}));
+        // Storage keeps every field.
+        assert_eq!(checkpoint["agreements"]["1"]["dialogue"], json!(["drop"]));
     }
 
     /// The validator accepts 16 decisions of 1 KiB summary, 4 KiB rationale and

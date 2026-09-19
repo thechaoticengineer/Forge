@@ -565,6 +565,29 @@ that compact view of the saved checkpoint instead of the raw record, and the
 routing reconciliation prompt carries the checkpoint once. The view is a clone,
 so stored checkpoints and events are unchanged.
 
+The same view reshapes two more records for prompts. Each constraint gets a
+stable ID, `c-` plus eight hex characters of its content hash, listed as
+`constraint_ids` in checkpoint order next to the unchanged `constraints` strings;
+the architect still returns and retires constraints as text. An agreement becomes
+a compact record: its id, stage, validity and invalidation trigger, the effective
+model (or the tier for a tier agreement), the planner and architect reasons,
+the trigger, and `constraint_refs` naming the constraint IDs it was made under.
+Constraints the checkpoint has since retired are listed as
+`retired_constraint_refs`. Dialogue, policy inputs, provenance, the validated
+proposal, bootstraps and the stored constraint copy stay in the architecture
+events (`events.jsonl`). Execution outcomes keep their stage, status, sha and
+round fields, and their review gate becomes a `review` summary: gate status,
+role states, the number of requests and the file holding the full review
+records (`.forge/plan.json` when no indexed review file exists). No prompt
+contains a `review_gate` object.
+
+Implementer and fixer prompts list committed stages as id, title, sha and a
+compact outcome. Only stages in the current stage's direct `depends_on` (every
+earlier stage when the field is absent) keep their `acceptance`. The prompt tells
+the agent to read full details with `git show <sha>` and from `.forge/plan.json`.
+Saved constraints, completed interfaces, outstanding risks, guidance and the
+decision-history pointer stay in the prompt.
+
 Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
 
 - `events.jsonl`: serialized append-only committed events for decisions,

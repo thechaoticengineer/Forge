@@ -464,7 +464,7 @@ impl Ctx {
             let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
                 .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
             if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
-            format!("\nArchitecture checkpoint and referenced decisions: {}", crate::prompt_view::checkpoint(&cp))
+            format!("\nArchitecture checkpoint and referenced decisions: {}", crate::prompt_view::checkpoint_for(&cp, plan))
         } else { String::new() };
         Ok(format!("{checkpoint}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. During execution reassessment only, higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
             self.git(&["status","--short"]).unwrap_or_else(|e| e) , self.git(&["diff","HEAD","--",".",":(exclude).forge"] ).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>()))
@@ -802,7 +802,7 @@ impl Ctx {
                     "{}\n{}\nPlan: {context_plan}\nSaved architecture: {}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
                     self.stage_selection_prompt(plan, &affected)?,
                     EVALUATION_CONTRACT,
-                    crate::prompt_view::checkpoint(cp),
+                    crate::prompt_view::checkpoint_for(cp, plan),
                     json!(disagreements)
                 );
                 // The prompt above already carries the saved checkpoint.
