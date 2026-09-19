@@ -194,7 +194,7 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 
 - Given: one or more features whose milestones list business test files on `Business tests:` lines
 - When: any plan (a milestone plan or any other plan) is reviewed
-- Then: the stage and plan reviewers are given the list of registered business test files of all features and must run them, a failing business test prevents approval, and a `Business tests:` line naming a file that does not exist makes the feature invalid with a reason naming that file
+- Then: the stage and plan reviewers are given the list of registered business test files of all features (parsed as defined in D16) and must run them, a failing business test prevents approval, and a `Business tests:` line that names a file that does not exist, or has an entry that is not a path, makes the feature invalid with a reason naming that entry
 
 ## S33: Changes to business test files are surfaced to reviewers
 
@@ -204,9 +204,9 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 
 ## S34: A completed milestone plan marks its milestone implemented
 
-- Given: a milestone plan whose stages are all committed and whose plan review approved it
-- When: the plan completes
-- Then: the milestone's `Status:` line in `milestones.md` reads `implemented` and its `Business tests:` line names the test files covering its scenarios, and `.forge/features/<slug>.json` records the plan as completed with its commit range
+- Given: a milestone plan being generated and later reviewed
+- When: the planner writes its final stage, and later the plan review approves the plan
+- Then: the final stage updates the milestone's `Status:` line in `milestones.md` to `implemented` and its `Business tests:` line to name the test files covering its scenarios, inside the reviewed commit range and checked by the plan reviewers; the engine makes no repository change after approval, and records the plan as completed with its commit range in `.forge/features/<slug>.json` only once the plan review approved it
 
 ## S35: Plans not started from a feature get no feature context
 

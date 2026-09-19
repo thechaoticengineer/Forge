@@ -89,3 +89,9 @@ Reason: Detection is deterministic and cheap, but whether a change is legitimate
 Decision: Milestone plans carry the feature slug, folder path, milestone and covered scenario IDs. Prompts for the planner, architect and reviewers include this reference, not the contents of the feature's files; agents read the files they need from the repository.
 
 Reason: Keeps prompts small and stable as specs grow, following the rule that agents get a compact work status and read details themselves.
+
+## D16: Grammar of `Business tests:` lines
+
+Decision: A milestone has at most one `Business tests:` line. Its value is a list of entries separated by commas or by the word `and`, ignoring separators inside parentheses. Each entry is a repository-relative file path without spaces, optionally wrapped in backticks, optionally followed by a parenthesized note (for example `src/feature_spec_tests.rs (S1-S6, S9)`); the note is free text and is ignored. A path is registered as a business test file; an entry that is not a path, or a path to a file that does not exist, is a validation error naming that entry. A planned milestone may omit the line.
+
+Reason: Makes the registry deterministic while accepting both forms already in use in the repository, so existing feature folders stay valid without edits.
