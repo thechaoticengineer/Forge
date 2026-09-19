@@ -40,6 +40,8 @@ Rectangle {
   property var activity: null
   property string selectedSlug: ""
   property var detailState: null
+  // The latest refused "Plan milestone" request: {slug, milestone, message}.
+  property var planRefusal: null
   // A tab fills its area: no dimmed backdrop, and clicking beside the list
   // does not close it. The default stays the full-window overlay.
   property bool embedded: false
@@ -65,6 +67,7 @@ Rectangle {
   signal approveSpecRequested(var feature)
   signal approveScenariosRequested(var feature)
   signal featureSelected(var feature)
+  signal planMilestoneRequested(var feature, var milestone)
 
   function submitNewFeature() {
     const message = Features.validateNewFeature(newSlugFieldItem.text, newTitleFieldItem.text)
@@ -491,6 +494,8 @@ Rectangle {
           }
           readonly property var selectedSpec: view.specs[view.selectedSlug] || ({})
           readonly property var verdict: Features.reviewSummary(detailPanel.selectedSpec.latest_review)
+          readonly property var milestones: Array.isArray(detailPanel.selectedSpec.milestones)
+            ? detailPanel.selectedSpec.milestones : []
           readonly property var chatEntries: (view.detailState && view.detailState.state
             && Array.isArray(view.detailState.state.chat)) ? view.detailState.state.chat : []
           readonly property bool sending: !!view.activity
@@ -556,6 +561,85 @@ Rectangle {
                 color: view.mutedForeground
                 font.family: view.fontFamily
                 font.pixelSize: view.fontSize10
+              }
+            }
+          }
+
+          Column {
+            id: milestoneBlock
+
+            objectName: "featureMilestones"
+            visible: detailPanel.milestones.length > 0
+            width: parent.width
+            spacing: 4
+
+            Repeater {
+              model: detailPanel.milestones
+              delegate: Column {
+                id: milestoneRow
+
+                required property var modelData
+                readonly property var action: Features.milestonePlanAction(detailPanel.selectedSpec, milestoneRow.modelData)
+                readonly property string planStatus: Features.milestonePlanStatus(milestoneRow.modelData)
+                readonly property bool refused: !!view.planRefusal && view.planRefusal.slug === view.selectedSlug
+                  && view.planRefusal.milestone === milestoneRow.modelData.id
+                width: milestoneBlock.width
+                spacing: 2
+
+                Row {
+                  spacing: 8
+
+                  Text {
+                    objectName: "featureMilestoneTitle"
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: milestoneRow.modelData.id + " " + milestoneRow.modelData.title
+                    color: view.foreground
+                    font.family: view.fontFamily
+                    font.pixelSize: view.fontSize10
+                  }
+
+                  Text {
+                    objectName: "featureMilestoneStatus"
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: milestoneRow.modelData.status
+                    color: milestoneRow.modelData.status === "implemented" ? view.success : view.mutedForeground
+                    font.family: view.fontFamily
+                    font.pixelSize: view.fontSize10
+                  }
+
+                  Text {
+                    objectName: "featureMilestonePlanStatus"
+                    visible: milestoneRow.planStatus !== ""
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: milestoneRow.planStatus
+                    color: milestoneRow.planStatus === "failed" ? view.urgent
+                      : milestoneRow.planStatus === "completed" ? view.success : view.accent
+                    font.family: view.fontFamily
+                    font.bold: true
+                    font.pixelSize: view.fontSize10
+                  }
+
+                  ViewButton {
+                    objectName: "featurePlanMilestoneButton"
+                    visible: milestoneRow.action.visible
+                    label: "Plan milestone"
+                    enabled: milestoneRow.action.enabled
+                    onClicked: view.planMilestoneRequested(detailPanel.selectedRow || { slug: view.selectedSlug },
+                      milestoneRow.modelData)
+                  }
+                }
+
+                Text {
+                  objectName: "featureMilestoneReason"
+                  visible: text !== ""
+                  width: milestoneRow.width
+                  text: milestoneRow.refused ? view.planRefusal.message
+                    : (milestoneRow.action.visible && !milestoneRow.action.enabled ? milestoneRow.action.reason : "")
+                  wrapMode: Text.Wrap
+                  color: milestoneRow.refused ? view.urgent : view.mutedForeground
+                  font.family: view.fontFamily
+                  font.pixelSize: view.fontSize10
+                }
               }
             }
           }

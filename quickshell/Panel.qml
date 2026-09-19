@@ -1441,6 +1441,7 @@ Item {
               activity: features.featureActivity
               selectedSlug: features.selectedFeatureSlug
               detailState: features.featureDetailState
+              planRefusal: features.planRefusal
               theme: root.theme
               onCloseRequested: features.closeFeatures()
               onRefreshRequested: features.openFeatures()
@@ -1451,6 +1452,7 @@ Item {
               onApproveSpecRequested: feature => features.approveFeatureSpec(feature)
               onApproveScenariosRequested: feature => features.approveFeatureScenarios(feature)
               onFeatureSelected: feature => features.selectFeature(feature)
+              onPlanMilestoneRequested: (feature, milestone) => features.planMilestone(feature, milestone)
               onLeaveRequested: keyHandler.forceActiveFocus()
             }
 

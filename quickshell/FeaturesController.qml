@@ -25,6 +25,8 @@ Item {
   property var featureActivity: null
   property string selectedFeatureSlug: ""
   property var featureDetailState: null
+  // The latest refused "Plan milestone" request: {slug, milestone, message}.
+  property var planRefusal: null
 
   // A project switch drops the previous project's list and selection.
   function reset() {
@@ -35,6 +37,7 @@ Item {
     featureActivity = null
     selectedFeatureSlug = ""
     featureDetailState = null
+    planRefusal = null
   }
 
   // Shows the Features tab and loads its list.
@@ -191,6 +194,26 @@ Item {
         if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
       } else {
         root.featuresError = Features.errorMessage(resp)
+      }
+    }, true)
+  }
+
+  // Starts planning a milestone of an approved feature. A refusal keeps the
+  // engine's reason for that milestone; success opens the Plan tab.
+  function planMilestone(feature, milestone) {
+    const revision = projectViewRevision
+    root.planRefusal = null
+    api("POST", "/api/features/plan", Features.featurePlanRequest(root.lastProject, feature.slug, milestone.id), function(resp, status) {
+      if (revision !== root.projectViewRevision) return
+      if (status === 200) {
+        root.featuresError = ""
+        root.refreshFeatures()
+        if (root.selectedFeatureSlug === feature.slug) root.loadFeatureState(feature.slug)
+        if (host.refresh) host.refresh()
+        host.currentTab = "plan"
+      } else {
+        root.featuresError = Features.errorMessage(resp)
+        root.planRefusal = { slug: feature.slug, milestone: milestone.id, message: Features.errorMessage(resp) }
       }
     }, true)
   }
