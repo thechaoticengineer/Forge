@@ -29,7 +29,7 @@ Planning an approved milestone from the panel; supplying compact feature context
 Status: implemented
 Covers: S27, S28, S29, S30, S31, S32, S33, S34, S35
 
-Business tests: src/feature_spec_m3_tests.rs (S27-S35) and tests/panel_feature_plan.test.mjs (panel parts of S27-S28)
+Business tests: src/feature_spec_m3_tests.rs (S27-S35), tests/panel_feature_plan.test.mjs (panel parts of S27-S28) and tests/qml/tst_feature_plan_action.qml (panel parts of S27-S28)
 
 ## M4: pen.dev integration
 
