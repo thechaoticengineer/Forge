@@ -30,10 +30,16 @@ pub(crate) fn guidance(map_or_record: &Value) -> Value {
     view
 }
 
+/// A short, stable content ID: `prefix`, a hyphen and the first eight hex
+/// characters of the text's content hash. Equal texts always share an ID.
+pub(crate) fn content_id(prefix: &str, text: &str) -> String {
+    format!("{prefix}-{}", &crate::metadata::fingerprint(text.as_bytes())[..8])
+}
+
 /// A short, stable ID for one constraint text: `c-` plus the first eight hex
 /// characters of its content hash. Equal texts always share an ID.
 pub(crate) fn constraint_id(text: &str) -> String {
-    format!("c-{}", &crate::metadata::fingerprint(text.as_bytes())[..8])
+    content_id("c", text)
 }
 
 fn text_id(value: &Value) -> String {

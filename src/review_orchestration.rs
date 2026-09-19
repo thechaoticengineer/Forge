@@ -181,6 +181,7 @@ impl Ctx {
                 "\nCRITERIA TO EVIDENCE:\n{acceptance}\n")),
         }
         prompt.push_str(&format!("\nREVIEW IDENTITY (echo exactly): {identity}\nSaved constraints: {}\nCompleted interfaces: {}\nGuidance: {}\nDecision history: .forge/architecture/{}/events.jsonl\n", cp["constraints"], cp["completed_interfaces"], guidance, plan["plan_id"].as_str().unwrap()));
+        if let Some(section) = self.synthesis_section() { prompt.push_str(&section); }
         crate::durable_json::publish_pretty(&self.forge_path("review-identity.json"), &identity)?;
         prompt.push_str("\nThe engine also wrote the exact identity to .forge/review-identity.json (read-only during this review). Assemble your final verdict in private /tmp using a script: load that file with json.load, assign the resulting object to verdict['identity'], and serialize the verdict with json.dumps. Return that exact serialized JSON. Do not manually transcribe hashes or reconstruct the identity. The engine still validates the complete identity and rejects any mismatch.\n");
         if role == "architect" {

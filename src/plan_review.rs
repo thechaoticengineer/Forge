@@ -296,6 +296,7 @@ impl Ctx {
                 if let Some(clarification) = escalation::clarification_text(&plan["plan_review"]) {
                     prompt.push_str(&clarification);
                 }
+                if let Some(section) = self.synthesis_section() { prompt.push_str(&section); }
                 let turn = crate::architecture::identity();
                 if !plan["plan_review"]["model_invocations"].is_array() { plan["plan_review"]["model_invocations"] = json!([]); }
                 let round = plan["plan_review"]["rounds"].clone();

@@ -126,6 +126,7 @@ impl Ctx {
             let completed = crate::prompt_view::committed_stages(&current, &cp, stage);
             let outcomes = crate::prompt_view::checkpoint_for(&cp, &current)["execution_outcomes"].clone();
             prompt.push_str(&format!("\nCompleted stage interfaces and verified outcomes (id, title, sha, outcome; acceptance only for stages this one depends on): {}\nRecent execution outcomes: {}\nRead full details of a completed stage with `git show <sha>` and from {FORGE_DIR}/plan.json. Read the decision history for relevant decisions omitted from the recent preview; inspect completed interfaces in code before changing them.\n", json!(completed), outcomes));
+            if let Some(section) = self.synthesis_section() { prompt.push_str(&section); }
             prompt.push_str(&format!("\n[implementer] Last validated outcome/escalation request: {}\n[engine] Latest routing handoff: {}\n", stage["implementer_outcome"], stage["reassessment"]["history"].as_array().and_then(|h| h.last()).map(|h| json!({"kind":h["kind"],"evidence":h["evidence"]})).unwrap_or(Value::Null)));
             let clarification = &stage["scope_clarification"];
             if clarification["source_inputs"] == crate::plan::stage_inputs(&current, idx) {

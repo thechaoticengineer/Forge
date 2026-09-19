@@ -535,6 +535,8 @@ impl Ctx {
                 "unfinished_diff_preview":self.git(&["diff","HEAD","--",".",":(exclude).forge"]).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>(),
                 "required_stage_ids":required,"required_model_stage_ids":routing_ids,"reason":reason});
             let mut context = context;
+            // Advisory cross-plan context; never part of the checkpoint.
+            context["project_synthesis"] = self.synthesis_context(Some(&candidate));
             let feature = crate::feature_context::feature_summary(&candidate["feature"]);
             let context_has_feature = feature.is_some();
             if let Some(feature) = feature {

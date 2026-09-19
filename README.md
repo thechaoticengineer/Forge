@@ -755,6 +755,53 @@ descriptions stay in durable artefacts; polling preserves the choice, both reaso
 policy provenance, current gates, editing content and token totals.
 All these artefacts remain inside the existing `.forge` commit exclusion.
 
+#### Project synthesis
+
+Architecture checkpoints belong to one plan, and each new plan starts from an
+empty checkpoint. The project synthesis carries what holds across plans. It is
+runtime state in `.forge/architecture/synthesis.json`, next to the plan
+directories. The file name contains a dot, so it can never be a plan identity.
+Discarding a plan, resetting it and archiving it when a new plan identity is
+published never touch the file.
+
+The synthesis has two parts:
+
+- **What holds** is stored: `{"version":1, "source":{plan_id, checkpoint, sha,
+  goal, unix}, "constraints":[{id, text}], "interfaces":[{id, text}],
+  "decisions":[{id, text}], "retired":[{id, text, reason}]}`. The engine
+  validates it before every atomic write, under the persistence lock. The
+  pretty-printed document holds at most 8192 bytes, 24 constraints, 24
+  interfaces and 16 decisions. Each text is at most 300 bytes and not empty.
+  The engine derives every ID from the entry's text: `c-`, `i-` or `d-` plus
+  eight hex characters of its content hash, so a constraint has the same ID as
+  in the prompt's `constraint_ids`. A replacement must keep every previous entry
+  with identical text, or retire its ID with a non-empty reason. A changed text
+  is a new entry, so the old ID must be retired. `retired` lists only the
+  retirements of the latest replacement. The source must name a plan and a
+  commit sha. An invalid stored file is reported and left out of prompts.
+- **Current work** is derived from the plan, the goal queue and the feature
+  state on every read and never stored. It lists the plan (ID, goal cut to 300
+  characters, status and every stage's ID, title cut to 120 characters, and
+  status), up to 10 queue items (goal cut to 200 characters) and up to 8
+  features or milestones in progress. A feature or milestone is in progress
+  when it is the plan's own milestone, when its latest plan link is `planning`
+  or `planned`, or when the feature is partly implemented. The whole value stays
+  within 4 KiB. `omitted` counts the stages, queue items and features left out.
+
+The synthesis is a separate prompt field. It never enters a checkpoint's
+`constraints` or any stored checkpoint. Roles see it as follows:
+
+- The architect publish context and planner chat get `project_synthesis`:
+  `{current_work, what_holds, note}`. `what_holds` is the stored document
+  without `retired`, or null when nothing is stored.
+- Implementer, fixer, stage review (reviewer and architect), plan review and
+  PLAN_FIX prompts get one compact `PROJECT SYNTHESIS` section with what holds
+  and the note. The section is absent when nothing is stored.
+- Routing prompts get neither part.
+
+The note tells every receiving role that the synthesis is advisory, recorded at
+`source.sha`, and must be checked against the repository code before use.
+
 ### Asking about the plan
 
 Type a question about the current plan into the field beside **Plan Q&A**
@@ -765,7 +812,8 @@ status and explicit dependencies — not model selection, agreement,
 proposal-input, reassessment or invocation records. It also carries the saved
 architecture context as the compact prompt view (see
 [Plan identity and architectural records](#plan-identity-and-architectural-records)),
-never the raw checkpoint. Expand **Plan Q&A** to read the conversation. Asking requires an existing plan, with Forge idle, the
+never the raw checkpoint, and the advisory project synthesis with current work
+(see [Project synthesis](#project-synthesis)). Expand **Plan Q&A** to read the conversation. Asking requires an existing plan, with Forge idle, the
 queue inactive, and plan editing closed.
 
 This is separate from the **Discuss before planning** chat, which does not

@@ -176,6 +176,10 @@ fn saved_plan_and_architect_context_stay_flat_across_a_six_stage_plan() {
              per-stage cap (samples {architect_prompt_lens:?}); the work-status context may be carrying plan bookkeeping again", n + 2);
     }
 
+    // Without a stored project synthesis, worker and reviewer prompts carry no
+    // synthesis section, and the architect context says there is nothing held.
+    assert_synthesis_absent(&f.ctx);
+
     // The completed plan still carries the full design and only a compact
     // proposal-input fingerprint per stage.
     let done = f.ctx.load_plan().unwrap();
@@ -265,6 +269,58 @@ const PROMPT_MAX_BYTES_PER_COMMITTED_STAGE: usize = 4 * 1024;
 // (about 6 KB each here): a fixed base plus an allowance per stage.
 const ONCE_PER_PLAN_BASE_BYTES: usize = 32 * 1024;
 const ONCE_PER_PLAN_BYTES_PER_STAGE: usize = 16 * 1024;
+
+/// A distinctive word in every entry of the fixture synthesis.
+const SYNTHESIS_MARKER: &str = "SYNTHESIS-FIXTURE";
+
+/// Stores a fixture synthesis of close to the 8 KiB limit, so the growth
+/// guards below also bound prompts that carry the largest synthesis.
+fn seed_synthesis(ctx: &Ctx) {
+    let texts = |kind: &str, n: usize| -> Vec<String> {
+        (1..=n).map(|i| format!("{SYNTHESIS_MARKER} {kind} {i}: {}", "the greeting handlers keep one shared error type. ".repeat(5))).collect()
+    };
+    let output = json!({"constraints": texts("constraint", 8), "interfaces": texts("interface", 8), "decisions": texts("decision", 6), "retired": []});
+    let source = json!({"plan_id": "earlier-plan", "checkpoint": "earlier-checkpoint", "sha": "0123abcd", "goal": "An earlier goal", "unix": 1});
+    let doc = crate::architecture_synthesis::build(&output, None, source).unwrap();
+    assert!(serde_json::to_vec_pretty(&doc).unwrap().len() > crate::architecture_synthesis::MAX_BYTES - 1024);
+    ctx.save_project_synthesis(&doc).unwrap();
+}
+
+fn recorded(ctx: &Ctx, kind: &str) -> Vec<String> {
+    ctx.all_recorded_prompts().iter().filter(|r| r["kind"] == kind)
+        .map(|r| r["prompt"].as_str().unwrap().to_string()).collect()
+}
+
+/// Architect publish and planner chat receive current work plus what holds,
+/// workers and reviewers what holds only, and routing neither. The synthesis
+/// never enters the checkpoint.
+fn assert_synthesis_scopes(ctx: &Ctx, kinds: &[&str]) {
+    for kind in kinds {
+        let prompts = recorded(ctx, kind);
+        assert!(!prompts.is_empty(), "no {kind} prompt was captured");
+        for prompt in prompts {
+            let (holds, work) = (prompt.contains(SYNTHESIS_MARKER), prompt.contains("\"current_work\""));
+            let advisory = prompt.contains("check every entry against the repository code");
+            match *kind {
+                "architect_publish" | "planner_chat" => assert!(holds && work && advisory, "{kind} must carry current work and what holds"),
+                "routing_reconciliation" => assert!(!holds && !work && !prompt.contains("project_synthesis") && !prompt.contains("PROJECT SYNTHESIS"),
+                    "routing must carry no project synthesis"),
+                _ => assert!(holds && !work && advisory && prompt.contains("PROJECT SYNTHESIS"), "{kind} must carry what holds only"),
+            }
+        }
+    }
+    let plan = ctx.load_plan().unwrap();
+    let cp = ctx.architecture_store().checkpoint(&plan).unwrap();
+    assert!(!cp.to_string().contains(SYNTHESIS_MARKER), "the synthesis must never enter the checkpoint: {}", cp["constraints"]);
+}
+
+fn assert_synthesis_absent(ctx: &Ctx) {
+    for record in ctx.all_recorded_prompts() {
+        let prompt = record["prompt"].as_str().unwrap();
+        assert!(!prompt.contains("PROJECT SYNTHESIS"), "{} prompt has a synthesis section without a stored synthesis", record["kind"]);
+        if record["kind"] == "architect_publish" { assert!(prompt.contains("\"what_holds\":null")); }
+    }
+}
 
 /// One recorded prompt with the number of stages committed when it was sent.
 struct Sample { kind: String, role: String, stage_id: Option<i64>, committed: i64, bytes: usize }
@@ -398,7 +454,9 @@ fn every_role_prompt_stays_bounded_across_an_eight_stage_plan() {
         }
         verdicts.push(approve());
     }
-    let mut run = Run::new(Fixture::new(), verdicts, vec![]);
+    let f = Fixture::new();
+    seed_synthesis(&f.ctx);
+    let mut run = Run::new(f, verdicts, vec![]);
     run.ask("What is planned?");
     for id in 1..=LINKED_STAGES {
         if id == LINKED_STAGES { run.edit_last_stage_with_routing_disagreement(); }
@@ -416,6 +474,7 @@ fn every_role_prompt_stays_bounded_across_an_eight_stage_plan() {
     for kind in ["architect_publish", "implementer", "fixer", "planner_chat", "routing_reconciliation"] { run.assert_growth(kind, None); }
     run.assert_growth("stage_review", Some("reviewer"));
     run.assert_growth("stage_review", Some("architect"));
+    assert_synthesis_scopes(&run.f.ctx, &["architect_publish", "implementer", "fixer", "stage_review", "planner_chat", "routing_reconciliation"]);
 }
 
 #[test]
@@ -425,7 +484,9 @@ fn plan_review_and_plan_fix_prompts_stay_bounded_across_an_eight_stage_plan() {
     // once and is then approved after PLAN_FIX.
     let mut verdicts = vec![json!({"approved":false,"issues":["Handler 4 must document its error mapping"]})];
     verdicts.extend((0..4).map(|_| approve()));
-    let mut run = Run::new(Fixture::with_cadence("per_plan", "per_plan"), verdicts, vec![]);
+    let f = Fixture::with_cadence("per_plan", "per_plan");
+    seed_synthesis(&f.ctx);
+    let mut run = Run::new(f, verdicts, vec![]);
     for id in 1..=LINKED_STAGES { run.stage(id); }
 
     for kind in ["architect_publish", "implementer", "planner_chat", "plan_review", "plan_fix"] { run.assert_captured(kind, None); }
@@ -438,4 +499,5 @@ fn plan_review_and_plan_fix_prompts_stay_bounded_across_an_eight_stage_plan() {
     for kind in ["architect_publish", "implementer", "planner_chat"] { run.assert_growth(kind, None); }
     run.assert_once_per_plan_bound("plan_review");
     run.assert_once_per_plan_bound("plan_fix");
+    assert_synthesis_scopes(&run.f.ctx, &["architect_publish", "implementer", "planner_chat", "plan_review", "plan_fix"]);
 }
