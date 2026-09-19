@@ -188,6 +188,8 @@ impl Ctx {
                 "Current actionable independent requests (not an endorsement): {requests:?}\n"
             ));
             prompt.push_str("\nYou are the persistent architect reviewing recorded design, cross-stage interfaces and regressions. Your verdict has independent authority. For conflicting requests, record architectural clarification in architecture_context_gap without dismissing either role's unresolved findings.\n");
+            prompt.push_str(crate::prompts::REVIEWER_HISTORY_RULE);
+            prompt.push('\n');
         }
         self.set_step(
             step,

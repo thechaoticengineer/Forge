@@ -1,6 +1,39 @@
 // ------------------------------------------------------------- prompts
 
-pub(crate) const PLANNER_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+// Shared prompt text is written once as a literal-producing macro so `concat!`
+// can splice it into the prompt constants at compile time.
+macro_rules! plan_constraint_rules {
+    () => {
+        "CONSTRAINT RULES FOR EVERY STAGE:\n\
+- A stage's constraints must be satisfiable together. A restriction such as \"change only documentation\" or \"change only X\" must still allow every project test suite to pass after the stage, and all tests must pass after every stage.\n\
+- Before planning a stage that changes documentation, milestone or status lines, README or other real project files, find the tests that read those files. If any exist, plan an earlier stage that moves those tests onto fixture data, or drop the restriction.\n\
+- Committed stages are fixed history, so corrections only move forward and never amend, rewrite or reorder committed work.\n\n"
+    };
+}
+
+macro_rules! implementer_history_rule {
+    () => {
+        "Commits of earlier stages cannot be changed: do not amend, rebase or rewrite history and do not move work into an earlier commit. Make every change in the current working tree."
+    };
+}
+
+macro_rules! reviewer_history_rule {
+    () => {
+        "Commits of earlier stages cannot be changed. A review must never ask to move a change into an earlier commit, or to amend, rebase or rewrite history. Every finding must be satisfiable in the current working tree."
+    };
+}
+
+/// Planning rules shared by every prompt that writes or rewrites plan stages.
+#[cfg(test)]
+pub(crate) const PLAN_CONSTRAINT_RULES: &str = plan_constraint_rules!();
+/// Fixed-history rule for implementing and fixing agents.
+#[cfg(test)]
+pub(crate) const IMPLEMENTER_HISTORY_RULE: &str = implementer_history_rule!();
+/// Fixed-history rule for reviewers, plan reviewers and the architect review.
+pub(crate) const REVIEWER_HISTORY_RULE: &str = reviewer_history_rule!();
+
+pub(crate) const PLANNER_PROMPT: &str = concat!(
+r#"You are the planning agent of Forge, an AI build orchestrator.
 Explore this repository, then produce an implementation plan for the goal below.
 
 GOAL:
@@ -17,9 +50,12 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 ]}
 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
-Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
+"#,
+plan_constraint_rules!(),
+r#"Do NOT implement anything, do not modify any other file. Only write {plan_path}."#);
 
-pub(crate) const DISCUSSION_PLANNER_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+pub(crate) const DISCUSSION_PLANNER_PROMPT: &str = concat!(
+r#"You are the planning agent of Forge, an AI build orchestrator.
 Explore this repository, then produce an implementation plan for the goal below.
 
 The user discussed this work with Forge before planning. The transcript is authoritative context.
@@ -43,9 +79,12 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 ]}
 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
-Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
+"#,
+plan_constraint_rules!(),
+r#"Do NOT implement anything, do not modify any other file. Only write {plan_path}."#);
 
-pub(crate) const REFACTOR_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+pub(crate) const REFACTOR_PROMPT: &str = concat!(
+r#"You are the planning agent of Forge, an AI build orchestrator.
 Explore this repository and read the code. Identify concrete refactoring opportunities:
 duplication, dead code, overly long functions, unclear naming, and poor module structure.
 Produce a staged refactoring plan WITHOUT changing observable behavior.
@@ -65,9 +104,12 @@ Write the plan as JSON to the file {plan_path} (create the directory if needed) 
 
 Rules: 2 to 8 stages, each independently committable, ordered by dependency.
 Every stage's acceptance criteria must require that observable behavior is preserved and builds/tests still pass.
-Do NOT implement anything, do not modify any other file. Only write {plan_path}."#;
+"#,
+plan_constraint_rules!(),
+r#"Do NOT implement anything, do not modify any other file. Only write {plan_path}."#);
 
-pub(crate) const REVISE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+pub(crate) const REVISE_PROMPT: &str = concat!(
+r#"You are the planning agent of Forge, an AI build orchestrator.
 You are revising an existing draft plan for this repository.
 
 Here is the current plan JSON:
@@ -92,7 +134,9 @@ Rewrite the plan and write it as JSON to the file {plan_path} (create the direct
 Stages whose status is "committed" are already done and MUST be kept exactly as-is at the start of the plan, in their original relative order (same id, title, instructions, acceptance, commit, status, depends_on).
 Apply the feedback to the remaining stages: you may rewrite, merge, split, add, remove, or reorder them.
 Rules: 2 to 8 stages total, each independently committable, ordered by dependency.
-Do NOT implement anything and do NOT modify any other file. Only write {plan_path}."#;
+"#,
+plan_constraint_rules!(),
+r#"Do NOT implement anything and do NOT modify any other file. Only write {plan_path}."#);
 
 pub(crate) const CHAT_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
 Answer the user's question about the current plan. Explore the repository as needed to give an accurate answer.
@@ -176,7 +220,8 @@ When "rewritten" is true, only "block" is valid.
 Return ONLY JSON, no fences: {"action":"uncommit|continue|block","reason":"concise explanation for the user"}
 Decision history: .forge/architecture/{plan_id}/events.jsonl"#;
 
-pub(crate) const IMPLEMENT_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
+pub(crate) const IMPLEMENT_PROMPT: &str = concat!(
+r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
 {goal}
@@ -195,13 +240,17 @@ Implement this stage completely.
 Before handing off, inspect the repository instructions and build/test configuration, then run the project's build, test suites and any additional checks required by the repository or acceptance criteria (for Rust, run cargo build and cargo test). A manual check supplements these commands; it does not replace them. This verification is mandatory even when architect or reviewer checks are deferred until the end of the plan.
 Fix every build error and every failing test in this stage before handing off, regardless of which change, stage or earlier commit caused it; such failures are never out of scope and must never be reported as pre-existing or as blockers instead of being fixed, and warnings introduced by your changes must also be fixed. Rerun the affected checks on the final code. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. If a test cannot be made to pass because this stage's intended behavior legitimately changes what the test expects, do not delete, skip, ignore or weaken that test on your own; leave it unchanged and escalate to the architect through the engine outcome channel with status "escalation" and request kind "scope", naming the test, the behavior change and the concrete evidence, so the architect decides whether the test is updated or removed.
 Report the exact commands, exit status and concise results in your final response, using the evidence field when the engine requires JSON. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution; use the engine's failure or escalation outcome when supplied. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
-Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+"#,
+implementer_history_rule!(),
+"\n",
+r#"Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
 {git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
-To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#);
 
-pub(crate) const FIX_PROMPT: &str = r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
+pub(crate) const FIX_PROMPT: &str = concat!(
+r#"You are the implementing agent of Forge for exactly one stage of an approved plan.
 
 OVERALL GOAL:
 {goal}
@@ -225,13 +274,17 @@ Address every outstanding change request, including legacy notes. If a request i
 Before handing off, inspect the repository instructions and build/test configuration, then run the project's build, test suites and any additional checks required by the repository or acceptance criteria (for Rust, run cargo build and cargo test). A manual check supplements these commands; it does not replace them. This verification is mandatory even when architect or reviewer checks are deferred until the end of the plan.
 Fix every build error and every failing test in this stage before handing off, regardless of which change, stage or earlier commit caused it; such failures are never out of scope and must never be reported as pre-existing or as blockers instead of being fixed, and warnings introduced by your changes must also be fixed. Rerun the affected checks on the final code. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. If a test cannot be made to pass because this stage's intended behavior legitimately changes what the test expects, do not delete, skip, ignore or weaken that test on your own; leave it unchanged and escalate to the architect through the engine outcome channel with status "escalation" and request kind "scope", naming the test, the behavior change and the concrete evidence, so the architect decides whether the test is updated or removed.
 Report the exact commands, exit status and concise results in your final response, using the evidence field when the engine requires JSON. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution; use the engine's failure or escalation outcome when supplied. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
-Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
+"#,
+implementer_history_rule!(),
+"\n",
+r#"Do NOT commit, do NOT push, do NOT touch the {forge_dir}/ directory.
 {git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
-To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#);
 
-pub(crate) const REVIEW_PROMPT: &str = r#"You are an independent reviewer in a fresh session. Another agent implemented one stage of a plan in this repository. Judge only whether the current uncommitted changes correctly implement the stage.
+pub(crate) const REVIEW_PROMPT: &str = concat!(
+r#"You are an independent reviewer in a fresh session. Another agent implemented one stage of a plan in this repository. Judge only whether the current uncommitted changes correctly implement the stage.
 
 STAGE: {title}
 INSTRUCTIONS GIVEN TO THE IMPLEMENTER:
@@ -261,12 +314,16 @@ Both issues and notes MUST be empty when approved=true. issues MUST be non-empty
 checks MUST list at least the commands and inspections actually performed and their results, including the individual acceptance-criterion verifications. Never claim a check was performed or passed without evidence.
 notes is retained for compatibility and MUST be empty in new verdicts; put all requested edits in issues. Legacy notes are treated as change requests, even if approved=true.
 Always fill summary with short feedback describing what you inspected and what you found, even when approving.
-Do NOT fix anything yourself; do NOT modify implementation or runtime files. The engine alone records your validated final JSON.
+"#,
+reviewer_history_rule!(),
+"\n",
+r#"Do NOT fix anything yourself; do NOT modify implementation or runtime files. The engine alone records your validated final JSON.
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
-To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#);
 
-pub(crate) const PLAN_FIX_PROMPT: &str = r#"You are the implementing agent fixing deferred review findings for the whole approved plan.
+pub(crate) const PLAN_FIX_PROMPT: &str = concat!(
+r#"You are the implementing agent fixing deferred review findings for the whole approved plan.
 
 OVERALL GOAL:
 {goal}
@@ -290,13 +347,17 @@ Inspect and preserve inherited partial work. Resolve every request with its role
 Before handing off, inspect the repository instructions and build/test configuration, then run the project's build, test suites and any additional checks required by the repository or acceptance criteria (for Rust, run cargo build and cargo test). A manual check supplements these commands; it does not replace them. Verify the combined plan after fixes, including integration between stages.
 Fix every build error and every failing test found by plan review or your own checks within this plan, regardless of which change, stage or earlier commit caused it, then rerun the affected checks on the final code. Such failures are never out of scope and must not be reported as pre-existing or as blockers instead of being fixed. Warnings introduced by your changes must still be fixed. Add or update regression tests when needed to cover changed behavior. Do not disable tests, weaken assertions or suppress warnings merely to obtain a passing result; intentional exceptions require repository-supported justification. If a test cannot be made to pass because the plan's intended behavior legitimately changes what the test expects, do not delete, skip, ignore or weaken that test on your own; leave it unchanged and escalate to the architect by surfacing it as an architectural context gap in your final response, naming the test, the behavior change and the concrete evidence, so the architect decides whether the test is updated or removed.
 Report the exact commands, exit status and concise results in your final response. Previous runs, another agent's claims and checks run before subsequent relevant edits are not evidence for the final code. Do not claim completion while required verification is failing or incomplete. If a required check cannot run, explain the command, blocker and attempted resolution. If no build or test command exists, report the inspected files that establish this and the alternative verification performed.
-Edit the working tree only. The engine alone commits approved fixes. Do not rewrite history: no commit, amend, rebase, reset --hard, cherry-pick, revert or any ref update. Do NOT push or touch the .forge/ directory.
+"#,
+implementer_history_rule!(),
+"\n",
+r#"Edit the working tree only. The engine alone commits approved fixes. Do not rewrite history: no commit, amend, rebase, reset --hard, cherry-pick, revert or any ref update. Do NOT push or touch the .forge/ directory.
 {git_rule}
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
-To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#);
 
-pub(crate) const PLAN_REVIEW_PROMPT: &str = r#"You are an independent reviewer in a fresh session. Agents implemented the stages of a plan in this repository. Judge whether the stages, taken together, correctly implement the plan.
+pub(crate) const PLAN_REVIEW_PROMPT: &str = concat!(
+r#"You are an independent reviewer in a fresh session. Agents implemented the stages of a plan in this repository. Judge whether the stages, taken together, correctly implement the plan.
 
 GOAL:
 {goal}
@@ -329,12 +390,16 @@ Both issues and notes MUST be empty when approved=true. issues MUST be non-empty
 checks MUST list at least the commands and inspections actually performed and their results, including the individual acceptance-criterion verifications. Never claim a check was performed or passed without evidence.
 notes is retained for compatibility and MUST be empty in new verdicts; put all requested edits in issues. Legacy notes are treated as change requests, even if approved=true.
 Always fill summary with short feedback describing what you inspected and what you found, even when approving.
-Do NOT fix anything yourself; do NOT modify implementation or runtime files. The engine alone records your validated final JSON.
+"#,
+reviewer_history_rule!(),
+"\n",
+r#"Do NOT fix anything yourself; do NOT modify implementation or runtime files. The engine alone records your validated final JSON.
 CRITICAL: the Forge engine that orchestrates you is itself running from this repository on port 8734.
 Never kill it (no `pkill forge` or similar) and never start another instance on its port.
-To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#;
+To test the engine binary, run it on a different port: `FORGE_PORT=18734 ./target/debug/forge`."#);
 
-pub(crate) const SCOPE_PROMPT: &str = r#"You are the planning agent of Forge, an AI build orchestrator.
+pub(crate) const SCOPE_PROMPT: &str = concat!(
+r#"You are the planning agent of Forge, an AI build orchestrator.
 The implementer refused to build one stage of an approved plan, reporting that the stage
 as written cannot be built as specified. You own the stage text, so you decide what it says.
 
@@ -364,10 +429,12 @@ private helpers or test fixture data.
 
 If the report is wrong and the stage can be built as written, say so instead and explain how.
 
-Return ONLY JSON in your final response, no fences and no output files, either:
+"#,
+plan_constraint_rules!(),
+r#"Return ONLY JSON in your final response, no fences and no output files, either:
 {"revised": {"instructions": "...", "acceptance": "..."}, "removed": "what you changed and why, one short paragraph"}
 or:
-{"refused": "why the stage is buildable as written, and how"}"#;
+{"refused": "why the stage is buildable as written, and how"}"#);
 
 /// Co-authoring one feature spec folder (M2, S11/S12). The agent stays
 /// read-only and proposes complete file contents; the engine validates every
@@ -422,3 +489,43 @@ Rules:
 - "approved" is false when the spec needs changes; then give at least one entry in "issues" (a required change) or "questions" (something you need answered).
 - "summary" is a non-empty string; every entry of "issues" and "questions" is a non-empty string, at most {max_entries} entries each.
 - The engine validates this verdict and returns it to you for correction if it is malformed."#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SATISFIABLE: &str = "A stage's constraints must be satisfiable together.";
+    const ALL_PASS: &str = "all tests must pass after every stage";
+    const FIXTURES: &str = "find the tests that read those files. If any exist, plan an earlier stage that moves those tests onto fixture data";
+    const FIXED_HISTORY: &str = "Committed stages are fixed history, so corrections only move forward";
+
+    #[test]
+    fn every_planning_prompt_carries_the_shared_constraint_rules() {
+        for (name, prompt) in [("PLANNER", PLANNER_PROMPT), ("DISCUSSION_PLANNER", DISCUSSION_PLANNER_PROMPT),
+            ("REVISE", REVISE_PROMPT), ("REFACTOR", REFACTOR_PROMPT), ("SCOPE", SCOPE_PROMPT)] {
+            assert!(prompt.contains(PLAN_CONSTRAINT_RULES), "{name} lacks the shared block");
+            for rule in [SATISFIABLE, ALL_PASS, FIXTURES, FIXED_HISTORY, "\"change only documentation\"", "README or other real project files"] {
+                assert!(prompt.contains(rule), "{name} lacks: {rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn implementing_agents_are_told_earlier_commits_are_fixed() {
+        for (name, prompt) in [("IMPLEMENT", IMPLEMENT_PROMPT), ("FIX", FIX_PROMPT), ("PLAN_FIX", PLAN_FIX_PROMPT)] {
+            assert!(prompt.contains(IMPLEMENTER_HISTORY_RULE), "{name}");
+            assert!(prompt.contains("Commits of earlier stages cannot be changed"), "{name}");
+            assert!(prompt.contains("move work into an earlier commit"), "{name}");
+        }
+    }
+
+    #[test]
+    fn reviewers_may_not_request_history_changes() {
+        for (name, prompt) in [("REVIEW", REVIEW_PROMPT), ("PLAN_REVIEW", PLAN_REVIEW_PROMPT)] {
+            assert!(prompt.contains(REVIEWER_HISTORY_RULE), "{name}");
+            assert!(prompt.contains("Commits of earlier stages cannot be changed."), "{name}");
+            assert!(prompt.contains("must never ask to move a change into an earlier commit, or to amend, rebase or rewrite history"), "{name}");
+            assert!(prompt.contains("Every finding must be satisfiable in the current working tree."), "{name}");
+        }
+    }
+}

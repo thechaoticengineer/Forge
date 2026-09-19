@@ -43,7 +43,7 @@ pub(crate) fn feature_reference(plan_feature: &Value) -> Option<String> {
         Read scenarios.md, decisions.md and milestones.md in that folder from the repository yourself; they are not included here.\n\
         Rules for this plan:\n\
         (a) The first stage turns every covered scenario into an executable test named after its scenario ID that fails before implementation, and names every covered scenario ID ({ids}) in its instructions or acceptance.\n\
-        (b) The final stage sets the milestone's `Status: implemented` and its `Business tests:` line in {}milestones.md to name the test files that cover its scenarios (comma or `and` separated repository paths, each optionally followed by a parenthesized note), inside the reviewed commit range.\n",
+        (b) The final stage sets the milestone's `Status: implemented` and its `Business tests:` line in {}milestones.md to name the test files that cover its scenarios (comma or `and` separated repository paths, each optionally followed by a parenthesized note), inside the reviewed commit range. Tests that read the real milestones.md must not change result because of this edit; if any would, an earlier stage must move them onto fixtures, and the final stage must not be restricted in a way that forbids the edits needed to keep tests passing.\n",
         folder(plan_feature),
         plan_feature["milestone"].as_str().unwrap_or(""),
         plan_feature["title"].as_str().unwrap_or(""),
@@ -254,6 +254,16 @@ mod tests {
         assert_ne!(plan["status"], "done", "{plan}");
         assert_eq!(plan["stages"][0]["status"], "committed");
         assert_ne!(plan["stages"][1]["status"], "committed", "{}", plan["stages"][1]);
+    }
+
+    #[test]
+    fn reference_rule_b_links_the_final_status_edit_to_fixture_migration() {
+        let reference = feature_reference(&json!({"slug":"f","milestone":"M1","title":"T","scenario_ids":["S1"]})).unwrap();
+        for text in ["Tests that read the real milestones.md must not change result because of this edit",
+            "an earlier stage must move them onto fixtures",
+            "the final stage must not be restricted in a way that forbids the edits needed to keep tests passing"] {
+            assert!(reference.contains(text), "{text}");
+        }
     }
 
     #[test]

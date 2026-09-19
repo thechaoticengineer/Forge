@@ -17,6 +17,19 @@ fn review_response_corrections_do_not_repeat_implementation_or_spend_fix_rounds(
 }
 
 #[test]
+fn review_prompts_forbid_requests_to_change_earlier_commits() {
+    let f = Fixture::new("Implement feature", 0);
+    f.setting("mock_verdicts", json!([clean()]));
+    f.run();
+    let sessions = f.ctx.app.settings.lock().unwrap()["test_review_sessions"].clone();
+    for role in ["reviewer", "architect"] {
+        let prompt = sessions.as_array().unwrap().iter().find(|s| s["role"] == role)
+            .unwrap_or_else(|| panic!("no {role} session"))["prompt"].as_str().unwrap().to_owned();
+        assert!(prompt.contains(crate::prompts::REVIEWER_HISTORY_RULE), "{role}: {prompt}");
+    }
+}
+
+#[test]
 fn mutation_or_stop_during_a_correction_prevents_further_calls_and_publication() {
     for action in [json!({"write":{"mock.txt":"changed during correction"}}), json!({"stop":true})] {
         let f = Fixture::new("Implement feature", 0);
