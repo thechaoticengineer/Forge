@@ -876,64 +876,65 @@ fn s32_registry_parses_both_forms_and_api_lists_files() {
     }
 }
 
+// The user explicitly authorised rewriting this registered business test: the
+// exact business-test lists of the real docs/features no longer belong here,
+// because they change whenever a milestone registers another file. S32 stays
+// fully covered: the grammar of both forms used in the repository is asserted
+// exactly on verbatim fixture lines, and the real docs/features are still
+// checked for parsing, validity and existing registered files.
 #[test]
 fn s32_repository_registry_lines_parse_without_edits() {
     // S32: both forms in the repository today parse without edits
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let env = Env::new();
-    copy_dir_all(&repo.join("docs/features"), &env.features_dir());
-    // Mirror every file a `Business tests:` line names, so only the grammar is under test.
-    for feature in fs::read_dir(repo.join("docs/features")).unwrap() {
-        let milestones = feature.unwrap().path().join("milestones.md");
-        let Ok(text) = fs::read_to_string(&milestones) else { continue };
-        for line in text.lines().filter(|line| line.starts_with("Business tests:")) {
-            for token in line.split(|c: char| c.is_whitespace() || "(),`".contains(c)) {
-                if token.contains('/') && repo.join(token).is_file() {
-                    let target = env.test.path.join(token);
-                    fs::create_dir_all(target.parent().unwrap()).unwrap();
-                    fs::copy(repo.join(token), target).unwrap();
-                }
-            }
-        }
+    env.commit_files(&[
+        ("src/a.rs", "// a\n"),
+        ("tests/b.test.mjs", "// b\n"),
+        ("src/m.rs", "// m\n"),
+        ("tests/n.test.mjs", "// n\n"),
+        ("tests/q/one.qml", "// one\n"),
+        ("tests/q/two.qml", "// two\n"),
+        ("tests/q/three.qml", "// three\n"),
+        ("tests/q/four.qml", "// four\n"),
+        ("tests/q/five.qml", "// five\n"),
+    ]);
+    let scenarios = scenarios_md(0);
+    // The plain form of feature-specs M1, the three-entry form of feature-specs
+    // M3 and the backticked comma-and-`and` form of panel-redesign M1.
+    let plain = "src/a.rs (S1-S6, S9) and tests/b.test.mjs (S7-S8)";
+    let three = "src/m.rs (S27-S35), tests/n.test.mjs (panel parts of S27-S28) and tests/q/one.qml (panel parts of S27-S28)";
+    let backticked = "`tests/b.test.mjs`, `tests/q/two.qml`, `tests/q/three.qml`, `tests/q/four.qml` and `tests/q/five.qml`";
+    for (slug, line) in [("plain-form", plain), ("three-entry-form", three), ("backtick-form", backticked)] {
+        env.write_feature(slug, slug, &scenarios, &milestones_md(Some(line)));
     }
 
     let (code, listing) = env.get(&format!("/api/features?project={}", env.project));
     assert_eq!(code, 200, "response was {listing}");
-    for slug in ["feature-specs", "panel-redesign"] {
+    for (slug, expected) in [
+        ("plain-form", json!(["src/a.rs", "tests/b.test.mjs"])),
+        ("three-entry-form", json!(["src/m.rs", "tests/n.test.mjs", "tests/q/one.qml"])),
+        (
+            "backtick-form",
+            json!(["tests/b.test.mjs", "tests/q/two.qml", "tests/q/three.qml", "tests/q/four.qml", "tests/q/five.qml"]),
+        ),
+    ] {
         let feature = feature_entry(&listing, slug);
         assert_eq!(feature["status"], "valid", "{slug} must stay valid without edits: {}", feature["reasons"]);
+        assert_eq!(milestone_entry(&feature, "M2")["business_tests"], expected, "feature was {feature}");
     }
-    let specs = feature_entry(&listing, "feature-specs");
-    assert_eq!(
-        milestone_entry(&specs, "M1")["business_tests"],
-        json!(["src/feature_spec_tests.rs", "tests/panel_features.test.mjs"])
-    );
-    assert_eq!(
-        milestone_entry(&specs, "M2")["business_tests"],
-        json!(["src/feature_spec_m2_tests.rs", "tests/panel_feature_spec.test.mjs"])
-    );
-    assert_eq!(milestone_entry(&specs, "M4")["business_tests"], json!(["src/pen_dev_tests.rs"]));
-    let redesign = feature_entry(&listing, "panel-redesign");
-    assert_eq!(
-        milestone_entry(&redesign, "M1")["business_tests"],
-        json!([
-            "tests/panel_redesign_m1.test.mjs",
-            "tests/qml/tst_panel_shell.qml",
-            "tests/qml/tst_panel_overview.qml",
-            "tests/qml/tst_panel_settings.qml",
-            "tests/qml/tst_panel_queue.qml",
-        ])
-    );
-    assert_eq!(
-        milestone_entry(&redesign, "M2")["business_tests"],
-        json!([
-            "tests/panel_redesign_m2.test.mjs",
-            "tests/qml/tst_panel_plan.qml",
-            "tests/qml/tst_panel_stage_detail.qml",
-            "tests/qml/tst_panel_overview_attention.qml",
-            "tests/qml/tst_panel_settings_compact.qml",
-        ])
-    );
+
+    // The real docs/features parse, stay valid and register only existing files.
+    // Which files are listed is deliberately not asserted.
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let found = crate::features::discover(repo);
+    assert!(!found.is_empty(), "the repository must have feature specs");
+    for feature in &found {
+        assert_eq!(feature.status(), "valid", "{} must stay valid: {:?}", feature.slug, feature.reasons);
+        for milestone in &feature.milestones {
+            for file in &milestone.business_tests {
+                assert!(repo.join(file).is_file(), "{} {} registers a missing file {file}", feature.slug, milestone.id);
+            }
+        }
+    }
 }
 
 #[test]

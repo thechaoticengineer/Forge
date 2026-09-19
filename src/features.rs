@@ -390,6 +390,7 @@ pub(crate) fn registered_business_tests(project_root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::discover;
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -400,8 +401,26 @@ mod tests {
             .iter()
             .find(|f| f.slug == "feature-specs")
             .expect("this repository's own docs/features/feature-specs should be discovered");
-        assert_eq!(feature_specs.title, "Feature specs (self-specification)");
         assert_eq!(feature_specs.status(), "valid", "reasons: {:?}", feature_specs.reasons);
         assert!(!found.iter().any(|f| f.slug == "_template"));
+    }
+
+    #[test]
+    fn a_feature_takes_its_title_from_the_readme_heading() {
+        let root = std::env::temp_dir().join(format!("forge-feature-title-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let titled = root.join("docs/features/titled");
+        let untitled = root.join("docs/features/untitled");
+        for dir in [&titled, &untitled] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(titled.join("README.md"), "# Known fixture title (with parens)\n\n## Goal\n").unwrap();
+        fs::write(untitled.join("README.md"), "No heading here\n").unwrap();
+
+        let found = discover(&root);
+        let title = |slug: &str| found.iter().find(|f| f.slug == slug).unwrap().title.clone();
+        assert_eq!(title("titled"), "Known fixture title (with parens)");
+        assert_eq!(title("untitled"), "untitled");
+        let _ = fs::remove_dir_all(&root);
     }
 }

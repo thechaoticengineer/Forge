@@ -156,20 +156,18 @@ fn the_global_registry_is_sorted_and_deduplicated_across_features() {
 }
 
 #[test]
-fn both_repository_features_are_valid_and_list_their_registered_files() {
+fn every_repository_feature_is_valid_and_registers_only_existing_files() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let found = features::discover(repo);
-    let files = |slug: &str| -> Vec<String> {
-        let f = found.iter().find(|f| f.slug == slug).unwrap();
-        assert_eq!(f.status(), "valid", "{slug}: {:?}", f.reasons);
-        f.milestones.iter().flat_map(|m| m.business_tests.clone()).collect()
-    };
-    let specs = files("feature-specs");
-    assert!(specs.contains(&"src/feature_spec_tests.rs".to_string()));
-    assert!(specs.contains(&"src/pen_dev_tests.rs".to_string()));
-    let redesign = files("panel-redesign");
-    assert!(redesign.contains(&"tests/panel_redesign_m1.test.mjs".to_string()));
-    assert!(redesign.contains(&"tests/qml/tst_panel_settings_compact.qml".to_string()));
+    assert!(!found.is_empty(), "the repository must have feature specs");
+    for feature in &found {
+        assert_eq!(feature.status(), "valid", "{}: {:?}", feature.slug, feature.reasons);
+        for milestone in &feature.milestones {
+            for file in &milestone.business_tests {
+                assert!(repo.join(file).is_file(), "{} {} registers {file}, which is not a file", feature.slug, milestone.id);
+            }
+        }
+    }
 }
 
 #[test]

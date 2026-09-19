@@ -94,14 +94,27 @@ fn status_lines_inside_fences_are_ignored() {
 }
 
 #[test]
-fn repository_feature_specs_report_their_progress() {
+fn feature_progress_is_implemented_only_when_every_milestone_is() {
+    let test = QueueTest::new(false);
+    let dir = test.path.join("docs/features");
+    write_feature(&dir, "all-done", "## M1: First\n\nStatus: implemented\nCovers: S1\n\n## M2: Second\n\nStatus: implemented\nCovers: S2\n");
+    write_feature(&dir, "unfinished", "## M1: First\n\nStatus: implemented\nCovers: S1\n\n## M2: Second\n\nStatus: planned\nCovers: S2\n");
+
+    let all_done = listed(&test, "all-done");
+    assert_eq!(all_done["status"], "valid", "reasons: {}", all_done["reasons"]);
+    assert_eq!(all_done["progress"], "implemented");
+    let unfinished = listed(&test, "unfinished");
+    assert_eq!(unfinished["status"], "valid", "reasons: {}", unfinished["reasons"]);
+    assert_eq!(unfinished["progress"], "in progress");
+}
+
+#[test]
+fn repository_feature_specs_are_valid_and_report_a_known_progress() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let found = features::discover(repo_root);
-    let progress = |slug: &str| {
-        let feature = found.iter().find(|f| f.slug == slug).expect(slug);
-        assert_eq!(feature.status(), "valid", "{slug}: {:?}", feature.reasons);
-        feature.progress()
-    };
-    assert_eq!(progress("panel-redesign"), "implemented");
-    assert_eq!(progress("feature-specs"), "implemented");
+    assert!(!found.is_empty(), "the repository must have feature specs");
+    for feature in &found {
+        assert_eq!(feature.status(), "valid", "{}: {:?}", feature.slug, feature.reasons);
+        assert!(["planned", "in progress", "implemented"].contains(&feature.progress()), "{}", feature.slug);
+    }
 }
