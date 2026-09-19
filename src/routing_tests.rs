@@ -1743,3 +1743,41 @@ fn legacy_expanded_proposal_inputs_are_reused_until_the_stage_changes() {
         assert!(f.ctx.proposal_inputs_current(&republished, 0));
     }
 }
+
+#[test]
+fn reconciliation_prompt_carries_the_checkpoint_once_and_no_input_fingerprint() {
+    const SUMMARY: &str = "Keep stage interfaces and acceptance constraints.";
+    let f = Fixture::new();
+    let p = f.publish(plan()).unwrap();
+    // Storage keeps the fingerprint that the prompts drop.
+    let stored = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(stored["guidance"]["1"]["relevant_inputs"].is_object());
+    assert!(stored["agreements"]["1"]["relevant_inputs"].is_object());
+    let mut revised = p.clone();
+    revised["stages"][0]["instructions"] = json!("Add a greeting and a farewell");
+    f.set("mock_model_evaluations", json!([[evaluation(false, "standard", "standard")]]));
+    f.set("mock_routing_architect_outputs", json!([{"model_evaluations":[evaluation(true,"standard","standard")]}]));
+    f.ctx.architect_publish(revised, Some(&p), "revision").unwrap();
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let calls = settings["mock_routing_architect_requests"].as_array().unwrap();
+    let reconciliation = calls.last().unwrap()["prompt"].as_str().unwrap();
+    assert!(calls.len() >= 3, "the revision needs a first turn and a reconciliation");
+    assert!(reconciliation.contains("Saved architecture:"), "{reconciliation}");
+    assert_eq!(reconciliation.matches(SUMMARY).count(), 1, "{reconciliation}");
+    for call in calls.iter().chain(settings["mock_routing_planner_requests"].as_array().unwrap()) {
+        assert!(!call["prompt"].as_str().unwrap().contains("relevant_inputs"));
+    }
+}
+
+#[test]
+fn selection_plan_drops_the_input_fingerprint_of_a_pending_replaced_agreement() {
+    let mut p = plan();
+    p["stages"][0]["reassessment"] = json!({"pending":{"kind":"capability","old_agreement":{"id":"a","validated_proposal":{"model":"m"},
+        "relevant_inputs":{"instructions":"copied stage text"}}},"visited":[]});
+    let view = selection_plan(&p);
+    let old = &view["stages"][0]["reassessment"]["pending"]["old_agreement"];
+    assert_eq!(old, &json!({"id":"a","validated_proposal":{"model":"m"}}));
+    assert!(!view.to_string().contains("relevant_inputs"));
+    // The stored plan keeps the complete agreement.
+    assert!(p["stages"][0]["reassessment"]["pending"]["old_agreement"]["relevant_inputs"].is_object());
+}

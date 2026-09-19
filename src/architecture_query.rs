@@ -89,10 +89,7 @@ impl Store {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes).map(|p| p["turn"] != cp["last_turn"]).unwrap_or(true),
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         };
-        let mut guidance = cp["guidance"].clone();
-        for g in guidance.as_object_mut().into_iter().flat_map(|g| g.values_mut()) {
-            if let Some(g) = g.as_object_mut() { g.remove("relevant_inputs"); }
-        }
+        let guidance = crate::prompt_view::guidance(&cp["guidance"]);
         Ok(
             json!({"version": VERSION, "plan_id": plan["plan_id"], "revision": plan["revision"],
             "checkpoint": plan["architecture"]["checkpoint"], "event_end": plan["architecture"]["event_end"],

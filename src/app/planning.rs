@@ -153,7 +153,7 @@ impl Ctx {
                 Err(e) => return Err(format!("could not remove previous answer: {e}")),
             }
             let context = if current_plan.get("architecture").is_some() { self.architecture_store().checkpoint(current_plan)? } else { crate::architecture::checkpoint_default() };
-            let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only Q&A in a fresh conversation. Do not write files or alter plan/decisions. Return ONLY {{\"answer\":\"your answer\"}}. Saved architecture context: {context}");
+            let readonly_prompt = format!("{prompt}\nOUTPUT CONTRACT OVERRIDE: read-only Q&A in a fresh conversation. Do not write files or alter plan/decisions. Return ONLY {{\"answer\":\"your answer\"}}. Saved architecture context: {}", crate::prompt_view::checkpoint(&context));
             let reply = self.readonly_response("chat", &readonly_prompt, Some("answer.json"), |text| {
                 let output: Value = crate::response::parse_json(json_payload(text))
                     .map_err(|e| format!("invalid answer JSON: {e}"))?;

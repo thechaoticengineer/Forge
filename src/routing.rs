@@ -436,9 +436,16 @@ fn context_budget_error(bytes: usize, window: u64, percent: u64, provider: &str,
          a larger context, or shorten the pending plan"))
 }
 
+/// A pending reassessment holds the replaced agreement, whose input fingerprint a prompt never needs.
+fn pending_view(pending: &Value) -> Value {
+    let mut view = pending.clone();
+    if view["old_agreement"].is_object() { view["old_agreement"] = crate::prompt_view::agreement(&pending["old_agreement"]); }
+    view
+}
+
 fn selection_plan(plan: &Value) -> Value {
     json!({"goal":plan["goal"],"plan_id":plan["plan_id"],"revision":plan["revision"],
-        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":s["reassessment"]["pending"],"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
+        "stages":plan["stages"].as_array().into_iter().flatten().map(|s| json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],"acceptance":s["acceptance"],"depends_on":s["depends_on"],"status":s["status"],"model_constraint":s["model_constraint"],"model_proposal":s["model_proposal"],"reassessment":{"pending":pending_view(&s["reassessment"]["pending"]),"visited":s["reassessment"]["visited"]},"previous_requests":s["previous_requests"]})).collect::<Vec<_>>()})
 }
 
 impl Ctx {
@@ -450,12 +457,16 @@ impl Ctx {
         });
         settings
     }
-    fn routing_handoff(&self, plan: &Value) -> Result<String, String> {
-        let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
-            .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
-        if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
-        let cp = crate::architecture::prompt_checkpoint(&cp);
-        Ok(format!("\nArchitecture checkpoint and referenced decisions: {cp}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. During execution reassessment only, higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
+    /// Worktree and escalation guidance for a routing turn. The saved
+    /// checkpoint is included unless the caller's prompt already carries it.
+    fn routing_handoff(&self, plan: &Value, include_checkpoint: bool) -> Result<String, String> {
+        let checkpoint = if include_checkpoint {
+            let mut cp = self.load_plan().filter(|p| p["plan_id"] == plan["plan_id"] && p["architecture"].is_object())
+                .map(|p| self.architecture_store().checkpoint(&p)).transpose()?.unwrap_or(Value::Null);
+            if let Some(obj) = cp.as_object_mut() { obj.remove("agreements"); }
+            format!("\nArchitecture checkpoint and referenced decisions: {}", crate::prompt_view::checkpoint(&cp))
+        } else { String::new() };
+        Ok(format!("{checkpoint}\nWorktree: {}\nUnfinished diff preview: {}\nInspect and preserve staged, unstaged and untracked partial work before advising a replacement. During execution reassessment only, higher effort cannot supply missing capability. For reasoning escalation prefer a supported higher effort on the same adequate model; otherwise propose a stronger suitable tier. Never revisit retired assignments. Operational provider failure requires another provider and a fresh independent other-provider reviewer.\n",
             self.git(&["status","--short"]).unwrap_or_else(|e| e) , self.git(&["diff","HEAD","--",".",":(exclude).forge"] ).unwrap_or_else(|e| crate::util::last_chars(&e,500)).chars().take(16000).collect::<String>()))
     }
     pub(crate) fn has_operational_alternative(&self, plan: &Value, idx: usize) -> Result<bool,String> {
@@ -575,7 +586,7 @@ impl Ctx {
             "{}\nRead-only planner selection turn. Return ONLY {{\"proposals\":[{{\"stage_id\":1,\"proposal\":<model_proposal>}}]}} for exactly these IDs: {ids:?}. Plan: {context_plan}\nArchitect/engine feedback: {feedback}\nWhen engine_reason rejects an otherwise agreed proposal, preserve its agreed risk, complexity and task. For planning correct only the capability tier. Concrete model/provider/effort changes belong exclusively to execution reassessment. Do not reclassify work to evade the capability policy.",
             self.stage_selection_prompt(plan, ids)?
         );
-        let prompt = prompt + &self.routing_handoff(plan)?;
+        let prompt = prompt + &self.routing_handoff(plan, true)?;
         let reply = self.validated_routing_response("planner", &prompt, plan, ids)?;
         for usage in &reply.usage {
             accumulate_invocation_usage(plan, "usage", &reply.choice.0, usage);
@@ -791,10 +802,11 @@ impl Ctx {
                     "{}\n{}\nPlan: {context_plan}\nSaved architecture: {}\nEvaluate exactly stage IDs {affected:?}. Previous disagreement: {}",
                     self.stage_selection_prompt(plan, &affected)?,
                     EVALUATION_CONTRACT,
-                    crate::architecture::prompt_checkpoint(cp),
+                    crate::prompt_view::checkpoint(cp),
                     json!(disagreements)
                 );
-                let prompt = prompt + &self.routing_handoff(plan)?;
+                // The prompt above already carries the saved checkpoint.
+                let prompt = prompt + &self.routing_handoff(plan, false)?;
                 let reply = self.validated_routing_response("architect", &prompt, plan, &affected)?;
                 for usage in &reply.usage {
                     accumulate_invocation_usage(plan,"usage",&reply.choice.0,usage);

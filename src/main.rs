@@ -20,6 +20,7 @@ mod agent;
 mod agent_log;
 mod durable_json;
 mod architecture;
+mod prompt_view;
 mod architect;
 mod review_history;
 mod reports;

@@ -556,6 +556,15 @@ changes invalidate affected work and its transitive dependants. An unrelated edi
 dependencies retains an unchanged stage's agreements. Editing a draft still
 requires human approval again.
 
+Guidance and agreement records store a `relevant_inputs` fingerprint, a copy of
+the stage text that grows with every transitive dependency. Storage and every
+validity comparison keep it, but no provider prompt contains it: one shared
+prompt view (`src/prompt_view.rs`) removes it from the architect, planner chat,
+routing, stage review, plan review and plan-fix prompts. Planner chat receives
+that compact view of the saved checkpoint instead of the raw record, and the
+routing reconciliation prompt carries the checkpoint once. The view is a clone,
+so stored checkpoints and events are unchanged.
+
 Per-plan artefacts live under `.forge/architecture/<plan-id>/`:
 
 - `events.jsonl`: serialized append-only committed events for decisions,
@@ -730,8 +739,10 @@ on the Plan tab, then click **Ask** or press `Enter`. The selected planner tool
 answers without modifying the plan. Its prompt receives only the plan's
 content — goal, stages, instructions, acceptance criteria, commit messages,
 status and explicit dependencies — not model selection, agreement,
-proposal-input, reassessment or invocation records. Expand **Plan Q&A** to
-read the conversation. Asking requires an existing plan, with Forge idle, the
+proposal-input, reassessment or invocation records. It also carries the saved
+architecture context as the compact prompt view (see
+[Plan identity and architectural records](#plan-identity-and-architectural-records)),
+never the raw checkpoint. Expand **Plan Q&A** to read the conversation. Asking requires an existing plan, with Forge idle, the
 queue inactive, and plan editing closed.
 
 This is separate from the **Discuss before planning** chat, which does not

@@ -1630,3 +1630,62 @@ fn configured_reviewer_runs_fresh_codex_reviews_after_codex_for_both_cadences() 
         assert!(reviewers.iter().all(|r| r["provider"] == "codex" && r["session"].is_null()));
     }
 }
+
+/// Every provider prompt of a run, from each mock recorder.
+fn all_prompts(f: &Fixture) -> Vec<(String, String)> {
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let mut prompts = vec![];
+    for (key, role_key, prompt_key) in [("test_review_sessions", "role", "prompt"), ("mock_agent_requests", "role", "prompt"),
+        ("mock_architect_requests", "plan_id", "prompt")] {
+        for r in settings[key].as_array().into_iter().flatten() {
+            prompts.push((format!("{key}:{}", r[role_key]), r[prompt_key].as_str().unwrap_or("").to_owned()));
+        }
+    }
+    for p in settings["mock_fixer_prompts"].as_array().into_iter().flatten() {
+        prompts.push(("mock_fixer_prompts".into(), p.as_str().unwrap_or("").to_owned()));
+    }
+    prompts
+}
+
+#[test]
+fn stage_review_prompts_omit_input_fingerprints_but_keep_guidance() {
+    let f = Fixture::new("Implement feature", 0);
+    f.setting("mock_verdicts", json!([clean()]));
+    let p = f.run();
+    assert_eq!(p["stages"][0]["status"], "committed", "{p}");
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(cp["guidance"]["1"]["relevant_inputs"].is_object(), "storage keeps the fingerprint");
+    let guidance_text = cp["guidance"]["1"]["text"].as_str().unwrap();
+    let sessions = f.ctx.app.settings.lock().unwrap()["test_review_sessions"].clone();
+    for role in ["reviewer", "architect"] {
+        let prompt = sessions.as_array().unwrap().iter().find(|s| s["role"] == role).unwrap_or_else(|| panic!("no {role} session"))["prompt"].as_str().unwrap();
+        assert!(prompt.contains("Guidance: "), "{role}");
+        assert!(prompt.contains(guidance_text), "{role}: guidance text survives");
+    }
+    let prompts = all_prompts(&f);
+    assert!(prompts.len() >= 3);
+    for (source, prompt) in prompts { assert!(!prompt.contains("relevant_inputs"), "{source}: {prompt}"); }
+}
+
+#[test]
+fn plan_review_and_plan_fix_prompts_omit_input_fingerprints_but_keep_guidance() {
+    let f = Fixture::new("Implement feature", 1);
+    f.two_deferred_stages();
+    f.setting("mock_edits", json!([{"first.rs":"first"},{"second.rs":"second"},{"first.rs":"fixed"}]));
+    f.setting("mock_verdicts", json!([reject("Fix feature behavior"),clean()]));
+    f.setting("mock_architect_verdicts", json!([reject("Fix integration"),clean()]));
+    let p = f.run();
+    assert_eq!(p["status"], "done", "{p}");
+    let cp = f.ctx.architecture_store().checkpoint(&p).unwrap();
+    assert!(cp["guidance"]["1"]["relevant_inputs"].is_object(), "storage keeps the fingerprint");
+    let guidance_text = cp["guidance"]["1"]["text"].as_str().unwrap();
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let fixer = settings["mock_fixer_prompts"][0].as_str().unwrap();
+    assert!(fixer.contains(guidance_text), "PLAN_FIX keeps the guidance text");
+    let plan_reviews: Vec<&Value> = settings["test_review_sessions"].as_array().unwrap().iter().collect();
+    assert!(plan_reviews.len() >= 4);
+    drop(settings);
+    let prompts = all_prompts(&f);
+    assert!(prompts.iter().any(|(source, _)| source == "mock_fixer_prompts"));
+    for (source, prompt) in prompts { assert!(!prompt.contains("relevant_inputs"), "{source}: {prompt}"); }
+}

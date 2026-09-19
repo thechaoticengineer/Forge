@@ -32,19 +32,9 @@ const CHECKPOINT_LIMIT: usize = storage::EXPANDED_LIMIT;
 const EVENT_LIMIT: usize = 512 * 1024;
 const HISTORY_PAGE_BYTES: usize = 256 * 1024;
 
-/// Guidance and agreement records carry a `relevant_inputs` fingerprint that
-/// copies the stage text a prompt already contains, and it grows with every
-/// dependency. Strip it before a checkpoint enters a provider turn; storage
-/// and every validity comparison keep the complete value.
+/// Provider-prompt view of a checkpoint; see [`crate::prompt_view::checkpoint`].
 pub(crate) fn prompt_checkpoint(checkpoint: &Value) -> Value {
-    let mut checkpoint = checkpoint.clone();
-    for group in ["guidance", "agreements"] {
-        let Some(records) = checkpoint.get_mut(group).and_then(Value::as_object_mut) else { continue };
-        for record in records.values_mut() {
-            if let Some(record) = record.as_object_mut() { record.remove("relevant_inputs"); }
-        }
-    }
-    checkpoint
+    crate::prompt_view::checkpoint(checkpoint)
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {

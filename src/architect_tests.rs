@@ -327,6 +327,23 @@ fn qa_is_read_only_and_does_not_touch_authoritative_session_or_decisions() {
 }
 
 #[test]
+fn chat_receives_the_prompt_view_of_the_checkpoint() {
+    let f = Fixture::new();
+    let p = f.initial();
+    let cp = f.cp(&p);
+    assert!(cp["guidance"]["1"]["relevant_inputs"].is_object(), "storage keeps the fingerprint");
+    f.ctx.chat_worker(&p, "Why this interface?");
+    let chat: Vec<Value> = f.ctx.app.settings.lock().unwrap()["mock_agent_requests"].as_array().unwrap()
+        .iter().filter(|r| r["role"] == "chat").cloned().collect();
+    assert_eq!(chat.len(), 1);
+    let prompt = chat[0]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("Saved architecture context: "), "{prompt}");
+    assert!(!prompt.contains("relevant_inputs"), "{prompt}");
+    assert!(prompt.contains(cp["guidance"]["1"]["text"].as_str().unwrap()), "guidance text survives");
+    assert!(prompt.contains(cp["guidance"]["1"]["id"].as_str().unwrap()), "guidance identity survives");
+}
+
+#[test]
 fn a_rejected_turn_is_corrected_in_the_same_session_before_being_abandoned() {
     let f = Fixture::new();
     let published = f.initial();

@@ -269,7 +269,7 @@ impl Ctx {
                     ("{base}",r["base"].as_str().unwrap_or("")),
                     ("{head}",r["head"].as_str().unwrap_or("")),
                     ("{requests}",&r["outstanding_requests"].to_string()),
-                    ("{guidance}",&cp["guidance"].to_string()),
+                    ("{guidance}",&crate::prompt_view::guidance(&cp["guidance"]).to_string()),
                     ("{constraints}",&cp["constraints"].to_string()),
                     ("{interfaces}",&cp["completed_interfaces"].to_string()),
                     ("{plan_id}",plan["plan_id"].as_str().unwrap_or("")),

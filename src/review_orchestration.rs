@@ -106,7 +106,7 @@ impl Ctx {
                 }
                 (self.stage_prompt(REVIEW_PROMPT, plan, &context_stage)?,
                     self.stage_review_acceptance(plan, idx)?,
-                    cp["guidance"][context_stage["id"].to_string()].clone(), context_stage["id"].as_i64())
+                    crate::prompt_view::guidance(&cp["guidance"][context_stage["id"].to_string()]), context_stage["id"].as_i64())
             }
             ReviewScope::Plan => {
                 self.validate_plan_subject(plan)?;
@@ -114,7 +114,7 @@ impl Ctx {
                     return Err("plan review attempt changed".into());
                 }
                 if role == "reviewer" { self.validate_plan_reviewer(plan, provider)?; }
-                (self.plan_review_prompt(plan), plan["plan_review"]["acceptance"].as_str().unwrap_or("").to_string(), cp["guidance"].clone(), None)
+                (self.plan_review_prompt(plan), plan["plan_review"]["acceptance"].as_str().unwrap_or("").to_string(), crate::prompt_view::guidance(&cp["guidance"]), None)
             }
         };
         // Reviewer and architect prompts share this path: point both at any
