@@ -139,8 +139,9 @@ fn collect(
 
 // ---------------------------------------------------------------- persistence
 
-/// `plans` holds the milestone plan links added by M3; files written before it
-/// have none, and `load` defaults it.
+/// `plans` holds the milestone plan links added by M3 and `scenario_results`
+/// the per-scenario review history added by M5; files written before them
+/// have none, and `load` defaults both.
 pub(crate) fn default_state(slug: &str) -> Value {
     json!({
         "version": 1,
@@ -150,6 +151,7 @@ pub(crate) fn default_state(slug: &str) -> Value {
         "chat": [],
         "architect_session": Value::Null,
         "plans": [],
+        "scenario_results": [],
     })
 }
 
@@ -158,8 +160,9 @@ pub(crate) fn state_path(ctx: &Ctx, slug: &str) -> PathBuf {
 }
 
 /// The persisted state, or the default for a feature that has none yet.
-/// A file written before M3 has no `plans`; it loads with `plans: []`, and
-/// the file itself is never rewritten by a read.
+/// A file written before M3 has no `plans` and one written before M5 has no
+/// `scenario_results`; each loads as an empty list, and the file itself is
+/// never rewritten by a read.
 /// An unreadable or structurally wrong file is an error: state is never
 /// silently reset, because that would drop approval history.
 pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
@@ -197,15 +200,17 @@ pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
             ));
         }
     }
-    match state.get("plans") {
-        None => state["plans"] = json!([]),
-        Some(plans) if !plans.is_array() => {
-            return Err(format!(
-                "invalid feature state {}: plans must be an array",
-                path.display()
-            ));
-        },
-        Some(_) => {},
+    for key in ["plans", "scenario_results"] {
+        match state.get(key) {
+            None => state[key] = json!([]),
+            Some(value) if !value.is_array() => {
+                return Err(format!(
+                    "invalid feature state {}: {key} must be an array",
+                    path.display()
+                ));
+            },
+            Some(_) => {},
+        }
     }
     Ok(state)
 }
@@ -511,6 +516,33 @@ pub(crate) fn complete_plan_link(
         link["commit_range"] = json!({"base": base, "head": head});
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------- scenario results
+
+/// Appends per-scenario review results (M5 S38). Earlier entries are never
+/// changed or removed: the history is append-only and the displayed result of
+/// a scenario is derived from its latest entry (D18).
+pub(crate) fn append_scenario_results(ctx: &Ctx, slug: &str, entries: Vec<Value>) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    update(ctx, slug, |state| {
+        if !state["scenario_results"].is_array() {
+            state["scenario_results"] = json!([]);
+        }
+        state["scenario_results"].as_array_mut().unwrap().extend(entries);
+        Ok(())
+    })
+}
+
+/// The latest recorded result of scenario `id`, or null when none exists.
+pub(crate) fn latest_scenario_result(state: &Value, id: &str) -> Value {
+    state["scenario_results"]
+        .as_array()
+        .and_then(|results| results.iter().rfind(|entry| entry["scenario_id"] == json!(id)))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 // ---------------------------------------------------------------- creation

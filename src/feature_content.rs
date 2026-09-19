@@ -157,6 +157,63 @@ fn parse_scenarios(content: &str) -> Vec<Scenario> {
     scenarios
 }
 
+/// The section of scenario `id` in `scenarios.md`: its `## <id>` heading
+/// through the line before the next `## ` heading, with headings inside fenced
+/// code ignored (fenced lines within the section are part of it) and trailing
+/// whitespace trimmed. The first section wins, as in [`parse_scenarios`].
+/// None when the scenario has no section.
+pub(crate) fn scenario_section(content: &str, id: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut section: Option<Vec<&str>> = None;
+    for line in content.lines() {
+        let fence = line.starts_with("```") || line.starts_with("~~~");
+        if !in_fence && !fence && let Some(rest) = line.strip_prefix("## ") {
+            if section.is_some() {
+                break;
+            }
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if token.strip_suffix(':').unwrap_or(token) == id {
+                section = Some(Vec::new());
+            }
+        }
+        if fence {
+            in_fence = !in_fence;
+        }
+        if let Some(lines) = section.as_mut() {
+            lines.push(line);
+        }
+    }
+    section.map(|lines| lines.join("\n").trim_end().to_string())
+}
+
+/// Digest of scenario `id`'s section (see [`scenario_section`]), or None when
+/// the scenario has no section. Recording a result and judging whether it is
+/// out of date both use this, so they can never disagree (D18).
+pub(crate) fn scenario_hash(content: &str, id: &str) -> Result<Option<String>, String> {
+    scenario_section(content, id).map(|section| crate::util::digest(section.as_bytes())).transpose()
+}
+
+/// The text of `scenarios.md` in the feature folder `dir`, read under the same
+/// no-symlink, containment and size rules as the content endpoint.
+pub(crate) fn read_scenarios(dir: &Path) -> Result<String, String> {
+    Root::open(dir)?.read_text(Path::new("scenarios.md"))
+}
+
+/// A scenario's latest recorded result as served (S39): null when none was
+/// recorded, else the entry's fields plus `out_of_date`, true when the
+/// scenario's current section hashes differently from the recorded hash.
+fn result_view(state: &Value, id: &str, current_hash: Option<&str>) -> Value {
+    let latest = crate::feature_state::latest_scenario_result(state, id);
+    if latest.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "status": latest["status"], "evidence": latest["evidence"], "role": latest["role"],
+        "plan_id": latest["plan_id"], "milestone": latest["milestone"], "unix": latest["unix"],
+        "out_of_date": current_hash.is_none() || latest["scenario_hash"].as_str() != current_hash,
+    })
+}
+
 fn design_kind(name: &str) -> &'static str {
     match Path::new(name).extension().and_then(|e| e.to_str()) {
         Some("pen") => "pen",
@@ -266,7 +323,9 @@ fn display(rel: &Path) -> String {
 
 /// The full read-only content of a discovered `feature`, or an error when the
 /// feature folder itself cannot be served (for example because it is a link).
-pub(crate) fn read(feature: &Feature) -> Result<Value, String> {
+/// `state` is the feature's runtime state, which supplies each scenario's
+/// latest recorded result.
+pub(crate) fn read(feature: &Feature, state: &Value) -> Result<Value, String> {
     let root = Root::open(&feature.path)?;
 
     let mut files = Map::new();
@@ -288,8 +347,12 @@ pub(crate) fn read(feature: &Feature) -> Result<Value, String> {
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
+            // A hash that cannot be computed never matches, so the result
+            // shows as possibly out of date rather than failing the response.
+            let current_hash = scenarios_text.as_deref().and_then(|text| scenario_hash(text, &s.id).ok().flatten());
+            let result = result_view(state, &s.id, current_hash.as_deref());
             json!({"id": s.id, "title": s.title, "given": s.given, "when": s.when, "then": s.then,
-                "milestone": milestone_of(&s.id)})
+                "milestone": milestone_of(&s.id), "result": result})
         })
         .collect();
 
@@ -319,7 +382,7 @@ pub(crate) fn read(feature: &Feature) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_FILE_BYTES, Root, parse_scenarios};
+    use super::{MAX_FILE_BYTES, Root, parse_scenarios, scenario_hash, scenario_section};
     use std::fs;
     use std::path::Path;
 
@@ -351,6 +414,20 @@ mod tests {
         assert!(root.read_text(Path::new("big.md")).unwrap_err().contains("too large"));
         assert_eq!(root.read_text(Path::new("ok.md")).unwrap(), "inside");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scenario_section_runs_to_the_next_heading_outside_fences() {
+        let text = "# Scenarios\n\n## S1: One\n\n- Given: a\n```\n## S9: Fenced\n```\n\n## S2: Two\n- Then: b\n\n## Notes\nx\n";
+        assert_eq!(scenario_section(text, "S1").unwrap(), "## S1: One\n\n- Given: a\n```\n## S9: Fenced\n```");
+        assert_eq!(scenario_section(text, "S2").unwrap(), "## S2: Two\n- Then: b");
+        assert_eq!(scenario_section(text, "S9"), None, "a fenced heading is no section");
+        assert_eq!(scenario_section(text, "S3"), None);
+
+        let edited = text.replace("- Then: b", "- Then: c");
+        assert_eq!(scenario_hash(text, "S1").unwrap(), scenario_hash(&edited, "S1").unwrap());
+        assert_ne!(scenario_hash(text, "S2").unwrap(), scenario_hash(&edited, "S2").unwrap());
+        assert_eq!(scenario_hash(text, "S3").unwrap(), None);
     }
 
     #[test]

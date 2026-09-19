@@ -60,8 +60,17 @@ pub(super) fn api_feature_content(ctx: &Ctx, query: &str) -> ApiResponse {
     else {
         return (404, json!({"error": format!("unknown feature: {slug}")}));
     };
-    match crate::feature_content::read(&feature) {
-        Ok(content) => (200, content),
+    // Read-only: a missing state file loads as the default and is not created.
+    // An unreadable state only costs the recorded results, never the content.
+    let (state, results_error) = match feature_state::load(ctx, &slug) {
+        Ok(state) => (state, Value::Null),
+        Err(error) => (feature_state::default_state(&slug), json!(error)),
+    };
+    match crate::feature_content::read(&feature, &state) {
+        Ok(mut content) => {
+            content["results_error"] = results_error;
+            (200, content)
+        },
         Err(error) => (403, json!({"error": error})),
     }
 }

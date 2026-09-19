@@ -355,6 +355,8 @@ impl Ctx {
         } else {
             self.save_plan(plan)?;
         }
+        // Only now is the verdict durable, so its scenario results may be recorded.
+        self.record_scenario_results(plan, &acceptance, &verdict);
         for usage in response_usage {
             match scope {
                 ReviewScope::Stage(idx) => self.record_stage_usage(plan, idx, role, provider, Some(usage))?,
@@ -362,6 +364,62 @@ impl Ctx {
             }
         }
         Ok(verdict)
+    }
+
+    /// Appends one scenario result per verdict criterion that is a scenario
+    /// criterion of the reviewed acceptance (S38): a plan review's, or a final
+    /// stage review's when `stage_review_acceptance` added them. Only the
+    /// independent reviewer's verdicts are test results (S38, D18); the
+    /// architect's verdict follows it and would otherwise shadow the latest
+    /// result. Runtime metadata only; a failed write is logged and never
+    /// changes the verdict, and a plan without a feature records nothing and
+    /// touches no state.
+    fn record_scenario_results(&self, plan: &Value, acceptance: &str, verdict: &Value) {
+        let feature = &plan["feature"];
+        if !feature.is_object() || verdict["role"] != "reviewer" {
+            return;
+        }
+        let required = acceptance_criteria_items(acceptance);
+        let pairs: Vec<(String, String)> = crate::feature_context::scenario_criterion_pairs(feature)
+            .into_iter()
+            .filter(|(_, criterion)| required.contains(&criterion.as_str()))
+            .collect();
+        let matched: Vec<(&str, &Value)> = verdict["criteria"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let text = item["criterion"].as_str()?;
+                pairs.iter().find(|(_, criterion)| criterion == text).map(|(id, _)| (id.as_str(), item))
+            })
+            .collect();
+        if matched.is_empty() {
+            return;
+        }
+        let slug = feature["slug"].as_str().unwrap_or("");
+        let scenarios = crate::feature_state::validate_slug(slug)
+            .and_then(|()| crate::feature_content::read_scenarios(&crate::feature_state::feature_dir(self, slug)));
+        let entries: Vec<Value> = matched
+            .into_iter()
+            .map(|(id, item)| {
+                let hash = scenarios.as_deref().ok().and_then(|text| crate::feature_content::scenario_hash(text, id).ok().flatten());
+                json!({
+                    "scenario_id": id,
+                    "status": if item["status"] == "passed" { "passed" } else { "failed" },
+                    "evidence": item["evidence"],
+                    "role": verdict["role"],
+                    "plan_id": verdict["plan_id"],
+                    "milestone": feature["milestone"],
+                    "unix": verdict["unix"],
+                    "scenario_hash": hash,
+                })
+            })
+            .collect();
+        let count = entries.len();
+        match crate::feature_state::append_scenario_results(self, slug, entries) {
+            Ok(()) => self.log_event("features", &format!("feature {slug} recorded {count} scenario results")),
+            Err(error) => self.log_event("error", &format!("could not record scenario results of feature {slug}: {error}")),
+        }
     }
 
     /// The acceptance a stage review evidences. For the final stage of a
@@ -474,7 +532,9 @@ impl Ctx {
         if v["requires_dual"].is_null() {
             v["requires_dual"] = json!(false);
         }
-        if v["criteria"].is_null() {
+        // Only an approval needs per-criterion evidence; a rejection that names
+        // no criteria must not gain invented "passed" results (S38).
+        if v["criteria"].is_null() && v["approved"] != false {
             v["criteria"] = json!(acceptance_criteria_items(stage["acceptance"].as_str().unwrap_or("")).iter().map(|s| json!({"criterion":s,"status":"passed","evidence":"Mock individual criterion verified"})).collect::<Vec<_>>());
         }
         if v["notes"].is_null() {

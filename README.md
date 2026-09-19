@@ -934,10 +934,15 @@ Serves one discovered feature's content read-only, whether the feature is valid 
   `{"text": string|null, "error": string|null}`. A file that is missing, not a regular file, a
   symbolic link, unreadable, not UTF-8 or larger than 2 MiB has `text: null` and a reason in `error`;
   the request itself does not fail.
-- `scenarios`: `[{"id", "title", "given", "when", "then", "milestone"}]` from the `## S<n>: <title>`
-  sections of `scenarios.md` (headings inside fenced code are ignored, the first section of a repeated
-  ID wins), each with its `- Given:`, `- When:` and `- Then:` text (or `null`) and the ID of the
-  milestone whose `Covers:` names it (or `null`).
+- `scenarios`: `[{"id", "title", "given", "when", "then", "milestone", "result"}]` from the
+  `## S<n>: <title>` sections of `scenarios.md` (headings inside fenced code are ignored, the first
+  section of a repeated ID wins), each with its `- Given:`, `- When:` and `- Then:` text (or `null`)
+  and the ID of the milestone whose `Covers:` names it (or `null`). `result` is `null` when no review
+  recorded the scenario, else its latest `scenario_results` entry (see
+  [Feature runtime state](#feature-runtime-state)) as `{"status", "evidence", "role", "plan_id",
+  "milestone", "unix", "out_of_date"}`; `out_of_date` is true when the scenario's section now hashes
+  differently from the recorded `scenario_hash`.
+- `results_error`: `null`, or why the runtime state could not be read; the results are then `null`.
 - `milestones`: `[{"id", "title", "status", "covers", "business_tests"}]` as discovery reads them.
 - `design`: the files under `design/`, walked recursively in name order, each `{"path", "kind",
   "error"}` with `path` relative to the feature folder (e.g. `design/main.pen`) and `kind` one of
@@ -949,7 +954,8 @@ Serves one discovered feature's content read-only, whether the feature is valid 
 
 No symbolic link under `docs/features/<slug>/` is ever followed, the folder itself included; `..` or
 absolute components are refused, and nothing outside the folder is opened. The endpoint never creates,
-modifies or removes a file. HTTP 400 for a missing or invalid slug; 404 when discovery does not list
+modifies or removes a file (the runtime state is only read; a missing state file is not created).
+HTTP 400 for a missing or invalid slug; 404 when discovery does not list
 the slug; 403 when the feature folder itself cannot be served (for example because it is a symbolic
 link).
 
@@ -1085,13 +1091,25 @@ business tests and no milestone feature context, these prompts are unchanged.
 
 #### Feature runtime state
 
-Reviews, approvals, the co-authoring chat transcript and milestone plan links are runtime state, stored at
-`.forge/features/<slug>.json` inside the project, never under `docs/features/`. A missing file means the
-defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[], "architect_session":null,
-"plans":[]}`. A file written before milestone M3 has no `plans` key: it is read with `plans` defaulted
-to `[]` and is not rewritten by the read; if `plans` is present it must be an array. Reviews and
-approvals are append-only: a later review or approval never removes an earlier one, so the full history
+Reviews, approvals, the co-authoring chat transcript, milestone plan links and scenario results are
+runtime state, stored at `.forge/features/<slug>.json` inside the project, never under `docs/features/`.
+A missing file means the defaults `{"version":1, "slug", "reviews":[], "approvals":[], "chat":[],
+"architect_session":null, "plans":[], "scenario_results":[]}`. A file written before milestone M3 has no
+`plans` key and one written before M5 has no `scenario_results` key: each is read defaulted to `[]` and
+the file is not rewritten by the read; if present, each must be an array. Reviews, approvals and
+scenario results are append-only: a later entry never removes an earlier one, so the full history
 survives every later change.
+
+`scenario_results` holds the per-scenario test results of milestone plan reviews, in order:
+`{"scenario_id", "status", "evidence", "role", "plan_id", "milestone", "unix", "scenario_hash"}`. After
+the reviewer's verdict on a milestone plan is persisted — the plan review's, or the final stage review's
+when every role reviews per stage and that stage carries the scenario criteria — the engine appends one
+entry per verdict criterion `an executable test traceable to <ID> exists and passes`: `status` is
+`"passed"` or `"failed"`, `evidence` is the reviewer's evidence, and `scenario_hash` is the digest of
+that scenario's section of `scenarios.md` (its `## <ID>` heading through the line before the next `## `
+heading outside fenced code) at recording time, or `null` if it could not be read. A scenario's shown
+result is its latest entry. Plans not started from a feature record nothing. Recording is best effort: a
+failed write is logged and never changes the review outcome.
 
 `plans` holds one link per `POST /api/features/plan` that started, in order: `{"milestone", "title",
 "goal", "scenario_ids", "started_unix", "status", "plan_id", "error"?, "completed_unix", "commit_range"}`.

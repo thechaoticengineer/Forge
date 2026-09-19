@@ -63,9 +63,16 @@ pub(crate) fn missing_first_stage_ids(plan_feature: &Value, first_stage: &Value)
 /// Plan-review criteria for a milestone plan: one item per covered scenario ID
 /// (S31). Empty for a plan without a `feature` object.
 pub(crate) fn scenario_criteria(plan_feature: &Value) -> Vec<String> {
+    scenario_criterion_pairs(plan_feature).into_iter().map(|(_, criterion)| criterion).collect()
+}
+
+/// `(scenario ID, criterion)` for every covered scenario, so a verdict's
+/// criterion text maps back to the scenario it evidences (S38). Empty for a
+/// plan without a `feature` object.
+pub(crate) fn scenario_criterion_pairs(plan_feature: &Value) -> Vec<(String, String)> {
     if !plan_feature.is_object() { return Vec::new(); }
     scenario_ids(plan_feature).into_iter()
-        .map(|id| format!("an executable test traceable to {id} exists and passes")).collect()
+        .map(|id| (id.to_owned(), format!("an executable test traceable to {id} exists and passes"))).collect()
 }
 
 /// `acceptance` followed by the scenario criteria of `plan_feature`, one per

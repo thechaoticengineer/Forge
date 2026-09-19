@@ -4,8 +4,8 @@
 //! business tests in src/feature_spec_m2_tests.rs.
 
 use crate::feature_state::{
-    Snapshot, append_plan_link, approved_scenario_ids, complete_plan_link, content_hash, create, default_state,
-    latest_plan_link, load, plan_link_view, set_plan_link_status, snapshot, spec_status,
+    Snapshot, append_plan_link, append_scenario_results, approved_scenario_ids, complete_plan_link, content_hash, create, default_state,
+    latest_plan_link, latest_scenario_result, load, plan_link_view, set_plan_link_status, snapshot, spec_status,
     state_path, update, validate_slug, validate_title,
 };
 use crate::test_support::{QueueTest, api_request};
@@ -385,6 +385,38 @@ fn an_old_state_file_without_plans_loads_with_an_empty_list_and_is_not_rewritten
     fs::write(state_path(ctx, "demo"), broken.to_string()).unwrap();
     let error = load(ctx, "demo").unwrap_err();
     assert!(error.contains("plans must be an array"), "error was {error}");
+}
+
+#[test]
+fn an_old_state_file_without_scenario_results_loads_unchanged_and_appends_keep_history() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    fs::create_dir_all(test.path.join(".forge/features")).unwrap();
+    let old = json!({"version": 1, "slug": "demo", "reviews": [], "approvals": [approval("spec", "h")],
+        "chat": [], "architect_session": Value::Null, "plans": []});
+    let bytes = serde_json::to_vec_pretty(&old).unwrap();
+    fs::write(state_path(ctx, "demo"), &bytes).unwrap();
+
+    let state = load(ctx, "demo").unwrap();
+    assert_eq!(state["scenario_results"], json!([]), "a missing scenario_results field defaults to an empty list");
+    assert_eq!(fs::read(state_path(ctx, "demo")).unwrap(), bytes, "a read must not rewrite the file");
+    assert_eq!(latest_scenario_result(&state, "S1"), Value::Null);
+
+    let entry = |id: &str, status: &str| json!({"scenario_id": id, "status": status, "evidence": status});
+    append_scenario_results(ctx, "demo", vec![entry("S1", "failed"), entry("S2", "passed")]).unwrap();
+    append_scenario_results(ctx, "demo", vec![entry("S1", "passed")]).unwrap();
+    let state = load(ctx, "demo").unwrap();
+    assert_eq!(state["scenario_results"].as_array().unwrap().len(), 3, "earlier entries are kept");
+    assert_eq!(state["approvals"], old["approvals"], "the rest of the state is kept");
+    assert_eq!(latest_scenario_result(&state, "S1"), entry("S1", "passed"));
+    assert_eq!(latest_scenario_result(&state, "S2"), entry("S2", "passed"));
+
+    // A present scenario_results field must be a list; anything else is an error.
+    let mut broken = old.clone();
+    broken["scenario_results"] = json!("nope");
+    fs::write(state_path(ctx, "demo"), broken.to_string()).unwrap();
+    let error = load(ctx, "demo").unwrap_err();
+    assert!(error.contains("scenario_results must be an array"), "error was {error}");
 }
 
 #[test]
