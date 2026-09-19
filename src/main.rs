@@ -15,6 +15,7 @@ mod metadata;
 mod features;
 mod feature_state;
 mod feature_context;
+mod feature_content;
 mod agent;
 mod agent_log;
 mod durable_json;

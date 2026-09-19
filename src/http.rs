@@ -51,6 +51,7 @@ impl<'a> ApiRequest<'a> {
             "/api/state"
                 | "/api/features"
                 | "/api/features/state"
+                | "/api/features/content"
                 | "/api/features/create"
                 | "/api/features/chat"
                 | "/api/features/review"
@@ -194,6 +195,9 @@ fn dispatch(
         (tiny_http::Method::Get, "/api/state") => api_state(app, ctx, active_project),
         (tiny_http::Method::Get, "/api/features") => api_features(ctx),
         (tiny_http::Method::Get, "/api/features/state") => api_feature_state(ctx, request.query),
+        (tiny_http::Method::Get, "/api/features/content") => {
+            api_feature_content(ctx, request.query)
+        }
         (tiny_http::Method::Post, "/api/features/create") => {
             api_feature_create(ctx, &request.body)
         }

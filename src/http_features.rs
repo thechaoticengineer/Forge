@@ -43,6 +43,29 @@ pub(super) fn api_feature_state(ctx: &Ctx, query: &str) -> ApiResponse {
     }
 }
 
+/// `GET /api/features/content` (M5 S37): transport only; the read-only
+/// content policy lives in `crate::feature_content`.
+pub(super) fn api_feature_content(ctx: &Ctx, query: &str) -> ApiResponse {
+    let slug = match query_value(query, "slug") {
+        Ok(Some(slug)) => slug,
+        Ok(None) => return (400, json!({"error": "slug required"})),
+        Err(error) => return (400, json!({"error": error})),
+    };
+    if let Err(error) = feature_state::validate_slug(&slug) {
+        return (400, json!({"error": error}));
+    }
+    let Some(feature) = crate::features::discover(Path::new(ctx.project()))
+        .into_iter()
+        .find(|feature| feature.slug == slug)
+    else {
+        return (404, json!({"error": format!("unknown feature: {slug}")}));
+    };
+    match crate::feature_content::read(&feature) {
+        Ok(content) => (200, content),
+        Err(error) => (403, json!({"error": error})),
+    }
+}
+
 pub(super) fn api_feature_create(ctx: &Ctx, body: &Value) -> ApiResponse {
     let _queue_guard = ctx.session.queue_lock.lock().unwrap();
     let slug = body["slug"].as_str().unwrap_or("").to_string();

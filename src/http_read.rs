@@ -211,7 +211,7 @@ pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
             entry["milestones"] = f.milestones.iter().map(|m| json!({
                 "id": m.id,
                 "title": m.title,
-                "status": if m.implemented { "implemented" } else { "planned" },
+                "status": m.status(),
                 "covers": m.covers,
                 "business_tests": m.business_tests,
                 // M3: the milestone's latest plan link, or null.

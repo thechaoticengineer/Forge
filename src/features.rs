@@ -30,6 +30,12 @@ pub(crate) struct Milestone {
     pub(crate) business_tests: Vec<String>,
 }
 
+impl Milestone {
+    pub(crate) fn status(&self) -> &'static str {
+        if self.implemented { "implemented" } else { "planned" }
+    }
+}
+
 impl Feature {
     pub(crate) fn status(&self) -> &'static str {
         if self.reasons.is_empty() { "valid" } else { "invalid" }
@@ -53,7 +59,7 @@ const REQUIRED_FILES: [&str; 4] = ["README.md", "scenarios.md", "decisions.md", 
 
 /// Lines of `text` outside ``` / ~~~ fenced code blocks; fence delimiter
 /// lines themselves are dropped since they are never headings or `Covers:`.
-fn lines_outside_fences(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn lines_outside_fences(text: &str) -> impl Iterator<Item = &str> {
     let mut in_fence = false;
     text.lines().filter(move |line| {
         if line.starts_with("```") || line.starts_with("~~~") {
@@ -64,7 +70,7 @@ fn lines_outside_fences(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-fn is_valid_scenario_id(id: &str) -> bool {
+pub(crate) fn is_valid_scenario_id(id: &str) -> bool {
     match id.strip_prefix('S') {
         Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
         None => false,

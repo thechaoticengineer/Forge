@@ -924,6 +924,36 @@ HTTP 400 for an invalid slug; 404 when discovery does not list the slug; 500 `{"
 runtime state file exists but cannot be read or parsed, rather than a silent reset.
 
 ```
+GET /api/features/content?slug=<slug>[&project=<path>]
+```
+
+Serves one discovered feature's content read-only, whether the feature is valid or invalid:
+
+- `slug`.
+- `files`: an object keyed by `README.md`, `scenarios.md`, `decisions.md` and `milestones.md`, each
+  `{"text": string|null, "error": string|null}`. A file that is missing, not a regular file, a
+  symbolic link, unreadable, not UTF-8 or larger than 2 MiB has `text: null` and a reason in `error`;
+  the request itself does not fail.
+- `scenarios`: `[{"id", "title", "given", "when", "then", "milestone"}]` from the `## S<n>: <title>`
+  sections of `scenarios.md` (headings inside fenced code are ignored, the first section of a repeated
+  ID wins), each with its `- Given:`, `- When:` and `- Then:` text (or `null`) and the ID of the
+  milestone whose `Covers:` names it (or `null`).
+- `milestones`: `[{"id", "title", "status", "covers", "business_tests"}]` as discovery reads them.
+- `design`: the files under `design/`, walked recursively in name order, each `{"path", "kind",
+  "error"}` with `path` relative to the feature folder (e.g. `design/main.pen`) and `kind` one of
+  `"pen"`, `"png"`, `"mermaid"` (`.mmd`) or `"other"`. A `pen` entry adds `png`, the relative path of
+  its exported PNG (`<name>.png`, or the first `<name>.<frame>.png`) or `null`, and `pngs`, every
+  export by the engine's naming rule. A `png` entry adds `absolute_path`. A `mermaid` entry adds
+  `text` (or `null` with an `error`, like `files`). Symbolic links are listed with an `error` and never
+  followed.
+
+No symbolic link under `docs/features/<slug>/` is ever followed, the folder itself included; `..` or
+absolute components are refused, and nothing outside the folder is opened. The endpoint never creates,
+modifies or removes a file. HTTP 400 for a missing or invalid slug; 404 when discovery does not list
+the slug; 403 when the feature folder itself cannot be served (for example because it is a symbolic
+link).
+
+```
 POST /api/features/create {"project"?, "slug", "title"}
 ```
 
