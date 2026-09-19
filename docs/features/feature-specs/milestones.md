@@ -1,8 +1,8 @@
 # Milestones
 
-**Status: M1, M2, M3 and M4 are implemented; M5 is planned.**
+**Status: M1, M2, M3, M4 and M5 are implemented.**
 
-The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9), M2's scenarios (S10-S19), M3's scenarios (S27-S35) and M4's scenarios (S20-S26) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
+The feature-spec workflow is split into successive milestones (M1-M5). M1's scenarios (S1-S9), M2's scenarios (S10-S19), M3's scenarios (S27-S35), M4's scenarios (S20-S26) and M5's scenarios (S36-S42) have executable business tests. Each milestone becomes one Forge plan: the plan's first stage turns that milestone's scenarios into executable tests that fail before implementation, and later stages implement the feature until those tests pass.
 
 ## M1: Format and discovery
 
@@ -42,7 +42,8 @@ Business tests: src/pen_dev_tests.rs (S20-S26)
 
 ## M5: Panel viewer
 
-Not yet implemented. A feature page in the panel with rendered Markdown for the feature's documentation; a read-only content API; scenarios shown with test results recorded from milestone plan reviews; designs as images and Mermaid diagrams as source; status indicators; review, approval and planning actions on the page.
+A feature page in the panel with rendered Markdown for the feature's documentation; a read-only content API; scenarios shown with test results recorded from milestone plan reviews; designs as images and Mermaid diagrams as source; status indicators; review, approval and planning actions on the page.
 
-Status: planned
+Status: implemented
 Covers: S36, S37, S38, S39, S40, S41, S42
+Business tests: src/feature_spec_m5_tests.rs (S37-S39), tests/panel_feature_viewer.test.mjs (S36, S39-S42) and tests/qml/tst_feature_page.qml (S36, S39-S42)

@@ -103,5 +103,5 @@ fn repository_feature_specs_report_their_progress() {
         feature.progress()
     };
     assert_eq!(progress("panel-redesign"), "implemented");
-    assert_eq!(progress("feature-specs"), "in progress");
+    assert_eq!(progress("feature-specs"), "implemented");
 }
