@@ -89,7 +89,7 @@ fn correction_body(plan: &Value, idx: usize, decision: &Decision) -> Value {
 /// A short, human-readable account of what a correction changes.
 fn correction_summary(decision: &Decision, sid: &Value) -> String {
     match decision {
-        Decision::Revise { stages, insert_before } => {
+        Decision::Revise { stages, insert_before, .. } => {
             let mut parts = vec![];
             if !stages.is_empty() {
                 let ids: Vec<String> = stages.iter().map(|s| s.id.to_string()).collect();
@@ -195,7 +195,7 @@ impl Ctx {
         }
         let inserted = match &decision { Decision::Revise { insert_before, .. } => insert_before.len(), _ => 0 };
         let current_only = match &decision {
-            Decision::Revise { stages, insert_before } => insert_before.is_empty() && stages.iter().all(|s| sid == s.id),
+            Decision::Revise { stages, insert_before, .. } => insert_before.is_empty() && stages.iter().all(|s| sid == s.id),
             _ => true,
         };
         let body = correction_body(&current, target, &decision);
@@ -276,11 +276,13 @@ impl Ctx {
         })
     }
 
-    /// The draft plan carries a planner correction the user has not approved.
+    /// The draft plan carries a planner correction the user has not approved,
+    /// from a stage or from the plan review.
     pub(super) fn correction_awaits_approval(plan: &Value) -> bool {
-        plan["status"] == "draft" && plan["stages"].as_array().into_iter().flatten().any(|stage|
-            stage[RECORDS].as_array().into_iter().flatten().any(|r|
-                r["outcome"] == "awaiting_approval" && r["plan_revision"] == plan["revision"]))
+        let awaiting = |container: &Value| container[RECORDS].as_array().into_iter().flatten().any(|r|
+            r["outcome"] == "awaiting_approval" && r["plan_revision"] == plan["revision"]);
+        plan["status"] == "draft" && (awaiting(&plan["plan_review"])
+            || plan["stages"].as_array().into_iter().flatten().any(awaiting))
     }
 
     /// Resume escalations a restart interrupted: apply an answered record's

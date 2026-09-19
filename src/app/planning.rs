@@ -347,7 +347,7 @@ impl Ctx {
             ("{acceptance}", stage["acceptance"].as_str().unwrap_or("")),
             ("{escalation}", &escalation),
         ]);
-        let answer = self.planner_answer(plan, idx, "scope revision", &prompt, |text| {
+        let answer = self.planner_answer(plan, Some(idx), "scope revision", &prompt, |text| {
             let answer: Value = crate::response::parse_json(json_payload_with_keys(text, &["revised", "refused"]))
                 .map_err(|e| format!("invalid scope revision: {e}"))?;
             crate::response::object_fields(&answer, &["revised", "refused", "removed"])?;
@@ -413,18 +413,23 @@ impl Ctx {
         self.resume_scope_revision(plan, target).map(ScopeResolution::Revised)
     }
 
-    /// Ask the stage's planner once and validate the complete answer, spending
-    /// the shared correction budget on malformed answers. The mock planner
+    /// Ask the planner once and validate the complete answer, spending the
+    /// shared correction budget on malformed answers. Usage is charged to the
+    /// stage `idx`, or to the plan review when it is None. The mock planner
     /// answers from the `mock_scope_output` setting (a string, object or queue).
-    fn planner_answer<T>(&self, plan: &mut Value, idx: usize, operation: &str, prompt: &str,
+    pub(super) fn planner_answer<T>(&self, plan: &mut Value, idx: Option<usize>, operation: &str, prompt: &str,
         mut validate: impl FnMut(&str) -> Result<T, String>) -> Result<T, String>
     {
+        let record = |ctx: &Self, plan: &mut Value, tool: &str, usage| match idx {
+            Some(idx) => ctx.record_stage_usage(plan, idx, "planner", tool, usage),
+            None => ctx.record_plan_usage(plan, "planner", tool, usage),
+        };
         let requirements = self.model_requirements("planner", None)?;
         let (result, (tool, model, effort)) = self.with_selected_model(&requirements, None, |(tool, model, effort)|
             self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,prompt }))?;
         let expected_model = result.effective_model.clone();
         let model_reported = result.model_reported;
-        self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
+        record(self, plan, &tool, result.usage)?;
         // The mock planner answers through settings, the way it answers plan
         // generation through the candidate file.
         let text = if tool == "mock" {
@@ -439,7 +444,7 @@ impl Ctx {
                 || !crate::agent::same_model(&tool, &expected_model, &result.effective_model))) {
                 return Err(format!("{operation} correction model changed or did not complete"));
             }
-            self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
+            record(self, plan, &tool, result.usage)?;
             if tool == "mock" {
                 Ok(self.mock_scope_response())
             } else { Ok(result.output) }
@@ -494,7 +499,7 @@ impl Ctx {
         self.log_event("plan", &format!("stage {sid}: constraint conflict handed to the planner"));
         let prompt = conflict::prompt(plan, idx, &record);
         let snapshot = plan.clone();
-        let answer = self.planner_answer(plan, idx, "constraint conflict", &prompt,
+        let answer = self.planner_answer(plan, Some(idx), "constraint conflict", &prompt,
             |text| conflict::validate_answer(text, &snapshot, idx))?;
         let revision = plan["revision"].clone();
         let record = &mut plan["stages"][idx][conflict::RECORDS][at];

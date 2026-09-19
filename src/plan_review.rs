@@ -1,5 +1,7 @@
 //! Frozen plan subjects and the deferred review publication gate.
 use super::*;
+use super::plan_review_escalation::{self as escalation, PlanConflict, PlanFollowUp};
+use crate::constraint_conflict::CRITERIA;
 use std::collections::BTreeSet;
 
 const FIX_MESSAGE: &str = "fix(review): apply deferred plan review findings";
@@ -48,11 +50,29 @@ fn subject(plan: &Value) -> Result<Value, String> {
         captured["feature"] = json!({"slug":plan["feature"]["slug"],"milestone":plan["feature"]["milestone"],
             "scenario_ids":plan["feature"]["scenario_ids"]});
     }
+    // Criteria the planner corrected for committed stages; like the feature
+    // key, absent unless there is one, so other subjects stay byte-identical.
+    if plan[CRITERIA].as_object().is_some_and(|c| !c.is_empty()) {
+        captured["criteria_corrections"] = plan[CRITERIA].clone();
+    }
     Ok(captured)
+}
+/// The stages as the plan reviewers and fixer see them: a planner-corrected
+/// criterion is shown next to the committed stage it replaces in the review.
+fn stage_views(subject: &Value) -> Vec<Value> {
+    subject["stages"].as_array().into_iter().flatten().map(|s| {
+        let mut view = json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],
+            "acceptance":s["acceptance"],"commit":s["commit"],"sha":s["sha"]});
+        let corrected = &subject["criteria_corrections"][s["id"].to_string()];
+        if corrected.is_object() { view["planner_corrected_criteria"] = corrected.clone(); }
+        view
+    }).collect()
 }
 fn acceptance(subject: &Value) -> String {
     let stages = subject["stages"].as_array().unwrap().iter().flat_map(|stage| {
-        acceptance_criteria_items(stage["acceptance"].as_str().unwrap_or("")).into_iter().map(|line|
+        let text = subject["criteria_corrections"][stage["id"].to_string()]["acceptance"].as_str()
+            .or_else(|| stage["acceptance"].as_str()).unwrap_or("");
+        acceptance_criteria_items(text).into_iter().map(|line|
             format!("stage {} ({}): {line}", stage["id"], stage["title"].as_str().unwrap_or("")))
     }).collect::<Vec<_>>().join("\n");
     // One criterion per covered scenario ID (S31) flows through CRITERIA TO
@@ -139,9 +159,7 @@ impl Ctx {
 
     pub(super) fn plan_review_prompt(&self, plan: &Value) -> String {
         let r = &plan["plan_review"];
-        let stages = r["subject"]["stages"].as_array().unwrap().iter().map(|s|
-            json!({"id":s["id"],"title":s["title"],"instructions":s["instructions"],
-                "acceptance":s["acceptance"],"commit":s["commit"],"sha":s["sha"]})).collect::<Vec<_>>();
+        let stages = stage_views(&r["subject"]);
         let prior = r["reviews"].as_array().into_iter().flatten().filter(|v|
             v["attempt_id"] == r["attempt_id"] && v["round"].as_u64() < r["rounds"].as_u64())
             .map(|v| json!({"role":v["role"],"round":v["round"],"requests":Self::review_requests(v)})).collect::<Vec<_>>();
@@ -247,7 +265,7 @@ impl Ctx {
                 let r = &plan["plan_review"];
                 let mut prompt = crate::util::fill_template(crate::prompts::PLAN_FIX_PROMPT, &[
                     ("{goal}",r["subject"]["goal"].as_str().unwrap_or("")),
-                    ("{stages}",&r["subject"]["stages"].to_string()),
+                    ("{stages}",&json!(stage_views(&r["subject"])).to_string()),
                     ("{base}",r["base"].as_str().unwrap_or("")),
                     ("{head}",r["head"].as_str().unwrap_or("")),
                     ("{requests}",&r["outstanding_requests"].to_string()),
@@ -274,6 +292,9 @@ impl Ctx {
                 if let Some(rules) = crate::feature_context::conflict_paragraph(&registered, &plan["feature"],
                     "surface it as an architectural context gap in your final response, as described above") {
                     prompt.push_str(&rules);
+                }
+                if let Some(clarification) = escalation::clarification_text(&plan["plan_review"]) {
+                    prompt.push_str(&clarification);
                 }
                 let turn = crate::architecture::identity();
                 if !plan["plan_review"]["model_invocations"].is_array() { plan["plan_review"]["model_invocations"] = json!([]); }
@@ -313,6 +334,8 @@ impl Ctx {
                         record["failure_kind"] = json!(crate::model_selection::failure_kind(error));
                     }
                 }
+                // The reply is planner input if the review cannot converge.
+                if let Ok(output) = &result { escalation::record_fixer_reply(&mut plan["plan_review"], &output.output); }
                 self.save_plan(plan)?;
                 if let Ok(output) = &result { self.record_plan_usage(plan,"fixer",&choice.0,output.usage.clone())?; }
                 // A moved HEAD is resolved by the architect after this selection loop,
@@ -366,17 +389,33 @@ impl Ctx {
                 return Ok(false);
             }
             DesignExport::Failed => {
-                if self.plan_review_stalled(plan, false)? { return Ok(false); }
+                if self.plan_review_stalled(plan, false)? { return self.plan_stall_escalation(plan); }
                 plan["plan_review"]["next_action"] = json!("reserve_fix");
                 self.plan_action_checkpoint(plan)?;
                 return Ok(true);
             }
         }
         let committed = self.commit_plan_fix_round(plan)?;
-        if self.plan_review_stalled(plan, committed)? { return Ok(false); }
+        if self.plan_review_stalled(plan, committed)? { return self.plan_stall_escalation(plan); }
         plan["plan_review"]["next_action"] = json!("review_pending");
         self.plan_action_checkpoint(plan)?;
+        // The round's work is committed; a conflict the fixer reported goes to
+        // the planner before the review, which still follows a clarification.
+        if let Some(statement) = escalation::fixer_conflict(plan) {
+            let trigger = escalation::role_trigger(&[("fixer".to_owned(), statement)]).unwrap();
+            let follow = PlanFollowUp { blocks_as: "stalled", rounds_left: true, resume_action: "review_pending" };
+            return Ok(self.escalate_plan_conflict(plan, trigger, follow)? == PlanConflict::Clarified);
+        }
         Ok(true)
+    }
+
+    /// A stalled fix round gets its planner pass before the review blocks. A
+    /// refusal with a fix round left continues fixing with the explanation.
+    fn plan_stall_escalation(&self, plan: &mut Value) -> Result<bool, String> {
+        let rounds = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
+        let budget = plan["plan_review"]["budget"].as_u64().ok_or("invalid plan budget")?;
+        let follow = PlanFollowUp { blocks_as: "stalled", rounds_left: rounds <= budget, resume_action: "reserve_fix" };
+        Ok(self.plan_review_nonconvergent(plan, follow)? == PlanConflict::Clarified)
     }
 
     /// Export `.pen` files the plan fixer changed since the plan review HEAD
@@ -473,7 +512,8 @@ impl Ctx {
     /// A fix round that changed nothing about requests the previous round already
     /// failed to change is not going to converge: the requests ask for something
     /// outside the working tree. Stop there instead of spending the rest of the
-    /// budget re-reviewing identical content.
+    /// budget re-reviewing identical content: the planner gets one pass, then
+    /// the review blocks with the `stalled` gate.
     fn plan_review_stalled(&self, plan: &mut Value, committed: bool) -> Result<bool, String> {
         let requests = plan["plan_review"]["outstanding_requests"].clone();
         if committed || requests.as_array().is_none_or(|r| r.is_empty()) {
@@ -485,13 +525,6 @@ impl Ctx {
             self.save_plan(plan)?;
             return Ok(false);
         }
-        plan["plan_review"]["gate"]["status"] = json!("stalled");
-        plan["plan_review"]["status"] = json!("blocked");
-        plan["plan_review"]["next_action"] = json!("stalled");
-        self.plan_action_checkpoint(plan)?;
-        self.log_event("plan_review", "plan review stalled: two fix rounds changed nothing against \
-            the same requests; resolve them outside the working tree, then edit and approve a \
-            revised plan; commits remain local");
         Ok(true)
     }
 
@@ -629,6 +662,13 @@ impl Ctx {
         let result = self.run_plan_review_inner(plan);
         match result {
             Ok(true) => Ok(true),
+            // The planner's correction made the plan a draft again: nothing is
+            // blocked, the user approves (or edits) it before anything runs.
+            Ok(false) if plan["plan_review"]["next_action"] == "awaiting_approval" => {
+                self.set_phase("plan_ready");
+                self.log_event("plan_review", "plan review paused: the planner's correction awaits your approval; commits remain local");
+                Ok(false)
+            }
             outcome => {
                 let stopped = self.session.stop_requested.load(Ordering::SeqCst);
                 let failed = outcome.is_err();
@@ -699,6 +739,9 @@ impl Ctx {
                     next["plan_review"][key] = value.clone();
                 }
             }
+            // Escalation ancestry survives the fresh attempt, so the same
+            // conflict after an approved correction blocks without a new pass.
+            escalation::carry_lineage(&plan["plan_review"], &mut next["plan_review"], &plan["revision"]);
             self.validate_plan_subject(&next)?;
             self.save_plan(&next)?;
             *plan = next;
@@ -730,17 +773,21 @@ impl Ctx {
             self.validate_plan_subject(plan)?;
             if self.session.stop_requested.load(Ordering::SeqCst) { return Err("plan review stopped; resume to continue".into()); }
             let action = plan["plan_review"]["next_action"].as_str().unwrap_or("reserve_review").to_string();
-            if action == "stalled" { return Ok(false); }
+            if matches!(action.as_str(), "stalled" | "awaiting_approval") { return Ok(false); }
+            // A restart during an escalation applies the saved answer or blocks;
+            // it never asks the planner again.
+            if action == "conflict_pending" {
+                if self.resume_plan_conflict(plan)? != PlanConflict::Clarified { return Ok(false); }
+                continue;
+            }
             if matches!(action.as_str(), "reserve_review" | "reserve_fix") {
                 let rounds = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
                 let budget = plan["plan_review"]["budget"].as_u64().ok_or("invalid plan budget")?;
                 // Same contract as stages: initial review + B corrective cycles.
+                // A spent budget gets its planner pass before the review blocks.
                 if rounds > budget {
-                    plan["plan_review"]["gate"]["status"] = json!("exhausted");
-                    plan["plan_review"]["status"] = json!("blocked");
-                    plan["plan_review"]["next_action"] = json!("exhausted");
-                    self.plan_action_checkpoint(plan)?;
-                    self.log_event("plan_review", "plan review budget exhausted; inspect outstanding requests and edit and approve a revised plan; commits remain local");
+                    let follow = PlanFollowUp { blocks_as: "exhausted", rounds_left: false, resume_action: "reserve_fix" };
+                    self.plan_review_nonconvergent(plan, follow)?;
                     return Ok(false);
                 }
                 plan["plan_review"]["rounds"] = json!(rounds + 1);
@@ -786,6 +833,19 @@ impl Ctx {
                     if approved {
                         self.commit_plan_reviewed(plan)?;
                         return Ok(true);
+                    }
+                    // A reported constraint conflict goes to the planner before
+                    // the next fix round; without a round left it blocks exhausted.
+                    let reported: Vec<(String, String)> = plan["plan_review"]["gate"]["constraint_conflicts"].as_array()
+                        .into_iter().flatten().map(|c| (c["role"].as_str().unwrap_or("reviewer").to_owned(),
+                            c["text"].as_str().unwrap_or("").to_owned())).collect();
+                    if let Some(trigger) = escalation::role_trigger(&reported) {
+                        let rounds = plan["plan_review"]["rounds"].as_u64().ok_or("invalid plan round counter")?;
+                        let budget = plan["plan_review"]["budget"].as_u64().ok_or("invalid plan budget")?;
+                        let rounds_left = rounds <= budget;
+                        let follow = PlanFollowUp { blocks_as: if rounds_left {"stalled"} else {"exhausted"},
+                            rounds_left, resume_action: "reserve_fix" };
+                        if self.escalate_plan_conflict(plan, trigger, follow)? != PlanConflict::Clarified { return Ok(false); }
                     }
                 }
                 _ => return Err("invalid plan review next action; restore the checkpoint before retrying".into()),

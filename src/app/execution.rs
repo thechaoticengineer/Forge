@@ -251,6 +251,9 @@ impl Ctx {
             self.log_event("plan", "the planner's constraint-conflict correction awaits your approval; approve the revised plan to continue");
             return Ok(());
         }
+        // An approved plan-review correction: its stages run first, then a fresh
+        // plan review attempt reviews the corrected plan.
+        self.start_approved_plan_correction(&mut plan)?;
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {

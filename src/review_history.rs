@@ -146,6 +146,20 @@ fn bounded_field(value: &Value) -> Value {
     limited(value, &mut 4096, 6)
 }
 
+/// The dispute-relevant part of a constraint escalation record: who escalated,
+/// the signature, the planner's analysis and decision, and the outcome. The
+/// full inputs stay in the saved plan.
+fn escalation_preview(record: &Value) -> Value {
+    let mut result = json!({});
+    for key in ["trigger", "signature", "attempt_id", "round", "analysis", "decision", "correction_summary",
+        "outcome", "detail", "plan_revision", "repeats", "unix", "updated_unix"] {
+        if let Some(value) = record.get(key).filter(|v| !v.is_null()) {
+            result[key] = limited(value, &mut 1024, 2);
+        }
+    }
+    result
+}
+
 fn bounded_plan_review(review: &Value) -> Value {
     let mut result = json!({});
     for key in ["version", "attempt_id", "status", "base", "head", "rounds", "budget",
@@ -159,7 +173,7 @@ fn bounded_plan_review(review: &Value) -> Value {
     }
     if let Some(gate) = review.get("gate").filter(|g| g.is_object()) {
         result["gate"] = json!({});
-        for key in ["status", "roles", "requests", "identity", "policy"] {
+        for key in ["status", "roles", "requests", "identity", "policy", "reason"] {
             if let Some(value) = gate.get(key) {
                 result["gate"][key] = bounded_field(value);
                 if result["gate"][key] != *value || gate[format!("{key}_truncated")] == true {
@@ -167,16 +181,21 @@ fn bounded_plan_review(review: &Value) -> Value {
                 }
             }
         }
+        if let Some(record) = gate.get("constraint_escalation").filter(|r| r.is_object()) {
+            result["gate"]["constraint_escalation"] = escalation_preview(record);
+        }
     }
     for (key, count_key, flag) in [("reviews", "review_count", "reviews_truncated"),
         ("model_invocations", "model_invocation_count", "model_invocations_truncated"),
-        ("fixes", "fix_count", "fixes_truncated")] {
+        ("fixes", "fix_count", "fixes_truncated"),
+        ("constraint_escalations", "constraint_escalation_count", "constraint_escalations_truncated")] {
         if let Some(records) = review[key].as_array() {
             let total = (records.len() as u64).max(review[count_key].as_u64().unwrap_or(0));
             let recent: Vec<_> = records.iter().skip(records.len().saturating_sub(PREVIEW_COUNT))
                 .map(|r| match key {
                     "reviews" => plan_preview(r),
                     "fixes" => fix_preview(r),
+                    "constraint_escalations" => escalation_preview(r),
                     _ => bounded_field(r),
                 }).collect();
             let truncated = review[flag] == true || total > recent.len() as u64

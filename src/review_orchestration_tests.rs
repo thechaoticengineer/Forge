@@ -1246,6 +1246,9 @@ fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
         let f = Fixture::new("Implement feature",budget);
         f.two_deferred_stages();
         f.setting("mock_verdicts",json!(vec![reject("Fix behavior");4]));
+        // The spent budget first gets one planner pass; a refusal leaves no fix
+        // round to use it, so the review still blocks as exhausted.
+        f.setting("mock_scope_output",json!({"analysis":"The requests are buildable.","decision":{"refused":"Fix the behavior."}}));
         f.setting("auto_push",json!(true));
         let remote = f.root.join(".git/test-remote");
         f.ctx.git(&["init","--bare",remote.to_str().unwrap()]).unwrap();
@@ -1254,6 +1257,15 @@ fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
         assert_eq!(p["plan_review"]["rounds"],budget+1);
         assert_eq!(p["plan_review"]["gate"]["status"],"exhausted");
         assert_eq!(p["plan_review"]["status"],"blocked");
+        assert_eq!(p["plan_review"]["next_action"],"exhausted");
+        let escalation = &p["plan_review"]["gate"]["constraint_escalation"];
+        assert_eq!(escalation["trigger"]["kind"],"plan_review_exhausted");
+        assert_eq!(escalation["decision"],"refused");
+        assert_eq!(escalation["outcome"],"blocked");
+        assert_eq!(p["plan_review"]["constraint_escalations"].as_array().unwrap().len(),1);
+        let planner = |ctx: &Ctx| ctx.app.settings.lock().unwrap()["mock_agent_requests"].as_array().unwrap()
+            .iter().filter(|r| r["role"] == "planner").count();
+        assert_eq!(planner(&f.ctx),1);
         assert_eq!(p["plan_review"]["outstanding_requests"],json!(["[reviewer] Fix behavior"]));
         assert_eq!(f.count("fixer"),budget as usize);
         // Every fix round commits, so exhaustion keeps the corrections it produced.
@@ -1270,6 +1282,7 @@ fn plan_review_exhaustion_preserves_corrections_budget_across_restart() {
         ctx.run_worker();
         let resumed = ctx.load_plan().unwrap();
         assert_eq!(resumed["plan_review"],p["plan_review"]);
+        assert_eq!(planner(&ctx),1);
         assert!(!ctx.forge_path("reports.jsonl").exists());
         assert!(ctx.git(&["ls-remote","origin"]).unwrap().is_empty());
     }
@@ -1283,11 +1296,19 @@ fn plan_review_stalls_when_two_fix_rounds_change_nothing_for_the_same_requests()
     f.setting("mock_edits",json!([{"first.rs":"fn first() {}\n"},{"second.rs":"fn second() {}\n"},
         {"first.rs":"fn first() {}\n"},{"first.rs":"fn first() {}\n"},{"first.rs":"fn first() {}\n"}]));
     f.setting("mock_verdicts",json!(vec![reject("Resolve the saved constraint conflict");4]));
+    // The stall first gets one planner pass; a planner that returns no valid
+    // answer leaves the original blocking path.
+    f.setting("mock_scope_output",json!("no valid answer"));
     let p = f.run();
     let r = &p["plan_review"];
     assert_eq!(r["gate"]["status"],"stalled","{p}");
     assert_eq!(r["status"],"blocked");
     assert_eq!(r["next_action"],"stalled");
+    let escalation = &r["gate"]["constraint_escalation"];
+    assert_eq!(escalation["trigger"]["kind"],"plan_review_stalled");
+    assert_eq!(escalation["outcome"],"failed");
+    assert_eq!(r["constraint_escalations"].as_array().unwrap().len(),1);
+    assert_eq!(p["status"],"ready");
     // The captured budget would have allowed four rounds; the stall stops at three.
     assert_eq!(r["rounds"],3);
     assert_eq!(r["budget"],3);

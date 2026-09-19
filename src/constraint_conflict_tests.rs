@@ -207,3 +207,113 @@ fn the_planner_prompt_carries_every_input_and_rule() {
     assert!(!prompt.contains("stale attempt"));
     assert!(!prompt.contains("{requests}"));
 }
+
+/// A plan whose stages are all committed, under plan review.
+fn reviewed_plan() -> Value {
+    let mut plan = plan();
+    for stage in plan["stages"].as_array_mut().unwrap() { stage["status"] = json!("committed"); }
+    plan["plan_review"] = json!({"attempt_id":"r2","base":"base-sha","head":"head-sha","rounds":3,"budget":3,
+        "acceptance":"stage 2 (Docs): Status is implemented",
+        "outstanding_requests":["[reviewer] Milestone test fails","[architect] Keep docs-only scope","untagged request"],
+        "fixes":[{"round":2,"sha":"f1x","message":"fix(review): apply round 2 plan review findings"}],
+        "fixer_replies":[{"attempt_id":"r2","round":2,"reply":"cargo test: 1 failed","constraint_conflict":null},
+                         {"attempt_id":"r1","round":2,"reply":"stale reply"}],
+        "reviews":[{"identity":{"role":"architect","round":2,"attempt_id":"r2"},"project_checks":[{"command":"cargo test","status":"failed","evidence":"milestone test failed"}]},
+                   {"identity":{"role":"reviewer","round":1,"attempt_id":"r1"},"project_checks":[{"command":"stale","status":"passed","evidence":"old"}]}]});
+    plan
+}
+
+#[test]
+fn plan_review_answers_only_correct_forward() {
+    let plan = reviewed_plan();
+    let valid = [
+        json!({"revise":{"append":[{"title":"Move test","instructions":"Move it onto fixtures","acceptance":"Uses fixtures","commit":"test: move"}]}}),
+        json!({"revise":{"criteria":[{"id":2,"acceptance":"Status is implemented and tests pass"}]}}),
+        json!({"constraint_wrong":{"stage":2,"constraint":"Change only documentation","instructions":"Change documentation and the fixture test",
+            "acceptance":"Status is implemented","justification":"The fixture change keeps tests passing"}}),
+        json!({"refused":"Point the test at a fixture copy"}),
+    ];
+    for decision in valid {
+        validate_answer_for(&answer(decision.clone()), &plan, Scope::Plan).unwrap_or_else(|e| panic!("{decision}: {e}"));
+    }
+    let cases: Vec<(Value, &str)> = vec![
+        (json!({"revise":{"stages":[{"id":2,"instructions":"New","acceptance":"New"}]}}), "committed history and cannot change"),
+        (json!({"revise":{"insert_before":[{"title":"t","instructions":"i","acceptance":"a","commit":"c"}]}}), "only append stages"),
+        (json!({"revise":{}}), "append a stage or correct"),
+        (json!({"revise":{"criteria":[{"id":9,"acceptance":"x"}]}}), "not a committed stage"),
+        (json!({"revise":{"criteria":[{"id":2,"acceptance":"Status  is implemented"}]}}), "unchanged"),
+        (json!({"revise":{"criteria":[{"id":2,"acceptance":"a"},{"id":2,"acceptance":"b"}]}}), "twice"),
+        (json!({"revise":{"criteria":[{"id":2,"acceptance":" "}]}}), "acceptance must be a non-empty"),
+        (json!({"revise":{"append":[{"title":"t","instructions":"i","acceptance":"a","commit":""}]}}), "append.commit must be a non-empty"),
+        (json!({"constraint_wrong":{"constraint":"c","instructions":"i","acceptance":"a","justification":"j"}}), "must name the committed stage"),
+        (json!({"constraint_wrong":{"stage":7,"constraint":"c","instructions":"i","acceptance":"a","justification":"j"}}), "not a committed stage"),
+        (json!({"constraint_wrong":{"stage":2,"constraint":"c","instructions":"Change only documentation","acceptance":"Status is implemented","justification":"j"}}), "unchanged"),
+    ];
+    for (decision, expected) in cases {
+        let error = validate_answer_for(&answer(decision.clone()), &plan, Scope::Plan).unwrap_err();
+        assert!(error.contains(expected), "{decision}: {error}");
+    }
+    // A corrected criterion is the text a later correction is compared with.
+    let mut corrected = plan.clone();
+    corrected[CRITERIA] = json!({"2":{"acceptance":"Status is implemented and tests pass"}});
+    assert_eq!(review_acceptance(&corrected, &corrected["stages"][1]), "Status is implemented and tests pass");
+    let error = validate_answer_for(&answer(json!({"revise":{"criteria":[{"id":2,"acceptance":"Status is implemented and tests pass"}]}})),
+        &corrected, Scope::Plan).unwrap_err();
+    assert!(error.contains("unchanged"), "{error}");
+    // Plan-review fields are refused in a stage review, and a stage review's
+    // constraint_wrong may only name the current stage.
+    let stage_plan = self::plan();
+    for decision in [json!({"revise":{"append":[{"title":"t","instructions":"i","acceptance":"a","commit":"c"}]}}),
+        json!({"revise":{"criteria":[{"id":2,"acceptance":"x"}]}})] {
+        let error = validate_answer(&answer(decision), &stage_plan, 1).unwrap_err();
+        assert!(error.contains("only to a plan review"), "{error}");
+    }
+    let error = validate_answer(&answer(json!({"constraint_wrong":{"stage":3,"constraint":"c","instructions":"i","acceptance":"a","justification":"j"}})),
+        &stage_plan, 1).unwrap_err();
+    assert!(error.contains("only correct the current stage"), "{error}");
+    // Plan-review fields stay out of a stage record's saved correction.
+    let parsed = validate_answer(&answer(json!({"revise":{"insert_before":[{"title":"t","instructions":"i","acceptance":"a","commit":"c"}]}})), &stage_plan, 1).unwrap();
+    assert_eq!(json!(parsed.decision), json!({"revise":{"stages":[],"insert_before":[{"title":"t","instructions":"i","acceptance":"a","commit":"c"}]}}));
+}
+
+#[test]
+fn the_plan_review_planner_prompt_carries_every_input() {
+    let plan = reviewed_plan();
+    let statements = vec![plan_fallback_statement()];
+    let requests = plan_review_requests(&plan);
+    assert_eq!(requests, vec![json!({"role":"reviewer","text":"Milestone test fails"}),
+        json!({"role":"architect","text":"Keep docs-only scope"}), json!({"role":"reviewer","text":"untagged request"})]);
+    let inputs = plan_review_inputs(&plan, &statements, &["docs/features/x/milestones.md".into()]);
+    assert_eq!(inputs["rounds"], json!({"used":3,"budget":3}));
+    assert_eq!(inputs["commit_range"], json!({"base":"base-sha","head":"head-sha"}));
+    assert_eq!(inputs["fixer_replies"]["total"], 1);
+    assert_eq!(inputs["checks"]["total"], 1);
+    let sig = signature(&statements, &requests);
+    let record = new_record("engine", PLAN_STALLED_KIND, "two fix rounds changed nothing", &sig, inputs, 1).unwrap();
+    let prompt = plan_prompt(&plan, &record);
+    for needle in [
+        "Stop contradictory stage constraints", "STAGE 2 [committed — committed history, cannot change]: Docs",
+        "COMMIT RANGE UNDER REVIEW: base-sha..head-sha", "stage 2 (Docs): Status is implemented",
+        "\"source\": \"engine\"", "plan_review_stalled", "could not converge",
+        "\"role\": \"architect\"", "Keep docs-only scope", "fix(review): apply round 2", "cargo test: 1 failed",
+        "milestone test failed", "docs/features/x/milestones.md", "\"used\": 3", "\"budget\": 3",
+        crate::prompts::PLAN_CONSTRAINT_RULES, "A business test must never be weakened", "\"append\"", "\"criteria\"",
+    ] {
+        assert!(prompt.contains(needle), "prompt lacks {needle}:\n{prompt}");
+    }
+    assert!(!prompt.contains("(CURRENT)"));
+    assert!(!prompt.contains("stale reply"));
+    assert!(!prompt.contains("{fixes}"));
+    // Stall and exhaustion with the same requests are the same conflict.
+    assert_eq!(signature(&[plan_fallback_statement()], &requests), sig);
+}
+
+#[test]
+fn a_plan_fixer_reports_a_conflict_with_a_trailing_json_object() {
+    assert_eq!(fixer_reported("Ran cargo test.\n{\"constraint_conflict\": \"Docs only vs the milestone test\"}").as_deref(),
+        Some("Docs only vs the milestone test"));
+    for output in ["Mock implementation completed.", "{\"constraint_conflict\": null}", "{\"constraint_conflict\": \" \"}",
+        "{\"constraint_conflict\": 3}", "{\"other\": \"x\"}"] {
+        assert_eq!(fixer_reported(output), None, "{output}");
+    }
+}

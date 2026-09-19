@@ -52,5 +52,12 @@ mod orchestration_tests;
 #[path = "plan_review.rs"]
 mod plan_review;
 
+#[path = "plan_review_escalation.rs"]
+mod plan_review_escalation;
+
+#[cfg(test)]
+#[path = "plan_review_escalation_tests.rs"]
+mod plan_review_escalation_tests;
+
 #[path = "history_decision.rs"]
 mod history_decision;
