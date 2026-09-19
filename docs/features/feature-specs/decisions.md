@@ -95,3 +95,15 @@ Reason: Keeps prompts small and stable as specs grow, following the rule that ag
 Decision: A milestone has at most one `Business tests:` line. Its value is a list of entries separated by commas or by the word `and`, ignoring separators inside parentheses. Each entry is a repository-relative file path without spaces, optionally wrapped in backticks, optionally followed by a parenthesized note (for example `src/feature_spec_tests.rs (S1-S6, S9)`); the note is free text and is ignored. A path is registered as a business test file; an entry that is not a path, or a path to a file that does not exist, is a validation error naming that entry. A planned milestone may omit the line.
 
 Reason: Makes the registry deterministic while accepting both forms already in use in the repository, so existing feature folders stay valid without edits.
+
+## D17: The panel shows Mermaid diagrams as source
+
+Decision: The M5 viewer shows Mermaid diagrams (`.mmd` files and fenced `mermaid` blocks) as their source text in a labelled monospace block. It does not render them and adds no `mmdc` or other rendering dependency.
+
+Reason: QML cannot render Mermaid, and pre-rendering would add a Node/Chromium dependency to the engine for a read-only convenience. The source is readable, diffable and matches what agents see; rendering can be added later without changing the viewer's contract.
+
+## D18: Scenario test results come from recorded plan reviews
+
+Decision: The test result shown for a scenario is the latest result of its per-scenario criterion (S31) recorded from a milestone plan's review in `.forge/features/<slug>.json`. The panel does not run tests itself. Scenarios never checked by such a review, including those of milestones implemented before M3, are shown as not recorded.
+
+Reason: Plan reviewers already run the business tests and record evidence per scenario in a verified verdict; reusing that evidence avoids a second, slower test runner in the engine and keeps each result traceable to the review and plan that produced it.

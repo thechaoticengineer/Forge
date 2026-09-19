@@ -1,8 +1,8 @@
 # Scenarios
 
-**Status: M1 scenarios (S1-S9), M2 scenarios (S10-S19), M3 scenarios (S27-S35) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation.**
+**Status: M1 scenarios (S1-S9), M2 scenarios (S10-S19), M3 scenarios (S27-S35) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation. M5 scenarios (S36-S42) are planned.**
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery), M2 (spec phase), M3 (feature to plans) and M4 (pen.dev integration); scenarios for M5 are to be written before that milestone is planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M2 scenarios are verified by business tests in src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18). The M3 scenarios are verified by business tests in src/feature_spec_m3_tests.rs (S27-S35), tests/panel_feature_plan.test.mjs (panel parts of S27-S28) and tests/qml/tst_feature_plan_action.qml (panel parts of S27-S28). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery), M2 (spec phase), M3 (feature to plans), M4 (pen.dev integration) and M5 (panel viewer) (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M2 scenarios are verified by business tests in src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18). The M3 scenarios are verified by business tests in src/feature_spec_m3_tests.rs (S27-S35), tests/panel_feature_plan.test.mjs (panel parts of S27-S28) and tests/qml/tst_feature_plan_action.qml (panel parts of S27-S28). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
 
 ## S1: A valid feature folder is discovered
 
@@ -213,3 +213,45 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: a plan started from a goal, a discussion, a refactor request or the queue
 - When: it is planned, executed and reviewed
 - Then: no feature context is added to its planner, architect or reviewer prompts and no feature runtime state is written, while the business-test rules of S32 and S33 still apply
+
+## S36: Opening a feature shows its documentation
+
+- Given: the panel's Features tab lists a discovered feature
+- When: the user clicks the feature or presses Enter on it
+- Then: a feature page is pushed, like the stage detail page, with sub-tabs README, Scenarios, Decisions, Milestones and Design; Markdown files are shown rendered (headings, lists, emphasis, code blocks and links), and Escape, q or Back return to the Features tab with that feature still selected
+
+## S37: The engine serves a feature's content read-only
+
+- Given: a discovered feature, valid or invalid
+- When: a client requests `GET /api/features/content` with its slug
+- Then: the response contains the text of README.md, scenarios.md, decisions.md and milestones.md, the parsed scenarios (ID, title, Given, When, Then, covering milestone), the milestones (ID, title, status, covered scenario IDs, registered business test files) and the files of `design/`; a file that is missing or not UTF-8 is reported with a reason instead of failing the request; an unknown slug is refused; paths never leave `docs/features/<slug>/` (including `..` or symlink escapes); and no file is created, modified or removed
+
+## S38: Plan review records test results per scenario
+
+- Given: a milestone plan whose plan review has one criterion per covered scenario ID (S31)
+- When: a plan reviewer's verdict is recorded
+- Then: the result of each scenario criterion (passed or failed, evidence, reviewer role, plan, milestone, time) is appended to `.forge/features/<slug>.json`, earlier results are kept as history, and plans not started from a feature record nothing
+
+## S39: Scenarios are shown with their test results
+
+- Given: a feature page open on the Scenarios sub-tab
+- When: the page shows the feature's scenarios
+- Then: each scenario shows its ID, title, Given/When/Then, the milestone that covers it and its latest recorded result: passed, failed (with the evidence) or not recorded; the time and plan of the result are shown, and scenarios whose content changed after that result are marked as possibly out of date
+
+## S40: Designs and diagrams are shown on the Design sub-tab
+
+- Given: a feature whose `design/` folder holds `.pen` files with exported PNGs, and Mermaid diagrams as `.mmd` files or fenced `mermaid` blocks in its Markdown files
+- When: the user opens the Design sub-tab, or a Markdown sub-tab containing a `mermaid` block
+- Then: each PNG is shown as an image labelled with its `.pen` source, a `.pen` file without a PNG is listed with a note that no export exists, and Mermaid diagrams are shown as their source text in a monospace block labelled as a Mermaid diagram
+
+## S41: The feature page shows status indicators
+
+- Given: a feature page is open
+- When: the feature's state is loaded or refreshed
+- Then: the page header shows the validation status with its reasons, the spec status (draft, spec approved or scenarios approved), milestone progress (`N/M implemented`), the latest architect spec review verdict and whether it covers the current content, and the plan status of each milestone that has a plan
+
+## S42: Review, approval and planning actions work from the feature page
+
+- Given: a feature page is open
+- When: the user chooses Request review, Approve spec, Approve scenarios or Plan milestone
+- Then: each action calls the same engine endpoint as the Features tab, is enabled under the same conditions, shows a refusal reason inline, and refreshes the page's indicators on success; the co-authoring chat and the review verdict details remain reachable, and every action available in the Features tab today stays available there

@@ -42,7 +42,7 @@ Business tests: src/pen_dev_tests.rs (S20-S26)
 
 ## M5: Panel viewer
 
-Not yet implemented. Rendered markdown for a feature's documentation; scenarios shown together with their test results; status indicators and approval buttons.
+Not yet implemented. A feature page in the panel with rendered Markdown for the feature's documentation; a read-only content API; scenarios shown with test results recorded from milestone plan reviews; designs as images and Mermaid diagrams as source; status indicators; review, approval and planning actions on the page.
 
 Status: planned
-Covers: none yet
+Covers: S36, S37, S38, S39, S40, S41, S42

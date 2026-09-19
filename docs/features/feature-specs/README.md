@@ -48,12 +48,12 @@ See `docs/features/README.md` for the full folder format and flow description, a
 
 - **pen.dev cost (FS-RISK-PEN-COST).** pen.dev requires an account and may become a paid product. The documented fallback is OpenPencil, an MIT-licensed tool that reads `.pen` files, so mockups would remain usable even if pen.dev access is lost.
 - **pen.dev MCP is desktop-only (FS-RISK-PEN-MCP).** pen.dev's MCP server only connects to the running desktop application. M4 resolves this by using `pen interactive` through the shell with the CLI's bundled skill, which works headlessly for every provider without MCP.
-- **QML cannot render Mermaid (FS-RISK-MERMAID-QML).** The panel is built with QML, which has no Mermaid renderer. A later implementation must choose between pre-rendering diagrams to SVG with `mmdc` (mermaid-cli) and showing the Mermaid source as text.
+- **QML cannot render Mermaid (FS-RISK-MERMAID-QML).** The panel is built with QML, which has no Mermaid renderer. M5 shows the Mermaid source as text (D17).
 - **Codex MCP parity is unknown (FS-RISK-CODEX-MCP).** Whether Codex-based agents have MCP capabilities equivalent to Claude's is not established. M4 resolves this by using `pen interactive` through the shell (D11), which works headlessly for every provider without MCP.
 
 ## Open questions
 
-- Which Mermaid rendering option (pre-rendered SVG via `mmdc`, or showing source) will the panel viewer use?
+- ~~Which Mermaid rendering option (pre-rendered SVG via `mmdc`, or showing source) will the panel viewer use?~~ Decided in D17: showing source.
 - ~~What is the exact schema of `.forge/features/<slug>.json`?~~ Decided in M2: see [Feature runtime state](../../../README.md#feature-runtime-state) in the top-level README and `src/feature_state.rs`.
 - ~~How do scenario IDs (S1, S2, ...) map to generated test names?~~ Decided for M3: each business test is named after its scenario ID (S29, S31).
 - ~~How are spec co-authoring writes restricted to a single feature folder?~~ Decided in D8.
