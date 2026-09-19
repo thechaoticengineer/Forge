@@ -206,15 +206,18 @@ pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
                 "status": f.status(),
                 "reasons": f.reasons,
                 "progress": f.progress(),
-                "milestones": f.milestones.iter().map(|m| json!({
-                    "id": m.id,
-                    "title": m.title,
-                    "status": if m.implemented { "implemented" } else { "planned" },
-                    "covers": m.covers,
-                    "business_tests": m.business_tests,
-                })).collect::<Vec<_>>(),
             });
-            for (key, value) in crate::feature_state::listing_fields(ctx, &f.slug)
+            let (fields, state) = crate::feature_state::listing(ctx, &f.slug);
+            entry["milestones"] = f.milestones.iter().map(|m| json!({
+                "id": m.id,
+                "title": m.title,
+                "status": if m.implemented { "implemented" } else { "planned" },
+                "covers": m.covers,
+                "business_tests": m.business_tests,
+                // M3: the milestone's latest plan link, or null.
+                "plan": crate::feature_state::plan_link_view(&state, &m.id),
+            })).collect::<Vec<_>>().into();
+            for (key, value) in fields
                 .as_object()
                 .expect("listing fields are an object")
                 .clone()

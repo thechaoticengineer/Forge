@@ -45,18 +45,11 @@ pub(super) fn api_plan(ctx: &Ctx, body: &Value) -> ApiResponse {
         PlanMode::Refactor { focus } => format!("Refactor the codebase — focus: {focus}"),
         PlanMode::Discussion { note, .. } if note.is_empty() => "Plan from discussion".into(),
         PlanMode::Discussion { note, .. } => note.clone(),
+        PlanMode::Milestone { .. } => unreachable!("POST /api/plan never plans a milestone"),
     };
     if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
         (409, json!({"error": "busy"}))
     } else {
-        ctx.session.stop_requested.store(false, Ordering::SeqCst);
-        {
-            let mut s = ctx.session.state.lock().unwrap();
-            s.goal = goal.clone();
-            s.phase = "planning".into();
-            s.architect_activity = Value::Null;
-            s.role_usage = Value::Null;
-        }
         let log_text = if discussion {
             let note_short: String = focus.chars().take(300).collect();
             if note_short.is_empty() { "planning started from discussion".to_string() }
@@ -65,11 +58,25 @@ pub(super) fn api_plan(ctx: &Ctx, body: &Value) -> ApiResponse {
             let short: String = goal.chars().take(300).collect();
             format!("planning started for goal: {short}")
         };
-        ctx.log_event("plan", &log_text);
-        let ctx2 = ctx.clone();
-        std::thread::spawn(move || ctx2.plan_worker(&goal, &mode));
+        start_planning(ctx, goal, &log_text, mode);
         (200, json!({"ok": true}))
     }
+}
+
+/// Starts the planner for a caller that holds the queue lock and has just
+/// acquired the busy claim, which the spawned worker takes over.
+pub(super) fn start_planning(ctx: &Ctx, goal: String, log_text: &str, mode: PlanMode) {
+    ctx.session.stop_requested.store(false, Ordering::SeqCst);
+    {
+        let mut s = ctx.session.state.lock().unwrap();
+        s.goal = goal.clone();
+        s.phase = "planning".into();
+        s.architect_activity = Value::Null;
+        s.role_usage = Value::Null;
+    }
+    ctx.log_event("plan", log_text);
+    let ctx2 = ctx.clone();
+    std::thread::spawn(move || ctx2.plan_worker(&goal, &mode));
 }
 
 pub(super) fn api_plan_revise(ctx: &Ctx, body: &Value) -> ApiResponse {

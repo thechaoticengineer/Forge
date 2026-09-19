@@ -56,6 +56,7 @@ impl<'a> ApiRequest<'a> {
                 | "/api/features/review"
                 | "/api/features/approve_spec"
                 | "/api/features/approve_scenarios"
+                | "/api/features/plan"
                 | "/api/architecture/history"
                 | "/api/architecture/reviews"
                 | "/api/agent_log"
@@ -204,6 +205,7 @@ fn dispatch(
         (tiny_http::Method::Post, "/api/features/approve_scenarios") => {
             api_feature_approve_scenarios(ctx, &request.body)
         }
+        (tiny_http::Method::Post, "/api/features/plan") => api_feature_plan(ctx, &request.body),
         (tiny_http::Method::Get, "/api/agent_records") => api_agent_records(ctx, request.query),
         (tiny_http::Method::Get, "/api/agent_log") => api_agent_log(ctx, request.query),
         (tiny_http::Method::Get, "/api/diff") => api_diff(ctx),

@@ -4,8 +4,9 @@
 //! business tests in src/feature_spec_m2_tests.rs.
 
 use crate::feature_state::{
-    Snapshot, content_hash, create, default_state, load, snapshot, spec_status, state_path, update,
-    validate_slug, validate_title,
+    Snapshot, append_plan_link, approved_scenario_ids, content_hash, create, default_state,
+    latest_plan_link, load, plan_link_view, set_plan_link_status, snapshot, spec_status,
+    state_path, update, validate_slug, validate_title,
 };
 use crate::test_support::{QueueTest, api_request};
 use serde_json::{Value, json};
@@ -359,4 +360,178 @@ fn the_create_endpoint_validates_and_refuses_while_the_engine_is_busy() {
     assert!(state_path(ctx, "demo").exists(), "creation initializes durable state");
     // Nothing under docs/features/ holds runtime state.
     assert!(!features.join("demo/demo.json").exists());
+}
+
+#[test]
+fn an_old_state_file_without_plans_loads_with_an_empty_list_and_is_not_rewritten() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    fs::create_dir_all(test.path.join(".forge/features")).unwrap();
+    let old = json!({"version": 1, "slug": "demo", "reviews": [], "approvals": [approval("spec", "h")],
+        "chat": [], "architect_session": Value::Null});
+    let bytes = serde_json::to_vec_pretty(&old).unwrap();
+    fs::write(state_path(ctx, "demo"), &bytes).unwrap();
+
+    let state = load(ctx, "demo").unwrap();
+    assert_eq!(state["plans"], json!([]), "a missing plans field defaults to an empty list");
+    assert_eq!(state["approvals"], old["approvals"], "the rest of the file is kept");
+    assert_eq!(fs::read(state_path(ctx, "demo")).unwrap(), bytes, "a read must not rewrite the file");
+    assert_eq!(latest_plan_link(&state, "M1"), Value::Null);
+    assert_eq!(plan_link_view(&state, "M1"), Value::Null);
+
+    // A present plans field must be a list; anything else is an error.
+    let mut broken = old.clone();
+    broken["plans"] = json!({});
+    fs::write(state_path(ctx, "demo"), broken.to_string()).unwrap();
+    let error = load(ctx, "demo").unwrap_err();
+    assert!(error.contains("plans must be an array"), "error was {error}");
+}
+
+#[test]
+fn plan_links_move_from_planning_to_planned_or_failed_on_the_latest_link() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    let feature = json!({"slug": "demo", "milestone": "M1", "title": "Alpha",
+        "scenario_ids": ["S1", "S2"], "folder": "docs/features/demo/"});
+    update(ctx, "demo", |state| {
+        state["approvals"].as_array_mut().unwrap().push(approval("spec", "h"));
+        Ok(())
+    })
+    .unwrap();
+
+    // Settling a milestone that is not planning is reported, not invented.
+    let error = set_plan_link_status(ctx, "demo", "M1", "planned", Some("p0"), None).unwrap_err();
+    assert!(error.contains("M1"), "error was {error}");
+
+    append_plan_link(ctx, &feature, "Implement M1").unwrap();
+    let state = load(ctx, "demo").unwrap();
+    let link = latest_plan_link(&state, "M1");
+    assert_eq!(link["status"], "planning");
+    assert_eq!(link["goal"], "Implement M1");
+    assert_eq!(link["title"], "Alpha");
+    assert_eq!(link["scenario_ids"], json!(["S1", "S2"]));
+    assert_eq!(link["plan_id"], Value::Null);
+    assert_eq!(link["completed_unix"], Value::Null);
+    assert_eq!(link["commit_range"], Value::Null);
+    assert!(link["started_unix"].as_i64().unwrap() > 0);
+    assert_eq!(state["approvals"].as_array().unwrap().len(), 1, "approvals survive a link append");
+
+    set_plan_link_status(ctx, "demo", "M1", "failed", None, Some("planner broke")).unwrap();
+    append_plan_link(ctx, &feature, "Implement M1").unwrap();
+    set_plan_link_status(ctx, "demo", "M1", "planned", Some("plan-2"), None).unwrap();
+
+    let state = load(ctx, "demo").unwrap();
+    let plans = state["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0]["status"], "failed");
+    assert_eq!(plans[0]["error"], "planner broke");
+    assert_eq!(plans[1]["status"], "planned");
+    assert_eq!(plans[1]["plan_id"], "plan-2");
+    assert!(plans[1].get("error").is_none());
+    assert_eq!(latest_plan_link(&state, "M1"), plans[1]);
+    let view = plan_link_view(&state, "M1");
+    assert_eq!(view["status"], "planned");
+    assert_eq!(view["plan_id"], "plan-2");
+    assert_eq!(view["commit_range"], Value::Null);
+    assert_eq!(latest_plan_link(&state, "M2"), Value::Null);
+}
+
+#[test]
+fn approved_scenario_ids_come_from_the_latest_current_scenarios_approval() {
+    let mut state = default_state("demo");
+    assert_eq!(approved_scenario_ids(&state, "h"), None);
+    let mut older = approval("scenarios", "h");
+    older["scenario_ids"] = json!(["S1"]);
+    let mut latest = approval("scenarios", "h");
+    latest["scenario_ids"] = json!(["S1", "S2"]);
+    state["approvals"] = json!([older, latest]);
+    assert_eq!(approved_scenario_ids(&state, "h"), Some(vec!["S1".to_string(), "S2".to_string()]));
+    assert_eq!(approved_scenario_ids(&state, "other"), None, "an approval of other content does not count");
+}
+
+#[test]
+fn a_planner_supplied_feature_key_never_survives_in_a_goal_plan() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    ctx.app.settings.lock().unwrap()["mock_plan_output"] = json!({
+        "goal": "Ship", "status": "draft",
+        "feature": {"slug": "forged", "milestone": "M1", "title": "Forged", "scenario_ids": ["S1"]},
+        "stages": [{"id": 1, "title": "One", "instructions": "Do one.", "acceptance": "Done.",
+            "commit": "feat: one"}],
+    });
+    let (code, resp) = api_request(&ctx.app, "POST", "/api/plan", json!({"goal": "Ship"}));
+    assert_eq!(code, 200, "response was {resp}");
+    crate::test_support::wait_for_worker(ctx);
+    let plan = ctx.load_plan().expect("the goal plan was published");
+    assert!(plan.get("feature").is_none(), "plan was {plan}");
+    assert!(!test.path.join(".forge/features").exists(), "a goal plan writes no feature state");
+}
+
+/// A scenarios-approved feature `demo` whose M1 covers S1 and S2, approved by
+/// writing the approval records the way the approval endpoints record them.
+fn approved_feature(test: &QueueTest) {
+    let dir = test.path.join("docs/features/demo");
+    write(&dir, "README.md", "# Demo\n\n## Goal\n\nDo it.\n\n## Scope\n\nIn.\n\n## Out of scope\n\nNone.\n\n\
+        ## Behavior\n\nWorks.\n\n## Open questions\n\nNone.\n");
+    write(&dir, "scenarios.md", "# Scenarios\n\n## S1: One\n\n- Given: a\n- When: b\n- Then: c\n\n\
+        ## S2: Two\n\n- Given: d\n- When: e\n- Then: f\n");
+    write(&dir, "decisions.md", "# Decisions\n");
+    write(&dir, "milestones.md", "# Milestones\n\n## M1: Alpha\n\nStatus: planned\nCovers: S1, S2\n");
+    let hash = content_hash(&dir).unwrap();
+    let mut scenarios = approval("scenarios", &hash);
+    scenarios["scenario_ids"] = json!(["S1", "S2"]);
+    update(&test.app, "demo", |state| {
+        state["approvals"] = json!([approval("spec", &hash), scenarios]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_failed_milestone_planning_marks_its_link_failed_and_releases_the_engine() {
+    let test = QueueTest::new(false);
+    let ctx = &test.app;
+    let project = test.path.display().to_string();
+    approved_feature(&test);
+    let plan_m1 = || {
+        api_request(&ctx.app, "POST", "/api/features/plan",
+            json!({"project": project, "slug": "demo", "milestone": "M1"}))
+    };
+    let listed_plan = || {
+        let (code, resp) = api_request(&ctx.app, "GET", &format!("/api/features?project={}", encode(&project)), json!({}));
+        assert_eq!(code, 200, "response was {resp}");
+        resp["features"][0]["milestones"][0]["plan"].clone()
+    };
+    assert_eq!(listed_plan(), Value::Null, "an unplanned milestone has no plan");
+
+    ctx.app.settings.lock().unwrap()["mock_plan_output"] = json!({"goal": "x", "stages": "not a list"});
+    let (code, resp) = plan_m1();
+    assert_eq!(code, 200, "response was {resp}");
+    assert!(resp["goal"].as_str().unwrap().contains("docs/features/demo/"), "response was {resp}");
+    crate::test_support::wait_for_worker(ctx);
+    let link = latest_plan_link(&load(ctx, "demo").unwrap(), "M1");
+    assert_eq!(link["status"], "failed", "link was {link}");
+    assert!(link["error"].as_str().is_some_and(|e| !e.is_empty()), "link was {link}");
+    assert_eq!(listed_plan()["status"], "failed");
+    assert!(!ctx.session.busy.load(std::sync::atomic::Ordering::SeqCst), "planning failure releases the engine");
+
+    ctx.app.settings.lock().unwrap()["mock_plan_output"] = json!({"goal": "x", "status": "draft",
+        "stages": [{"id": 1, "title": "One", "instructions": "Write failing tests for S1, S2.",
+            "acceptance": "Tests for S1, S2 fail.", "commit": "test: one"}]});
+    let (code, resp) = plan_m1();
+    assert_eq!(code, 200, "response was {resp}");
+    crate::test_support::wait_for_worker(ctx);
+    let plan = ctx.load_plan().unwrap();
+    assert_eq!(plan["feature"], json!({"slug": "demo", "milestone": "M1", "title": "Alpha", "scenario_ids": ["S1", "S2"]}));
+    let view = listed_plan();
+    assert_eq!(view["status"], "planned", "plan was {view}");
+    assert_eq!(view["plan_id"], plan["plan_id"]);
+    assert_eq!(load(ctx, "demo").unwrap()["plans"].as_array().unwrap().len(), 2);
+
+    // A manual edit keeps the engine-owned feature record.
+    let stages = json!([{"id": 1, "title": "One edited", "instructions": "Write failing tests for S1, S2.",
+        "acceptance": "Tests fail.", "commit": "test: one"}]);
+    let (code, resp) = api_request(&ctx.app, "POST", "/api/plan/edit", json!({"plan": {"goal": plan["goal"], "stages": stages}}));
+    assert_eq!(code, 200, "response was {resp}");
+    assert_eq!(ctx.load_plan().unwrap()["feature"], plan["feature"], "an edit keeps the feature record");
 }

@@ -31,7 +31,7 @@ impl Ctx {
             return self.plan_with_busy_claim(goal, &PlanMode::Standard);
         };
         match self.finalize_plan(candidate, None, "ready") {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(error) => {
                 self.set_phase("blocked");
                 self.log_event("error", &format!("planning continuation failed: {error}"));
@@ -50,7 +50,7 @@ impl Ctx {
     pub(super) fn plan_with_busy_claim(&self, goal: &str, mode: &PlanMode) -> bool {
         let discussion = matches!(mode, PlanMode::Discussion { .. });
         let prompt = match mode {
-            PlanMode::Standard => PLANNER_PROMPT
+            PlanMode::Standard | PlanMode::Milestone { .. } => PLANNER_PROMPT
                 .replace("{goal}", goal)
                 .replace("{plan_path}", &format!("{FORGE_DIR}/plan-candidate.json")),
             PlanMode::Refactor { focus } => fill_template(REFACTOR_PROMPT, &[
@@ -61,23 +61,48 @@ impl Ctx {
                 ("{plan_path}", ".forge/plan-candidate.json"),
             ]),
         };
-        let result = self.generate_plan(&prompt, goal, discussion, None)
+        let feature = match mode {
+            PlanMode::Milestone { feature } => Some(feature),
+            _ => None,
+        };
+        let result = self.generate_plan(&prompt, goal, discussion, None, feature)
             .and_then(|plan| {
                 let final_goal = plan["goal"].as_str().unwrap_or("").to_string();
-                self.finalize_plan(plan, None, "ready")?;
+                let published = self.finalize_plan(plan, None, "ready")?;
                 if discussion {
                     self.session.state.lock().unwrap().goal = final_goal;
                 }
-                Ok(())
+                Ok(published)
             });
-        match result {
-            Ok(()) => true,
+        let planned = match &result {
+            Ok(_) => true,
             Err(e) => {
                 let blocked = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
                 self.set_phase(if blocked { "blocked" } else { "failed" });
                 self.log_event("error", &format!("planning failed: {e}"));
                 false
             }
+        };
+        if let Some(feature) = feature {
+            self.settle_plan_link(feature, &result);
+        }
+        planned
+    }
+
+    /// Moves the milestone's `planning` link to `planned` with the published
+    /// plan ID, or to `failed` with the error. The plan itself is already
+    /// settled, so a state write failure is logged rather than undoing it.
+    fn settle_plan_link(&self, feature: &Value, result: &Result<Value, String>) {
+        let slug = feature["slug"].as_str().unwrap_or("");
+        let milestone = feature["milestone"].as_str().unwrap_or("");
+        let settled = match result {
+            Ok(plan) => crate::feature_state::set_plan_link_status(
+                self, slug, milestone, "planned", plan["plan_id"].as_str(), None),
+            Err(error) => crate::feature_state::set_plan_link_status(
+                self, slug, milestone, "failed", None, Some(error)),
+        };
+        if let Err(error) = settled {
+            self.log_event("error", &format!("could not record the plan link of {slug} {milestone}: {error}"));
         }
     }
 
@@ -91,7 +116,7 @@ impl Ctx {
             ("{current_plan}", snapshot.as_str()), ("{feedback}", feedback),
             ("{goal}", goal), ("{plan_path}", ".forge/plan-candidate.json"),
         ]);
-        let result = self.generate_plan(&prompt, goal, false, Some(current_plan))
+        let result = self.generate_plan(&prompt, goal, false, Some(current_plan), None)
             .and_then(|plan| self.finalize_plan(plan, Some(current_plan), "revised"));
         if let Err(error) = result {
             let architecture_failed = self.session.state.lock().unwrap().architect_activity["status"] == "failed";
@@ -181,7 +206,15 @@ impl Ctx {
     /// For a discussion run the engine has no goal to enforce up front, so the
     /// candidate's own trimmed `goal` field is validated and used instead of
     /// the engine-supplied override every other mode keeps applying.
-    fn generate_plan(&self, prompt: &str, goal: &str, discussion: bool, previous: Option<&Value>) -> Result<Value, String> {
+    ///
+    /// `feature` is the milestone plan mode's feature object. Only then does
+    /// the plan carry a `feature` record, and it is always the engine's: a
+    /// planner-supplied `feature` key is removed from every candidate (S35).
+    /// A revision passes None and keeps the previous plan's record, because
+    /// the revised draft is built from that plan.
+    fn generate_plan(&self, prompt: &str, goal: &str, discussion: bool, previous: Option<&Value>,
+        feature: Option<&Value>) -> Result<Value, String>
+    {
         self.ensure_forge_dir();
         let _ = fs::remove_file(self.forge_path("chat.jsonl"));
         match fs::remove_file(self.forge_path("plan-candidate.json")) {
@@ -191,9 +224,11 @@ impl Ctx {
         }
         let prompt = format!("{prompt}\n{}\nOUTPUT CONTRACT OVERRIDE: inspect only; do not write any files, implement, commit or push. Return the complete candidate plan as a JSON object in your final response, without markdown fences. Forge validates and writes the candidate file itself.", self.routing_prompt()?);
         let reply = self.readonly_response("planner", &prompt, Some("plan-candidate.json"), |text| {
-            let candidate: Value = crate::response::parse_json(json_payload(text))
+            let mut candidate: Value = crate::response::parse_json(json_payload(text))
                 .map_err(|e| format!("invalid candidate: {e}"))?;
             if !candidate["stages"].is_array() { return Err("planner did not produce valid stages".into()); }
+            // Only the engine attaches a feature, and only to a milestone plan (S35).
+            candidate.as_object_mut().unwrap().remove("feature");
             let resolved_goal: String = if discussion {
                 let candidate_goal = candidate["goal"].as_str().map(str::trim).unwrap_or("").to_string();
                 if candidate_goal.is_empty() || candidate_goal.chars().count() > 20000 {
@@ -208,6 +243,12 @@ impl Ctx {
             Ok(draft)
         })?;
         let mut plan = reply.value;
+        if let Some(feature) = feature {
+            plan["feature"] = json!({
+                "slug": feature["slug"], "milestone": feature["milestone"],
+                "title": feature["title"], "scenario_ids": feature["scenario_ids"],
+            });
+        }
         plan["planner_selection_actor"] = json!({"provider":reply.choice.0,"model":reply.result.effective_model,"native_effort":reply.choice.2});
         // Only measured calls contribute usage, including every correction.
         plan.as_object_mut().unwrap().remove("planner_usage");
@@ -235,14 +276,14 @@ impl Ctx {
     }
 
     fn finalize_plan(&self, mut plan: Value, previous: Option<&Value>, action: &str)
-        -> Result<(), String>
+        -> Result<Value, String>
     {
         let n = plan["stages"].as_array().unwrap().len();
         self.bind_planner_proposals(&mut plan);
-        self.architect_publish(plan, previous, if previous.is_some() { "draft revision" } else { "initial plan guidance" })?;
+        let published = self.architect_publish(plan, previous, if previous.is_some() { "draft revision" } else { "initial plan guidance" })?;
         self.set_phase("plan_ready");
         self.log_event("plan", &format!("plan {action} with {n} stages"));
-        Ok(())
+        Ok(published)
     }
 
     /// A scope escalation reports that the stage as written cannot be built. The

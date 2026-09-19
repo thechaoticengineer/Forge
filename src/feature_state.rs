@@ -139,6 +139,8 @@ fn collect(
 
 // ---------------------------------------------------------------- persistence
 
+/// `plans` holds the milestone plan links added by M3; files written before it
+/// have none, and `load` defaults it.
 pub(crate) fn default_state(slug: &str) -> Value {
     json!({
         "version": 1,
@@ -147,6 +149,7 @@ pub(crate) fn default_state(slug: &str) -> Value {
         "approvals": [],
         "chat": [],
         "architect_session": Value::Null,
+        "plans": [],
     })
 }
 
@@ -155,6 +158,8 @@ pub(crate) fn state_path(ctx: &Ctx, slug: &str) -> PathBuf {
 }
 
 /// The persisted state, or the default for a feature that has none yet.
+/// A file written before M3 has no `plans`; it loads with `plans: []`, and
+/// the file itself is never rewritten by a read.
 /// An unreadable or structurally wrong file is an error: state is never
 /// silently reset, because that would drop approval history.
 pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
@@ -165,7 +170,7 @@ pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(default_state(slug)),
         Err(e) => return Err(format!("could not read {}: {e}", path.display())),
     };
-    let state: Value = serde_json::from_slice(&bytes)
+    let mut state: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("invalid feature state {}: {e}", path.display()))?;
     if !state.is_object() {
         return Err(format!("invalid feature state {}: not an object", path.display()));
@@ -191,6 +196,16 @@ pub(crate) fn load(ctx: &Ctx, slug: &str) -> Result<Value, String> {
                 path.display()
             ));
         }
+    }
+    match state.get("plans") {
+        None => state["plans"] = json!([]),
+        Some(plans) if !plans.is_array() => {
+            return Err(format!(
+                "invalid feature state {}: plans must be an array",
+                path.display()
+            ));
+        },
+        Some(_) => {},
     }
     Ok(state)
 }
@@ -325,22 +340,142 @@ pub(crate) fn snapshot(ctx: &Ctx, slug: &str) -> Result<Snapshot, String> {
 /// downgraded to `"draft"`, which would hide a corrupt file behind a status
 /// that looks like ordinary unapproved work. `/api/features/state` answers
 /// 500 with the same reason for that feature.
-pub(crate) fn listing_fields(ctx: &Ctx, slug: &str) -> Value {
+///
+/// The second value is the state the fields were derived from, so the listing
+/// also reports per-milestone plan links from the same read; it is null when
+/// the state could not be read.
+pub(crate) fn listing(ctx: &Ctx, slug: &str) -> (Value, Value) {
     match snapshot(ctx, slug) {
-        Ok(snapshot) => json!({
-            "spec_status": snapshot.spec_status,
-            "content_hash": snapshot.content_hash,
-            "latest_review": snapshot.latest_review,
-            "review_current": snapshot.review_current,
-        }),
-        Err(error) => json!({
-            "spec_status": "error",
-            "content_hash": Value::Null,
-            "latest_review": Value::Null,
-            "review_current": false,
-            "state_error": error,
-        }),
+        Ok(snapshot) => (
+            json!({
+                "spec_status": snapshot.spec_status,
+                "content_hash": snapshot.content_hash,
+                "latest_review": snapshot.latest_review,
+                "review_current": snapshot.review_current,
+            }),
+            snapshot.state,
+        ),
+        Err(error) => (
+            json!({
+                "spec_status": "error",
+                "content_hash": Value::Null,
+                "latest_review": Value::Null,
+                "review_current": false,
+                "state_error": error,
+            }),
+            Value::Null,
+        ),
     }
+}
+
+// ---------------------------------------------------------------- milestone plan links
+
+/// The scenario IDs of the latest `scenarios` approval, if it approved exactly
+/// the current content; None otherwise.
+pub(crate) fn approved_scenario_ids(state: &Value, current_hash: &str) -> Option<Vec<String>> {
+    let approval = state["approvals"]
+        .as_array()?
+        .iter()
+        .rfind(|a| a["kind"] == json!("scenarios"))?;
+    if approval["content_hash"] != json!(current_hash) {
+        return None;
+    }
+    Some(
+        approval["scenario_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// The most recent plan link recorded for `milestone`, or null.
+pub(crate) fn latest_plan_link(state: &Value, milestone: &str) -> Value {
+    state["plans"]
+        .as_array()
+        .and_then(|plans| plans.iter().rfind(|link| link["milestone"] == json!(milestone)))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The compact view of a milestone's latest plan link that `/api/features`
+/// reports, or null when the milestone was never planned.
+pub(crate) fn plan_link_view(state: &Value, milestone: &str) -> Value {
+    let link = latest_plan_link(state, milestone);
+    if link.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "status": link["status"],
+        "plan_id": link["plan_id"],
+        "started_unix": link["started_unix"],
+        "completed_unix": link["completed_unix"],
+        "commit_range": link["commit_range"],
+    })
+}
+
+fn plans_mut(state: &mut Value) -> &mut Vec<Value> {
+    if !state["plans"].is_array() {
+        state["plans"] = json!([]);
+    }
+    state["plans"].as_array_mut().unwrap()
+}
+
+/// Records that planning of `feature.milestone` started with `goal`.
+/// `feature` is the plan mode's feature object ({slug, milestone, title,
+/// scenario_ids, ...}).
+pub(crate) fn append_plan_link(ctx: &Ctx, feature: &Value, goal: &str) -> Result<(), String> {
+    let slug = feature["slug"].as_str().ok_or("feature has no slug")?;
+    let link = json!({
+        "milestone": feature["milestone"],
+        "title": feature["title"],
+        "goal": goal,
+        "scenario_ids": feature["scenario_ids"],
+        "started_unix": crate::util::unix_timestamp(),
+        "status": "planning",
+        "plan_id": Value::Null,
+        "completed_unix": Value::Null,
+        "commit_range": Value::Null,
+    });
+    update(ctx, slug, |state| {
+        plans_mut(state).push(link);
+        Ok(())
+    })
+}
+
+/// Settles the latest `planning` link of `milestone`: `planned` with the
+/// published plan ID, or `failed` with the error. A milestone with no link in
+/// `planning` is an error, so a lost link is reported rather than invented.
+pub(crate) fn set_plan_link_status(
+    ctx: &Ctx,
+    slug: &str,
+    milestone: &str,
+    status: &str,
+    plan_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    update(ctx, slug, |state| {
+        let link = plans_mut(state)
+            .iter_mut()
+            .rev()
+            .find(|link| link["milestone"] == json!(milestone) && link["status"] == json!("planning"))
+            .ok_or_else(|| format!("no planning link for {slug} {milestone}"))?;
+        link["status"] = json!(status);
+        if let Some(plan_id) = plan_id {
+            link["plan_id"] = json!(plan_id);
+        }
+        match error {
+            Some(error) => link["error"] = json!(error),
+            None => {
+                if let Some(link) = link.as_object_mut() {
+                    link.remove("error");
+                }
+            },
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------- creation

@@ -36,6 +36,10 @@ pub(crate) enum PlanMode {
     Standard,
     Refactor { focus: String },
     Discussion { transcript: String, note: String },
+    /// A milestone of a scenarios-approved feature (M3). `feature` is the
+    /// engine-built {slug, milestone, title, scenario_ids, folder}; it is the
+    /// only mode that carries feature context or writes feature state.
+    Milestone { feature: Value },
 }
 
 pub(crate) struct App {

@@ -1,7 +1,7 @@
 //! Feature-spec endpoints of the spec phase (M2): per-feature runtime state
-//! and creation from the template. Discovery itself stays in
-//! `crate::features` and is read by `/api/features`.
-use crate::app::Ctx;
+//! and creation from the template, plus planning an approved milestone (M3).
+//! Discovery itself stays in `crate::features` and is read by `/api/features`.
+use crate::app::{Ctx, PlanMode};
 use crate::feature_state;
 use crate::http::{ApiResponse, query_value};
 use serde_json::{Value, json};
@@ -215,4 +215,110 @@ pub(super) fn api_feature_approve_spec(ctx: &Ctx, body: &Value) -> ApiResponse {
 
 pub(super) fn api_feature_approve_scenarios(ctx: &Ctx, body: &Value) -> ApiResponse {
     api_feature_approve(ctx, body, Approval::Scenarios)
+}
+
+/// Admission of milestone planning (S27/S28).
+///
+/// Every refusal is decided from read-only checks before the busy claim, so a
+/// refused request starts no agent and writes neither the plan nor the feature
+/// state (M3-ARCH-02). Once the claim is taken, the plan link is recorded
+/// first; if that write fails the claim is released and nothing starts.
+pub(super) fn api_feature_plan(ctx: &Ctx, body: &Value) -> ApiResponse {
+    let _queue_guard = ctx.session.queue_lock.lock().unwrap();
+    let slug = body["slug"].as_str().unwrap_or("").to_string();
+    if let Err(error) = feature_state::validate_slug(&slug) {
+        return (400, json!({"error": error}));
+    }
+    let milestone_id = body["milestone"].as_str().unwrap_or("").trim().to_string();
+    if milestone_id.is_empty() {
+        return (400, json!({"error": "milestone required"}));
+    }
+    let Some(feature) = crate::features::discover(Path::new(ctx.project()))
+        .into_iter()
+        .find(|feature| feature.slug == slug)
+    else {
+        return (404, json!({"error": format!("unknown feature: {slug}")}));
+    };
+    if !feature.reasons.is_empty() {
+        return (
+            409,
+            json!({
+                "error": format!("feature is invalid: {}", feature.reasons.join("; ")),
+                "reasons": feature.reasons,
+            }),
+        );
+    }
+    let snapshot = match feature_state::snapshot(ctx, &slug) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return (500, json!({"error": error})),
+    };
+    if snapshot.spec_status != "scenarios approved" {
+        return (
+            409,
+            json!({"error": format!(
+                "feature {slug} is not scenarios approved for its current content (status: {})",
+                snapshot.spec_status
+            )}),
+        );
+    }
+    let Some(milestone) = feature.milestones.iter().find(|m| m.id == milestone_id) else {
+        return (404, json!({"error": format!("unknown milestone: {milestone_id}")}));
+    };
+    if milestone.implemented {
+        return (409, json!({"error": format!("milestone {milestone_id} is already implemented")}));
+    }
+    if milestone.covers.is_empty() {
+        return (
+            409,
+            json!({"error": format!("milestone {milestone_id} covers no scenarios yet (Covers: none yet)")}),
+        );
+    }
+    let approved =
+        feature_state::approved_scenario_ids(&snapshot.state, &snapshot.content_hash).unwrap_or_default();
+    let unapproved: Vec<&str> = milestone
+        .covers
+        .iter()
+        .filter(|id| !approved.contains(id))
+        .map(String::as_str)
+        .collect();
+    if !unapproved.is_empty() {
+        return (
+            409,
+            json!({"error": format!(
+                "milestone {milestone_id} covers scenarios that are not approved: {}",
+                unapproved.join(", ")
+            )}),
+        );
+    }
+    if ctx.session.queue_active.load(Ordering::SeqCst) || ctx.acquire_busy().is_err() {
+        return (409, json!({"error": "busy"}));
+    }
+
+    let folder = format!("docs/features/{slug}/");
+    let goal = format!(
+        "Implement milestone {milestone_id} ({}) of the feature {} specified in {folder}, covering scenarios {}.",
+        milestone.title,
+        feature.title,
+        milestone.covers.join(", ")
+    );
+    let reference = json!({
+        "slug": slug,
+        "milestone": milestone_id,
+        "title": milestone.title,
+        "scenario_ids": milestone.covers,
+        "folder": folder,
+    });
+    if let Err(error) = feature_state::append_plan_link(ctx, &reference, &goal) {
+        ctx.session.busy.store(false, Ordering::SeqCst);
+        ctx.log_event("error", &format!("planning {slug} {milestone_id} not started: {error}"));
+        return (500, json!({"error": error}));
+    }
+    let short: String = goal.chars().take(300).collect();
+    super::plan::start_planning(
+        ctx,
+        goal.clone(),
+        &format!("planning started for goal: {short}"),
+        PlanMode::Milestone { feature: reference },
+    );
+    (200, json!({"ok": true, "goal": goal}))
 }
