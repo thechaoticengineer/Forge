@@ -55,6 +55,6 @@ See `docs/features/README.md` for the full folder format and flow description, a
 
 - Which Mermaid rendering option (pre-rendered SVG via `mmdc`, or showing source) will the panel viewer use?
 - ~~What is the exact schema of `.forge/features/<slug>.json`?~~ Decided in M2: see [Feature runtime state](../../../README.md#feature-runtime-state) in the top-level README and `src/feature_state.rs`.
-- How do scenario IDs (S1, S2, ...) map to generated test names?
+- ~~How do scenario IDs (S1, S2, ...) map to generated test names?~~ Decided for M3: each business test is named after its scenario ID (S29, S31).
 - ~~How are spec co-authoring writes restricted to a single feature folder?~~ Decided in D8.
 - ~~What does "architect spec review" require beyond the existing plan-review mechanics?~~ Decided in D9.

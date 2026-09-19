@@ -71,3 +71,21 @@ Reason: pen.dev's MCP server needs the running desktop app, and MCP support diff
 Decision: The engine, not the agent, exports PNGs for changed `.pen` files after each editing turn, one per top-level frame, and treats export failures like failing checks.
 
 Reason: Exported images must always match the committed design, and reviewers in read-only sandboxes need the PNGs because they cannot run `pen` themselves.
+
+## D13: Business-test rules apply to every plan
+
+Decision: The rules of D7 apply to every Forge plan, not only to milestone plans: reviewers of any plan run the registered business tests of all features and judge changes to them. This is the one deliberate exception to D5; apart from it, plans not started from a feature are unchanged and get no feature context.
+
+Reason: Business tests only protect the documented behavior if no plan can break or rewrite them, whatever started the plan.
+
+## D14: The engine detects business test changes, reviewers judge them
+
+Decision: `Business tests:` lines in each feature's `milestones.md` are the registry of business test files. The engine lists which registered files a stage or plan-fix diff modifies or deletes and puts that list in the reviewers' prompts; the reviewers decide whether the change is allowed. The engine does not block such diffs by itself.
+
+Reason: Detection is deterministic and cheap, but whether a change is legitimate (added tests, a mechanical rename, an approved scenario change) needs judgement; a hard block would stop harmless mechanical edits.
+
+## D15: Agents get a compact feature context and read the files themselves
+
+Decision: Milestone plans carry the feature slug, folder path, milestone and covered scenario IDs. Prompts for the planner, architect and reviewers include this reference, not the contents of the feature's files; agents read the files they need from the repository.
+
+Reason: Keeps prompts small and stable as specs grow, following the rule that agents get a compact work status and read details themselves.

@@ -1,8 +1,8 @@
 # Scenarios
 
-**Status: M1 scenarios (S1-S9), M2 scenarios (S10-S19) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation.**
+**Status: M1 scenarios (S1-S9), M2 scenarios (S10-S19) and M4 scenarios (S20-S26) have executable business tests and are covered by the implementation. M3 scenarios (S27-S35) are planned.**
 
-Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery), M2 (spec phase) and M4 (pen.dev integration); scenarios for M3 and M5 are to be written before those milestones are planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M2 scenarios are verified by business tests in src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
+Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never renumbered or reused. This file currently covers milestones M1 (format and discovery), M2 (spec phase), M3 (feature to plans) and M4 (pen.dev integration); scenarios for M5 are to be written before that milestone is planned (see `milestones.md`). The M1 scenarios are verified by business tests in src/feature_spec_tests.rs (S1-S6, S9) and tests/panel_features.test.mjs (S7-S8). The M2 scenarios are verified by business tests in src/feature_spec_m2_tests.rs (S10-S19) and tests/panel_feature_spec.test.mjs (panel parts of S10-S18). The M4 scenarios are verified by business tests in src/pen_dev_tests.rs (S20-S26).
 
 ## S1: A valid feature folder is discovered
 
@@ -159,3 +159,57 @@ Acceptance scenarios below use stable IDs (S1, S2, ...), assigned once and never
 - Given: a stage snapshot containing `.pen` files and their exported PNGs
 - When: stage or plan reviewers run in their read-only sandbox
 - Then: their prompts point them to the PNGs and the `.pen` JSON, and they are not required to run `pen`
+
+## S27: A milestone of an approved feature is planned from the panel
+
+- Given: a valid feature whose status is `scenarios approved` for its current content, and a planned milestone whose `Covers:` scenario IDs are all among the approved scenario IDs
+- When: the user chooses "Plan milestone" for that milestone in the panel's Features tab (`POST /api/features/plan` with the slug and milestone ID)
+- Then: Forge starts planning with a goal built by the engine from the feature and milestone, the resulting plan records the feature slug, milestone ID and covered scenario IDs, and `.forge/features/<slug>.json` records a link to that plan
+
+## S28: Milestone planning is refused unless the feature is ready
+
+- Given: a feature that is invalid or not `scenarios approved` for its current content, or a milestone that is unknown, already implemented, has `Covers: none yet` or covers a scenario ID that is not approved, or an engine that is busy with another plan or the queue
+- When: the user requests planning of that milestone
+- Then: the request is refused with the reason, no agent is started, and neither the current plan nor the feature's runtime state changes
+
+## S29: The planner gets the feature context and plans failing tests first
+
+- Given: a milestone plan is being generated
+- When: the planner returns its plan
+- Then: the planner's prompt named the feature folder, the milestone and its covered scenario IDs; the plan's first stage turns every covered scenario into an executable test named after its scenario ID that fails before implementation; and a plan whose first stage does not name every covered scenario ID is returned to the planner through the shared response-correction budget
+
+## S30: The architect gets a compact feature context
+
+- Given: a milestone plan
+- When: the engine builds the architect's context for any architect turn of that plan
+- Then: the context includes the feature slug, folder path, milestone ID and title and the covered scenario IDs, but not the contents of the feature's files
+
+## S31: Plan review requires every covered scenario to be tested and passing
+
+- Given: the stages of a milestone plan are committed and plan review runs
+- When: the plan reviewers build their verdicts
+- Then: the review criteria contain one item per covered scenario ID (an executable test traceable to that ID exists and passes), stage and plan reviewers are pointed to the feature folder, and the plan cannot be approved while any of those items fails
+
+## S32: Every plan keeps all business tests of all features passing
+
+- Given: one or more features whose milestones list business test files on `Business tests:` lines
+- When: any plan (a milestone plan or any other plan) is reviewed
+- Then: the stage and plan reviewers are given the list of registered business test files of all features and must run them, a failing business test prevents approval, and a `Business tests:` line naming a file that does not exist makes the feature invalid with a reason naming that file
+
+## S33: Changes to business test files are surfaced to reviewers
+
+- Given: a stage or plan-fix diff that modifies or deletes a registered business test file
+- When: the engine prepares the reviewers' prompts
+- Then: the engine lists the affected business test files in the prompts, and the reviewers reject the change unless it only adds tests or implements a scenario change approved in the feature spec; an implementer that finds an approved scenario in conflict with the plan escalates it to the architect instead of changing the test
+
+## S34: A completed milestone plan marks its milestone implemented
+
+- Given: a milestone plan whose stages are all committed and whose plan review approved it
+- When: the plan completes
+- Then: the milestone's `Status:` line in `milestones.md` reads `implemented` and its `Business tests:` line names the test files covering its scenarios, and `.forge/features/<slug>.json` records the plan as completed with its commit range
+
+## S35: Plans not started from a feature get no feature context
+
+- Given: a plan started from a goal, a discussion, a refactor request or the queue
+- When: it is planned, executed and reviewed
+- Then: no feature context is added to its planner, architect or reviewer prompts and no feature runtime state is written, while the business-test rules of S32 and S33 still apply
