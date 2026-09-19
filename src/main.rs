@@ -51,6 +51,8 @@ mod feature_spec_tests;
 #[cfg(test)]
 mod feature_spec_m2_tests;
 #[cfg(test)]
+mod feature_spec_m3_tests;
+#[cfg(test)]
 mod feature_state_tests;
 #[cfg(test)]
 mod feature_author_tests;
