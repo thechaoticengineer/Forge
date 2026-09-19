@@ -2239,8 +2239,8 @@ and why. The planner's response is a non-empty analysis and exactly one of three
   rounds. If later pending stages change, new stages are inserted, or the revision touches
   plan review scope, the plan returns to draft status for user approval; the stage does
   not commit and work is kept.
-- `constraint_wrong`: the stage can be done as written. The planner identifies which
-  constraint was misspecified, supplies corrected stage text, and explains why the
+- `constraint_wrong`: a stage constraint was misspecified. The planner names that
+  constraint, supplies corrected stage instructions/acceptance, and explains why the
   delivered work meets the corrected requirement. Forge applies the corrected text to the
   current stage (keeping its approval), and the stage is reviewed again under the new
   instructions without discarding the working tree.
