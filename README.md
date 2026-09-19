@@ -193,8 +193,9 @@ or scope clarification retains its meaning and follows the existing review/fix o
 scope workflow. Provider failures, cancellation, changed repository/model/session
 identities and storage failures are not response corrections. Their existing failure
 and recovery paths remain responsible; the engine does not replay writes, commits or
-pushes to repair JSON. Review fix budgets, scope renegotiation limits and routing
-reassessment budgets are separate and are never reset by response correction.
+pushes to repair JSON. Review fix budgets, scope renegotiation limits, constraint-conflict
+escalation budgets and routing reassessment budgets are separate and are never reset by
+response correction.
 
 ### Verdict protocol and verification
 
@@ -210,6 +211,10 @@ are excluded. A normalized tree hash separately represents the eventual commit.
 Alongside `approved`, `summary`, `issues`, `notes` and `checks`, output includes:
 
 - `requires_dual` and `scope_reason` for scope verification;
+- `constraint_conflict` (optional, non-empty when present): a verdict field stating
+  which of the stage's own constraints cannot all be met together. Distinct from
+  `architecture_context_gap`, which records role disagreement and routes to the architect.
+  A reported constraint conflict routes to the planner for one revision attempt;
 - `criteria`, with each supplied criterion, its status and concrete evidence;
 - `acceptance_evidence`, echoing the complete acceptance text, verification and evidence;
 - `project_checks`, recording exact commands, passed/failed/unavailable status,
@@ -292,8 +297,21 @@ A fix round that commits nothing while the outstanding requests are unchanged fr
 the previous such round stalls the review: the gate becomes `stalled`, the phase
 blocks and the remaining budget is not spent re-reviewing identical content. That
 signals requests that no working-tree edit can satisfy, such as a saved
-architectural constraint to reconcile; resolve them outside the working tree, then
-edit and approve a revised plan.
+architectural constraint to reconcile. Before blocking, Forge hands the stalled or
+exhausted plan review to the planner once per conflict signature for a corrected plan.
+
+A stage that exhausts its review budget, or any stage or plan review where a role reports
+a `constraint_conflict` verdict or request, is handed to the planner once per conflict
+signature. The planner receives the complete context (plan, stage text, role requests,
+implementer/fixer evidence, check results, changed files, round usage) and returns one of
+three decisions: `revise` (apply through plan publication; current-stage-only revisions
+keep approval and restart the stage; later-stage changes, insertions or plan-review scope
+changes return the plan to draft), `constraint_wrong` (corrected stage text; stage keeps
+approval and is reviewed again), or `refused` (explanation passed to next implementer/fixer
+round if budget remains, otherwise blocks). A reported constraint conflict skips the
+repeated-findings model reassessment that round. The same conflict after an applied
+correction blocks with the escalation record kept, bounding escalation to one planner pass
+per signature per stage or plan-review lineage.
 
 Only a clean evidenced plan gate can authorize the remaining
 `fix(review): apply deferred plan review findings` commit of the approved tree,
@@ -2189,6 +2207,9 @@ status (`completed`, `test_failure`, `escalation`), bounded evidence and optiona
 request (`kind`, `reason`, `required_capability`). Unknown fields and stale IDs
 are rejected. Legacy prose is accepted as ordinary completion and cannot request
 an escalation. Agents must never write routing or outcome data into `.forge`.
+The `kind` field can be `scope` or `constraint_conflict`. A `constraint_conflict`
+request reports that the stage's own constraints contradict each other and cannot
+all be satisfied, with the `reason` explaining which constraints conflict and why.
 
 A scope escalation returns the stage to the planner for one revision of its
 instructions and acceptance. Forge saves that revision before selecting models
@@ -2200,9 +2221,65 @@ Forge saves that explanation and returns it to the implementer for one follow-up
 within the current attempt's remaining budget. This does not change acceptance or
 approve the implementation. The handoff survives restart; another scope escalation
 under the same requirements blocks without repeating the planner dialogue.
+
+### Constraint-conflict escalation
+
+When a stage review exhausts its budget, stalls (for plan review), or when an implementer,
+fixer, reviewer, plan fixer or architect reports a `constraint_conflict`, Forge hands the
+stage to the planner once per conflict signature. The planner receives the full plan with
+each stage's status and commit range, the current stage text, role-tagged outstanding
+requests, implementer and fixer evidence from each round, check results, files changed
+since the stage attempt began, round and budget counts, and who triggered the escalation
+and why. The planner's response is a non-empty analysis and exactly one of three decisions:
+
+- `revise`: changed or new stage instructions/acceptance and/or pending stages to insert
+  before the current stage (for example, to move a test onto fixtures first). The engine
+  applies the revision through the standard plan publication path. If only the current
+  stage changes, the run retains its approval and stage execution restarts with replenished
+  rounds. If later pending stages change, new stages are inserted, or the revision touches
+  plan review scope, the plan returns to draft status for user approval; the stage does
+  not commit and work is kept.
+- `constraint_wrong`: the stage can be done as written. The planner identifies which
+  constraint was misspecified, supplies corrected stage text, and explains why the
+  delivered work meets the corrected requirement. Forge applies the corrected text to the
+  current stage (keeping its approval), and the stage is reviewed again under the new
+  instructions without discarding the working tree.
+- `refused`: the stage can be done as written. The planner explains how the outstanding
+  requests can be satisfied within the current constraints. That explanation is recorded
+  and passed to the implementer or fixer for one additional round within the current
+  attempt's remaining budget.
+
+When a constraint conflict is reported by any role or triggered by budget exhaustion,
+Forge does not call repeated-findings reassessment for that round. Instead, it escalates
+to the planner. A reported conflict skips the model reassessment logic and proceeds
+directly to escalation.
+
+The same conflict signature after one applied planner correction blocks the stage as
+before, with the escalation record (trigger, conflict statement, planner analysis, decision,
+outcome and timestamp) kept on the stage or plan review for future visibility. The engine
+limits escalation to one planner pass per stage per conflict, across attempts and restarts.
+If a planner call fails or if the same conflict returns after its correction was applied,
+the stage or plan review blocks with the escalation record attached and a clear reason.
 Malformed routing proposal fields are returned to the planner with the validation
 error for up to three corrections. The full proposal batch must validate before any
 stage receives a replacement proposal; unknown fields are never silently ignored.
+
+### Planning rules for satisfiable constraints
+
+To prevent contradictory stage constraints, the planner follows three core rules:
+
+1. **Stage constraints must be satisfiable together.** A stage instruction such as
+   "change only documentation" or "change only X" must still allow all project test
+   suites to pass. If any test would fail because of the restriction, the stage is
+   constrained to fail—a contradiction the planner must avoid or resolve.
+2. **Tests reading real project files must be moved onto fixtures first.** Before
+   planning a stage that changes documentation, milestones, statuses, README titles,
+   or other real project files, the planner finds tests that read those files and
+   depend on their current content. If any exist, the planner must include an earlier
+   stage to move them onto fixture data before the restricted stage runs.
+3. **Committed stages are fixed history.** Reviews and corrections never ask to
+   change, amend or rewrite commits of earlier stages. A finding must be satisfiable
+   in the current working tree.
 
 Agents must not disable tests, weaken assertions or suppress warnings merely to
 pass; intentional exceptions require repository-supported justification. When a
