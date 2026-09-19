@@ -27,7 +27,7 @@ struct Escalation {
 }
 
 pub(crate) use crate::model_selection::failure_kind;
-fn signature(kind: &str, evidence: &Value) -> String {
+pub(crate) fn signature(kind: &str, evidence: &Value) -> String {
     crate::metadata::fingerprint(format!("{kind}:{evidence}").as_bytes())
 }
 
@@ -70,7 +70,7 @@ fn parse_outcome(plan: &Value, idx: usize, turn: &str, text: &str) -> Result<Opt
         return Err("implementer failure/escalation requires evidence".into());
     }
     if let Some(r) = &o.request {
-        if !["reasoning", "scope", "capability"].contains(&r.kind.as_str())
+        if !["reasoning", "scope", "capability", crate::constraint_conflict::KIND].contains(&r.kind.as_str())
             || [&r.reason, &r.required_capability]
                 .iter()
                 .any(|s| s.trim().is_empty() || s.len() > 2000)
@@ -447,7 +447,7 @@ impl Ctx {
     }
     pub(super) fn outcome_prompt(&self, plan: &Value, idx: usize, turn: &str) -> String {
         format!(
-            "\nENGINE OUTCOME CHANNEL: Never edit .forge state. Finish with ONLY JSON: {}. status is completed, test_failure, or escalation. evidence contains concrete checks/findings (max 16 strings, 2000 bytes each). request is null unless status=escalation, then {{\"kind\":\"reasoning|scope|capability\",\"reason\":\"specific limitation\",\"required_capability\":\"specific need\"}}. The engine validates identity and decides whether selection is warranted; you cannot assign models. Preserve inherited partial work.",
+            "\nENGINE OUTCOME CHANNEL: Never edit .forge state. Finish with ONLY JSON: {}. status is completed, test_failure, or escalation. evidence contains concrete checks/findings (max 16 strings, 2000 bytes each). request is null unless status=escalation, then {{\"kind\":\"reasoning|scope|capability|constraint_conflict\",\"reason\":\"specific limitation\",\"required_capability\":\"specific need\"}}. Use kind constraint_conflict when the stage's own constraints contradict each other; its reason states which constraints contradict each other and why. The engine validates identity and decides whether selection is warranted; you cannot assign models. Preserve inherited partial work.",
             json!({"version":1,"plan_id":plan["plan_id"],"stage_id":plan["stages"][idx]["id"],"attempt_id":plan["stages"][idx]["attempt_id"],"turn_id":turn,"status":"completed","evidence":[],"request":null})
         )
     }
@@ -460,6 +460,15 @@ impl Ctx {
     ) -> Result<Option<(String, Value)>, String> {
         let Some(o) = parse_outcome(plan, idx, turn, &output.output)? else { return Ok(None); };
         plan["stages"][idx]["implementer_outcome"] = json!(o);
+        // Keep each round's reply so a planner hand-back sees how fixes went.
+        let stage = &mut plan["stages"][idx];
+        if !stage["outcome_history"].is_array() { stage["outcome_history"] = json!([]); }
+        let entry = json!({"round":stage["rounds"],"attempt_id":stage["attempt_id"],"turn_id":o.turn_id,
+            "status":o.status,"evidence":o.evidence,"request":o.request,"unix":unix_timestamp()});
+        let history = stage["outcome_history"].as_array_mut().unwrap();
+        history.push(entry);
+        let excess = history.len().saturating_sub(crate::constraint_conflict::OUTCOME_HISTORY_KEEP);
+        history.drain(..excess);
         self.save_plan(plan)?;
         if o.status == "test_failure" {
             self.reassessment_init(plan, idx);
@@ -488,6 +497,8 @@ impl Ctx {
             (
                 if r.kind == "scope" {
                     "material_scope_change"
+                } else if r.kind == crate::constraint_conflict::KIND {
+                    crate::constraint_conflict::KIND
                 } else {
                     "implementer_escalation"
                 }

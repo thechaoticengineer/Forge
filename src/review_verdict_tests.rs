@@ -232,3 +232,51 @@ fn legacy_policy_without_partition_still_requires_evidenced_role_approvals() {
         assert_eq!(result.is_err(), invalid, "{result:?}");
     }
 }
+
+#[test]
+fn constraint_conflict_verdict_field_is_validated_and_rejects_with_its_statement() {
+    let f = Fixture::new("Implement feature", 0);
+    let p = f.reviewed();
+    let record = &p["stages"][0]["reviews"][0];
+    let parse = |conflict: Value| {
+        let mut verdict = record.clone();
+        verdict["constraint_conflict"] = conflict;
+        normalize_review_verdict(&verdict.to_string(), &record["identity"], "The requested change works.")
+    };
+    // Absent or null leaves an evidenced approval intact.
+    assert_eq!(parse(Value::Null).unwrap()["approved"], true);
+    // A statement turns the verdict into an ordinary rejection that keeps it.
+    let statement = "Change only documentation contradicts keeping the milestone test passing";
+    let rejected = parse(json!(statement)).unwrap();
+    assert_eq!(rejected["approved"], false);
+    assert_eq!(rejected["constraint_conflict"], statement);
+    let issues = rejected["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1);
+    assert!(issues[0].as_str().unwrap().contains(statement));
+    // Malformed values invalidate the whole verdict.
+    for bad in [json!(""), json!("   "), json!(42), json!(true), json!([statement]), json!({"text":statement})] {
+        let error = parse(bad.clone()).unwrap_err();
+        assert!(error.contains("constraint_conflict"), "{bad}: {error}");
+    }
+}
+
+#[test]
+fn review_gate_keeps_role_tagged_conflict_statements_and_rejects_normally() {
+    let f = Fixture::new("Implement feature", 0);
+    let statement = "The stage may change only docs, yet a test reads the changed milestones.md";
+    f.setting("mock_verdicts", json!([{"approved":false,"issues":[],"constraint_conflict":statement}]));
+    f.setting("mock_architect_verdicts", json!([{"approved":false,"issues":["Keep tests passing"]}]));
+    let p = f.run();
+    f.assert_no_commit();
+    let gate = &p["stages"][0]["review_gate"];
+    assert_eq!(gate["status"], "blocked");
+    assert_eq!(gate["constraint_conflicts"], json!([{"role":"reviewer","text":statement}]));
+    assert!(gate["requests"].as_array().unwrap().iter()
+        .any(|r| r["role"] == "reviewer" && r["text"].as_str().unwrap().contains(statement)));
+    // No planner hand-back yet: the conflict acts as a normal rejection.
+    assert_eq!(f.count("planner"), 0);
+    assert!(p["stages"][0]["constraint_escalations"].is_null());
+    // Gates without conflicts keep their previous shape.
+    let clean_gate = aggregate_review_gate(&gate["identity"], &[]);
+    assert!(clean_gate.get("constraint_conflicts").is_none());
+}

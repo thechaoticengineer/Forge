@@ -38,6 +38,7 @@ mod prompts;
 mod util;
 mod usage;
 mod quota;
+mod constraint_conflict;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

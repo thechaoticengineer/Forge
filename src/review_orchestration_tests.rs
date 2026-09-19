@@ -17,7 +17,7 @@ fn review_response_corrections_do_not_repeat_implementation_or_spend_fix_rounds(
 }
 
 #[test]
-fn review_prompts_forbid_requests_to_change_earlier_commits() {
+fn review_prompts_forbid_history_requests_and_explain_constraint_conflicts() {
     let f = Fixture::new("Implement feature", 0);
     f.setting("mock_verdicts", json!([clean()]));
     f.run();
@@ -26,6 +26,10 @@ fn review_prompts_forbid_requests_to_change_earlier_commits() {
         let prompt = sessions.as_array().unwrap().iter().find(|s| s["role"] == role)
             .unwrap_or_else(|| panic!("no {role} session"))["prompt"].as_str().unwrap().to_owned();
         assert!(prompt.contains(crate::prompts::REVIEWER_HISTORY_RULE), "{role}: {prompt}");
+        assert!(prompt.contains(crate::prompts::REVIEWER_CONFLICT_RULE), "{role}: {prompt}");
+        if role == "architect" {
+            assert!(prompt.contains("set constraint_conflict for the planner instead of rejecting round after round"), "{prompt}");
+        }
     }
 }
 

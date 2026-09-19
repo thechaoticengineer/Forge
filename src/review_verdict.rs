@@ -69,6 +69,10 @@ pub(super) fn normalize_review_verdict(output: &str, identity: &Value, acceptanc
         gap.as_str().filter(|text| !text.trim().is_empty())
             .ok_or("architecture_context_gap must be a non-empty explanation or null")?;
     }
+    // A context gap is two roles disagreeing and goes to the architect; a
+    // constraint conflict is the stage (or plan) text contradicting itself and
+    // goes to the planner. Both are rejections that keep their own statement.
+    let conflict = crate::constraint_conflict::verdict_field(&v)?;
     if let Some(gap) = v["architecture_context_gap"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
@@ -79,6 +83,13 @@ pub(super) fn normalize_review_verdict(output: &str, identity: &Value, acceptanc
             .as_array_mut()
             .unwrap()
             .push(json!(format!("Resolve architectural context gap: {gap}")));
+    }
+    if let Some(conflict) = conflict {
+        v["approved"] = json!(false);
+        v["issues"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(format!("Resolve constraint conflict (the planner owns the stage text): {conflict}")));
     }
     if v["approved"] == true {
         let required = acceptance_criteria_items(acceptance);
@@ -120,7 +131,7 @@ pub(super) fn normalize_review_verdict(output: &str, identity: &Value, acceptanc
             );
         }
     } else if Ctx::review_requests(&v).is_empty() {
-        return Err("review rejection requires actionable issues, notes or an architecture context gap; preserve the rejection and explain what needs correction".into());
+        return Err("review rejection requires actionable issues, notes, an architecture context gap or a constraint conflict; preserve the rejection and explain what needs correction".into());
     }
     Ok(v)
 }
@@ -140,6 +151,7 @@ pub(super) fn aggregate_review_gate(identity: &Value, records: &[Value]) -> Valu
     let required = stage_required_roles(&identity["policy"]).unwrap();
     let mut roles = json!({"architect":"not_required","reviewer":if identity["scope"] == "plan" {"not_required"} else {"pending"}});
     let mut requests = vec![];
+    let mut conflicts = vec![];
     for role in required {
         let name = role.as_str().unwrap();
         let record = records.iter().find(|r| {
@@ -162,6 +174,9 @@ pub(super) fn aggregate_review_gate(identity: &Value, records: &[Value]) -> Valu
             for text in Ctx::review_requests(r) {
                 requests.push(json!({"role":name,"text":text}));
             }
+            if let Ok(Some(text)) = crate::constraint_conflict::verdict_field(r) {
+                conflicts.push(json!({"role":name,"text":text}));
+            }
         }
     }
     for role in identity["policy"]["deferred_roles"].as_array().into_iter().flatten() {
@@ -170,6 +185,11 @@ pub(super) fn aggregate_review_gate(identity: &Value, records: &[Value]) -> Valu
     let approved = required
         .iter()
         .all(|r| roles[r.as_str().unwrap()] == "approved");
-    json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if required.is_empty() {"deferred"} else if approved {"approved"} else {"blocked"},"requests":requests})
+    let mut gate = json!({"identity":identity,"policy":identity["policy"],"roles":roles,"status":if required.is_empty() {"deferred"} else if approved {"approved"} else {"blocked"},"requests":requests});
+    // Reported constraint conflicts stay on the gate for the planner hand-back.
+    if !conflicts.is_empty() {
+        gate["constraint_conflicts"] = json!(conflicts);
+    }
+    gate
 }
 

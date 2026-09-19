@@ -837,6 +837,10 @@ fn planner_clarification_survives_restart_without_changing_scope_or_resetting_bu
 }
 
 fn install_scope_cli(f: &Fixture, repeat: bool) {
+    install_escalating_cli(f, repeat, "scope");
+}
+
+fn install_escalating_cli(f: &Fixture, repeat: bool, kind: &str) {
     use std::os::unix::fs::PermissionsExt;
     let cli = f.root.join("fake-scope-codex");
     fs::write(&cli, format!(r#"#!/usr/bin/env python3
@@ -847,11 +851,11 @@ outcome,_=json.JSONDecoder().raw_decode(prompt.split('Finish with ONLY JSON: ',1
 with pathlib.Path('unfinished.txt').open('a') as output: output.write('preserved work\n')
 clarified='Interim warnings are expected; wire the caller in the next stage.' in prompt
 if not clarified or {repeat}:
-    outcome.update(status='escalation',evidence=['Caller is introduced in the next stage'],request={{'kind':'scope','reason':'Interim warnings','required_capability':'Clarify stage boundaries'}})
+    outcome.update(status='escalation',evidence=['Caller is introduced in the next stage'],request={{'kind':'{kind}','reason':'Interim warnings','required_capability':'Clarify stage boundaries'}})
 print(json.dumps({{'type':'thread.started','thread_id':'11111111-2222-4333-8444-555555555555','model':model}}))
 print(json.dumps({{'type':'item.completed','item':{{'type':'agent_message','text':json.dumps(outcome)}}}}))
 print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':10,'output_tokens':5}}}}))
-"#, repeat=if repeat {"True"} else {"False"})).unwrap();
+"#, repeat=if repeat {"True"} else {"False"}, kind=kind)).unwrap();
     fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
     f.set("test_cli_codex", json!(cli));
     f.set("test_real_implementation_cli", json!(true));
@@ -1139,4 +1143,121 @@ fn archived_history_leaves_reassessment_budget_and_blocking_unchanged() {
     let saved = f.ctx.load_plan().unwrap();
     assert_eq!(saved["stages"][0]["reassessment"]["count"], 1);
     assert_eq!(saved["stages"][0]["reassessment"]["signatures"].as_array().unwrap().len(), 1);
+}
+
+fn conflict_outcome(p: &Value, reason: Value) -> Value {
+    json!({"version":1,"plan_id":p["plan_id"],"stage_id":1,"attempt_id":"attempt","turn_id":"turn","status":"escalation",
+        "evidence":["docs-only stage flips the milestone test"],
+        "request":{"kind":"constraint_conflict","reason":reason,"required_capability":"Planner correction of the stage constraints"}})
+}
+
+#[test]
+fn implementers_and_fixers_can_report_a_validated_constraint_conflict() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    f.ctx.reassessment_init(&mut p, 0);
+    assert!(f.ctx.outcome_prompt(&p, 0, "turn").contains("reasoning|scope|capability|constraint_conflict"));
+    let valid = conflict_outcome(&p, json!("Change only docs contradicts keeping the milestone test passing"));
+    assert_eq!(parse_outcome(&p, 0, "turn", &valid.to_string()).unwrap().unwrap().request.unwrap().kind, "constraint_conflict");
+    for reason in [json!(""), json!("  ")] {
+        let error = parse_outcome(&p, 0, "turn", &conflict_outcome(&p, reason).to_string()).err().unwrap();
+        assert!(error.contains("invalid implementer escalation request"), "{error}");
+    }
+    let mut wrong_type = valid.clone();
+    wrong_type["request"]["kind"] = json!(7);
+    assert!(parse_outcome(&p, 0, "turn", &wrong_type.to_string()).is_err());
+    let mut unknown = valid.clone();
+    unknown["request"]["kind"] = json!("constraint");
+    assert!(parse_outcome(&p, 0, "turn", &unknown.to_string()).is_err());
+    let result = crate::agent::AgentResult { output: valid.to_string(), ..Default::default() };
+    let (kind, evidence) = f.ctx.implementer_outcome(&mut p, 0, "turn", &result).unwrap().unwrap();
+    assert_eq!(kind, "constraint_conflict");
+    assert_eq!(evidence["request"]["reason"], valid["request"]["reason"]);
+    // Each round's reply is kept, bounded, for a later planner hand-back.
+    for _ in 0..crate::constraint_conflict::OUTCOME_HISTORY_KEEP + 2 {
+        f.ctx.implementer_outcome(&mut p, 0, "turn", &result).unwrap();
+    }
+    let saved = f.ctx.load_plan().unwrap();
+    let history = saved["stages"][0]["outcome_history"].as_array().unwrap();
+    assert_eq!(history.len(), crate::constraint_conflict::OUTCOME_HISTORY_KEEP);
+    assert_eq!(history[0]["attempt_id"], "attempt");
+    assert_eq!(history[0]["request"]["kind"], "constraint_conflict");
+}
+
+#[test]
+fn the_mock_planner_answers_a_constraint_escalation_through_the_validated_contract() {
+    let f = Fixture::new();
+    let mut p = f.attempt();
+    p["stages"][0]["rounds"] = json!(1);
+    p["stages"][0]["review_gate"] = json!({"status":"blocked","requests":[{"role":"reviewer","text":"Milestone test fails"}]});
+    p["stages"][0]["attempt_head"] = json!(f.ctx.git(&["rev-parse", "HEAD"]).unwrap());
+    f.ctx.save_plan(&p).unwrap();
+    fs::write(f.root.join("changed.md"), "work\n").unwrap();
+    let statement = "Change only docs contradicts keeping the milestone test passing".to_string();
+    let at = f.ctx.begin_constraint_escalation(&mut p, 0, "fixer", "constraint_conflict", &statement,
+        std::slice::from_ref(&statement)).unwrap();
+    let pending = f.ctx.load_plan().unwrap()["stages"][0]["constraint_escalations"][at].clone();
+    assert_eq!(pending["outcome"], "pending");
+    assert_eq!(pending["trigger"]["source"], "fixer");
+    assert_eq!(pending["inputs"]["changed_files"]["items"], json!(["changed.md"]));
+    assert_eq!(pending["signature"], crate::constraint_conflict::signature(
+        std::slice::from_ref(&statement), &[json!({"role":"architect","text":"milestone  test fails"})]));
+    let revise = json!({"analysis":"The docs-only limit collides with a test reading real docs.",
+        "decision":{"revise":{"stages":[{"id":1,"instructions":"Implement greeting with a fixture test","acceptance":"Greeting works"}]}}});
+    f.set("mock_scope_output", json!(["{broken", {"analysis":"x","decision":{"refused":"a","revise":{}}}, revise]));
+    let answer = f.ctx.consult_conflict_planner(&mut p, 0, at).unwrap();
+    assert_eq!(answer.decision.name(), "revise");
+    let saved = f.ctx.load_plan().unwrap();
+    let record = &saved["stages"][0]["constraint_escalations"][at];
+    assert_eq!(record["analysis"], revise["analysis"]);
+    assert_eq!(record["decision"], "revise");
+    assert_eq!(record["correction"]["revise"]["stages"], revise["decision"]["revise"]["stages"]);
+    assert_eq!(record["correction"]["revise"]["insert_before"], json!([]));
+    // Validation happens before anything changes the plan: the stage is intact.
+    assert_eq!(saved["stages"][0]["instructions"], "Implement greeting");
+    let settings = f.ctx.app.settings.lock().unwrap().clone();
+    let planner: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
+    assert_eq!(planner.len(), 3);
+    let prompt = planner[0]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("Milestone test fails") && prompt.contains("changed.md") && prompt.contains("\"source\": \"fixer\""));
+    assert!(planner[1]["prompt"].as_str().unwrap().contains("invalid constraint conflict answer"));
+    drop(settings);
+    f.ctx.settle_constraint_escalation(&mut p, 0, at, "awaiting_approval", Some("later stage changed")).unwrap();
+    let settled = &f.ctx.load_plan().unwrap()["stages"][0]["constraint_escalations"][at];
+    assert_eq!(settled["outcome"], "awaiting_approval");
+    assert_eq!(settled["plan_revision"], saved["revision"]);
+    assert_eq!(p["stages"][0]["constraint_escalations"][at], *settled);
+    assert!(f.ctx.settle_constraint_escalation(&mut p, 0, at, "unknown", None).is_err());
+}
+
+#[test]
+fn an_implementer_constraint_conflict_reaches_scope_renegotiation_and_is_recorded() {
+    // Clarified: the planner keeps the stage and the implementer completes it.
+    let f = Fixture::new();
+    install_escalating_cli(&f, false, "constraint_conflict");
+    let p = f.run();
+    let s = &p["stages"][0];
+    assert_eq!(s["status"], "committed", "{p}");
+    assert_eq!(s["scope_clarification"]["message"], "Interim warnings are expected; wire the caller in the next stage.");
+    let records = s["constraint_escalations"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["trigger"], json!({"source":"implementer","kind":"constraint_conflict","reason":"Interim warnings"}));
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["inputs"]["statements"]["items"], json!(["Interim warnings"]));
+    assert_eq!(records[0]["inputs"]["fixer_replies"]["items"][0]["request"]["kind"], "constraint_conflict");
+    let settings = f.ctx.app.settings.lock().unwrap();
+    let planner: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
+    assert_eq!(planner.len(), 1);
+    assert!(planner[0]["prompt"].as_str().unwrap().contains("reason: Interim warnings"));
+    drop(settings);
+
+    // Repeated after the clarification: blocked like a scope escalation, never dropped.
+    let g = Fixture::new();
+    install_escalating_cli(&g, true, "constraint_conflict");
+    let p = g.run();
+    assert_eq!(p["stages"][0]["status"], "blocked");
+    assert_eq!(p["stages"][0]["review_gate"]["status"], "scope_blocked");
+    let outcomes: Vec<_> = p["stages"][0]["constraint_escalations"].as_array().unwrap().iter()
+        .map(|r| r["outcome"].clone()).collect();
+    assert_eq!(outcomes, vec![json!("refused"), json!("blocked")]);
 }

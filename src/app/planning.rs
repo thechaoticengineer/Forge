@@ -347,20 +347,7 @@ impl Ctx {
             ("{acceptance}", stage["acceptance"].as_str().unwrap_or("")),
             ("{escalation}", &escalation),
         ]);
-        let requirements = self.model_requirements("planner", None)?;
-        let (result, (tool, model, effort)) = self.with_selected_model(&requirements, None, |(tool, model, effort)|
-            self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,prompt:&prompt }))?;
-        let expected_model = result.effective_model.clone();
-        let model_reported = result.model_reported;
-        self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
-        // The mock planner answers through settings, the way it answers plan
-        // generation through the candidate file.
-        let text = if tool == "mock" {
-            self.mock_scope_response()
-        } else {
-            result.output
-        };
-        let (_, answer) = self.repair_response("scope revision", text, |text| {
+        let answer = self.planner_answer(plan, idx, "scope revision", &prompt, |text| {
             let answer: Value = crate::response::parse_json(json_payload_with_keys(text, &["revised", "refused"]))
                 .map_err(|e| format!("invalid scope revision: {e}"))?;
             crate::response::object_fields(&answer, &["revised", "refused", "removed"])?;
@@ -388,17 +375,6 @@ impl Ctx {
                 return Err("the planner returned the stage unchanged without clarification; return refused with an explanation or an actual revision".into());
             }
             Ok(answer)
-        }, |text, error| {
-            let correction = crate::response::correction_prompt(&prompt, text, error);
-            let result = self.run_agent(&AgentRequest { role:"planner",provider:&tool,model:&model,effort:&effort,session:None,prompt:&correction })?;
-            if !result.completed || (tool != "mock" && model_reported && (!result.model_reported
-                || !crate::agent::same_model(&tool, &expected_model, &result.effective_model))) {
-                return Err("scope correction model changed or did not complete".into());
-            }
-            self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
-            if tool == "mock" {
-                Ok(self.mock_scope_response())
-            } else { Ok(result.output) }
         })?;
         if let Some(refused) = answer["refused"].as_str().filter(|r| !r.trim().is_empty()) {
             plan["stages"][idx]["scope_clarification"] = json!({
@@ -435,6 +411,113 @@ impl Ctx {
         });
         *plan = self.publish_plan(&current, false)?;
         self.resume_scope_revision(plan, target).map(ScopeResolution::Revised)
+    }
+
+    /// Ask the stage's planner once and validate the complete answer, spending
+    /// the shared correction budget on malformed answers. The mock planner
+    /// answers from the `mock_scope_output` setting (a string, object or queue).
+    fn planner_answer<T>(&self, plan: &mut Value, idx: usize, operation: &str, prompt: &str,
+        mut validate: impl FnMut(&str) -> Result<T, String>) -> Result<T, String>
+    {
+        let requirements = self.model_requirements("planner", None)?;
+        let (result, (tool, model, effort)) = self.with_selected_model(&requirements, None, |(tool, model, effort)|
+            self.run_agent(&AgentRequest { role:"planner",provider:tool,model,effort,session:None,prompt }))?;
+        let expected_model = result.effective_model.clone();
+        let model_reported = result.model_reported;
+        self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
+        // The mock planner answers through settings, the way it answers plan
+        // generation through the candidate file.
+        let text = if tool == "mock" {
+            self.mock_scope_response()
+        } else {
+            result.output
+        };
+        let (_, answer) = self.repair_response(operation, text, |text| validate(text), |text, error| {
+            let correction = crate::response::correction_prompt(prompt, text, error);
+            let result = self.run_agent(&AgentRequest { role:"planner",provider:&tool,model:&model,effort:&effort,session:None,prompt:&correction })?;
+            if !result.completed || (tool != "mock" && model_reported && (!result.model_reported
+                || !crate::agent::same_model(&tool, &expected_model, &result.effective_model))) {
+                return Err(format!("{operation} correction model changed or did not complete"));
+            }
+            self.record_stage_usage(plan, idx, "planner", &tool, result.usage)?;
+            if tool == "mock" {
+                Ok(self.mock_scope_response())
+            } else { Ok(result.output) }
+        })?;
+        Ok(answer)
+    }
+
+    /// Files changed since the stage attempt began: tracked edits against the
+    /// attempt head plus untracked files, excluding Forge runtime data.
+    pub(super) fn attempt_changed_files(&self, plan: &Value, idx: usize) -> Result<Vec<String>, String> {
+        let Some(base) = plan["stages"][idx]["attempt_head"].as_str() else { return Ok(vec![]); };
+        let mut files = std::collections::BTreeSet::new();
+        for args in [vec!["diff", "--name-only", base, "--", ".", ":(exclude).forge"],
+            vec!["ls-files", "--others", "--exclude-standard", "--", ".", ":(exclude).forge"]] {
+            files.extend(self.git(&args)?.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned));
+        }
+        Ok(files.into_iter().collect())
+    }
+
+    /// Persist a pending constraint escalation on the stage before anything asks
+    /// the planner, so a restart finds it. Returns the record's index.
+    pub(super) fn begin_constraint_escalation(&self, plan: &mut Value, idx: usize, source: &str, kind: &str,
+        reason: &str, statements: &[String]) -> Result<usize, String>
+    {
+        use crate::constraint_conflict as conflict;
+        let changed = self.attempt_changed_files(plan, idx)?;
+        let requests = plan["stages"][idx]["review_gate"]["requests"].as_array().cloned().unwrap_or_default();
+        let signature = conflict::signature(statements, &requests);
+        let inputs = conflict::stage_inputs(plan, idx, statements, &changed);
+        let record = conflict::new_record(source, kind, reason, &signature, inputs, unix_timestamp())?;
+        let at = conflict::push_record(&mut plan["stages"][idx], record);
+        self.save_plan(plan)?;
+        Ok(at)
+    }
+
+    /// Ask the planner about a pending escalation record and store its validated
+    /// answer (analysis, decision, correction) on the record.
+    // Only tests call this until the stage loop hands conflicts to the planner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn consult_conflict_planner(&self, plan: &mut Value, idx: usize, at: usize)
+        -> Result<crate::constraint_conflict::PlannerAnswer, String>
+    {
+        use crate::constraint_conflict as conflict;
+        let sid = plan["stages"][idx]["id"].clone();
+        let record = plan["stages"][idx][conflict::RECORDS][at].clone();
+        if !record.is_object() { return Err("missing constraint escalation record".into()); }
+        self.set_step(sid.as_i64(), "asking the planner about a constraint conflict");
+        self.log_event("plan", &format!("stage {sid}: constraint conflict handed to the planner"));
+        let prompt = conflict::prompt(plan, idx, &record);
+        let snapshot = plan.clone();
+        let answer = self.planner_answer(plan, idx, "constraint conflict", &prompt,
+            |text| conflict::validate_answer(text, &snapshot, idx))?;
+        conflict::record_answer(&mut plan["stages"][idx][conflict::RECORDS][at], &answer);
+        self.save_plan(plan)?;
+        Ok(answer)
+    }
+
+    /// Settle an escalation record with the given outcome. The saved plan is
+    /// authoritative (a failed hand-back may leave the caller's copy stale), so
+    /// the record is settled there and mirrored into the caller's copy.
+    pub(super) fn settle_constraint_escalation(&self, plan: &mut Value, idx: usize, at: usize, outcome: &str,
+        detail: Option<&str>) -> Result<(), String>
+    {
+        use crate::constraint_conflict as conflict;
+        let sid = plan["stages"][idx]["id"].clone();
+        let mut current = self.load_plan().ok_or("missing plan")?;
+        let target = current["stages"].as_array().ok_or("invalid stages")?.iter()
+            .position(|s| s["id"] == sid).ok_or("stage disappeared during constraint escalation")?;
+        let revision = current["revision"].clone();
+        let record = &mut current["stages"][target][conflict::RECORDS][at];
+        if !record.is_object() { return Err("missing constraint escalation record".into()); }
+        conflict::set_outcome(record, outcome, detail, Some(&revision), unix_timestamp())?;
+        let settled = record.clone();
+        self.save_plan(&current)?;
+        if plan["stages"][idx][conflict::RECORDS][at].is_object() {
+            plan["stages"][idx][conflict::RECORDS][at] = settled;
+        }
+        Ok(())
     }
 
     fn mock_scope_response(&self) -> String {

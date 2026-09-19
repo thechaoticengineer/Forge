@@ -187,8 +187,10 @@ impl Ctx {
             prompt.push_str(&format!(
                 "Current actionable independent requests (not an endorsement): {requests:?}\n"
             ));
-            prompt.push_str("\nYou are the persistent architect reviewing recorded design, cross-stage interfaces and regressions. Your verdict has independent authority. For conflicting requests, record architectural clarification in architecture_context_gap without dismissing either role's unresolved findings.\n");
+            prompt.push_str("\nYou are the persistent architect reviewing recorded design, cross-stage interfaces and regressions. Your verdict has independent authority. For conflicting requests, record architectural clarification in architecture_context_gap without dismissing either role's unresolved findings. When the stage's (or plan's) own constraints contradict each other, set constraint_conflict for the planner instead of rejecting round after round.\n");
             prompt.push_str(crate::prompts::REVIEWER_HISTORY_RULE);
+            prompt.push('\n');
+            prompt.push_str(crate::prompts::REVIEWER_CONFLICT_RULE);
             prompt.push('\n');
         }
         self.set_step(
@@ -792,8 +794,27 @@ impl Ctx {
                     // A scope escalation says this stage cannot be built as written.
                     // Re-running it against the same words only spends the remaining
                     // fix rounds, so the planner that owns the text decides instead.
-                    if kind == "material_scope_change" {
-                        let message = match self.renegotiate_scope(plan, idx, &evidence)? {
+                    // A constraint conflict (the stage's own constraints contradict
+                    // each other) also goes to the planner. Until the stage loop has its
+                    // own conflict hand-back it takes the scope path, recorded as an
+                    // escalation so it is never dropped.
+                    if kind == "material_scope_change" || kind == crate::constraint_conflict::KIND {
+                        let record = if kind == crate::constraint_conflict::KIND {
+                            let reason = evidence["request"]["reason"].as_str().unwrap_or("").to_owned();
+                            Some(self.begin_constraint_escalation(plan, idx, role, &kind, &reason, std::slice::from_ref(&reason))?)
+                        } else { None };
+                        let resolution = self.renegotiate_scope(plan, idx, &evidence);
+                        if let Some(at) = record {
+                            use super::super::planning::ScopeResolution as R;
+                            let (outcome, detail) = match &resolution {
+                                Ok(R::Revised(changed)) => ("applied", format!("scope renegotiation revised the stage: {changed}")),
+                                Ok(R::Clarified(message)) => ("refused", format!("scope renegotiation kept the stage: {message}")),
+                                Ok(R::Blocked(message)) => ("blocked", message.clone()),
+                                Err(error) => ("failed", error.clone()),
+                            };
+                            self.settle_constraint_escalation(plan, idx, at, outcome, Some(&detail))?;
+                        }
+                        let message = match resolution? {
                             super::super::planning::ScopeResolution::Revised(_) => return Ok("renegotiated"),
                             super::super::planning::ScopeResolution::Clarified(_) => {
                                 if round < budget { continue; }
