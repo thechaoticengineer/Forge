@@ -1230,34 +1230,53 @@ fn the_mock_planner_answers_a_constraint_escalation_through_the_validated_contra
     assert!(f.ctx.settle_constraint_escalation(&mut p, 0, at, "unknown", None).is_err());
 }
 
+fn conflict_refusal() -> Value {
+    json!({"analysis":"The warnings are interim; the caller arrives in the next stage.",
+        "decision":{"refused":"Interim warnings are expected; wire the caller in the next stage."}})
+}
+
 #[test]
-fn an_implementer_constraint_conflict_reaches_scope_renegotiation_and_is_recorded() {
-    // Clarified: the planner keeps the stage and the implementer completes it.
+fn an_implementer_constraint_conflict_goes_to_the_planner_once_and_is_recorded() {
+    // Refused: the planner keeps the stage and the implementer completes it.
     let f = Fixture::new();
     install_escalating_cli(&f, false, "constraint_conflict");
+    f.set("mock_scope_output", conflict_refusal());
     let p = f.run();
     let s = &p["stages"][0];
     assert_eq!(s["status"], "committed", "{p}");
     assert_eq!(s["scope_clarification"]["message"], "Interim warnings are expected; wire the caller in the next stage.");
+    assert_eq!(s["scope_clarification"]["source"], "constraint_conflict");
     let records = s["constraint_escalations"].as_array().unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["trigger"], json!({"source":"implementer","kind":"constraint_conflict","reason":"Interim warnings"}));
+    assert_eq!(records[0]["decision"], "refused");
     assert_eq!(records[0]["outcome"], "refused");
     assert_eq!(records[0]["inputs"]["statements"]["items"], json!(["Interim warnings"]));
     assert_eq!(records[0]["inputs"]["fixer_replies"]["items"][0]["request"]["kind"], "constraint_conflict");
     let settings = f.ctx.app.settings.lock().unwrap();
     let planner: Vec<_> = settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").collect();
     assert_eq!(planner.len(), 1);
-    assert!(planner[0]["prompt"].as_str().unwrap().contains("reason: Interim warnings"));
+    let prompt = planner[0]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("REPORTED CONFLICT STATEMENTS") && prompt.contains("Interim warnings"), "{prompt}");
     drop(settings);
 
-    // Repeated after the clarification: blocked like a scope escalation, never dropped.
+    // Repeated after the planner's answer: the same conflict blocks the stage
+    // without a second planner pass, with the escalation record attached.
     let g = Fixture::new();
     install_escalating_cli(&g, true, "constraint_conflict");
+    g.set("mock_scope_output", conflict_refusal());
     let p = g.run();
-    assert_eq!(p["stages"][0]["status"], "blocked");
-    assert_eq!(p["stages"][0]["review_gate"]["status"], "scope_blocked");
-    let outcomes: Vec<_> = p["stages"][0]["constraint_escalations"].as_array().unwrap().iter()
+    let s = &p["stages"][0];
+    assert_eq!(s["status"], "blocked");
+    let outcomes: Vec<_> = s["constraint_escalations"].as_array().unwrap().iter()
         .map(|r| r["outcome"].clone()).collect();
     assert_eq!(outcomes, vec![json!("refused"), json!("blocked")]);
+    assert_eq!(s["constraint_escalations"][1]["repeats"], 0);
+    assert_eq!(s["review_gate"]["constraint_escalation"]["outcome"], "blocked");
+    assert!(s["review_gate"]["reason"].as_str().unwrap().contains("already had its planner pass"));
+    let settings = g.ctx.app.settings.lock().unwrap();
+    assert_eq!(settings["mock_agent_requests"].as_array().unwrap().iter().filter(|r| r["role"] == "planner").count(), 1);
 }
+
+#[path = "constraint_escalation_tests.rs"]
+mod constraint_escalation;

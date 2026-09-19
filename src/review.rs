@@ -7,9 +7,8 @@ use std::sync::atomic::Ordering;
 
 #[path = "review_scope.rs"]
 mod scope;
-use scope::{
-    classify_review_scope, dual_review_policy, review_snapshot, review_snapshot_against,
-};
+use scope::{classify_review_scope, dual_review_policy, review_snapshot_against};
+pub(in crate::app) use scope::review_snapshot;
 
 #[path = "review_verdict.rs"]
 mod verdict;

@@ -104,12 +104,36 @@ fn bounded_text(text: &str) -> Value {
         "fingerprint": crate::metadata::fingerprint(text.as_bytes())})
 }
 
+/// The stage's outstanding role-tagged requests: the current gate's, or, once a
+/// new round reset the gate, the combined requests carried to that round.
+pub(crate) fn outstanding_requests(stage: &Value) -> Vec<Value> {
+    if let Some(requests) = stage["review_gate"]["requests"].as_array().filter(|r| !r.is_empty()) {
+        return requests.clone();
+    }
+    let previous = &stage["previous_requests"];
+    ["issues", "notes"].iter().flat_map(|field| previous[*field].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(|text| match text.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+            Some((role, text)) => json!({"role":role,"text":text}),
+            None => json!({"role":"reviewer","text":text}),
+        })
+        .collect()
+}
+
+/// Trigger kind and synthetic conflict statement of the engine fallback that
+/// hands an exhausted review to the planner. Deterministic, so the same
+/// exhaustion of the same stage with the same requests has the same signature.
+pub(crate) const EXHAUSTED_KIND: &str = "review_exhausted";
+pub(crate) fn exhausted_statement(stage_id: &Value) -> String {
+    format!("engine fallback: the review budget of stage {stage_id} ran out with requests outstanding")
+}
+
 /// The planner inputs for one stage, from the saved plan and the files changed
 /// since the attempt began. Statements are the reported conflicts.
 pub(crate) fn stage_inputs(plan: &Value, idx: usize, statements: &[String], changed_files: &[String]) -> Value {
     let stage = &plan["stages"][idx];
     let attempt = &stage["attempt_id"];
-    let requests: Vec<Value> = stage["review_gate"]["requests"].as_array().cloned().unwrap_or_default();
+    let requests = outstanding_requests(stage);
     let replies: Vec<Value> = stage["outcome_history"].as_array().into_iter().flatten()
         .filter(|entry| entry["attempt_id"] == *attempt).cloned().collect();
     let checks: Vec<Value> = stage["reviews"].as_array().into_iter().flatten()

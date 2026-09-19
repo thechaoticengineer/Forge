@@ -273,9 +273,15 @@ fn review_gate_keeps_role_tagged_conflict_statements_and_rejects_normally() {
     assert_eq!(gate["constraint_conflicts"], json!([{"role":"reviewer","text":statement}]));
     assert!(gate["requests"].as_array().unwrap().iter()
         .any(|r| r["role"] == "reviewer" && r["text"].as_str().unwrap().contains(statement)));
-    // No planner hand-back yet: the conflict acts as a normal rejection.
-    assert_eq!(f.count("planner"), 0);
-    assert!(p["stages"][0]["constraint_escalations"].is_null());
+    // The conflict goes to the planner once; without a usable answer the
+    // pass fails and the stage blocks with the record attached.
+    let records = p["stages"][0]["constraint_escalations"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["trigger"]["source"], "reviewer");
+    assert_eq!(records[0]["inputs"]["statements"]["items"], json!([statement]));
+    assert_eq!(records[0]["outcome"], "failed");
+    assert_eq!(gate["constraint_escalation"]["signature"], records[0]["signature"]);
+    assert_eq!(p["stages"][0]["status"], "blocked");
     // Gates without conflicts keep their previous shape.
     let clean_gate = aggregate_review_gate(&gate["identity"], &[]);
     assert!(clean_gate.get("constraint_conflicts").is_none());

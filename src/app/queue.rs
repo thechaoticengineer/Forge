@@ -73,6 +73,8 @@ impl Ctx {
         let status = match phase.as_str() {
             "done" => "done",
             "failed" => "failed",
+            // A planner correction returned the plan to the user for approval.
+            _ if self.load_plan().is_some_and(|plan| plan["status"] == "draft") => "awaiting_approval",
             _ => "blocked",
         };
         let mut queue = self.load_queue();

@@ -215,12 +215,17 @@ fn exhausted_run_keeps_usage_without_replenishing_budget() {
         settings["mock_verdicts"] = json!([
             {"approved": false, "issues": ["Try again."]},
         ]);
+        // The exhausted review gets its one planner pass, which keeps the stage.
+        settings["mock_scope_output"] = json!({"analysis": "The stage is buildable.",
+            "decision": {"refused": "Address the review request."}});
     }
     test.app.run_worker();
     let blocked = test.app.load_plan().unwrap();
     assert_eq!(blocked["stages"][0]["status"], "blocked");
+    // Implementer, reviewer, architect and the one planner pass; a restart
+    // replenishes neither the fix budget nor the planner pass.
     assert_eq!(blocked["usage"]["mock"], json!({
-        "input_tokens": 0, "output_tokens": 0, "total_tokens": 30, "calls": 3,
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 40, "calls": 4,
         "models": {"configured-model": 10},
     }));
     assert_eq!(blocked["stages"][0]["usage"], blocked["usage"]);

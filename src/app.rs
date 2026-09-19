@@ -1,5 +1,6 @@
 //! Shared application/session state, metadata scheduling, and repository discovery.
 mod agent_execution;
+mod constraint_escalation;
 mod discussion;
 mod execution;
 /// Approvals bind reviewed content to a commit; their Git and state

@@ -7,6 +7,7 @@ use super::{
 use crate::agent::{AgentRequest, AgentResult, AgentUsage};
 use crate::prompts::{FIX_PROMPT, IMPLEMENT_PROMPT, REVIEW_PROMPT};
 use crate::util::unix_timestamp;
+use super::super::constraint_escalation::{CONFLICT_BLOCKED, ConflictResolution, Trigger};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -149,6 +150,16 @@ impl Ctx {
             let changed = self.changed_business_tests(diff_base, &registered)?;
             if let Some(section) = crate::feature_context::changed_section(&changed) {
                 prompt.push_str(&section);
+            }
+        }
+        // Reviewers see the planner's answer to an earlier conflict report, so
+        // they do not report the same conflict again without cause.
+        if let ReviewScope::Stage(idx) = scope {
+            let clarification = &plan["stages"][idx]["scope_clarification"];
+            if clarification["source"] == crate::constraint_conflict::KIND
+                && clarification["source_inputs"] == crate::plan::stage_inputs(plan, idx) {
+                prompt.push_str(&format!("\nPLANNER ANSWER TO A CONSTRAINT CONFLICT REPORTED EARLIER IN THIS STAGE (the stage stays as written):\n{}\nThe planner decides each conflict once; reporting the same conflict again blocks the stage for a human.\n",
+                    clarification["message"].as_str().unwrap_or("")));
             }
         }
         if role == "architect" {
@@ -580,7 +591,22 @@ impl Ctx {
         })
     }
 
+    /// Run the stage's review rounds. An exhausted budget gets the engine
+    /// fallback: one planner pass per stage and conflict, even when no role
+    /// reported a conflict. An escalation that already blocked gets none.
     pub(in crate::app) fn run_review_stage(
+        &self,
+        plan: &mut Value,
+        idx: usize,
+    ) -> Result<&'static str, String> {
+        match self.run_review_rounds(plan, idx)? {
+            "exhausted" => self.exhaustion_fallback(plan, idx),
+            CONFLICT_BLOCKED => Ok("exhausted"),
+            outcome => Ok(outcome),
+        }
+    }
+
+    fn run_review_rounds(
         &self,
         plan: &mut Value,
         idx: usize,
@@ -652,7 +678,13 @@ impl Ctx {
             } else { None };
             // A resumed design block retries only the export: the turn that produced
             // these edits already ran and its round is already reserved.
-            if !resuming {
+            // A constraint_wrong correction re-reviews the delivered work under the
+            // corrected text: the round is reserved, but no implementer turn runs.
+            let rereview = !resuming && round == start && self.take_conflict_rereview(plan, idx)?;
+            if rereview {
+                self.reserve_review_round(plan, idx, round)?;
+            }
+            if !resuming && !rereview {
                 let clarifying = plan["stages"][idx]["scope_clarification"]["pending"] == true
                     && plan["stages"][idx]["scope_clarification"]["source_inputs"] == crate::plan::stage_inputs(plan, idx);
                 // Reserve clarification delivery with the round, before invocation.
@@ -661,17 +693,7 @@ impl Ctx {
                     plan["stages"][idx]["scope_clarification"]["pending"] = json!(false);
                     plan["stages"][idx]["scope_clarification"]["delivered_round"] = json!(round + 1);
                 }
-                // Reserve the round before any invocation; errors/restarts cannot replenish it.
-                plan["stages"][idx]["rounds"] = json!(round + 1);
-                plan["stages"][idx]["review_gate"] =
-                    json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
-                for role in ["architect", "reviewer"] {
-                    if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan" {
-                        plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
-                    }
-                }
-                plan["stages"][idx]["last_verdict_valid"] = json!(false);
-                self.save_plan(plan)?;
+                self.reserve_review_round(plan, idx, round)?;
                 let template = if round == 0 || clarifying {
                     IMPLEMENT_PROMPT
                 } else {
@@ -791,30 +813,25 @@ impl Ctx {
                 for usage in correction_usage { self.record_stage_usage(plan, idx, role, provider, Some(usage))?; }
                 let trigger = self.implementer_outcome(plan, idx, &turn, &output)?;
                 if let Some((kind,evidence)) = trigger {
+                    // A constraint conflict (the stage's own constraints contradict
+                    // each other) goes to the planner that owns the stage text, once
+                    // per conflict, instead of spending rounds or switching models.
+                    if kind == crate::constraint_conflict::KIND {
+                        let reason = evidence["request"]["reason"].as_str().unwrap_or("").to_owned();
+                        let trigger = Trigger { source: role, kind: &kind, reason: reason.clone(), statements: vec![reason] };
+                        match self.escalate_stage_conflict(plan, idx, trigger, round < budget)? {
+                            ConflictResolution::Restart => return Ok("renegotiated"),
+                            ConflictResolution::AwaitingApproval => return Ok("awaiting_approval"),
+                            ConflictResolution::Stopped => return Ok("stopped"),
+                            ConflictResolution::Clarified => continue,
+                            ConflictResolution::Blocked => return Ok(CONFLICT_BLOCKED),
+                        }
+                    }
                     // A scope escalation says this stage cannot be built as written.
                     // Re-running it against the same words only spends the remaining
                     // fix rounds, so the planner that owns the text decides instead.
-                    // A constraint conflict (the stage's own constraints contradict
-                    // each other) also goes to the planner. Until the stage loop has its
-                    // own conflict hand-back it takes the scope path, recorded as an
-                    // escalation so it is never dropped.
-                    if kind == "material_scope_change" || kind == crate::constraint_conflict::KIND {
-                        let record = if kind == crate::constraint_conflict::KIND {
-                            let reason = evidence["request"]["reason"].as_str().unwrap_or("").to_owned();
-                            Some(self.begin_constraint_escalation(plan, idx, role, &kind, &reason, std::slice::from_ref(&reason))?)
-                        } else { None };
-                        let resolution = self.renegotiate_scope(plan, idx, &evidence);
-                        if let Some(at) = record {
-                            use super::super::planning::ScopeResolution as R;
-                            let (outcome, detail) = match &resolution {
-                                Ok(R::Revised(changed)) => ("applied", format!("scope renegotiation revised the stage: {changed}")),
-                                Ok(R::Clarified(message)) => ("refused", format!("scope renegotiation kept the stage: {message}")),
-                                Ok(R::Blocked(message)) => ("blocked", message.clone()),
-                                Err(error) => ("failed", error.clone()),
-                            };
-                            self.settle_constraint_escalation(plan, idx, at, outcome, Some(&detail))?;
-                        }
-                        let message = match resolution? {
+                    if kind == "material_scope_change" {
+                        let message = match self.renegotiate_scope(plan, idx, &evidence)? {
                             super::super::planning::ScopeResolution::Revised(_) => return Ok("renegotiated"),
                             super::super::planning::ScopeResolution::Clarified(_) => {
                                 if round < budget { continue; }
@@ -927,6 +944,24 @@ impl Ctx {
             if gate["status"] == "deferred" {
                 return Ok("deferred");
             }
+            // A reported constraint conflict goes to the planner instead of the
+            // repeated-findings model reassessment for this round.
+            let conflicts: Vec<&Value> = gate["constraint_conflicts"].as_array().into_iter().flatten().collect();
+            let conflict_reported = !conflicts.is_empty();
+            if conflict_reported {
+                let statements: Vec<String> = conflicts.iter()
+                    .filter_map(|c| c["text"].as_str().map(str::to_owned)).collect();
+                let source = conflicts[0]["role"].as_str().unwrap_or("reviewer");
+                let trigger = Trigger { source, kind: crate::constraint_conflict::KIND,
+                    reason: statements.join("\n"), statements };
+                match self.escalate_stage_conflict(plan, idx, trigger, round < budget)? {
+                    ConflictResolution::Restart => return Ok("renegotiated"),
+                    ConflictResolution::AwaitingApproval => return Ok("awaiting_approval"),
+                    ConflictResolution::Stopped => return Ok("stopped"),
+                    ConflictResolution::Blocked => return Ok(CONFLICT_BLOCKED),
+                    ConflictResolution::Clarified => {}
+                }
+            }
             // Record clarification without erasing either role's requests.
             let gaps: Vec<_> = records
                 .iter()
@@ -942,18 +977,32 @@ impl Ctx {
                 cp["context_gap"] = json!({"stage_id":sid,"text":gaps.join("\n"),"unresolved_requests":gate["requests"]});
                 let current = self.architecture_store().publish(current, cp, json!({"kind":"review_clarification_requested","requests":gate["requests"],"gaps":gaps}))?;
                 *plan = current.clone();
-                if self.repeated_findings(plan, idx, &gate["requests"])? { continue; }
+                if !conflict_reported && self.repeated_findings(plan, idx, &gate["requests"])? { continue; }
                 let current = self.load_plan().ok_or("missing clarification plan")?;
                 *plan = self.architect_publish(
                     current.clone(),
                     Some(&current),
                     "review architectural clarification; retain both roles' unresolved authority",
                 )?;
-            } else if round < budget {
+            } else if round < budget && !conflict_reported {
                 self.repeated_findings(plan, idx, &gate["requests"])?;
             }
         }
         Ok("exhausted")
+    }
+
+    /// Reserve the round before any invocation; errors/restarts cannot replenish it.
+    fn reserve_review_round(&self, plan: &mut Value, idx: usize, round: u64) -> Result<(), String> {
+        plan["stages"][idx]["rounds"] = json!(round + 1);
+        plan["stages"][idx]["review_gate"] =
+            json!({"status":"pending","roles":{"architect":"pending","reviewer":"pending"}});
+        for role in ["architect", "reviewer"] {
+            if crate::plan::review_cadence(&plan["stages"][idx], role) == "per_plan" {
+                plan["stages"][idx]["review_gate"]["roles"][role] = json!("deferred");
+            }
+        }
+        plan["stages"][idx]["last_verdict_valid"] = json!(false);
+        self.save_plan(plan)
     }
 
     /// Export PNGs for `.pen` files changed in this attempt before anything

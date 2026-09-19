@@ -466,19 +466,23 @@ impl Ctx {
     {
         use crate::constraint_conflict as conflict;
         let changed = self.attempt_changed_files(plan, idx)?;
-        let requests = plan["stages"][idx]["review_gate"]["requests"].as_array().cloned().unwrap_or_default();
+        let requests = conflict::outstanding_requests(&plan["stages"][idx]);
         let signature = conflict::signature(statements, &requests);
         let inputs = conflict::stage_inputs(plan, idx, statements, &changed);
-        let record = conflict::new_record(source, kind, reason, &signature, inputs, unix_timestamp())?;
+        let mut record = conflict::new_record(source, kind, reason, &signature, inputs, unix_timestamp())?;
+        // Where in the stage's lineage the conflict arose.
+        let stage = &plan["stages"][idx];
+        record["stage_id"] = stage["id"].clone();
+        record["attempt_id"] = stage["attempt_id"].clone();
+        record["round"] = stage["rounds"].clone();
         let at = conflict::push_record(&mut plan["stages"][idx], record);
         self.save_plan(plan)?;
         Ok(at)
     }
 
     /// Ask the planner about a pending escalation record and store its validated
-    /// answer (analysis, decision, correction) on the record.
-    // Only tests call this until the stage loop hands conflicts to the planner.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// answer (analysis, decision, correction) on the record, with the plan
+    /// revision it answers, before anything applies it.
     pub(super) fn consult_conflict_planner(&self, plan: &mut Value, idx: usize, at: usize)
         -> Result<crate::constraint_conflict::PlannerAnswer, String>
     {
@@ -492,7 +496,10 @@ impl Ctx {
         let snapshot = plan.clone();
         let answer = self.planner_answer(plan, idx, "constraint conflict", &prompt,
             |text| conflict::validate_answer(text, &snapshot, idx))?;
-        conflict::record_answer(&mut plan["stages"][idx][conflict::RECORDS][at], &answer);
+        let revision = plan["revision"].clone();
+        let record = &mut plan["stages"][idx][conflict::RECORDS][at];
+        conflict::record_answer(record, &answer);
+        record["answer_revision"] = revision;
         self.save_plan(plan)?;
         Ok(answer)
     }

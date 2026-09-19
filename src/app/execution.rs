@@ -129,7 +129,10 @@ impl Ctx {
             prompt.push_str(&format!("\n[implementer] Last validated outcome/escalation request: {}\n[engine] Latest routing handoff: {}\n", stage["implementer_outcome"], stage["reassessment"]["history"].as_array().and_then(|h| h.last()).map(|h| json!({"kind":h["kind"],"evidence":h["evidence"]})).unwrap_or(Value::Null)));
             let clarification = &stage["scope_clarification"];
             if clarification["source_inputs"] == crate::plan::stage_inputs(&current, idx) {
-                prompt.push_str(&format!("\nPLANNER CLARIFICATION OF YOUR SCOPE ESCALATION:\n{}\nComplete this stage under its unchanged instructions and acceptance, using this explanation. Preserve inherited work and unresolved review findings. This clarification is not a review approval: verify the implementation and required checks before reporting completion.\n", clarification["message"].as_str().unwrap_or("")));
+                let heading = if clarification["source"] == crate::constraint_conflict::KIND {
+                    "PLANNER ANSWER TO THE REPORTED CONSTRAINT CONFLICT (the stage can be done as written)"
+                } else { "PLANNER CLARIFICATION OF YOUR SCOPE ESCALATION" };
+                prompt.push_str(&format!("\n{heading}:\n{}\nComplete this stage under its unchanged instructions and acceptance, using this explanation. Preserve inherited work and unresolved review findings. This clarification is not a review approval: verify the implementation and required checks before reporting completion.\n", clarification["message"].as_str().unwrap_or("")));
             }
             let worktree = self.git(&["status", "--short"])?;
             let diff = self.git(&["diff", "HEAD", "--", ".", ":(exclude).forge"])?;
@@ -206,6 +209,7 @@ impl Ctx {
         let _worker = WorkerGuard(&self.session);
         let mut plan = self.recover_execution_plan()?;
         let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
+        self.settle_suspended_work(&mut plan, idx)?;
         let outcome = loop {
             let title = plan["stages"][idx]["title"].as_str().unwrap_or("").to_string();
             self.initialize_stage_attempt(&mut plan, idx)?;
@@ -242,6 +246,11 @@ impl Ctx {
 
     fn run_worker_inner(&self) -> Result<(), String> {
         let mut plan = self.recover_execution_plan()?;
+        if Self::correction_awaits_approval(&plan) {
+            self.set_phase("plan_ready");
+            self.log_event("plan", "the planner's constraint-conflict correction awaits your approval; approve the revised plan to continue");
+            return Ok(());
+        }
         let count = plan["stages"].as_array().unwrap().len();
         for idx in 0..count {
             if plan["stages"][idx]["status"] == json!("committed") {
@@ -253,6 +262,9 @@ impl Ctx {
                 return Ok(());
             }
             let sid = plan["stages"][idx]["id"].as_i64().unwrap_or(0);
+            // An inserted predecessor commits on its own: work held for a later
+            // stage is suspended first, and restored when that stage runs.
+            self.settle_suspended_work(&mut plan, idx)?;
             // A renegotiated stage carries revised text and replenished rounds,
             // so it starts over as a fresh attempt rather than ending the run.
             let outcome = loop {
@@ -271,6 +283,14 @@ impl Ctx {
                 "stopped" => {
                     self.set_phase("plan_ready");
                     self.log_event("run", "stopped by user; progress is saved, run again to continue");
+                    return Ok(());
+                }
+                // The planner changed later stages or inserted stages: the plan
+                // is a draft again and the user approves it before anything runs.
+                "awaiting_approval" => {
+                    self.set_phase("plan_ready");
+                    self.log_event("run", &format!(
+                        "stage {sid} not committed: the planner's correction awaits your approval; uncommitted work is kept"));
                     return Ok(());
                 }
                 "configuration_blocked" => {
@@ -400,6 +420,8 @@ impl Ctx {
                 self.resume_scope_revision(&mut loaded, idx)?;
             }
         }
+        // Apply a saved planner correction; never ask the planner again.
+        self.recover_constraint_escalations(&mut loaded)?;
         let cp = if loaded["architecture"].is_object() { self.architecture_store().checkpoint(&loaded)? } else { Value::Null };
         let pending_turn = loaded["plan_id"].as_str().and_then(|id| fs::read(self.forge_path("architecture").join(id).join("architect-pending.json")).ok())
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap_or(json!({"turn":"invalid"})));

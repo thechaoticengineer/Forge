@@ -32,7 +32,7 @@ fn is_implementation_path(path: &str) -> bool {
 
 /// A raw layout identity and a normalized final tree are both necessary: git add
 /// changes the former legitimately, but must never change reviewed content.
-pub(super) fn review_snapshot(root: &str) -> Result<Value, String> {
+pub(in crate::app) fn review_snapshot(root: &str) -> Result<Value, String> {
     review_snapshot_against(root, "HEAD")
 }
 
