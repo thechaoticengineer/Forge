@@ -940,7 +940,8 @@ fn s32_invalid_registry_entries_make_the_feature_invalid_naming_the_entry() {
     env.commit_files(&[("tests/present.rs", "// present\n")]);
     let scenarios = scenarios_md(0);
     let with_line = |line: &str| milestones_md(Some(line));
-    let repeated = format!("{}\nBusiness tests: tests/present.rs\n", with_line("tests/present.rs"));
+    // The second line must sit in the same milestone as the first to be a repeat.
+    let repeated = with_line("tests/present.rs\nBusiness tests: tests/present.rs");
     let cases: [(&str, String, &str); 5] = [
         ("has-spaces", with_line("tests/present.rs and some words here"), "some words here"),
         ("not-a-path", with_line("none"), "none"),

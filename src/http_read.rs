@@ -210,6 +210,8 @@ pub(super) fn api_features(ctx: &Ctx) -> ApiResponse {
                     "id": m.id,
                     "title": m.title,
                     "status": if m.implemented { "implemented" } else { "planned" },
+                    "covers": m.covers,
+                    "business_tests": m.business_tests,
                 })).collect::<Vec<_>>(),
             });
             for (key, value) in crate::feature_state::listing_fields(ctx, &f.slug)
