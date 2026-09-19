@@ -49,6 +49,19 @@ impl Ctx {
             if !settings["mock_agent_requests"].is_array() { settings["mock_agent_requests"] = json!([]); }
             settings["mock_agent_requests"].as_array_mut().unwrap().push(json!({"role":role,"provider":tool,"model":model,"effort":effort,"prompt":prompt,"session":session}));
         }
+        // The other roles are recorded at their own mock boundaries, which
+        // never reach this function. A fixer outside a stage is PLAN_FIX.
+        #[cfg(test)]
+        {
+            let stage = self.session.state.lock().unwrap().current_stage;
+            match role {
+                "implementer" => self.record_prompt(role, crate::prompt_capture::IMPLEMENTER, stage, prompt),
+                "fixer" if stage.is_some() => self.record_prompt(role, crate::prompt_capture::FIXER, stage, prompt),
+                "fixer" => self.record_prompt(role, crate::prompt_capture::PLAN_FIX, None, prompt),
+                "chat" => self.record_prompt(role, crate::prompt_capture::PLANNER_CHAT, None, prompt),
+                _ => {}
+            }
+        }
         let mock_execution = tool == "mock";
         #[cfg(test)]
         let mock_execution = mock_execution || (matches!(role,"implementer"|"fixer"|"response_correction") && {

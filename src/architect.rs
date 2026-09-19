@@ -712,6 +712,8 @@ impl Ctx {
         prompt: &str,
         session: Option<&str>,
     ) -> Result<AgentResult, String> {
+        #[cfg(test)]
+        self.record_prompt("architect", crate::prompt_capture::ARCHITECT_PUBLISH, None, prompt);
         let mut settings = self.app.settings.lock().unwrap();
         let requests = settings
             .as_object_mut()

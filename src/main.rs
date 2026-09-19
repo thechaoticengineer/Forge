@@ -21,6 +21,8 @@ mod agent_log;
 mod durable_json;
 mod architecture;
 mod prompt_view;
+#[cfg(test)]
+mod prompt_capture;
 mod architect;
 mod review_history;
 mod reports;

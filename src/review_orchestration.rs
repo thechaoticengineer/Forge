@@ -239,6 +239,9 @@ impl Ctx {
                 settings["test_review_sessions"].as_array_mut().unwrap().push(json!({"role":role,"provider":provider,"model":model,"session":if role == "architect" {session.clone()} else {None},"prompt":prompt}));
             }
             let result = if mock {
+                #[cfg(test)]
+                self.record_prompt(role, if matches!(scope, ReviewScope::Plan) { crate::prompt_capture::PLAN_REVIEW } else { crate::prompt_capture::STAGE_REVIEW },
+                    step, prompt);
                 self.mock_review(&identity, &prompt, &json!({"acceptance":acceptance}))
             } else {
                 let policy = crate::catalogue::Policy::from_settings(&self.app.settings.lock().unwrap())?;

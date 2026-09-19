@@ -655,6 +655,10 @@ impl Ctx {
     ) -> Result<crate::agent::AgentResult, String> {
         if self.session.stop_requested.load(std::sync::atomic::Ordering::SeqCst) { return Err("selection stopped".into()); }
         if provider == "mock" {
+            #[cfg(test)]
+            if role == "architect" {
+                self.record_prompt(role, crate::prompt_capture::ROUTING_RECONCILIATION, None, prompt);
+            }
             let mut settings = self.app.settings.lock().unwrap();
             let key = format!("mock_routing_{role}_requests");
             if !settings[&key].is_array() {
