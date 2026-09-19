@@ -2266,7 +2266,7 @@ stage receives a replacement proposal; unknown fields are never silently ignored
 
 ### Planning rules for satisfiable constraints
 
-To prevent contradictory stage constraints, the planner follows three core rules:
+To prevent contradictory or unreachable stage constraints, the planner follows four core rules:
 
 1. **Stage constraints must be satisfiable together.** A stage instruction such as
    "change only documentation" or "change only X" must still allow all project test
@@ -2280,6 +2280,12 @@ To prevent contradictory stage constraints, the planner follows three core rules
 3. **Committed stages are fixed history.** Reviews and corrections never ask to
    change, amend or rewrite commits of earlier stages. A finding must be satisfiable
    in the current working tree.
+4. **Acceptance must be reachable in the working tree.** Every acceptance criterion
+   must be one the implementing agent can meet by changing files. Acceptance never
+   depends on what the engine produces, such as commit messages, commit boundaries
+   or runtime state under `.forge/`. Anything that must be recorded, such as an
+   authorisation or an audit result, goes into the stage's `commit` message or into
+   a file the stage changes.
 
 Agents must not disable tests, weaken assertions or suppress warnings merely to
 pass; intentional exceptions require repository-supported justification. When a

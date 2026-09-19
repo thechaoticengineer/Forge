@@ -7,7 +7,8 @@ macro_rules! plan_constraint_rules {
         "CONSTRAINT RULES FOR EVERY STAGE:\n\
 - A stage's constraints must be satisfiable together. A restriction such as \"change only documentation\" or \"change only X\" must still allow every project test suite to pass after the stage, and all tests must pass after every stage.\n\
 - Before planning a stage that changes documentation, milestone or status lines, README or other real project files, find the tests that read those files. If any exist, plan an earlier stage that moves those tests onto fixture data, or drop the restriction.\n\
-- Committed stages are fixed history, so corrections only move forward and never amend, rewrite or reorder committed work.\n\n"
+- Committed stages are fixed history, so corrections only move forward and never amend, rewrite or reorder committed work.\n\
+- Every acceptance criterion must be one the implementing agent can meet in the working tree. Never make acceptance depend on what the engine produces, such as commit messages, commit boundaries or runtime state under .forge/. Anything that must be recorded, such as an authorisation or an audit result, goes into the stage's \"commit\" message or into a file the stage changes.\n\n"
     };
 }
 
@@ -698,13 +699,14 @@ mod tests {
     const ALL_PASS: &str = "all tests must pass after every stage";
     const FIXTURES: &str = "find the tests that read those files. If any exist, plan an earlier stage that moves those tests onto fixture data";
     const FIXED_HISTORY: &str = "Committed stages are fixed history, so corrections only move forward";
+    const WORKING_TREE: &str = "Every acceptance criterion must be one the implementing agent can meet in the working tree.";
 
     #[test]
     fn every_planning_prompt_carries_the_shared_constraint_rules() {
         for (name, prompt) in [("PLANNER", PLANNER_PROMPT), ("DISCUSSION_PLANNER", DISCUSSION_PLANNER_PROMPT),
             ("REVISE", REVISE_PROMPT), ("REFACTOR", REFACTOR_PROMPT), ("SCOPE", SCOPE_PROMPT)] {
             assert!(prompt.contains(PLAN_CONSTRAINT_RULES), "{name} lacks the shared block");
-            for rule in [SATISFIABLE, ALL_PASS, FIXTURES, FIXED_HISTORY, "\"change only documentation\"", "README or other real project files"] {
+            for rule in [SATISFIABLE, ALL_PASS, FIXTURES, FIXED_HISTORY, WORKING_TREE, "\"change only documentation\"", "README or other real project files"] {
                 assert!(prompt.contains(rule), "{name} lacks: {rule}");
             }
         }
